@@ -1206,8 +1206,9 @@ As luce-js (`git log`: "Port skeleton: … typed stubs", then "Port region rNN: 
    test's own (house rule).
 5. Cross-region edits: a region may fill an unmapped field or fix a generated signature in a
    types file with a note in the merge message; it never ports another region's functions.
-6. Compiler bugs: reduce, record in `docs/compiler-issues/`, work around with `# workaround:`
-   (luce-js rule).
+6. Compiler bugs: write the most intuitive code; when the compiler rejects or miscompiles it,
+   reduce it to a repro and fix the compiler (the luce-base session owns it) rather than
+   working around the bug in the port (owner's rule, luce-js PORTING.md).
 
 ---
 
