@@ -1,0 +1,498 @@
+#==============================================================================================
+#
+#   node_1 - DOM::Node: unique ids, construction, text content, normalize, style scopes
+#
+#   DESCRIPTION:
+#       Port of LibWeb/DOM/Node.cpp (lines 81-566): the node directory of unique ids, the
+#       constructors, finalize and visit_edges, base URI and the enclosing-element queries,
+#       textContent, normalize(), nodeValue, the style scopes a node lives in, the
+#       shadow-including root and ensure-pre-insertion-validity.
+#
+#==============================================================================================
+
+# mark: Unique ids ==============================================================================
+
+## Ported from Node.cpp:84 Web::DOM::allocate_unique_id.
+pub func dom_allocate_unique_id(node: DomNode*?) -> i64:
+    let id = dom_s_next_unique_id
+    dom_s_next_unique_id += 1
+    # s_node_directory is a C++ static on the C heap: its storage must not live in (unscanned)
+    # managed memory, and its entries must not keep nodes alive (DESIGN.md §3.3 rule 4).
+    with memory.heap:
+        discard(ak.hash_map_set(&dom_s_node_directory, id, node))
+    return id
+
+## Ported from Node.cpp:92 Web::DOM::deallocate_unique_id.
+pub func dom_deallocate_unique_id(node_id: i64):
+    var removed = false
+    with memory.heap:
+        removed = ak.hash_map_remove_k(&dom_s_node_directory, node_id)
+    if not removed:
+        trap("VERIFY_NOT_REACHED")
+
+## Ported from Node.cpp:98 Web::DOM::Node::from_unique_id.
+pub func dom_node_from_unique_id(unique_id: i64) -> DomNode*?:
+    let node = ak.hash_map_get_k(&dom_s_node_directory, unique_id) else return none
+    return *node
+
+# mark: Construction ============================================================================
+
+## Ported from Node.cpp:103 Web::DOM::Node::Node(JS::Realm&, Document&, NodeType).
+pub func dom_node_construct_realm(this: DomNode*, realm: Realm*, document: DomDocument*, type_: DomNodeType):
+    dom_event_target_construct(this.dom_event_target(), realm)
+    this.m_document = document
+    this.m_type = type_
+    this.m_unique_id = dom_allocate_unique_id(this)
+
+    # A Document is its own shadow-including root, so it is always connected.
+    if type_ == DomNodeType.document_node:
+        this.m_is_connected = true
+
+## Ported from Node.cpp:114 Web::DOM::Node::Node(Document&, NodeType).
+pub func dom_node_construct_dom_document(this: DomNode*, document: DomDocument*, type_: DomNodeType):
+    dom_node_construct_realm(this, bind_platform_object_realm(document.bind_platform_object()), document, type_)
+
+## Ported from Node.cpp:121 Web::DOM::Node::finalize (override).
+pub func dom_node_finalize_impl(base: gc.Cell*):
+    let this = (DomNode*)base
+    # Base::finalize(): EventTarget inherits GC::Cell's.
+    gc.cell_finalize_impl(base)
+    dom_deallocate_unique_id(this.m_unique_id)
+
+## Ported from Node.cpp:127 Web::DOM::Node::visit_edges (override).
+pub func dom_node_visit_edges_impl(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (DomNode*)base
+    dom_event_target_visit_edges_impl(base, visitor)
+    tree_node_visit_edges(&this.tree_node, visitor)
+    gc.cell_visitor_visit_t(visitor, this.m_document)
+    gc.cell_visitor_visit_t(visitor, this.m_child_nodes)
+
+    gc.cell_visitor_visit_t(visitor, this.m_layout_node)
+    gc.cell_visitor_visit_t(visitor, this.m_paintable)
+
+    if let registered_observer_list = this.m_registered_observer_list:
+        gc.cell_visitor_visit_vector(visitor, registered_observer_list)
+
+# mark: Base URI and enclosing elements =========================================================
+
+## Ported from Node.cpp:143 Web::DOM::Node::base_uri.
+# https://dom.spec.whatwg.org/#dom-node-baseuri
+pub func dom_node_base_uri(this: DomNode*) -> ak.String:
+    # Return this’s node document’s document base URL, serialized.
+    let base_url = dom_document_base_url(dom_node_document(this))
+    return web_url.url_to_string(&base_url)
+
+## Ported from Node.cpp:149 Web::DOM::Node::enclosing_link_element.
+pub func dom_node_enclosing_link_element(this: DomNode*) -> HtmlAnchorElement*?:
+    var node: DomNode*? = this
+    while let current = node:
+        node = tree_node_parent(&current.tree_node)
+        let anchor_element = as_if_html_anchor_element(current) else continue
+        if dom_element_has_attribute(anchor_element.dom_element(), html_attribute_names_href):
+            return anchor_element
+    return none
+
+## Ported from Node.cpp:161 Web::DOM::Node::enclosing_html_element.
+pub func dom_node_enclosing_html_element(this: DomNode*) -> HtmlElement*?:
+    let ancestor = tree_node_first_ancestor_of_type(&this.tree_node, &html_element_class) else return none
+    return (HtmlElement*)ancestor
+
+## Ported from Node.cpp:166 Web::DOM::Node::enclosing_html_element_with_attribute.
+pub func dom_node_enclosing_html_element_with_attribute(this: DomNode*, attribute: ak.FlyString) -> HtmlElement*?:
+    var node: DomNode*? = this
+    while let current = node:
+        if let html_element = as_if_html_element(current):
+            if dom_element_has_attribute(html_element.dom_element(), attribute):
+                return html_element
+        node = tree_node_parent(&current.tree_node)
+    return none
+
+## Ported from Node.cpp:175 Web::DOM::Node::alternative_text (virtual).
+pub func dom_node_alternative_text_impl(this: DomNode*) -> ak.String?:
+    return none
+
+# mark: Text content ============================================================================
+
+## Ported from Node.cpp:181 Web::DOM::Node::descendant_text_content.
+# https://dom.spec.whatwg.org/#concept-descendant-text-content
+pub func dom_node_descendant_text_content(this: DomNode*) -> ak.Utf16String:
+    var builder = ak.string_builder_new_mode(ak.StringBuilderMode.utf16)
+
+    # for_each_in_subtree_of_type<Text>
+    for node in dom_node_subtree(this):
+        let text_node = as_if_dom_text(node) else continue
+        let data = dom_character_data_data(text_node.dom_character_data())
+        ak.string_builder_append_utf16_view(&builder, ak.utf16_string_base_utf16_view(&data.utf16_string_base))
+
+    return ak.string_builder_to_utf16_string(&builder)
+
+## Ported from Node.cpp:194 Web::DOM::Node::text_content.
+# https://dom.spec.whatwg.org/#dom-node-textcontent
+pub func dom_node_text_content(this: DomNode*) -> ak.Utf16String?:
+    # The textContent getter steps are to return the following, switching on the interface this implements:
+
+    # If DocumentFragment or Element, return the descendant text content of this.
+    if is_dom_document_fragment(this) or is_dom_element(this):
+        return dom_node_descendant_text_content(this)
+
+    # If CharacterData, return this’s data.
+    if let character_data = as_if_dom_character_data(this):
+        return dom_character_data_data(character_data)
+
+    # If Attr node, return this's value.
+    if let attribute = as_if_dom_attr(this):
+        let value = dom_attr_value(attribute)
+        return ak.utf16_string_from_utf8_string(&value)
+
+    # Otherwise, return null
+    return none
+
+## Ported from Node.cpp:215 Web::DOM::Node::set_text_content.
+# https://dom.spec.whatwg.org/#ref-for-dom-node-textcontent%E2%91%A0
+pub func dom_node_set_text_content(this: DomNode*, maybe_content: ak.Utf16String?) -> !:
+    # The textContent setter steps are to, if the given value is null, act as if it was the empty string instead,
+    # and then do as described below, switching on the interface this implements:
+    let content = maybe_content else ak.utf16_string_new()
+
+    # If DocumentFragment or Element, string replace all with the given value within this.
+    if is_dom_document_fragment(this) or is_dom_element(this):
+        # OPTIMIZATION: Replacing nothing with nothing is a no-op. Avoid all invalidation in this case.
+        if tree_node_first_child(&this.tree_node) == none and ak.utf16_string_base_is_empty(&content.utf16_string_base):
+            return
+        dom_node_string_replace_all(this, content)
+
+    # If CharacterData, replace data with node this, offset 0, count this’s length, and data the given value.
+    elif let character_data = as_if_dom_character_data(this):
+        try dom_character_data_replace_data(character_data, 0, dom_character_data_length_in_utf16_code_units(character_data), ak.utf16_string_base_utf16_view(&content.utf16_string_base))
+
+    # If Attr, set an existing attribute value with this and the given value.
+    elif let attribute = as_if_dom_attr(this):
+        try dom_attr_set_value(attribute, ak.utf16_string_base_to_utf8_but_should_be_ported_to_utf16(&content.utf16_string_base))
+
+    # Otherwise, do nothing.
+
+    if dom_node_is_connected(this):
+        dom_node_invalidate_style(this, DomStyleInvalidationReason.node_set_text_content)
+        dom_node_set_needs_layout_tree_update(this, true, DomSetNeedsLayoutTreeUpdateReason.node_set_text_content)
+
+    dom_document_bump_dom_tree_version(dom_node_document(this))
+
+# mark: normalize() =============================================================================
+
+## Node::normalize's contiguous_exclusive_text_nodes_excluding_self lambda.
+# https://dom.spec.whatwg.org/#contiguous-exclusive-text-nodes
+# The contiguous exclusive Text nodes of a node node are node, node’s previous sibling exclusive Text node, if any,
+# and its contiguous exclusive Text nodes, and node’s next sibling exclusive Text node, if any,
+# and its contiguous exclusive Text nodes, avoiding any duplicates.
+# NOTE: The callers of this method require node itself to be excluded.
+func dom_node_normalize_contiguous_exclusive_text_nodes_excluding_self(node: DomNode*) -> ak.Vector[DomText*]:
+    var nodes: ak.Vector[DomText*]
+
+    var current_node = tree_node_previous_sibling(&node.tree_node)
+    while let current = current_node:
+        if not dom_node_is_exclusive_text(current):
+            break
+        ak.vector_append_t(&nodes, (DomText*)current)
+        current_node = tree_node_previous_sibling(&current.tree_node)
+
+    # Reverse the order of the nodes so that they are in tree order.
+    ak.vector_reverse(&nodes)
+
+    current_node = tree_node_next_sibling(&node.tree_node)
+    while let current = current_node:
+        if not dom_node_is_exclusive_text(current):
+            break
+        ak.vector_append_t(&nodes, (DomText*)current)
+        current_node = tree_node_next_sibling(&current.tree_node)
+
+    return nodes
+
+## Ported from Node.cpp:252 Web::DOM::Node::normalize.
+# https://dom.spec.whatwg.org/#dom-node-normalize
+pub func dom_node_normalize(this: DomNode*) -> !:
+    # The normalize() method steps are to run these steps for each descendant exclusive Text node node of this
+    var descendant_exclusive_text_nodes: ak.Vector[DomText*]
+    # for_each_in_inclusive_subtree_of_type<Text>
+    for inclusive_descendant in dom_node_inclusive_subtree(this):
+        let text_node = as_if_dom_text(inclusive_descendant) else continue
+        if not dom_node_is_cdata_section(inclusive_descendant):
+            ak.vector_append_t(&descendant_exclusive_text_nodes, text_node)
+
+    for text in ak.vector_span(&descendant_exclusive_text_nodes):
+        let node = text.dom_node()
+
+        # 1. Let length be node’s length.
+        let character_data = text.dom_character_data()
+        var length = dom_character_data_length_in_utf16_code_units(character_data)
+
+        # 2. If length is zero, then remove node and continue with the next exclusive Text node, if any.
+        if length == 0:
+            if tree_node_parent(&node.tree_node) != none:
+                dom_node_remove(node)
+            continue
+
+        # 3. Let data be the concatenation of the data of node’s contiguous exclusive Text nodes (excluding itself), in tree order.
+        var data = ak.string_builder_new_mode(ak.StringBuilderMode.utf16)
+        var contiguous = dom_node_normalize_contiguous_exclusive_text_nodes_excluding_self(node)
+        for text_node in ak.vector_span(&contiguous):
+            let text_node_data = dom_character_data_data(text_node.dom_character_data())
+            ak.string_builder_append_utf16_view(&data, ak.utf16_string_base_utf16_view(&text_node_data.utf16_string_base))
+
+        # 4. Replace data with node node, offset length, count 0, and data data.
+        let data_string = ak.string_builder_to_utf16_string(&data)
+        try dom_character_data_replace_data(character_data, length, 0, ak.utf16_string_base_utf16_view(&data_string.utf16_string_base))
+
+        # 5. Let currentNode be node’s next sibling.
+        var current_node = tree_node_next_sibling(&node.tree_node)
+
+        # 6. While currentNode is an exclusive Text node:
+        while let current = current_node:
+            if not dom_node_is_exclusive_text(current):
+                break
+
+            # 1. For each live range whose start node is currentNode, add length to its start offset and set its start
+            #    node to node.
+            for entry in ak.hash_table_begin(dom_range_live_ranges()):
+                let range = *entry else continue
+                if dom_abstract_range_start_container(range.dom_abstract_range()) == current:
+                    dom_range_increase_start_offset(range, length)
+                    dom_range_set_start_node(range, node)
+
+            # 2. For each live range whose end node is currentNode, add length to its end offset and set its end node
+            #    to node.
+            for entry in ak.hash_table_begin(dom_range_live_ranges()):
+                let range = *entry else continue
+                if dom_abstract_range_end_container(range.dom_abstract_range()) == current:
+                    dom_range_increase_end_offset(range, length)
+                    dom_range_set_end_node(range, node)
+
+            # 3. For each live range whose start node is currentNode’s parent and start offset is currentNode’s index,
+            #    set its start node to node and its start offset to length.
+            for entry in ak.hash_table_begin(dom_range_live_ranges()):
+                let range = *entry else continue
+                if dom_abstract_range_start_container(range.dom_abstract_range()) == tree_node_parent(&current.tree_node) and (usize)dom_abstract_range_start_offset(range.dom_abstract_range()) == tree_node_index(&current.tree_node):
+                    dom_range_set_start_node(range, node)
+                    dom_range_set_start_offset(range, length)
+
+            # 4. For each live range whose end node is currentNode’s parent and end offset is currentNode’s index, set
+            #    its end node to node and its end offset to length.
+            for entry in ak.hash_table_begin(dom_range_live_ranges()):
+                let range = *entry else continue
+                if dom_abstract_range_end_container(range.dom_abstract_range()) == tree_node_parent(&current.tree_node) and (usize)dom_abstract_range_end_offset(range.dom_abstract_range()) == tree_node_index(&current.tree_node):
+                    dom_range_set_end_node(range, node)
+                    dom_range_set_end_offset(range, length)
+
+            # 5. Add currentNode’s length to length.
+            length += (u32)dom_node_length(current)
+
+            # 6. Set currentNode to its next sibling.
+            current_node = tree_node_next_sibling(&current.tree_node)
+
+        # 7. Remove node’s contiguous exclusive Text nodes (excluding itself), in tree order.
+        var to_remove = dom_node_normalize_contiguous_exclusive_text_nodes_excluding_self(node)
+        for text_node in ak.vector_span(&to_remove):
+            dom_node_remove(text_node.dom_node())
+
+# mark: nodeValue and navigable =================================================================
+
+## Ported from Node.cpp:366 Web::DOM::Node::node_value.
+# https://dom.spec.whatwg.org/#dom-node-nodevalue
+pub func dom_node_node_value(this: DomNode*) -> ak.String?:
+    # The nodeValue getter steps are to return the following, switching on the interface this implements:
+
+    # If Attr, return this’s value.
+    if let attr = as_if_dom_attr(this):
+        return dom_attr_value(attr)
+
+    # If CharacterData, return this’s data.
+    if let character_data = as_if_dom_character_data(this):
+        let data = dom_character_data_data(character_data)
+        return ak.utf16_string_base_to_utf8_but_should_be_ported_to_utf16(&data.utf16_string_base)
+
+    # Otherwise, return null.
+    return none
+
+## Ported from Node.cpp:385 Web::DOM::Node::set_node_value.
+# https://dom.spec.whatwg.org/#ref-for-dom-node-nodevalue%E2%91%A0
+pub func dom_node_set_node_value(this: DomNode*, maybe_value: ak.String?) -> !:
+    # The nodeValue setter steps are to, if the given value is null, act as if it was the empty string instead,
+    # and then do as described below, switching on the interface this implements:
+    let value = maybe_value else ak.string_new()
+
+    # If Attr, set an existing attribute value with this and the given value.
+    if let attr = as_if_dom_attr(this):
+        try dom_attr_set_value(attr, value)
+    elif let character_data = as_if_dom_character_data(this):
+        # If CharacterData, replace data with node this, offset 0, count this’s length, and data the given value.
+        dom_character_data_set_data(character_data, ak.utf16_string_from_utf8_string(&value))
+
+    # Otherwise, do nothing.
+
+## Ported from Node.cpp:404 Web::DOM::Node::navigable.
+# https://html.spec.whatwg.org/multipage/document-sequences.html#node-navigable
+pub func dom_node_navigable(this: DomNode*) -> HtmlNavigable*?:
+    # To get the node navigable of a node node, return the navigable whose active document is node's node document,
+    # or null if there is no such navigable.
+    return dom_document_navigable(dom_node_document(this))
+
+# mark: Style scopes and style invalidation =====================================================
+
+## Ported from Node.cpp:411 Web::DOM::Node::style_scope.
+pub func dom_node_style_scope(this: DomNode*) -> CssStyleScope*:
+    let root = tree_node_root(&this.tree_node)
+    if let shadow_root = as_if_dom_shadow_root(root):
+        if dom_shadow_root_uses_document_style_sheets(shadow_root):
+            return dom_document_style_scope(dom_node_document(this))
+        return dom_shadow_root_style_scope(shadow_root)
+    return dom_document_style_scope(dom_node_document(this))
+
+## The captures of Node::for_each_style_scope_which_may_observe_the_node's `visit` lambda.
+struct DomNodeForEachStyleScopeWhichMayObserveTheNodeVisit:
+    var visited_scopes: ak.HashTable[CssStyleScope*, ak.PtrTraits[CssStyleScope]]
+    var callback: ak.Function1[CssStyleScope*, unit]
+
+## Node::for_each_style_scope_which_may_observe_the_node's `visit` lambda.
+func dom_node_for_each_style_scope_which_may_observe_the_node_visit(captures: DomNodeForEachStyleScopeWhichMayObserveTheNodeVisit*, scope: CssStyleScope*):
+    if ak.hash_table_set(&captures.visited_scopes, scope) != ak.HashSetResult.inserted_new_entry:
+        return
+    ak.function1_call(&captures.callback, scope)
+
+## Ported from Node.cpp:422 Web::DOM::Node::for_each_style_scope_which_may_observe_the_node.
+pub func dom_node_for_each_style_scope_which_may_observe_the_node(this: DomNode*, callback: ak.Function1[CssStyleScope*, unit]):
+    var visit = DomNodeForEachStyleScopeWhichMayObserveTheNodeVisit(callback = callback)
+
+    dom_node_for_each_style_scope_which_may_observe_the_node_visit(&visit, dom_node_style_scope(this))
+
+    if let element = as_if_dom_element(this):
+        if let shadow_root = dom_element_shadow_root(element):
+            dom_node_for_each_style_scope_which_may_observe_the_node_visit(&visit, dom_shadow_root_style_scope(shadow_root))
+
+    var ancestor = dom_node_parent_or_shadow_host(this)
+    while let parent_node = ancestor:
+        dom_node_for_each_style_scope_which_may_observe_the_node_visit(&visit, dom_node_style_scope(parent_node.dom_node()))
+        if let element = as_if_dom_element(parent_node):
+            if let shadow_root = dom_element_shadow_root(element):
+                dom_node_for_each_style_scope_which_may_observe_the_node_visit(&visit, dom_shadow_root_style_scope(shadow_root))
+        ancestor = dom_node_parent_or_shadow_host(parent_node.dom_node())
+
+## Ported from Node.cpp:447 Web::DOM::Node::invalidate_style(StyleInvalidationReason).
+pub func dom_node_invalidate_style(this: DomNode*, reason: DomStyleInvalidationReason):
+    css_invalidation_invalidate_node_style(this, reason)
+
+## Ported from Node.cpp:452 Web::DOM::Node::invalidate_style(StyleInvalidationReason, properties, options).
+pub func dom_node_invalidate_style_vector(this: DomNode*, reason: DomStyleInvalidationReason, properties: ak.Vector[CssInvalidationSetProperty], options: DomStyleInvalidationOptions):
+    css_invalidation_invalidate_node_style_for_properties(this, reason, properties, options)
+
+## Ported from Node.cpp:457 Web::DOM::Node::child_text_content.
+pub func dom_node_child_text_content(this: DomNode*) -> ak.Utf16String:
+    let parent_node = as_if_dom_parent_node(this) else return ak.utf16_string_new()
+
+    var builder = ak.string_builder_new_mode(ak.StringBuilderMode.utf16)
+
+    # for_each_child_of_type<Text>
+    for child in dom_node_children(parent_node.dom_node()):
+        if not is_dom_text(child):
+            continue
+        if let content = dom_node_text_content(child):
+            ak.string_builder_append_utf16_view(&builder, ak.utf16_string_base_utf16_view(&content.utf16_string_base))
+
+    return ak.string_builder_to_utf16_string(&builder)
+
+# mark: Shadow-including root ===================================================================
+
+## Ported from Node.cpp:475 Web::DOM::Node::shadow_including_root.
+# https://dom.spec.whatwg.org/#concept-shadow-including-root
+pub func dom_node_shadow_including_root(this: DomNode*) -> DomNode*:
+    # The shadow-including root of an object is its root’s host’s shadow-including root,
+    # if the object’s root is a shadow root; otherwise its root.
+    let node_root = tree_node_root(&this.tree_node)
+    if let shadow_root = as_if_dom_shadow_root(node_root):
+        if let host = dom_document_fragment_host(shadow_root.dom_document_fragment()):
+            return dom_node_shadow_including_root(host.dom_node())
+    return node_root
+
+## Ported from Node.cpp:488 Web::DOM::Node::is_closed_shadow_hidden_from.
+# https://dom.spec.whatwg.org/#concept-closed-shadow-hidden
+pub func dom_node_is_closed_shadow_hidden_from(this: DomNode*, b: DomNode*) -> bool:
+    # A node A is closed-shadow-hidden from a node B if all of the following conditions are true:
+    let a_root = tree_node_root(&this.tree_node)
+
+    # - A’s root is a shadow root.
+    if not dom_node_is_shadow_root(a_root):
+        return false
+
+    # - A’s root is not a shadow-including inclusive ancestor of B.
+    if dom_node_is_shadow_including_inclusive_ancestor_of(a_root, b):
+        return false
+
+    # - A’s root is a shadow root whose mode is "closed" or A’s root’s host is closed-shadow-hidden from B.
+    if dom_node_is_shadow_root(a_root) and dom_shadow_root_mode((DomShadowRoot*)a_root) == BindShadowRootMode.closed:
+        return true
+    if dom_node_is_document_fragment(a_root):
+        let host = dom_document_fragment_host((DomDocumentFragment*)a_root) else trap("DocumentFragment::host() is null")
+        if dom_node_is_closed_shadow_hidden_from(host.dom_node(), b):
+            return true
+
+    return false
+
+## Ported from Node.cpp:511 Web::DOM::Node::is_browsing_context_connected.
+# https://html.spec.whatwg.org/multipage/infrastructure.html#browsing-context-connected
+pub func dom_node_is_browsing_context_connected(this: DomNode*) -> bool:
+    # A node is browsing-context connected when it is connected and its shadow-including root's browsing context is non-null.
+    return dom_node_is_connected(this) and dom_document_browsing_context(dom_node_document(dom_node_shadow_including_root(this))) != none
+
+# mark: Pre-insertion validity ==================================================================
+
+## is<DocumentType>(child.ptr()) || (child && child->has_following_node_of_type_in_tree_order<DocumentType>()),
+## a condition steps 6 of ensure-pre-insertion-validity and of move share.
+func dom_node_is_doctype_or_has_following_doctype(child: DomNode*?) -> bool:
+    let node = child else return false
+    return is_dom_document_type(node) or tree_node_has_following_node_of_type_in_tree_order(&node.tree_node, &dom_document_type_class)
+
+## Ported from Node.cpp:518 Web::DOM::Node::ensure_pre_insertion_validity.
+# https://dom.spec.whatwg.org/#concept-node-ensure-pre-insertion-validity
+pub func dom_node_ensure_pre_insertion_validity(this: DomNode*, realm: Realm*, node: DomNode*, child: DomNode*?) -> !:
+    # 1. If parent is not a Document, DocumentFragment, or Element node, then throw a "HierarchyRequestError" DOMException.
+    if not is_dom_document(this) and not is_dom_document_fragment(this) and not is_dom_element(this):
+        try idl_throw(.idl_dom_exception(idl_hierarchy_request_error_create(realm, ak.utf16_string_from_str("Can only insert into a document, document fragment or element"))))
+
+    # 2. If node is a host-including inclusive ancestor of parent, then throw a "HierarchyRequestError" DOMException.
+    if dom_node_is_host_including_inclusive_ancestor_of(node, this):
+        try idl_throw(.idl_dom_exception(idl_hierarchy_request_error_create(realm, ak.utf16_string_from_str("New node is an ancestor of this node"))))
+
+    # 3. If child is non-null and its parent is not parent, then throw a "NotFoundError" DOMException.
+    if let child_node = child:
+        if tree_node_parent(&child_node.tree_node) != this:
+            try idl_throw(.idl_dom_exception(idl_not_found_error_create(realm, ak.utf16_string_from_str("This node is not the parent of the given child"))))
+
+    # FIXME: All the following "Invalid node type for insertion" messages could be more descriptive.
+    # 4. If node is not a DocumentFragment, DocumentType, Element, or CharacterData node, then throw a "HierarchyRequestError" DOMException.
+    if not is_dom_document_fragment(node) and not is_dom_document_type(node) and not is_dom_element(node) and not is_dom_text(node) and not is_dom_comment(node) and not is_dom_processing_instruction(node) and not is_dom_cdata_section(node):
+        try idl_throw(.idl_dom_exception(idl_hierarchy_request_error_create(realm, ak.utf16_string_from_str("Invalid node type for insertion"))))
+
+    # 5. If either node is a Text node and parent is a document, or node is a doctype and parent is not a document, then throw a "HierarchyRequestError" DOMException.
+    if (is_dom_text(node) and is_dom_document(this)) or (is_dom_document_type(node) and not is_dom_document(this)):
+        try idl_throw(.idl_dom_exception(idl_hierarchy_request_error_create(realm, ak.utf16_string_from_str("Invalid node type for insertion"))))
+
+    # 6. If parent is a document, and any of the statements below, switched on the interface node implements, are true, then throw a "HierarchyRequestError" DOMException.
+    if is_dom_document(this):
+        # DocumentFragment
+        if is_dom_document_fragment(node):
+            # If node has more than one element child or has a Text node child.
+            # Otherwise, if node has one element child and either parent has an element child, child is a doctype, or child is non-null and a doctype is following child.
+            let node_element_child_count = dom_parent_node_child_element_count(as_dom_document_fragment(node).dom_parent_node())
+            if (node_element_child_count > 1 or tree_node_has_child_of_type(&node.tree_node, &dom_text_class)) or (node_element_child_count == 1 and (tree_node_has_child_of_type(&this.tree_node, &dom_element_class) or dom_node_is_doctype_or_has_following_doctype(child))):
+                try idl_throw(.idl_dom_exception(idl_hierarchy_request_error_create(realm, ak.utf16_string_from_str("Invalid node type for insertion"))))
+        elif is_dom_element(node):
+            # Element
+            # If parent has an element child, child is a doctype, or child is non-null and a doctype is following child.
+            if tree_node_has_child_of_type(&this.tree_node, &dom_element_class) or dom_node_is_doctype_or_has_following_doctype(child):
+                try idl_throw(.idl_dom_exception(idl_hierarchy_request_error_create(realm, ak.utf16_string_from_str("Invalid node type for insertion"))))
+        elif is_dom_document_type(node):
+            # DocumentType
+            # parent has a doctype child, child is non-null and an element is preceding child, or child is null and parent has an element child.
+            var element_precedes_child = false
+            if let child_node = child:
+                element_precedes_child = tree_node_has_preceding_node_of_type_in_tree_order(&child_node.tree_node, &dom_element_class)
+            if tree_node_has_child_of_type(&this.tree_node, &dom_document_type_class) or element_precedes_child or (child == none and tree_node_has_child_of_type(&this.tree_node, &dom_element_class)):
+                try idl_throw(.idl_dom_exception(idl_hierarchy_request_error_create(realm, ak.utf16_string_from_str("Invalid node type for insertion"))))

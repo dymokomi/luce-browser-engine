@@ -1,6 +1,6 @@
 #!/bin/sh
-# Type-check every module of luce-browser-engine with warnings as errors (and run its tests once
-# there are any). Stops at the first failing step.
+# Type-check every module of luce-browser-engine with warnings as errors, then run the unit tests
+# of every module. Stops at the first failing step.
 set -e
 cd "$(dirname "$0")"
 
@@ -12,4 +12,10 @@ for module in web; do
         echo "$output"
         exit 1
     fi
+done
+
+# Unit tests (the regions' `tests_*` fragments), module by module.
+for module in web; do
+    echo "== luce-base test src/luce_browser_engine/$module"
+    luce-base test "src/luce_browser_engine/$module"
 done
