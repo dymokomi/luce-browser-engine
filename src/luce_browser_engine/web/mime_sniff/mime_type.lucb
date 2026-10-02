@@ -1,0 +1,386 @@
+#==============================================================================================
+#
+#   mime_type - MimeSniff::MimeType: parsing, serializing and classifying MIME types
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibWeb/MimeSniff/MimeType.cpp (lines 1-370) with the inline accessors
+#       of MimeType.h (lines 53-55). A MimeType is a value: C++'s defaulted copy constructor is
+#       mime_type_copy, which clones the parameter map (DESIGN.md §3.3 rule 2).
+#
+#       Copyright (c) 2022, Luke Wilde <lukew@serenityos.org>
+#       Copyright (c) 2022-2023, Linus Groh <linusg@serenityos.org>
+#       Copyright (c) 2022, networkException <networkexception@serenityos.org>
+#       Copyright (c) 2024, Jamie Mansfield <jmansfield@cadixdev.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Code points =============================================================================
+
+## Ported from Libraries/LibWeb/MimeSniff/MimeType.cpp:24 Web::MimeSniff::is_javascript_mime_type_essence_match.
+# https://mimesniff.spec.whatwg.org/#javascript-mime-type-essence-match
+pub func mime_is_javascript_mime_type_essence_match(string: ak.StringView) -> bool:
+    # A string is a JavaScript MIME type essence match if it is an ASCII case-insensitive match for one of the JavaScript MIME type essence strings.
+    for javascript_essence in mime_s_javascript_mime_type_essence_strings:
+        if ak.string_view_equals_ignoring_ascii_case(&string, ak.sv(javascript_essence)):
+            return true
+    return false
+
+## Ported from Libraries/LibWeb/MimeSniff/MimeType.cpp:34 Web::MimeSniff::contains_only_http_quoted_string_token_code_points.
+func mime_contains_only_http_quoted_string_token_code_points(string: ak.StringView) -> bool:
+    # https://mimesniff.spec.whatwg.org/#http-quoted-string-token-code-point
+    # An HTTP quoted-string token code point is U+0009 TAB, a code point in the range U+0020 SPACE to U+007E (~), inclusive,
+    # or a code point in the range U+0080 through U+00FF (ÿ), inclusive.
+    var view: ak.Utf8View
+    ak.utf8_view_construct_string_view(&view, string)
+    var it = ak.utf8_view_begin(&view)
+    while not ak.utf8_code_point_iterator_done(&it):
+        let ch = ak.utf8_code_point_iterator_deref(&it)
+        if not (ch == (u32)'\t' or (ch >= 0x20 and ch <= 0x7E) or (ch >= 0x80 and ch <= 0xFF)):
+            return false
+        ak.utf8_code_point_iterator_inc(&it)
+    return true
+
+## Ported from Libraries/LibWeb/MimeSniff/MimeType.cpp:46 Web::MimeSniff::contains_only_http_token_code_points.
+func mime_contains_only_http_token_code_points(string: ak.StringView) -> bool:
+    # https://mimesniff.spec.whatwg.org/#http-token-code-point
+    # An HTTP token code point is U+0021 (!), U+0023 (#), U+0024 ($), U+0025 (%), U+0026 (&), U+0027 ('), U+002A (*),
+    # U+002B (+), U+002D (-), U+002E (.), U+005E (^), U+005F (_), U+0060 (`), U+007C (|), U+007E (~), or an ASCII alphanumeric.
+    let is_certain_non_ascii_alphanumeric = ak.is_any_of(ak.sv("!#$%&'*+-.^_`|~"))
+    for ch in ak.string_view_bytes(&string):
+        if not is_certain_non_ascii_alphanumeric.matches(ch) and not ak.is_ascii_alphanumeric((u32)ch):
+            return false
+    return true
+
+# mark: MimeType ================================================================================
+
+## Ported from Libraries/LibWeb/MimeSniff/MimeType.cpp:59 Web::MimeSniff::MimeType::MimeType.
+pub func mime_type_construct(this: MimeType*, type_: ak.String, subtype: ak.String):
+    this.m_type = type_
+    this.m_subtype = subtype
+
+    # NOTE: type and subtype are expected to be non-empty and contain only
+    # http token code points in the MIME type parsing algorithm. That's
+    # why we are performing the same checks here.
+    assert(not ak.string_is_empty(&this.m_type) and mime_contains_only_http_token_code_points(ak.string_bytes_as_string_view(&this.m_type)))
+    assert(not ak.string_is_empty(&this.m_subtype) and mime_contains_only_http_token_code_points(ak.string_bytes_as_string_view(&this.m_subtype)))
+
+## Ported from Libraries/LibWeb/MimeSniff/MimeType.cpp:69 Web::MimeSniff::MimeType::MimeType(MimeType const&):
+## the defaulted copy, whose parameter map is a copy of `this`'s.
+pub func mime_type_copy(this: const MimeType*) -> MimeType:
+    var copy = *this
+    copy.m_parameters = ak.ordered_hash_map_clone(&this.m_parameters) else trap("MimeType: out of memory")
+    return copy
+
+## Ported from Libraries/LibWeb/MimeSniff/MimeType.cpp:78 Web::MimeSniff::MimeType::create.
+pub func mime_type_create(type_: ak.String, subtype: ak.String) -> MimeType:
+    var mime_type: MimeType
+    mime_type_construct(&mime_type, type_, subtype)
+    var essence = ak.string_builder_new()
+    ak.string_builder_append_string_view(&essence, ak.string_bytes_as_string_view(&mime_type.m_type))
+    ak.string_builder_append_u8(&essence, '/')
+    ak.string_builder_append_string_view(&essence, ak.string_bytes_as_string_view(&mime_type.m_subtype))
+    mime_type.m_cached_essence = ak.string_builder_to_string(&essence) else trap("MUST: String::formatted")
+    return mime_type
+
+## The lambda `[](char ch) { return ch == ';' || ch == '='; }` of MimeType::parse.
+struct MimeTypeParseIsSemicolonOrEquals: ak.CharPredicate:
+    var unused: u8
+
+    func matches(ch: u8) -> bool:
+        return ch == ';' or ch == '='
+
+## Ported from Libraries/LibWeb/MimeSniff/MimeType.cpp:86 Web::MimeSniff::MimeType::parse.
+# https://mimesniff.spec.whatwg.org/#parse-a-mime-type
+pub func mime_type_parse(string: ak.StringView) -> MimeType?:
+    # Verify that the input string is valid UTF-8 first, so we don't have to think about it anymore.
+    var utf8_view: ak.Utf8View
+    ak.utf8_view_construct_string_view(&utf8_view, string)
+    if not ak.utf8_view_validate_allow_lonely_surrogates(&utf8_view):
+        return none
+
+    # 1. Remove any leading and trailing HTTP whitespace from input.
+    let trimmed_string = ak.string_view_trim(&string, ak.sv(http_whitespace), ak.TrimMode.both)
+
+    # 2. Let position be a position variable for input, initially pointing at the start of input.
+    var lexer = ak.generic_lexer_new(trimmed_string)
+
+    # 3. Let type be the result of collecting a sequence of code points that are not U+002F (/) from input, given position.
+    let type_ = ak.generic_lexer_consume_until_t_char_type(&lexer, '/')
+
+    # 4. If type is the empty string or does not solely contain HTTP token code points, then return failure.
+    if ak.string_view_is_empty(&type_) or not mime_contains_only_http_token_code_points(type_):
+        return none
+
+    # 5. If position is past the end of input, then return failure.
+    if ak.generic_lexer_is_eof(&lexer):
+        return none
+
+    # 6. Advance position by 1. (This skips past U+002F (/).)
+    ak.generic_lexer_ignore(&lexer, 1)
+
+    # 7. Let subtype be the result of collecting a sequence of code points that are not U+003B (;) from input, given position.
+    var subtype = ak.generic_lexer_consume_until_t_char_type(&lexer, ';')
+
+    # 8. Remove any trailing HTTP whitespace from subtype.
+    subtype = ak.string_view_trim(&subtype, ak.sv(http_whitespace), ak.TrimMode.right)
+
+    # 9. If subtype is the empty string or does not solely contain HTTP token code points, then return failure.
+    if ak.string_view_is_empty(&subtype) or not mime_contains_only_http_token_code_points(subtype):
+        return none
+
+    # 10. Let mimeType be a new MIME type record whose type is type, in ASCII lowercase, and subtype is subtype, in ASCII lowercase.
+    var mime_type = mime_type_create(ak.string_view_to_ascii_lowercase_string(&type_), ak.string_view_to_ascii_lowercase_string(&subtype))
+
+    # 11. While position is not past the end of input:
+    let http_whitespace_predicate = ak.is_any_of(ak.sv(http_whitespace))
+    let is_semicolon_or_equals = MimeTypeParseIsSemicolonOrEquals()
+    while not ak.generic_lexer_is_eof(&lexer):
+        # 1. Advance position by 1. (This skips past U+003B (;).)
+        ak.generic_lexer_ignore(&lexer, 1)
+
+        # 2. Collect a sequence of code points that are HTTP whitespace from input given position.
+        ak.generic_lexer_ignore_while(&lexer, &http_whitespace_predicate)
+
+        # 3. Let parameterName be the result of collecting a sequence of code points that are not U+003B (;) or U+003D (=) from input, given position.
+        let parameter_name_view = ak.generic_lexer_consume_until_tt_predicate(&lexer, &is_semicolon_or_equals)
+
+        # 4. Set parameterName to parameterName, in ASCII lowercase.
+        let parameter_name = ak.string_view_to_ascii_lowercase_string(&parameter_name_view)
+
+        # 5. If position is not past the end of input, then:
+        if not ak.generic_lexer_is_eof(&lexer):
+            # 1. If the code point at position within input is U+003B (;), then continue.
+            if ak.generic_lexer_peek(&lexer) == ';':
+                continue
+
+            # 2. Advance position by 1. (This skips past U+003D (=).)
+            ak.generic_lexer_ignore(&lexer, 1)
+
+        # 6. If position is past the end of input, then break.
+        # NOTE: This is not an `else` because the ignore on step 11.5.2 could put us past the end of the input.
+        if ak.generic_lexer_is_eof(&lexer):
+            break
+
+        # 7. Let parameterValue be null.
+        var parameter_value = ak.string_new()
+
+        # 8. If the code point at position within input is U+0022 ("), then:
+        if ak.generic_lexer_peek(&lexer) == '"':
+            # 1. Set parameterValue to the result of collecting an HTTP quoted string from input, given position and the extract-value flag.
+            parameter_value = http_collect_an_http_quoted_string(&lexer, HttpQuotedStringExtractValue.yes)
+
+            # 2. Collect a sequence of code points that are not U+003B (;) from input, given position.
+            ak.generic_lexer_ignore_until_t_char_type(&lexer, ';')
+
+        # 9. Otherwise:
+        else:
+            # 1. Set parameterValue to the result of collecting a sequence of code points that are not U+003B (;) from input, given position.
+            let value_view = ak.generic_lexer_consume_until_t_char_type(&lexer, ';')
+            parameter_value = ak.string_from_utf8_without_validation(ak.string_view_bytes(&value_view))
+
+            # 2. Remove any trailing HTTP whitespace from parameterValue.
+            parameter_value = ak.string_trim_string_view(&parameter_value, ak.sv(http_whitespace), ak.TrimMode.right) else trap("MUST: String::trim")
+
+            # 3. If parameterValue is the empty string, then continue.
+            if ak.string_is_empty(&parameter_value):
+                continue
+
+        # 10. If all of the following are true
+        if (
+            # - parameterName is not the empty string
+            not ak.string_is_empty(&parameter_name)
+            # - parameterName solely contains HTTP token code points
+            and mime_contains_only_http_token_code_points(ak.string_bytes_as_string_view(&parameter_name))
+            # - parameterValue solely contains HTTP quoted-string token code points
+            and mime_contains_only_http_quoted_string_token_code_points(ak.string_bytes_as_string_view(&parameter_value))
+            # - mimeType’s parameters[parameterName] does not exist
+            and not ak.ordered_hash_map_contains_k(&mime_type.m_parameters, parameter_name)):
+            # then set mimeType’s parameters[parameterName] to parameterValue.
+            discard(ak.ordered_hash_map_set(&mime_type.m_parameters, parameter_name, parameter_value))
+
+    # 12. Return mimeType.
+    return mime_type
+
+## Ported from Libraries/LibWeb/MimeSniff/MimeType.h:53 Web::MimeSniff::MimeType::type.
+pub func mime_type_type(this: const MimeType*) -> ak.String:
+    return this.m_type
+
+## Ported from Libraries/LibWeb/MimeSniff/MimeType.h:54 Web::MimeSniff::MimeType::subtype.
+pub func mime_type_subtype(this: const MimeType*) -> ak.String:
+    return this.m_subtype
+
+## Ported from Libraries/LibWeb/MimeSniff/MimeType.h:55 Web::MimeSniff::MimeType::parameters.
+pub func mime_type_parameters(this: const MimeType*) -> const ak.OrderedHashMap[ak.String, ak.String, ak.StringTraits]*:
+    return &this.m_parameters
+
+## Ported from Libraries/LibWeb/MimeSniff/MimeType.cpp:201 Web::MimeSniff::MimeType::essence.
+# https://mimesniff.spec.whatwg.org/#mime-type-essence
+pub func mime_type_essence(this: const MimeType*) -> ak.String:
+    # The essence of a MIME type mimeType is mimeType’s type, followed by U+002F (/), followed by mimeType’s subtype.
+    return this.m_cached_essence
+
+## Ported from Libraries/LibWeb/MimeSniff/MimeType.cpp:208 Web::MimeSniff::MimeType::serialized.
+# https://mimesniff.spec.whatwg.org/#serialize-a-mime-type
+pub func mime_type_serialized(this: const MimeType*) -> ak.String:
+    # 1. Let serialization be the concatenation of mimeType’s type, U+002F (/), and mimeType’s subtype.
+    var serialization = ak.string_builder_new()
+    ak.string_builder_append_string_view(&serialization, ak.string_bytes_as_string_view(&this.m_type))
+    ak.string_builder_append_u8(&serialization, '/')
+    ak.string_builder_append_string_view(&serialization, ak.string_bytes_as_string_view(&this.m_subtype))
+
+    # 2. For each name → value of mimeType’s parameters:
+    for entry in ak.ordered_hash_map_begin_const(&this.m_parameters):
+        let name = entry.key
+        var value = entry.value
+
+        # 1. Append U+003B (;) to serialization.
+        ak.string_builder_append_u8(&serialization, ';')
+
+        # 2. Append name to serialization.
+        ak.string_builder_append_string_view(&serialization, ak.string_bytes_as_string_view(&name))
+
+        # 3. Append U+003D (=) to serialization.
+        ak.string_builder_append_u8(&serialization, '=')
+
+        # 4. If value does not solely contain HTTP token code points or value is the empty string, then:
+        if not mime_contains_only_http_token_code_points(ak.string_bytes_as_string_view(&value)) or ak.string_is_empty(&value):
+            # 1. Precede each occurrence of U+0022 (") or U+005C (\) in value with U+005C (\).
+            value = ak.string_replace(&value, ak.sv("\\"), ak.sv("\\\\"), ak.ReplaceMode.all) else trap("MUST: String::replace")
+            value = ak.string_replace(&value, ak.sv("\""), ak.sv("\\\""), ak.ReplaceMode.all) else trap("MUST: String::replace")
+
+            # 2. Prepend U+0022 (") to value.
+            # 3. Append U+0022 (") to value.
+            var quoted = ak.string_builder_new()
+            ak.string_builder_append_u8(&quoted, '"')
+            ak.string_builder_append_string_view(&quoted, ak.string_bytes_as_string_view(&value))
+            ak.string_builder_append_u8(&quoted, '"')
+            value = ak.string_builder_to_string(&quoted) else trap("MUST: String::formatted")
+
+        # 5. Append value to serialization.
+        ak.string_builder_append_string_view(&serialization, ak.string_bytes_as_string_view(&value))
+
+    # 3. Return serialization.
+    return ak.string_builder_to_string_without_validation(&serialization)
+
+## Ported from Libraries/LibWeb/MimeSniff/MimeType.cpp:246 Web::MimeSniff::MimeType::set_parameter.
+pub func mime_type_set_parameter(this: MimeType*, name: ak.String, value: ak.String):
+    # https://mimesniff.spec.whatwg.org/#parameters
+    # A MIME type’s parameters is an ordered map whose keys are ASCII strings and values are strings limited to HTTP quoted-string token code points.
+    assert(mime_contains_only_http_quoted_string_token_code_points(ak.string_bytes_as_string_view(&name)))
+    assert(mime_contains_only_http_quoted_string_token_code_points(ak.string_bytes_as_string_view(&value)))
+    discard(ak.ordered_hash_map_set(&this.m_parameters, name, value))
+
+# mark: Classification ==========================================================================
+
+## `string == text` for a String and a literal.
+func mime_string_is(string: const ak.String*, text: str) -> bool:
+    return ak.string_eq_string_view(string, ak.sv(text))
+
+## Ported from Libraries/LibWeb/MimeSniff/MimeType.cpp:256 Web::MimeSniff::MimeType::is_image.
+# https://mimesniff.spec.whatwg.org/#image-mime-type
+pub func mime_type_is_image(this: const MimeType*) -> bool:
+    # An image MIME type is a MIME type whose type is "image".
+    return mime_string_is(&this.m_type, "image")
+
+## Ported from Libraries/LibWeb/MimeSniff/MimeType.cpp:263 Web::MimeSniff::MimeType::is_audio_or_video.
+# https://mimesniff.spec.whatwg.org/#audio-or-video-mime-type
+pub func mime_type_is_audio_or_video(this: const MimeType*) -> bool:
+    # An audio or video MIME type is any MIME type whose type is "audio" or "video", or whose essence is "application/ogg".
+    return mime_string_is(&this.m_type, "audio") or mime_string_is(&this.m_type, "video") or mime_string_is(&this.m_cached_essence, "application/ogg")
+
+## Ported from Libraries/LibWeb/MimeSniff/MimeType.cpp:270 Web::MimeSniff::MimeType::is_font.
+# https://mimesniff.spec.whatwg.org/#font-mime-type
+pub func mime_type_is_font(this: const MimeType*) -> bool:
+    # A font MIME type is any MIME type whose type is "font", or whose essence is one of the following:
+    #    - application/font-cff
+    #    - application/font-otf
+    #    - application/font-sfnt
+    #    - application/font-ttf
+    #    - application/font-woff
+    #    - application/vnd.ms-fontobject
+    #    - application/vnd.ms-opentype
+    if mime_string_is(&this.m_type, "font"):
+        return true
+
+    let essence = &this.m_cached_essence
+    return (mime_string_is(essence, "application/font-cff")
+        or mime_string_is(essence, "application/font-otf")
+        or mime_string_is(essence, "application/font-sfnt")
+        or mime_string_is(essence, "application/font-ttf")
+        or mime_string_is(essence, "application/font-woff")
+        or mime_string_is(essence, "application/vnd.ms-fontobject")
+        or mime_string_is(essence, "application/vnd.ms-opentype"))
+
+## Ported from Libraries/LibWeb/MimeSniff/MimeType.cpp:294 Web::MimeSniff::MimeType::is_zip_based.
+# https://mimesniff.spec.whatwg.org/#zip-based-mime-type
+pub func mime_type_is_zip_based(this: const MimeType*) -> bool:
+    # A ZIP-based MIME type is any MIME type whose subtype ends in "+zip" or whose essence is one of the following:
+    #    - application/zip
+    return ak.string_ends_with_bytes(&this.m_subtype, ak.sv("+zip")) or mime_string_is(&this.m_cached_essence, "application/zip")
+
+## Ported from Libraries/LibWeb/MimeSniff/MimeType.cpp:302 Web::MimeSniff::MimeType::is_archive.
+# https://mimesniff.spec.whatwg.org/#archive-mime-type
+pub func mime_type_is_archive(this: const MimeType*) -> bool:
+    # An archive MIME type is any MIME type whose essence is one of the following:
+    #    - application/x-rar-compressed
+    #    - application/zip
+    #    - application/x-gzip
+    let essence = &this.m_cached_essence
+    return mime_string_is(essence, "application/x-rar-compressed") or mime_string_is(essence, "application/zip") or mime_string_is(essence, "application/x-gzip")
+
+## Ported from Libraries/LibWeb/MimeSniff/MimeType.cpp:312 Web::MimeSniff::MimeType::is_xml.
+# https://mimesniff.spec.whatwg.org/#xml-mime-type
+pub func mime_type_is_xml(this: const MimeType*) -> bool:
+    # An XML MIME type is any MIME type whose subtype ends in "+xml" or whose essence is "text/xml" or "application/xml". [RFC7303]
+    return ak.string_ends_with_bytes(&this.m_subtype, ak.sv("+xml")) or mime_string_is(&this.m_cached_essence, "text/xml") or mime_string_is(&this.m_cached_essence, "application/xml")
+
+## Ported from Libraries/LibWeb/MimeSniff/MimeType.cpp:319 Web::MimeSniff::MimeType::is_html.
+# https://mimesniff.spec.whatwg.org/#html-mime-type
+pub func mime_type_is_html(this: const MimeType*) -> bool:
+    # An HTML MIME type is any MIME type whose essence is "text/html".
+    return mime_string_is(&this.m_cached_essence, "text/html")
+
+## Ported from Libraries/LibWeb/MimeSniff/MimeType.cpp:326 Web::MimeSniff::MimeType::is_scriptable.
+# https://mimesniff.spec.whatwg.org/#scriptable-mime-type
+pub func mime_type_is_scriptable(this: const MimeType*) -> bool:
+    # A scriptable MIME type is an XML MIME type, HTML MIME type, or any MIME type whose essence is "application/pdf".
+    return mime_type_is_xml(this) or mime_type_is_html(this) or mime_string_is(&this.m_cached_essence, "application/pdf")
+
+## Ported from Libraries/LibWeb/MimeSniff/MimeType.cpp:333 Web::MimeSniff::MimeType::is_javascript.
+# https://mimesniff.spec.whatwg.org/#javascript-mime-type
+pub func mime_type_is_javascript(this: const MimeType*) -> bool:
+    for javascript_essence in mime_s_javascript_mime_type_essence_strings:
+        if mime_string_is(&this.m_cached_essence, javascript_essence):
+            return true
+    return false
+
+## Ported from Libraries/LibWeb/MimeSniff/MimeType.cpp:339 Web::MimeSniff::MimeType::is_json.
+# https://mimesniff.spec.whatwg.org/#json-mime-type
+pub func mime_type_is_json(this: const MimeType*) -> bool:
+    # A JSON MIME type is any MIME type whose subtype ends in "+json" or whose essence is "application/json" or "text/json".
+    return ak.string_ends_with_bytes(&this.m_subtype, ak.sv("+json")) or mime_string_is(&this.m_cached_essence, "application/json") or mime_string_is(&this.m_cached_essence, "text/json")
+
+## Ported from Libraries/LibWeb/MimeSniff/MimeType.cpp:346 Web::MimeSniff::minimise_a_supported_mime_type.
+# https://mimesniff.spec.whatwg.org/#minimize-a-supported-mime-type
+pub func mime_minimise_a_supported_mime_type(mime_type: const MimeType*) -> ak.String:
+    # 1. If mimeType is a JavaScript MIME type, then return "text/javascript".
+    if mime_type_is_javascript(mime_type):
+        return ak.string_from_str("text/javascript")
+
+    # 2. If mimeType is a JSON MIME type, then return "application/json".
+    if mime_type_is_json(mime_type):
+        return ak.string_from_str("application/json")
+
+    # 3. If mimeType’s essence is "image/svg+xml", then return "image/svg+xml".
+    if mime_string_is(&mime_type.m_cached_essence, "image/svg+xml"):
+        return ak.string_from_str("image/svg+xml")
+
+    # 4. If mimeType is an XML MIME type, then return "application/xml".
+    if mime_type_is_xml(mime_type):
+        return ak.string_from_str("application/xml")
+
+    # FIXME: 5. If mimeType is supported by the user agent, then return mimeType’s essence.
+
+    # 6. Return the empty string.
+    return ak.string_new()
