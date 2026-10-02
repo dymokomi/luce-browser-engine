@@ -1,532 +1,574 @@
 #==============================================================================================
 #
-#   document_11 - DOM::Document: fullscreen, HTML string parsing, editing, repaint, display lists
+#   document_11 - DOM::Document: animations, named elements, design mode, hit tests
 #
 #   DESCRIPTION:
-#       Port of LibWeb/DOM/Document.cpp (lines 7084-7607): running the fullscreen steps, the
-#       pending fullscreen events, fullscreening and unfullscreening elements and documents,
-#       declarative shadow roots, parsing HTML from a string and Document.parseHTMLUnsafe(),
-#       the active input events target and the cursor position, the cursor blink cycle, the
-#       container document and the node navigable, repaint requests, recording the display
-#       list, and the grapheme, line and word segmenters.
+#       Port of LibWeb/DOM/Document.cpp (lines 5994-6605): the animation timelines and the
+#       animation-event queue, removing replaced animations, getAnimations(), the potentially
+#       named elements kept in tree order, the id and name bookkeeping, anchor names, form-
+#       associated elements with a form attribute, design mode, elementFromPoint() and
+#       elementsFromPoint(), scrollingElement, and the named properties of the document
+#       (supported names and namedItem).
 #
 #==============================================================================================
 
-# mark: Fullscreen ==============================================================================
+# mark: Animations ==============================================================================
 
-## Ported from Document.cpp:7084 Web::DOM::Document::run_fullscreen_steps.
-# https://fullscreen.spec.whatwg.org/#run-the-fullscreen-steps
-pub func dom_document_run_fullscreen_steps(this: DomDocument*):
-    # 1. Let pendingEvents be document’s list of pending fullscreen events.
-    var pending_events = ak.vector_clone(&this.m_pending_fullscreen_events)
+## Ported from Document.cpp:5994 Web::DOM::Document::timeline.
+# https://www.w3.org/TR/web-animations-1/#dom-document-timeline
+pub func dom_document_timeline(this: DomDocument*) -> AnimationsDocumentTimeline*:
+    # The DocumentTimeline object representing the default document timeline. The default document timeline has an
+    # origin time of zero.
+    if this.m_default_timeline == none:
+        this.m_default_timeline = animations_document_timeline_create(dom_document_realm(this), this, 0.0)
+    return this.m_default_timeline else trap("unreachable: set above")
 
-    # 2. Empty document’s list of pending fullscreen events.
-    ak.vector_clear(&this.m_pending_fullscreen_events)
+## Ported from Document.cpp:6003 Web::DOM::Document::associate_with_timeline.
+pub func dom_document_associate_with_timeline(this: DomDocument*, timeline: AnimationsAnimationTimeline*):
+    discard(ak.hash_table_set(&this.m_associated_animation_timelines, timeline))
 
-    # 3. For each (type, element) in pendingEvents:
-    for pending_event in ak.vector_span(&pending_events):
-        let element = pending_event.element
-        # 1. Let target be element if element is connected and its node document is document, and otherwise let target be document.
-        var target = this.dom_node()
-        if dom_node_is_connected(element.dom_node()) and dom_node_document(element.dom_node()) == this:
-            target = element.dom_node()
+## Ported from Document.cpp:6008 Web::DOM::Document::disassociate_with_timeline.
+pub func dom_document_disassociate_with_timeline(this: DomDocument*, timeline: AnimationsAnimationTimeline*):
+    discard(ak.hash_table_remove_t(&this.m_associated_animation_timelines, timeline))
 
-        # 2. Fire an event named type, with its bubbles and composed attributes set to true, at target.
-        match pending_event.type_:
-            .change:
-                discard(dom_event_target_dispatch_event(target.dom_event_target(), dom_event_create(dom_document_realm(this), html_event_names_fullscreenchange, DomEventInit(bubbles = true, composed = true))))
-            .error_:
-                discard(dom_event_target_dispatch_event(target.dom_event_target(), dom_event_create(dom_document_realm(this), html_event_names_fullscreenerror, DomEventInit(bubbles = true, composed = true))))
-            _: discard(pending_event)
+## Ported from Document.cpp:6013 Web::DOM::Document::append_pending_animation_event.
+pub func dom_document_append_pending_animation_event(this: DomDocument*, event: DomDocumentPendingAnimationEvent):
+    ak.vector_append_t(&this.m_pending_animation_event_queue, event)
 
-## Ported from Document.cpp:7112 Web::DOM::Document::append_pending_fullscreen_change.
-pub func dom_document_append_pending_fullscreen_change(this: DomDocument*, type_: DomPendingFullscreenEventType, element: DomElement*):
-    ak.vector_append_t(&this.m_pending_fullscreen_events, DomPendingFullscreenEvent(type_ = type_, element = element))
-    page_client_request_frame(page_client(dom_document_page(this)))
+## The block of update_animations_and_send_events that runs under a TemporaryExecutionContext (steps 1-3).
+func dom_document_update_animations_in_temporary_execution_context(this: DomDocument*, timestamp: f64, timelines_to_update: ak.Vector[AnimationsAnimationTimeline*]*):
+    var temporary_execution_context: HtmlTemporaryExecutionContext = ---
+    html_temporary_execution_context_construct_realm(&temporary_execution_context, dom_document_realm(this))
+    defer html_temporary_execution_context_destruct(&temporary_execution_context)
 
-## Ported from Document.cpp:7119 Web::DOM::Document::fullscreen_element_within_doc.
-# https://fullscreen.spec.whatwg.org/#fullscreen-an-element
-pub func dom_document_fullscreen_element_within_doc(this: DomDocument*, element: DomElement*):
-    # FIXME: Spec issue:  Finding topmost popover ancestor algorithm takes different parameters than those described
-    #        by the fullscreen spec. Since the new algorithm takes 4 parameters, with the new "popover list", we must
-    #        also account for the auto popover list.
-    #        See: https://github.com/whatwg/fullscreen/issues/245
-    # (get_hide_until is `HTMLElement::topmost_popover_ancestor(element, popover_list, nullptr, IsPopover::No)`.)
+    # 1. Update the current time of all timelines associated with doc passing now as the timestamp.
+    #
+    # Note: Due to the hierarchical nature of the timing model, updating the current time of a timeline also involves:
+    # - Updating the current time of any animations associated with the timeline.
+    # - Running the update an animation’s finished state procedure for any animations whose current time has been
+    #   updated.
+    # - Queueing animation events for any such animations.
+    for timeline in ak.vector_span(timelines_to_update):
+        animations_animation_timeline_update_current_time(timeline, timestamp)
 
-    # 1. Let hideUntil be the result of running topmost popover ancestor given element, null, and false.
-    var hide_until = html_element_topmost_popover_ancestor(element.dom_node(), this.m_showing_hint_popover_list, none, HtmlIsPopover.no)
+        var associated = animations_animation_timeline_associated_animations(timeline)
+        for animation in ak.vector_span(&associated):
+            animations_animation_update(animation)
 
-    if hide_until == none:
-        hide_until = html_element_topmost_popover_ancestor(element.dom_node(), this.m_showing_auto_popover_list, none, HtmlIsPopover.no)
+        var animations = animations_animation_timeline_associated_animations(timeline)
+        for animation in ak.vector_span(&animations):
+            dom_document_dispatch_events_for_animation_if_necessary(this, animation)
 
-    var hide_until_argument = HtmlElementOrDomDocument.html_element(hide_until)
+    # 2. Remove replaced animations for doc.
+    dom_document_remove_replaced_animations(this)
 
-    # 2. If hideUntil is null, then set hideUntil to element’s node document.
-    if hide_until == none:
-        hide_until_argument = .dom_document(dom_node_document(element.dom_node()))
+    # 3. Perform a microtask checkpoint.
+    # NB: This is executed by the destructor of the TemporaryExecutionContext above.
 
-    # 3. Run hide all popovers until given hideUntil, false, and true.
-    html_element_hide_all_popovers_until(hide_until_argument, HtmlFocusPreviousElement.no, HtmlFireEvents.yes)
+## The comparator `sort_events_by_composite_order` of update_animations_and_send_events.
+func dom_document_sort_events_by_composite_order(a: const DomDocumentPendingAnimationEvent*, b: const DomDocumentPendingAnimationEvent*) -> bool:
+    let a_effect = animations_animation_effect(a.animation) else return true
+    let b_effect = animations_animation_effect(b.animation) else return false
+    # as<Animations::KeyframeEffect>: the effects of CSS animations are keyframe effects.
+    return animations_keyframe_effect_composite_order((AnimationsKeyframeEffect*)a_effect, (AnimationsKeyframeEffect*)b_effect) < 0
 
-    # 4. Set element’s fullscreen flag.
-    dom_element_set_fullscreen_flag(element, true)
+## The insertion-sort comparator of update_animations_and_send_events (step 6).
+func dom_document_pending_animation_event_less_than(context: void*?, a: const DomDocumentPendingAnimationEvent*, b: const DomDocumentPendingAnimationEvent*) -> bool:
+    # Sort the events by their scheduled event time such that events that were scheduled to occur earlier, sort
+    # before events scheduled to occur later and events whose scheduled event time is unresolved sort before events
+    # with a resolved scheduled event time.
+    #
+    # Within events with equal scheduled event times, sort by their composite order.
+    if let b_time = b.scheduled_event_time:
+        let a_time = a.scheduled_event_time else return true
 
-    # 5. Remove from the top layer immediately given element.
-    dom_document_remove_an_element_from_the_top_layer_immediately(this, element)
+        if a_time == b_time:
+            return dom_document_sort_events_by_composite_order(a, b)
 
-    # 6. Add to the top layer given element.
-    dom_document_add_an_element_to_the_top_layer(this, element)
-    dom_node_invalidate_style(element.dom_node(), DomStyleInvalidationReason.fullscreen)
+        return a_time < b_time
 
-## Ported from Document.cpp:7156 Web::DOM::Document::fullscreen_element.
-# https://fullscreen.spec.whatwg.org/#fullscreen-element
-pub func dom_document_fullscreen_element(this: DomDocument*) -> DomElement*?:
-    # All documents have an associated fullscreen element. The fullscreen element is the topmost element in the
-    # document’s top layer whose fullscreen flag is set, if any, and null otherwise.
-    var elements = ak.ordered_hash_table_values(&this.m_top_layer_elements)
-    var index = ak.vector_size(&elements)
-    while index > 0:
-        index -= 1
-        let el = *ak.vector_at(&elements, index)
-        if dom_element_is_fullscreen_element(el):
-            return el
-    return none
+    if a.scheduled_event_time != none:
+        return false
 
-## Ported from Document.cpp:7168 Web::DOM::Document::fullscreen_element_for_bindings.
-# https://fullscreen.spec.whatwg.org/#dom-document-fullscreenelement
-pub func dom_document_fullscreen_element_for_bindings(this: DomDocument*) -> DomElement*?:
-    let fullscreen_element = dom_document_fullscreen_element(this) else return none
+    return dom_document_sort_events_by_composite_order(a, b)
 
-    # 1. If this is a shadow root and its host is not connected, then return null.
-    # NB: We're not a shadow root. See ShadowRoot::fullscreen_element_for_bindings().
+## Ported from Document.cpp:6019 Web::DOM::Document::update_animations_and_send_events.
+# https://www.w3.org/TR/web-animations-1/#update-animations-and-send-events
+pub func dom_document_update_animations_and_send_events(this: DomDocument*, timestamp: f64):
+    this.m_last_animation_frame_timestamp = timestamp
+    var timelines_to_update = ak.hash_table_values(&this.m_associated_animation_timelines)
 
-    # 2. Let candidate be the result of retargeting fullscreen element against this.
-    let candidate = dom_retarget(fullscreen_element.dom_event_target(), this.dom_event_target()) else return none
+    dom_document_update_animations_in_temporary_execution_context(this, timestamp, &timelines_to_update)
 
-    # 3. If candidate and this are in the same tree, then return candidate.
-    let retargeted_element = as_dom_element(candidate)
-    if tree_node_root(retargeted_element.dom_node()) == tree_node_root(this.dom_node()):
-        return retargeted_element
+    # 4. Let events to dispatch be a copy of doc’s pending animation event queue.
+    var events_to_dispatch = ak.vector_clone(&this.m_pending_animation_event_queue)
+
+    # 5. Clear doc’s pending animation event queue.
+    ak.vector_clear(&this.m_pending_animation_event_queue)
+
+    # 6. Perform a stable sort of the animation events in events to dispatch as follows:
+    ak.insertion_sort_t_comparator(ak.vector_span(&events_to_dispatch), ak.Function2[const DomDocumentPendingAnimationEvent*, const DomDocumentPendingAnimationEvent*, bool](call = dom_document_pending_animation_event_less_than, context = none))
+
+    # 7. Dispatch each of the events in events to dispatch at their corresponding target using the order established in
+    #    the previous step.
+    for event in ak.vector_span(&events_to_dispatch):
+        discard(dom_event_target_dispatch_event(event.target, event.event))
+
+## Ported from Document.cpp:6102 Web::DOM::Document::remove_replaced_animations.
+# https://www.w3.org/TR/web-animations-1/#remove-replaced-animations
+pub func dom_document_remove_replaced_animations(this: DomDocument*):
+    # When asked to remove replaced animations for a Document, doc, then for every animation, animation, that:
+    # - has an associated animation effect whose effect target is a descendant of doc, and
+    # - is replaceable, and
+    # - has a replace state of active, and
+    # - for which there exists for each target property of every animation effect associated with animation, an
+    #   animation effect associated with a replaceable animation with a higher composite order than animation that
+    #   includes the same target property
+
+    var replaceable_animations: ak.Vector[AnimationsAnimation*]
+    for timeline in ak.hash_table_begin(&this.m_associated_animation_timelines):
+        var associated = animations_animation_timeline_associated_animations(*timeline)
+        for animation in ak.vector_span(&associated):
+            let effect = animations_animation_effect(animation) else continue
+            let target = animations_animation_effect_target(effect) else continue
+            if dom_node_document(target.dom_node()) != this:
+                continue
+
+            if not animations_animation_is_replaceable(animation):
+                continue
+
+            if animations_animation_replace_state(animation) != BindAnimationReplaceState.active:
+                continue
+
+            # Composite order is only defined for KeyframeEffects
+            if not animations_animation_effect_is_keyframe_effect(effect):
+                continue
+
+            ak.vector_append_t(&replaceable_animations, animation)
+
+    # The rest sorts the replaceable animations by composite order, marks those whose every target property is
+    # overridden by a later one as removed, and queues their AnimationPlaybackEvent "remove" events; it needs
+    # Animations::KeyframeEffect and AnimationPlaybackEvent, which are outside the phase-1 closure.
+    if not ak.vector_is_empty(&replaceable_animations):
+        trap("unported (P4): Web::DOM::Document::remove_replaced_animations (replaceable animations)")
+
+## Ported from Document.cpp:6193 Web::DOM::Document::get_animations.
+pub func dom_document_get_animations(this: DomDocument*) -> ak.Vector[AnimationsAnimation*]!:
+    dom_document_update_style(this)
+    return try dom_calculate_get_animations(this.dom_node())
+
+# mark: Potentially named elements ==============================================================
+
+## Ported from Document.cpp:6200 Web::DOM::is_potentially_named_element.
+# https://html.spec.whatwg.org/multipage/dom.html#dom-document-nameditem-filter
+func dom_is_potentially_named_element(element: DomElement*) -> bool:
+    return is_html_embed_element(element) or is_html_form_element(element) or is_html_htmli_frame_element(element) or is_html_image_element(element) or is_html_object_element(element)
+
+## Ported from Document.cpp:6206 Web::DOM::is_potentially_named_element_by_id.
+# https://html.spec.whatwg.org/multipage/dom.html#dom-document-nameditem-filter
+func dom_is_potentially_named_element_by_id(element: DomElement*) -> bool:
+    return is_html_object_element(element) or is_html_image_element(element)
+
+## The captures of insert_in_tree_order's predicate: `[&]` (the element).
+struct DomInsertInTreeOrderPredicate:
+    var element: DomElement*
+
+## insert_in_tree_order's predicate: an existing element that the new element follows.
+func dom_insert_in_tree_order_follows(context: void*?, existing_element: const (DomElement*)*) -> bool:
+    let captures = (DomInsertInTreeOrderPredicate*)(context else trap("no captures"))
+    return (dom_node_compare_document_position((*existing_element).dom_node(), captures.element.dom_node()) & (u16)DomNodeDocumentPosition.document_position_following) != 0
+
+## Ported from Document.cpp:6211 Web::DOM::insert_in_tree_order.
+func dom_insert_in_tree_order(elements: ak.Vector[DomElement*]*, element: DomElement*):
+    for el in ak.vector_span(elements):
+        if el == element:
+            return
+
+    var captures = DomInsertInTreeOrderPredicate(element = element)
+    let index = ak.vector_find_first_index_if(elements, ak.Function1[const (DomElement*)*, bool](call = dom_insert_in_tree_order_follows, context = &captures))
+    if let found = index:
+        ak.vector_insert(elements, found, element)
+    else:
+        ak.vector_append_t(elements, element)
+
+## The captures of `remove_first_matching([element](auto& e) { return e == element; })`.
+struct DomDocumentIsElement:
+    var element: DomElement*
+
+## The predicate `e == element`.
+func dom_document_is_element(context: void*?, e: const (DomElement*)*) -> bool:
+    let captures = (DomDocumentIsElement*)(context else trap("no captures"))
+    return *e == captures.element
+
+## `m_potentially_named_elements.remove_first_matching([element](auto& e) { return e == element; })`.
+func dom_document_remove_potentially_named_element(this: DomDocument*, element: DomElement*):
+    var captures = DomDocumentIsElement(element = element)
+    discard(ak.vector_remove_first_matching(&this.m_potentially_named_elements, ak.Function1[const (DomElement*)*, bool](call = dom_document_is_element, context = &captures)))
+
+## Ported from Document.cpp:6227 Web::DOM::Document::element_id_changed.
+pub func dom_document_element_id_changed(this: DomDocument*, element: DomElement*, old_id: ak.FlyString?):
+    for form_associated_element in ak.vector_span(&this.m_form_associated_elements_with_form_attribute):
+        html_form_associated_element_element_id_changed(form_associated_element else trap("a null form-associated element"))
+
+    if dom_element_id(element) != none:
+        dom_insert_in_tree_order(&this.m_potentially_named_elements, element)
+    elif dom_element_name(element) == none:
+        dom_document_remove_potentially_named_element(this, element)
+
+    let new_id = dom_element_id(element)
+    if let old = old_id:
+        dom_element_by_id_map_remove(dom_element_document_or_shadow_root_element_by_id_map(element), old, element)
+    if let new_value = new_id:
+        dom_element_by_id_map_add(dom_element_document_or_shadow_root_element_by_id_map(element), new_value, element)
+
+## Ported from Document.cpp:6246 Web::DOM::Document::element_with_id_was_added.
+pub func dom_document_element_with_id_was_added(this: DomDocument*, element: DomElement*):
+    for form_associated_element in ak.vector_span(&this.m_form_associated_elements_with_form_attribute):
+        html_form_associated_element_element_with_id_was_added_or_removed(form_associated_element else trap("a null form-associated element"))
+
+    if dom_is_potentially_named_element_by_id(element):
+        dom_insert_in_tree_order(&this.m_potentially_named_elements, element)
+
+    if let id = dom_element_id(element):
+        dom_element_by_id_map_add(dom_element_document_or_shadow_root_element_by_id_map(element), id, element)
+
+## Ported from Document.cpp:6259 Web::DOM::Document::element_with_id_was_removed.
+pub func dom_document_element_with_id_was_removed(this: DomDocument*, element: DomElement*):
+    for form_associated_element in ak.vector_span(&this.m_form_associated_elements_with_form_attribute):
+        html_form_associated_element_element_with_id_was_added_or_removed(form_associated_element else trap("a null form-associated element"))
+
+    if dom_is_potentially_named_element_by_id(element):
+        dom_document_remove_potentially_named_element(this, element)
+
+    if let id = dom_element_id(element):
+        dom_element_by_id_map_remove(dom_element_document_or_shadow_root_element_by_id_map(element), id, element)
+
+## Ported from Document.cpp:6272 Web::DOM::Document::element_name_changed.
+pub func dom_document_element_name_changed(this: DomDocument*, element: DomElement*):
+    if dom_element_name(element) != none:
+        dom_insert_in_tree_order(&this.m_potentially_named_elements, element)
+    else:
+        if dom_is_potentially_named_element_by_id(element) and dom_element_id(element) != none:
+            return
+        dom_document_remove_potentially_named_element(this, element)
+
+## Ported from Document.cpp:6283 Web::DOM::Document::element_with_name_was_added.
+pub func dom_document_element_with_name_was_added(this: DomDocument*, element: DomElement*):
+    if dom_is_potentially_named_element(element):
+        dom_insert_in_tree_order(&this.m_potentially_named_elements, element)
+
+## Ported from Document.cpp:6289 Web::DOM::Document::element_with_name_was_removed.
+pub func dom_document_element_with_name_was_removed(this: DomDocument*, element: DomElement*):
+    if dom_is_potentially_named_element(element):
+        if dom_is_potentially_named_element_by_id(element) and dom_element_id(element) != none:
+            return
+        dom_document_remove_potentially_named_element(this, element)
+
+## Ported from Document.cpp:6298 Web::DOM::Document::element_by_anchor_name.
+pub func dom_document_element_by_anchor_name(this: DomDocument*, name: ak.FlyString, querying_node: DomNode*) -> DomElement*?:
+    # https://drafts.csswg.org/css-shadow-1/#tree-scoped-name
+    # If a tree-scoped name is global (such as @font-face names), then when a tree-scoped reference is dereferenced to
+    # find it, first search only the tree-scoped names associated with the same root as the tree-scoped reference. If
+    # no relevant tree-scoped name is found, and the root is a shadow root, then repeat this search in the root's
+    # host's node tree (recursively).
+    var node = querying_node
+    while let shadow_root = as_if_dom_shadow_root(tree_node_root(node)):
+        if let element = dom_anchor_name_map_element_by_name(dom_shadow_root_anchor_name_map(shadow_root), name):
+            return element
+        let host = dom_document_fragment_host(shadow_root.dom_document_fragment()) else return none
+        node = host.dom_node()
+    return dom_anchor_name_map_element_by_name(&this.m_anchor_name_map, name)
+
+## Ported from Document.cpp:6316 Web::DOM::Document::add_form_associated_element_with_form_attribute.
+pub func dom_document_add_form_associated_element_with_form_attribute(this: DomDocument*, form_associated_element: HtmlFormAssociatedElement*):
+    ak.vector_append_t(&this.m_form_associated_elements_with_form_attribute, form_associated_element)
+
+## The captures of remove_form_associated_element_with_form_attribute's predicate.
+struct DomDocumentIsFormAssociatedElement:
+    var form_associated_element: HtmlFormAssociatedElement*
+
+## The predicate `element == &form_associated_element`.
+func dom_document_is_form_associated_element(context: void*?, element: const (HtmlFormAssociatedElement*?)*) -> bool:
+    let captures = (DomDocumentIsFormAssociatedElement*)(context else trap("no captures"))
+    return *element == captures.form_associated_element
+
+## Ported from Document.cpp:6321 Web::DOM::Document::remove_form_associated_element_with_form_attribute.
+pub func dom_document_remove_form_associated_element_with_form_attribute(this: DomDocument*, form_associated_element: HtmlFormAssociatedElement*):
+    var captures = DomDocumentIsFormAssociatedElement(form_associated_element = form_associated_element)
+    discard(ak.vector_remove_all_matching(&this.m_form_associated_elements_with_form_attribute, ak.Function1[const (HtmlFormAssociatedElement*?)*, bool](call = dom_document_is_form_associated_element, context = &captures)))
+
+# mark: Design mode =============================================================================
+
+## Ported from Document.cpp:6328 Web::DOM::Document::set_design_mode_enabled_state.
+pub func dom_document_set_design_mode_enabled_state(this: DomDocument*, design_mode_enabled: bool):
+    this.m_design_mode_enabled = design_mode_enabled
+    dom_document_set_editable(this, design_mode_enabled)
+    for node in dom_node_inclusive_subtree(this.dom_node()):
+        dom_node_recompute_editable_subtree_flag(node)
+
+## Ported from Document.cpp:6339 Web::DOM::Document::design_mode.
+# https://html.spec.whatwg.org/multipage/interaction.html#making-entire-documents-editable:-the-designmode-idl-attribute
+pub func dom_document_design_mode(this: DomDocument*) -> ak.String:
+    # The designMode getter steps are to return "on" if this's design mode enabled is true; otherwise "off".
+    return ak.string_from_str("on") if dom_document_design_mode_enabled_state(this) else ak.string_from_str("off")
+
+## Ported from Document.cpp:6345 Web::DOM::Document::set_design_mode.
+pub func dom_document_set_design_mode(this: DomDocument*, design_mode: ak.String) -> !:
+    # 1. Let value be the given value, converted to ASCII lowercase.
+    let value = web_unicode.string_to_lowercase(&design_mode) else trap("MUST: String::to_lowercase")
+
+    # 2. If value is "on" and this's design mode enabled is false, then:
+    if ak.string_eq_string_view(&value, ak.sv("on")) and not this.m_design_mode_enabled:
+        # 1. Set this's design mode enabled to true.
+        dom_document_set_design_mode_enabled_state(this, true)
+        # 2. Reset this's active range's start and end boundary points to be at the start of this.
+        if let selection = dom_document_get_selection(this):
+            try selection_selection_collapse(selection, this.dom_node(), 0)
+            dom_document_update_layout(this, DomUpdateLayoutReason.document_set_design_mode)
+        # 3. Run the focusing steps for this's document element, if non-null.
+        if let document_element = dom_document_document_element(this):
+            html_run_focusing_steps(document_element.dom_node())
+    # 3. If value is "off", then set this's design mode enabled to false.
+    elif ak.string_eq_string_view(&value, ak.sv("off")):
+        dom_document_set_design_mode_enabled_state(this, false)
+
+# mark: Hit testing =============================================================================
+
+## Ported from Document.cpp:6370 Web::DOM::retarget_from_ua_internal_shadow_root.
+func dom_retarget_from_ua_internal_shadow_root(element: DomElement*) -> DomElement*:
+    var result = element
+    while let shadow_root = dom_node_containing_shadow_root(result.dom_node()):
+        if not dom_shadow_root_is_user_agent_internal(shadow_root):
+            break
+        result = dom_document_fragment_host(shadow_root.dom_document_fragment()) else trap("a shadow root has a host")
+    return result
+
+## The point (x, y) when it lies within the viewport (elementFromPoint's step 1 test).
+func dom_document_point_in_viewport(this: DomDocument*, x: f64, y: f64) -> gfx.CssPixelPoint?:
+    let viewport_rect = dom_document_viewport_rect(this)
+    let position = gfx.CssPixelPoint(m_x = gfx.css_pixels_from_f64(x), m_y = gfx.css_pixels_from_f64(y))
+    # FIXME: This should account for the size of the scroll bar.
+    if x < 0.0 or y < 0.0 or position.m_x.gt(gfx.css_pixel_rect_width(&viewport_rect)) or position.m_y.gt(gfx.css_pixel_rect_height(&viewport_rect)):
+        return none
+    return position
+
+## The captures of elementFromPoint's hit test callback: `[&]` (the hit element).
+struct DomDocumentElementFromPointHit:
+    var hit_element: DomElement*?
+
+## elementFromPoint's hit test callback: the first element hit.
+func dom_document_element_from_point_hit(context: void*?, result: PaintHitTestResult) -> TraversalDecision:
+    let captures = (DomDocumentElementFromPointHit*)(context else trap("no captures"))
+    var hit_result = result
+    if let node = paint_hit_test_result_dom_node(&hit_result):
+        if let element = as_if_dom_element(node):
+            captures.hit_element = element
+            return TraversalDecision.break_
+    return TraversalDecision.continue_
+
+## Ported from Document.cpp:6382 Web::DOM::Document::element_from_point.
+# https://drafts.csswg.org/cssom-view/#dom-document-elementfrompoint
+pub func dom_document_element_from_point(this: DomDocument*, x: f64, y: f64) -> DomElement*?:
+    # 1. If either argument is negative, x is greater than the viewport width excluding the size of a rendered scroll
+    #    bar (if any), or y is greater than the viewport height excluding the size of a rendered scroll bar (if any), or
+    #    there is no viewport associated with the document, return null and terminate these steps.
+    let position = dom_document_point_in_viewport(this, x, y) else return none
+
+    # Ensure the layout tree exists prior to hit testing.
+    dom_document_update_layout(this, DomUpdateLayoutReason.document_element_from_point)
+
+    # 2. If there is a box in the viewport that would be a target for hit testing at coordinates x,y, when applying the transforms
+    #    that apply to the descendants of the viewport, return the associated element and terminate these steps.
+    var captures = DomDocumentElementFromPointHit(hit_element = none)
+    if let paintable_box = dom_node_paintable_box(this.dom_node()):
+        discard(paint_paintable_hit_test(paintable_box.paint_paintable(), position, PaintHitTestType.exact, ak.Function1[PaintHitTestResult, TraversalDecision](call = dom_document_element_from_point_hit, context = &captures)))
+    if let hit_element = captures.hit_element:
+        # AD-HOC: If element is inside a UA internal shadow root, retarget to the host.
+        return dom_retarget_from_ua_internal_shadow_root(hit_element)
+
+    # 3. If the document has a root element, return the root element and terminate these steps.
+    if let root_element = dom_document_document_element(this):
+        return root_element
 
     # 4. Return null.
     return none
 
-## Ported from Document.cpp:7191 Web::DOM::Document::fullscreen.
-# https://fullscreen.spec.whatwg.org/#dom-document-fullscreen
-pub func dom_document_fullscreen(this: DomDocument*) -> bool:
-    # The fullscreen getter steps are to return false if this's fullscreen element is null, and true otherwise.
-    return dom_document_fullscreen_element(this) != none
+## The captures of elementsFromPoint's hit test callback: `[&]` (the sequence).
+struct DomDocumentElementsFromPointHits:
+    var sequence: ak.Vector[DomElement*]*
 
-## Ported from Document.cpp:7198 Web::DOM::Document::fullscreen_enabled.
-# https://fullscreen.spec.whatwg.org/#dom-document-fullscreenenabled
-pub func dom_document_fullscreen_enabled(this: DomDocument*) -> bool:
-    # FIXME: Implement check policy check and "is supported" check.
-    return dom_document_is_allowed_to_use_feature(this, DomPolicyControlledFeature.fullscreen)
+## elementsFromPoint's hit test callback: append every element hit, retargeted, without repeats.
+func dom_document_elements_from_point_hit(context: void*?, result: PaintHitTestResult) -> TraversalDecision:
+    let captures = (DomDocumentElementsFromPointHits*)(context else trap("no captures"))
+    var hit_result = result
+    if let node = paint_hit_test_result_dom_node(&hit_result):
+        if let hit_element = as_if_dom_element(node):
+            # AD-HOC: If element is inside a UA internal shadow root, retarget to the host.
+            let element = dom_retarget_from_ua_internal_shadow_root(hit_element)
+            # AD-HOC: Avoid adding duplicates when multiple internal elements retarget to the same host.
+            if ak.vector_is_empty(captures.sequence) or *ak.vector_last(captures.sequence) != element:
+                ak.vector_append_t(captures.sequence, element)
+    return TraversalDecision.continue_
 
-## Ported from Document.cpp:7205 Web::DOM::Document::fully_exit_fullscreen.
-# https://fullscreen.spec.whatwg.org/#fully-exit-fullscreen
-pub func dom_document_fully_exit_fullscreen(this: DomDocument*):
-    # 1. If document’s fullscreen element is null, terminate these steps.
-    let fullscreened_element = dom_document_fullscreen_element(this) else return
+## Ported from Document.cpp:6422 Web::DOM::Document::elements_from_point.
+# https://drafts.csswg.org/cssom-view/#dom-document-elementsfrompoint
+pub func dom_document_elements_from_point(this: DomDocument*, x: f64, y: f64) -> ak.Vector[DomElement*]:
+    # 1. Let sequence be a new empty sequence.
+    var sequence: ak.Vector[DomElement*]
 
-    # 2. Unfullscreen elements whose fullscreen flag is set, within document’s top layer, except for document’s fullscreen element.
-    var fullscreen_elements: ak.Vector[DomElement*]
-    for element in ak.ordered_hash_table_begin(&this.m_top_layer_elements):
-        if dom_element_is_fullscreen_element(*element) and *element != fullscreened_element:
-            ak.vector_append_t(&fullscreen_elements, *element)
+    # 2. If either argument is negative, x is greater than the viewport width excluding the size of a rendered scroll bar (if any),
+    #    or y is greater than the viewport height excluding the size of a rendered scroll bar (if any),
+    #    or there is no viewport associated with the document, return sequence and terminate these steps.
+    let position = dom_document_point_in_viewport(this, x, y) else return sequence
 
-    for element in ak.vector_span(&fullscreen_elements):
-        dom_document_unfullscreen_element(this, element)
+    # Ensure the layout tree exists prior to hit testing.
+    dom_document_update_layout(this, DomUpdateLayoutReason.document_elements_from_point)
 
-    # 3. Exit fullscreen document.
-    var context: HtmlTemporaryExecutionContext = ---
-    html_temporary_execution_context_construct_realm(&context, dom_document_realm(this), HtmlTemporaryExecutionContextCallbacksEnabled.yes)
-    defer html_temporary_execution_context_destruct(&context)
-    discard(dom_document_exit_fullscreen(this))
+    # 3. For each box in the viewport, in paint order, starting with the topmost box, that would be a target for
+    #    hit testing at coordinates x,y even if nothing would be overlapping it, when applying the transforms that
+    #    apply to the descendants of the viewport, append the associated element to sequence.
+    var captures = DomDocumentElementsFromPointHits(sequence = &sequence)
+    if let paintable_box = dom_node_paintable_box(this.dom_node()):
+        discard(paint_paintable_hit_test(paintable_box.paint_paintable(), position, PaintHitTestType.exact, ak.Function1[PaintHitTestResult, TraversalDecision](call = dom_document_elements_from_point_hit, context = &captures)))
 
-## Ported from Document.cpp:7228 Web::DOM::Document::exit_fullscreen.
-# https://fullscreen.spec.whatwg.org/#exit-fullscreen
-pub func dom_document_exit_fullscreen(this: DomDocument*) -> JsPromiseCapability*:
-    let realm = dom_document_realm(this)
+    # 4. If the document has a root element, and the last item in sequence is not the root element,
+    #    append the root element to sequence.
+    if let root_element = dom_document_document_element(this):
+        if ak.vector_is_empty(&sequence) or *ak.vector_last(&sequence) != root_element:
+            ak.vector_append_t(&sequence, root_element)
 
-    # 1. Let promise be a new promise.
-    let promise = idl_create_promise(realm)
+    # 5. Return sequence.
+    return sequence
 
-    # 2. If doc is not fully active or doc’s fullscreen element is null, then reject promise with a TypeError exception
-    #    and return promise.
-    if not dom_document_is_fully_active(this) or dom_document_fullscreen_element(this) == none:
-        idl_reject_promise(realm, promise, js_type_error_create(realm, ak.string_from_str("Document not fully active or no fullscreen element.")))
-        return promise
+## Ported from Document.cpp:6465 Web::DOM::Document::scrolling_element.
+# https://drafts.csswg.org/cssom-view/#dom-document-scrollingelement
+pub func dom_document_scrolling_element(this: DomDocument*) -> DomElement*?:
+    # 1. If the Document is in quirks mode, follow these substeps:
+    if dom_document_in_quirks_mode(this):
+        # 1. If the body element exists, and it is not potentially scrollable, return the body element and abort these steps.
+        #    For this purpose, a value of overflow:clip on the the body element’s parent element must be treated as overflow:hidden.
+        if let body_element = dom_document_body(this):
+            if not dom_element_is_potentially_scrollable(body_element.dom_element(), DomElementTreatOverflowClipOnBodyParentAsOverflowHidden.yes):
+                return body_element.dom_element()
 
-    # 3. Let resize be false.
-    var resize = false
+        # 2. Return null and abort these steps.
+        return none
 
-    # 4. Let docs be the result of collecting documents to unfullscreen given doc.
-    let docs = dom_document_collect_documents_to_unfullscreen(this)
+    # 2. If there is a root element, return the root element and abort these steps.
+    if let root_element = dom_document_document_element(this):
+        return root_element
 
-    # 5. Let topLevelDoc be doc’s node navigable’s top-level traversable’s active document.
-    let navigable = dom_document_navigable(this) else trap("a fully active document has a navigable")
-    let top_level_traversable = html_navigable_top_level_traversable(navigable) else trap("a navigable has a top-level traversable")
-    let top_level_doc = html_navigable_active_document(top_level_traversable.html_navigable())
-
-    # 6. If topLevelDoc is in docs, and it is a simple fullscreen document, then set doc to topLevelDoc and resize to true.
-    var doc = this
-    if let top_level = top_level_doc:
-        if dom_document_is_simple_fullscreen_document(top_level) and ak.vector_contains_slow[DomDocument*, ak.PtrTraits[DomDocument]](docs, top_level):
-            doc = top_level
-            resize = true
-
-    # 7. If doc’s fullscreen element is not connected:
-    let fullscreen_element = dom_document_fullscreen_element(doc) else trap("the document has a fullscreen element")
-    if not dom_node_is_connected(fullscreen_element.dom_node()):
-        # 1. Append (fullscreenchange, doc’s fullscreen element) to doc’s list of pending fullscreen events.
-        dom_document_append_pending_fullscreen_change(doc, DomPendingFullscreenEventType.change, fullscreen_element)
-
-        # 2. Unfullscreen doc’s fullscreen element.
-        dom_document_unfullscreen_element(doc, fullscreen_element)
-
-    # 8. Return promise, and run the remaining steps in parallel.
-    page_enqueue_fullscreen_exit(dom_document_page(this), doc, resize, promise)
-
-    return promise
-
-## Ported from Document.cpp:7274 Web::DOM::Document::unfullscreen.
-# https://fullscreen.spec.whatwg.org/#unfullscreen-a-document
-pub func dom_document_unfullscreen(this: DomDocument*):
-    # To unfullscreen a document, unfullscreen all elements, within document’s top layer, whose fullscreen flag is set.
-    # NB: This has to be a copy of the list of those elements, since unfullscreen an element immediately removes it
-    #     from the top layer, invalidating iterators.
-    let fullscreen_elements = new ak.Vector[DomElement*]() else trap("out of memory")
-    for el in ak.ordered_hash_table_begin(&this.m_top_layer_elements):
-        if dom_element_is_fullscreen_element(*el):
-            ak.vector_append_t(fullscreen_elements, *el)
-
-    for el in ak.vector_span(fullscreen_elements):
-        dom_document_unfullscreen_element(this, el)
-
-## Ported from Document.cpp:7290 Web::DOM::Document::is_simple_fullscreen_document.
-# https://fullscreen.spec.whatwg.org/#simple-fullscreen-document
-pub func dom_document_is_simple_fullscreen_document(this: DomDocument*) -> bool:
-    # A document is said to be a simple fullscreen document if there is exactly one element in its top layer that has its fullscreen flag set.
-    var total: u32 = 0
-    for element in ak.ordered_hash_table_begin(&this.m_top_layer_elements):
-        if dom_element_is_fullscreen_element(*element):
-            total += 1
-
-        if total > 1:
-            return false
-    return total == 1
-
-## Ported from Document.cpp:7305 Web::DOM::Document::collect_documents_to_unfullscreen.
-## (GC::HeapVector<GC::Ref<Document>> is a vector in managed memory, which the collector scans.)
-# https://fullscreen.spec.whatwg.org/#collect-documents-to-unfullscreen
-pub func dom_document_collect_documents_to_unfullscreen(this: DomDocument*) -> ak.Vector[DomDocument*]*:
-    # 1. Let docs be an ordered set consisting of doc.
-    let docs = new ak.Vector[DomDocument*]() else trap("out of memory")
-    ak.vector_append_t(docs, this)
-
-    # 2. While true:
-    while true:
-        # 1. Let lastDoc be docs’s last document.
-        let last_doc = *ak.vector_last(docs)
-
-        # 2. Assert: lastDoc’s fullscreen element is not null.
-        assert(dom_document_fullscreen_element(last_doc) != none)
-
-        # 3. If lastDoc is not a simple fullscreen document, break.
-        if not dom_document_is_simple_fullscreen_document(last_doc):
-            break
-
-        # 4. Let container be lastDoc’s node navigable’s container.
-        # Note on spec: It doesn't first check if `node navigable` is null.
-        var container: HtmlNavigableContainer*? = none
-        if let last_navigable = dom_document_navigable(last_doc):
-            container = html_navigable_container(last_navigable)
-
-        # 5. If container is null, then break.
-        let container_element = container else break
-
-        # 6. If container’s iframe fullscreen flag is set, break.
-        if let iframe_element = as_if_html_htmli_frame_element(container_element.dom_node()):
-            if html_htmli_frame_element_iframe_fullscreen_flag(iframe_element):
-                break
-
-        # 7. Append container’s node document to docs.
-        ak.vector_append_t(docs, dom_node_document(container_element.dom_node()))
-
-    # 3. Return docs.
-    return docs
-
-## Ported from Document.cpp:7344 Web::DOM::Document::unfullscreen_element.
-# https://fullscreen.spec.whatwg.org/#unfullscreen-an-element
-pub func dom_document_unfullscreen_element(this: DomDocument*, element: DomElement*):
-    # To unfullscreen an element, unset element’s fullscreen flag and iframe fullscreen flag (if any), and remove from
-    # the top layer immediately given element.
-    dom_element_set_fullscreen_flag(element, false)
-    if let iframe_element = as_if_html_htmli_frame_element(element.dom_node()):
-        html_htmli_frame_element_set_iframe_fullscreen_flag(iframe_element, false)
-
-    dom_document_remove_an_element_from_the_top_layer_immediately(this, element)
-
-## Ported from Document.cpp:7356 Web::DOM::Document::set_allow_declarative_shadow_roots.
-# https://dom.spec.whatwg.org/#document-allow-declarative-shadow-roots
-pub func dom_document_set_allow_declarative_shadow_roots(this: DomDocument*, allow: bool):
-    this.m_allow_declarative_shadow_roots = allow
-
-# mark: Parsing HTML from a string ==============================================================
-
-## Ported from Document.cpp:7362 Web::DOM::Document::parse_html_from_a_string.
-# https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#parse-html-from-a-string
-pub func dom_document_parse_html_from_a_string(this: DomDocument*, html: ak.StringView):
-    # 1. Set document's type to "html".
-    dom_document_set_document_type(this, DocumentDomDocumentType.html)
-
-    # 2. Create an HTML parser parser, associated with document.
-    # 3. Place html into the input stream for parser. The encoding confidence is irrelevant.
-    # FIXME: We don't have the concept of encoding confidence yet.
-    let scripting_mode = HtmlParserScriptingMode.normal if dom_node_is_scripting_enabled(this.dom_node()) else HtmlParserScriptingMode.disabled
-    let parser = html_parser_create(this, html, scripting_mode, ak.sv("UTF-8"))
-
-    # 4. Start parser and let it run until it has consumed all the characters just inserted into the input stream.
-    let window = as_html_window((gc.Cell*)html_relevant_global_object((JsObject*)this))
-    html_parser_run_url(parser, dom_document_url(html_window_associated_document(window)))
-
-## Ported from Document.cpp:7378 Web::DOM::Document::parse_html_unsafe.
-# https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-parsehtmlunsafe
-pub func dom_document_parse_html_unsafe(vm: Vm*, html: TrustedTypesTrustedHtmlOrString) -> DomDocument*?!:
-    let realm = vm_current_realm(vm) else trap("no current realm")
-
-    # FIXME: update description once https://github.com/whatwg/html/issues/11778 gets solved
-    # 1. Let compliantHTML to the result of invoking the Get Trusted Type compliant string algorithm with
-    #    TrustedHTML, this's relevant global object, html, "Document parseHTMLUnsafe", and "script".
-    # (TrustedTypes::Script.to_string() is "'script'".)
-    let compliant_html = try trusted_types_get_trusted_type_compliant_string(
-        TrustedTypesTrustedTypeName.trusted_html,
-        html_current_global_object(),
-        dom_element_trusted_html_or_string_as_trusted_type(html),
-        TrustedTypesInjectionSink.document_parse_html_unsafe,
-        ak.string_from_str("'script'"),
-    )
-
-    # 2. Let document be a new Document, whose content type is "text/html".
-    let document = dom_document_create_for_fragment_parsing(realm)
-    dom_document_set_content_type(document, ak.string_from_str("text/html"))
-
-    # 3. Set document's allow declarative shadow roots to true.
-    dom_document_set_allow_declarative_shadow_roots(document, true)
-
-    # 4. Parse HTML from a string given document and compliantHTML.
-    let compliant_view = ak.utf16_string_base_utf16_view(&compliant_html.utf16_string_base)
-    let compliant_utf8 = ak.utf16_view_to_utf8_but_should_be_ported_to_utf16(&compliant_view)
-    dom_document_parse_html_from_a_string(document, ak.string_bytes_as_string_view(&compliant_utf8))
-
-    # AD-HOC: Setting the origin to match that of the associated document matches the behavior of existing browsers.
-    let associated_document = html_window_associated_document(as_html_window((gc.Cell*)realm_global_object(realm)))
-    dom_document_set_origin(document, dom_document_origin(associated_document))
-
-    # 5. Return document.
-    return document
-
-# mark: Editing =================================================================================
-
-## The captures of active_input_events_target's ancestry predicate: `[&]` (the focused area).
-struct DomDocumentIsFocusedArea:
-    var focused_area: DomNode*
-
-## active_input_events_target's ancestry predicate: `&it == focused_area`.
-func dom_document_is_focused_area(context: void*?, it: DomNode*) -> bool:
-    let captures = (DomDocumentIsFocusedArea*)(context else trap("no captures"))
-    return it == captures.focused_area
-
-## Ported from Document.cpp:7410 Web::DOM::Document::active_input_events_target.
-pub func dom_document_active_input_events_target(this: DomDocument*, for_node: DomNode*? = none) -> InputEventsTarget*?:
-    let focused_area = dom_document_focused_area(this) else return none
-
-    if dom_node_is_editable_or_editing_host(focused_area):
-        var within_active_contenteditable = true
-        if let node = for_node:
-            within_active_contenteditable = dom_editing_host_manager_is_within_active_contenteditable(this.m_editing_host_manager, node)
-        if within_active_contenteditable:
-            return &this.m_editing_host_manager.input_events_target
-    if let form_text_element = as_if_form_associated_text_control_element(focused_area):
-        var focused_area_in_ancestry = true
-        if let node = for_node:
-            var captures = DomDocumentIsFocusedArea(focused_area = focused_area)
-            focused_area_in_ancestry = dom_node_find_in_shadow_including_ancestry(node, ak.Function1[DomNode*, bool](call = dom_document_is_focused_area, context = &captures)) != none
-        if focused_area_in_ancestry:
-            return &form_text_element.input_events_target_base
+    # 3. Return null.
     return none
 
-## Ported from Document.cpp:7427 Web::DOM::Document::cursor_position.
-pub func dom_document_cursor_position(this: DomDocument*) -> DomPosition*?:
-    let focused_area = dom_document_focused_area(this) else return none
+# mark: Named properties ========================================================================
 
-    var target: HtmlFormAssociatedTextControlElement*? = none
-    if let input_element = as_if_html_input_element(focused_area):
-        # Some types of <input> tags shouldn't have a cursor, like buttons
-        if not html_input_element_can_have_text_editing_cursor(input_element):
-            return none
-        target = &input_element.form_associated_text_control_element
-    elif let text_area_element = as_if_html_text_area_element(focused_area):
-        target = &text_area_element.form_associated_text_control_element
+## Ported from Document.cpp:6487 Web::DOM::is_exposed.
+# https://html.spec.whatwg.org/multipage/dom.html#exposed
+func dom_is_exposed(element: DomElement*) -> bool:
+    assert(is_html_embed_element(element) or is_html_object_element(element))
 
-    if let text_control = target:
-        return html_form_associated_text_control_element_cursor_position(text_control)
+    # FIXME: An embed or object element is said to be exposed if it has no exposed object ancestor, and,
+    #        for object elements, is additionally either not showing its fallback content or has no object or embed descendants.
+    return true
 
-    if dom_node_is_editable_or_editing_host(focused_area):
-        let selection = this.m_selection else trap("the document has no selection")
-        return selection_selection_cursor_position(selection)
+## Ported from Document.cpp:6497 Web::DOM::Document::supported_property_names (override).
+# https://html.spec.whatwg.org/multipage/dom.html#dom-tree-accessors:supported-property-names
+pub func dom_document_supported_property_names_impl(base: BindPlatformObject*) -> ak.Vector[ak.FlyString]:
+    let this = (DomDocument*)base
+    # The supported property names of a Document object document at any moment consist of the following,
+    # in tree order according to the element that contributed them, ignoring later duplicates,
+    # and with values from id attributes coming before values from name attributes when the same element contributes both:
+    var names: ak.OrderedHashTable[ak.FlyString, ak.FlyStringTraits]
 
-    return none
+    for element in ak.vector_span(&this.m_potentially_named_elements):
+        # - the value of the name content attribute for all exposed embed, form, iframe, img, and exposed object elements
+        #   that have a non-empty name content attribute and are in a document tree with document as their root;
+        if (is_html_embed_element(element) and dom_is_exposed(element)) or is_html_form_element(element) or is_html_htmli_frame_element(element) or is_html_image_element(element) or (is_html_object_element(element) and dom_is_exposed(element)):
+            if let name = dom_element_name(element):
+                discard(ak.ordered_hash_table_set(&names, name))
 
-## Ported from Document.cpp:7452 Web::DOM::Document::reset_cursor_blink_cycle.
-pub func dom_document_reset_cursor_blink_cycle(this: DomDocument*):
-    this.m_cursor_blink_state = true
+        # - the value of the id content attribute for all exposed object elements that have a non-empty id content attribute
+        #   and are in a document tree with document as their root; and
+        if is_html_object_element(element) and dom_is_exposed(element):
+            if let id = dom_element_id(element):
+                discard(ak.ordered_hash_table_set(&names, id))
 
-    # In testing mode, disable timed blinking so we can deterministically generate display lists.
-    if not html_window_in_test_mode():
-        let cursor_blink_timer = this.m_cursor_blink_timer else trap("the document has no cursor blink timer")
-        core_timer_restart(cursor_blink_timer)
+        # - the value of the id content attribute for all img elements that have both a non-empty id content attribute
+        #   and a non-empty name content attribute, and are in a document tree with document as their root.
+        if is_html_image_element(element):
+            if let id = dom_element_id(element):
+                if dom_element_name(element) != none:
+                    discard(ak.ordered_hash_table_set(&names, id))
 
-# mark: Navigables and repaints =================================================================
+    return ak.ordered_hash_table_values(&names)
 
-## Ported from Document.cpp:7462 Web::DOM::Document::container_document.
-# https://html.spec.whatwg.org/multipage/document-sequences.html#doc-container-document
-pub func dom_document_container_document(this: DomDocument*) -> DomDocument*?:
-    # 1. If document's node navigable is null, then return null.
-    let node_navigable = dom_document_navigable(this) else return none
+## `Optional<FlyString> == FlyString`.
+func dom_document_optional_fly_string_is(a: ak.FlyString?, b: ak.FlyString) -> bool:
+    let a_value = a else return false
+    return ak.fly_string_eq_fly_string(&a_value, &b)
 
-    # 2. Return document's node navigable's container document.
-    return html_navigable_container_document(node_navigable)
+## Ported from Document.cpp:6537 Web::DOM::is_named_element_with_name.
+func dom_is_named_element_with_name(element: DomElement*, name: ak.FlyString) -> bool:
+    # Named elements with the name name, for the purposes of the above algorithm, are those that are either:
 
-## Ported from Document.cpp:7473 Web::DOM::Document::navigable.
-pub func dom_document_navigable(this: DomDocument*) -> HtmlNavigable*?:
-    return gc.weak_ptr(&this.m_navigable)
+    # - Exposed embed, form, iframe, img, or exposed object elements that have a name content attribute whose value
+    #   is name, or
+    if (is_html_embed_element(element) and dom_is_exposed(element)) or is_html_form_element(element) or is_html_htmli_frame_element(element) or is_html_image_element(element) or (is_html_object_element(element) and dom_is_exposed(element)):
+        if dom_document_optional_fly_string_is(dom_element_name(element), name):
+            return true
 
-## Ported from Document.cpp:7478 Web::DOM::Document::set_navigable.
-pub func dom_document_set_navigable(this: DomDocument*, navigable: HtmlNavigable*?):
-    if gc.weak_ptr(&this.m_navigable) == navigable:
-        return
-    gc.weak_assign(&this.m_navigable, navigable)
-    html_event_loop_document_navigable_did_change(html_main_thread_event_loop())
+    # - Exposed object elements that have an id content attribute whose value is name, or
+    if is_html_object_element(element) and dom_is_exposed(element):
+        if dom_document_optional_fly_string_is(dom_element_id(element), name):
+            return true
 
-## Ported from Document.cpp:7486 Web::DOM::Document::set_needs_repaint.
-func dom_document_set_needs_repaint_invalidate_display_list(this: DomDocument*, should_invalidate_display_list: InvalidateDisplayList = InvalidateDisplayList.yes):
-    let navigable = dom_document_navigable(this)
+    # - img elements that have an id content attribute whose value is name, and that have a non-empty name content
+    #   attribute present also.
+    if is_html_image_element(element):
+        if dom_document_optional_fly_string_is(dom_element_id(element), name) and dom_element_name(element) != none:
+            return true
 
-    # OPTIMIZATION: Ignore set_needs_repaint() inside navigable containers (i.e frames) with visibility: hidden.
-    if let current = navigable:
-        if html_navigable_has_inclusive_ancestor_with_visibility_hidden(current):
-            return
+    return false
 
-    if should_invalidate_display_list == InvalidateDisplayList.yes:
-        dom_document_invalidate_display_list(this)
+## Ported from Document.cpp:6568 Web::DOM::named_elements_with_name.
+func dom_named_elements_with_name(document: DomDocument*, name: ak.FlyString) -> ak.Vector[DomElement*]:
+    var named_elements: ak.Vector[DomElement*]
 
-    let node_navigable = navigable else return
+    for element in ak.vector_span(&document.m_potentially_named_elements):
+        if dom_is_named_element_with_name(element, name):
+            ak.vector_append_t(&named_elements, element)
 
-    html_navigable_set_needs_repaint(node_navigable)
+    return named_elements
 
-    if html_navigable_is_traversable(node_navigable):
-        page_client_request_frame(page_client(dom_document_page(this)))
-        return
+## The captures of namedItem's collection filter: `[name]`.
+struct DomDocumentNamedItemFilter:
+    var name: ak.FlyString
 
-    if let container = html_navigable_container(node_navigable):
-        dom_document_set_needs_repaint_invalidate_display_list(dom_node_document(container.dom_node()), InvalidateDisplayList.no)
+## namedItem's collection filter: named elements with the name.
+func dom_document_named_item_filter(context: void*?, element: DomElement*) -> bool:
+    let captures = (DomDocumentNamedItemFilter*)(context else trap("no captures"))
+    return dom_is_named_element_with_name(element, captures.name)
 
-## Ported from Document.cpp:7513 Web::DOM::Document::invalidate_display_list.
-pub func dom_document_invalidate_display_list(this: DomDocument*):
-    this.m_cached_display_list = none
+## Ported from Document.cpp:6581 Web::DOM::Document::named_item_value (override).
+# https://html.spec.whatwg.org/multipage/dom.html#dom-document-nameditem
+pub func dom_document_named_item_value_impl(base: BindPlatformObject*, name: ak.FlyString) -> JsValue:
+    let this = (DomDocument*)base
+    # 1. Let elements be the list of named elements with the name name that are in a document tree with the Document as their root.
+    # NOTE: There will be at least one such element, since the algorithm would otherwise not have been invoked by Web IDL.
+    var elements = dom_named_elements_with_name(this, name)
 
-## Ported from Document.cpp:7518 Web::DOM::Document::cached_display_list.
-pub func dom_document_cached_display_list(this: DomDocument*) -> display_list.DisplayList*?:
-    return this.m_cached_display_list
+    # 2. If elements has only one element, and that element is an iframe element, and that iframe element's content navigable is not null,
+    #    then return the active WindowProxy of the element's content navigable.
+    if ak.vector_size(&elements) == 1 and is_html_htmli_frame_element(*ak.vector_first(&elements)):
+        let iframe_element = as_html_navigable_container(*ak.vector_first(&elements))
+        if let content_navigable = html_navigable_container_content_navigable(iframe_element):
+            return js_value_from_object((JsObject*?)html_navigable_active_window_proxy(content_navigable))
 
-## `layout_node->computed_values().color_scheme()` of an element's layout node.
-func dom_document_color_scheme_of(element: DomElement*) -> CssPreferredColorScheme?:
-    let layout_node = dom_element_layout_node(element) else return none
-    let computed_values = layout_node_with_style_computed_values(layout_node)
-    return css_computed_values_color_scheme(&computed_values.computed_values)
+    # 3. Otherwise, if elements has only one element, return that element.
+    if ak.vector_size(&elements) == 1:
+        return js_value_from_object((JsObject*)*ak.vector_first(&elements))
 
-## Ported from Document.cpp:7523 Web::DOM::Document::record_display_list.
-pub func dom_document_record_display_list(this: DomDocument*, config: HtmlPaintConfig) -> display_list.DisplayList*?:
-    if let cached_display_list = this.m_cached_display_list:
-        if let cached_config = this.m_cached_display_list_paint_config:
-            if cached_config == config:
-                return cached_display_list
-
-    dom_document_update_paint_and_hit_testing_properties_if_needed(this)
-    let viewport_paintable = dom_document_paintable(this) else trap("VERIFY: the document has a paintable")
-
-    let recorded_display_list = display_list.display_list_create(paint_viewport_paintable_visual_context_tree(viewport_paintable))
-    var display_list_recorder: display_list.DisplayListRecorder = ---
-    display_list.display_list_recorder_construct(&display_list_recorder, recorded_display_list)
-
-    # https://drafts.csswg.org/css-color-adjust-1/#color-scheme-effect
-    # On the root element, the used color scheme additionally must affect the surface color of the canvas, and the viewport’s scrollbars.
-    var color_scheme = CssPreferredColorScheme.light
-    if let html_element = dom_document_html_element(this):
-        if dom_document_color_scheme_of(html_element.dom_element()) == CssPreferredColorScheme.dark:
-            color_scheme = CssPreferredColorScheme.dark
-
-    # .. in the case of embedded documents typically rendered over a transparent canvas
-    # (such as provided via an HTML iframe element), if the used color scheme of the element
-    # and the used color scheme of the embedded document’s root element do not match,
-    # then the UA must use an opaque canvas of the Canvas color appropriate to the
-    # embedded document’s used color scheme instead of a transparent canvas.
-    var opaque_canvas = false
-    let navigable = dom_document_navigable(this) else trap("a painted document has a navigable")
-    if let container_element = html_navigable_container(navigable):
-        if let container_color_scheme = dom_document_color_scheme_of(container_element.dom_element()):
-            var container_scheme = container_color_scheme
-            if container_scheme == CssPreferredColorScheme.auto:
-                container_scheme = CssPreferredColorScheme.light
-
-            opaque_canvas = container_scheme != color_scheme
-
-    if let canvas_fill_rect = config.canvas_fill_rect:
-        display_list.display_list_recorder_fill_rect(&display_list_recorder, canvas_fill_rect, css_system_color_canvas(color_scheme))
-
-    let viewport_rect = page_css_to_device_rect(dom_document_page(this), dom_document_viewport_rect(this))
-    let bitmap_rect = gfx.DevicePixelRect(m_location = gfx.IntPoint(), m_size = gfx.device_pixel_rect_size(&viewport_rect))
-
-    if opaque_canvas:
-        display_list.display_list_recorder_fill_rect(&display_list_recorder, bitmap_rect, css_system_color_canvas(color_scheme))
-
-    display_list.display_list_recorder_fill_rect(&display_list_recorder, bitmap_rect, dom_document_background_color(this))
-
-    var context: DisplayListRecordingContext = ---
-    display_list_recording_context_construct(&context, &display_list_recorder, page_palette(dom_document_page(this)), page_client_device_pixels_per_css_pixel(page_client(dom_document_page(this))), page_chrome_metrics(dom_document_page(this)))
-    display_list_recording_context_set_device_viewport_rect(&context, viewport_rect)
-    display_list_recording_context_set_should_show_line_box_borders(&context, config.should_show_line_box_borders)
-    display_list_recording_context_set_should_paint_overlay(&context, config.paint_overlay)
-
-    paint_viewport_paintable_paint_all_phases(viewport_paintable, &context)
-
-    if let highlighted_node = this.m_highlighted_node:
-        if let highlighted_paintable = dom_node_paintable(highlighted_node):
-            paint_paintable_paint_inspector_overlay(highlighted_paintable, &context)
-
-    this.m_cached_display_list = recorded_display_list
-    this.m_cached_display_list_paint_config = config
-
-    return recorded_display_list
-
-# mark: Segmenters ==============================================================================
-
-## Ported from Document.cpp:7587 Web::DOM::Document::grapheme_segmenter.
-pub func dom_document_grapheme_segmenter(this: DomDocument*) -> web_unicode.Segmenter*:
-    if this.m_grapheme_segmenter == none:
-        this.m_grapheme_segmenter = web_unicode.segmenter_create_segmenter_granularity(web_unicode.SegmenterGranularity.grapheme)
-    return this.m_grapheme_segmenter else trap("unreachable: set above")
-
-## Ported from Document.cpp:7594 Web::DOM::Document::line_segmenter.
-pub func dom_document_line_segmenter(this: DomDocument*) -> web_unicode.Segmenter*:
-    if this.m_line_segmenter == none:
-        this.m_line_segmenter = web_unicode.segmenter_create_segmenter_granularity(web_unicode.SegmenterGranularity.line)
-    return this.m_line_segmenter else trap("unreachable: set above")
-
-## Ported from Document.cpp:7601 Web::DOM::Document::word_segmenter.
-pub func dom_document_word_segmenter(this: DomDocument*) -> web_unicode.Segmenter*:
-    if this.m_word_segmenter == none:
-        this.m_word_segmenter = web_unicode.segmenter_create_segmenter_granularity(web_unicode.SegmenterGranularity.word)
-    return this.m_word_segmenter else trap("unreachable: set above")
+    # 4. Otherwise return an HTMLCollection rooted at the Document node, whose filter matches only named elements with the name name.
+    let captures = new DomDocumentNamedItemFilter(name = name) else trap("out of memory")
+    return js_value_from_object((JsObject*)dom_html_collection_create(this.dom_parent_node(), DomHtmlCollectionScope.descendants, ak.Function1[DomElement*, bool](call = dom_document_named_item_filter, context = captures), ak.Function2[DomElement*, DomElement*, bool]()))

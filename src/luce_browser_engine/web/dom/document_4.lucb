@@ -1,16 +1,387 @@
 #==============================================================================================
 #
-#   document_4 - DOM::Document: hovering, collections, node factories, scripts, adoption
+#   document_4 - DOM::Document: updating style, link colors, color schemes, hovering
 #
 #   DESCRIPTION:
-#       Port of LibWeb/DOM/Document.cpp (lines 2131-2828): the hovered node and the pointer
-#       and mouse boundary events, getElementsByName, the document's HTMLCollections and
-#       document.all, fonts, the obsolete no-op methods, the link colors, the relevant
-#       settings object, createElement(NS), the node and event factories, the
-#       parsing-blocking and deferred script lists, importNode, adopting a node, the doctype
-#       and compatMode, and the active element.
+#       Port of LibWeb/DOM/Document.cpp (lines 1752-2281): the recursive style update and
+#       update_style(), the per-element style-update checks, animated style, paint and hit-
+#       testing properties, the link colors, the supported color schemes and theme color from
+#       meta elements, the layout-node accessors, the inspected and highlighted nodes, and the
+#       hovered node with its pointer and mouse boundary events.
 #
 #==============================================================================================
+
+# mark: Updating style ==========================================================================
+
+## Ported from Document.cpp:1752 Web::DOM::update_style_recursively.
+func dom_update_style_recursively(node: DomNode*, style_computer: CssStyleComputer*, needs_inherited_style_update: bool, recompute_elements_depending_on_custom_properties_: bool, parent_display_changed: bool) -> CssRequiredInvalidationAfterStyleChange:
+    var recompute_elements_depending_on_custom_properties = recompute_elements_depending_on_custom_properties_
+    let needs_full_style_update = dom_document_needs_full_style_update(dom_node_document(node))
+    var invalidation = CssRequiredInvalidationAfterStyleChange()
+
+    if dom_node_is_element(node):
+        css_style_computer_push_ancestor(style_computer, (DomElement*)node)
+
+    # NOTE: If the current node has `display:none`, we can disregard all invalidation
+    #       caused by its children, as they will not be rendered anyway.
+    #       We will still recompute style for the children, though.
+    var is_display_none = false
+
+    var did_change_custom_properties = false
+    var node_invalidation = CssRequiredInvalidationAfterStyleChange()
+    if let element = as_if_dom_element(node):
+        # FIXME: We can avoid some unnecessary re-computations by, skipping if a) the contained if() functions don't
+        #        include media conditions, or b) the data used to resolve media queries hasn't changed.
+        let needs_style_update_due_to_if_media = dom_element_style_uses_if_css_function(element)
+
+        if needs_full_style_update or dom_node_needs_style_update(node) or parent_display_changed or (recompute_elements_depending_on_custom_properties and (dom_element_style_uses_var_css_function(element) or dom_element_style_uses_inherit_css_function(element))) or needs_style_update_due_to_if_media:
+            node_invalidation = dom_element_recompute_style(element, &did_change_custom_properties)
+        elif needs_inherited_style_update:
+            node_invalidation = dom_element_recompute_inherited_style(element)
+        let computed_properties = dom_element_computed_properties(element) else trap("the element has no computed properties")
+        let display = css_computed_properties_display(computed_properties)
+        is_display_none = css_display_is_none(&display)
+
+        if not css_required_invalidation_after_style_change_is_none(&node_invalidation):
+            css_invalidation_invalidate_assigned_slottables_after_slot_style_change(element)
+    if node_invalidation.relayout:
+        dom_node_set_needs_layout_update(node, DomSetNeedsLayoutReason.style_change)
+    if node_invalidation.rebuild_layout_tree:
+        # We mark layout tree for rebuild starting from parent element to correctly invalidate
+        # "display" property change to/from "contents" value.
+        if let parent_element = dom_node_parent_element(node):
+            dom_node_set_needs_layout_tree_update(parent_element.dom_node(), true, DomSetNeedsLayoutTreeUpdateReason.style_change)
+        else:
+            dom_node_set_needs_layout_tree_update(node, true, DomSetNeedsLayoutTreeUpdateReason.style_change)
+    dom_node_set_needs_style_update(node, false)
+    css_required_invalidation_after_style_change_or_assign(&invalidation, node_invalidation)
+
+    if did_change_custom_properties:
+        recompute_elements_depending_on_custom_properties = true
+
+    let children_need_inherited_style_update = not css_required_invalidation_after_style_change_is_none(&invalidation)
+    # NB: When display changes to/from flex/grid/contents, children may need to be blockified or un-blockified.
+    #     This requires a full style recompute, not just inherited style update.
+    let children_need_full_style_recompute = node_invalidation.rebuild_layout_tree
+    if needs_full_style_update or dom_node_child_needs_style_update(node) or children_need_inherited_style_update or recompute_elements_depending_on_custom_properties or children_need_full_style_recompute:
+        if dom_node_is_element(node):
+            if let shadow_root = dom_element_shadow_root((DomElement*)node):
+                if needs_full_style_update or dom_node_needs_style_update(shadow_root.dom_node()) or dom_node_child_needs_style_update(shadow_root.dom_node()):
+                    let subtree_invalidation = dom_update_style_recursively(shadow_root.dom_node(), style_computer, children_need_inherited_style_update, recompute_elements_depending_on_custom_properties, children_need_full_style_recompute)
+                    if not is_display_none:
+                        css_required_invalidation_after_style_change_or_assign(&invalidation, subtree_invalidation)
+
+        for child in dom_node_children(node):
+            if needs_full_style_update or dom_node_needs_style_update(child) or children_need_inherited_style_update or dom_node_child_needs_style_update(child) or recompute_elements_depending_on_custom_properties or children_need_full_style_recompute:
+                let subtree_invalidation = dom_update_style_recursively(child, style_computer, children_need_inherited_style_update, recompute_elements_depending_on_custom_properties, children_need_full_style_recompute)
+                if not is_display_none:
+                    css_required_invalidation_after_style_change_or_assign(&invalidation, subtree_invalidation)
+
+    dom_node_set_child_needs_style_update(node, false)
+
+    if dom_node_is_element(node):
+        css_style_computer_pop_ancestor(style_computer, (DomElement*)node)
+
+    return invalidation
+
+## Ported from Document.cpp:1835 Web::DOM::Document::update_style.
+pub func dom_document_update_style(this: DomDocument*):
+    # NOTE: If our parent document needs a relayout, we must do that *first*. This is required as it may cause the
+    # viewport to change which will can affect media query evaluation and the value of the `vw` unit.
+    if let navigable = dom_document_navigable(this):
+        if let container = html_navigable_container(navigable):
+            let container_document = dom_node_document(container.dom_node())
+            if container_document != this:
+                dom_document_update_layout(container_document, DomUpdateLayoutReason.child_document_style_update)
+
+    if dom_document_browsing_context(this) == none:
+        return
+
+    dom_document_update_animated_style_if_needed(this)
+
+    # Associated with each top-level browsing context is a current transition generation that is incremented on each
+    # style change event. [CSS-Transitions-2]
+    this.m_transition_generation += 1
+
+    if this.m_needs_invalidation_of_elements_affected_by_has:
+        this.m_needs_invalidation_of_elements_affected_by_has = false
+        css_invalidation_invalidate_style_for_pending_has_mutations(this)
+
+    if not css_style_invalidator_has_pending_invalidations(this.m_style_invalidator) and not dom_document_needs_full_style_update(this) and not dom_node_needs_style_update(this.dom_node()) and not dom_node_child_needs_style_update(this.dom_node()):
+        return
+
+    css_style_invalidator_invalidate(this.m_style_invalidator, this.dom_node())
+
+    # NOTE: If this is a document hosting <template> contents, style update is unnecessary.
+    if this.m_created_for_appropriate_template_contents:
+        return
+
+    # Fetch the viewport rect once, instead of repeatedly, during style computation.
+    css_style_computer_set_viewport_rect(dom_document_style_computer(this), dom_document_viewport_rect(this))
+
+    dom_document_evaluate_media_rules(this)
+
+    css_style_computer_reset_has_result_cache(dom_document_style_computer(this))
+    css_style_computer_reset_ancestor_filter(dom_document_style_computer(this))
+
+    dom_document_build_registered_properties_cache(this)
+
+    let invalidation = dom_update_style_recursively(this.dom_node(), dom_document_style_computer(this), false, false, false)
+    if not css_required_invalidation_after_style_change_is_none(&invalidation):
+        dom_document_invalidate_display_list(this)
+
+    if invalidation.rebuild_accumulated_visual_contexts:
+        dom_document_set_needs_accumulated_visual_contexts_update(this, true)
+
+    if invalidation.rebuild_stacking_context_tree:
+        dom_document_invalidate_stacking_context_tree(this)
+    this.m_needs_full_style_update = false
+
+## Ported from Document.cpp:1887 Web::DOM::Document::update_style_if_needed_for_element.
+pub func dom_document_update_style_if_needed_for_element(this: DomDocument*, abstract_element: DomAbstractElement):
+    if dom_document_element_needs_style_update(this, abstract_element):
+        dom_document_update_style(this)
+
+## Ported from Document.cpp:1893 Web::DOM::Document::element_needs_style_update.
+pub func dom_document_element_needs_style_update(this: DomDocument*, abstract_element: DomAbstractElement) -> bool:
+    var target = abstract_element
+
+    # If there are document-level reasons to update style, we can't skip.
+    if this.m_needs_full_style_update:
+        return true
+    if this.m_needs_animated_style_update:
+        return true
+    if this.m_needs_invalidation_of_elements_affected_by_has:
+        return true
+    if css_style_invalidator_has_pending_invalidations(this.m_style_invalidator):
+        return true
+
+    # Check the element itself.
+    let element = dom_abstract_element_element(&target)
+    if dom_node_needs_style_update(element.dom_node()):
+        return true
+    if dom_node_entire_subtree_needs_style_update(element.dom_node()):
+        return true
+
+    # Walk the inheritance ancestor chain. We use element_to_inherit_style_from()
+    # because style inheritance follows the flat tree (slotted elements inherit
+    # from their assigned slot, not their DOM parent). If any ancestor on the
+    # path has its style marked dirty, the target element's computed style could
+    # change via inherited properties, so we must update.
+    var ancestor = dom_abstract_element_element_to_inherit_style_from(&target)
+    while let current = ancestor:
+        var current_ancestor = current
+        let ancestor_element = dom_abstract_element_element(&current_ancestor)
+        if dom_node_needs_style_update(ancestor_element.dom_node()):
+            return true
+        if dom_node_entire_subtree_needs_style_update(ancestor_element.dom_node()):
+            return true
+        ancestor = dom_abstract_element_element_to_inherit_style_from(&current_ancestor)
+
+    # If the navigable has a container and that container needs a style update, then we need one as well, since the
+    # container's style can affect this element (e.g. via media queries or viewport units).
+    if let navigable = dom_document_navigable(this):
+        if let container = html_navigable_container(navigable):
+            var container_element: DomAbstractElement = ---
+            dom_abstract_element_construct(&container_element, container.dom_element())
+            if dom_document_element_needs_style_update(dom_node_document(container.dom_node()), container_element):
+                return true
+
+    return false
+
+## Ported from Document.cpp:1935 Web::DOM::Document::update_animated_style_if_needed.
+pub func dom_document_update_animated_style_if_needed(this: DomDocument*):
+    if not this.m_needs_animated_style_update:
+        return
+
+    var context = AnimationsAnimationUpdateContext()
+    # ~AnimationUpdateContext() applies the collected invalidations when the context goes out of scope.
+    defer animations_animation_update_context_destruct(&context)
+
+    for timeline in ak.hash_table_begin(&this.m_associated_animation_timelines):
+        var animations = animations_animation_timeline_associated_animations(*timeline)
+        for animation in ak.vector_span(&animations):
+            if animations_animation_is_idle(animation):
+                continue
+            if let effect = animations_animation_effect(animation):
+                animations_animation_effect_update_computed_properties(effect, &context)
+
+    this.m_needs_animated_style_update = false
+
+## Ported from Document.cpp:1954 Web::DOM::Document::set_needs_animated_style_update.
+pub func dom_document_set_needs_animated_style_update(this: DomDocument*):
+    if this.m_needs_animated_style_update:
+        return
+
+    this.m_needs_animated_style_update = true
+    dom_document_set_needs_repaint_invalidate_display_list(this, InvalidateDisplayList.no)
+
+## Ported from Document.cpp:1963 Web::DOM::Document::update_paint_and_hit_testing_properties_if_needed.
+pub func dom_document_update_paint_and_hit_testing_properties_if_needed(this: DomDocument*):
+    # NB: Called during paint property resolution.
+    if let paintable = dom_document_unsafe_paintable(this):
+        paint_viewport_paintable_refresh_scroll_state(paintable)
+
+    if this.m_needs_accumulated_visual_contexts_update:
+        this.m_needs_accumulated_visual_contexts_update = false
+        if let paintable = dom_document_unsafe_paintable(this):
+            paint_viewport_paintable_assign_accumulated_visual_contexts(paintable)
+
+# mark: Link colors and color schemes ===========================================================
+
+## Ported from Document.cpp:1978 Web::DOM::Document::set_normal_link_color.
+pub func dom_document_set_normal_link_color(this: DomDocument*, color: gfx.Color):
+    this.m_normal_link_color = color
+
+## Ported from Document.cpp:1983 Web::DOM::Document::set_active_link_color.
+pub func dom_document_set_active_link_color(this: DomDocument*, color: gfx.Color):
+    this.m_active_link_color = color
+
+## Ported from Document.cpp:1988 Web::DOM::Document::set_visited_link_color.
+pub func dom_document_set_visited_link_color(this: DomDocument*, color: gfx.Color):
+    this.m_visited_link_color = color
+
+## Ported from Document.cpp:1993 Web::DOM::Document::supported_color_schemes.
+## C++ answers `Optional<Vector<String> const&>`; the Vector shares its storage, so this answers it by value.
+pub func dom_document_supported_color_schemes(this: DomDocument*) -> ak.Vector[ak.String]?:
+    return this.m_supported_color_schemes
+
+## `element.name().has_value() && element.name()->equals_ignoring_ascii_case(name)`.
+func dom_element_name_equals_ignoring_ascii_case(element: DomElement*, name: str) -> bool:
+    let element_name = dom_element_name(element) else return false
+    return ak.fly_string_equals_ignoring_ascii_case_string_view(&element_name, ak.sv(name))
+
+## Ported from Document.cpp:1999 Web::DOM::Document::obtain_supported_color_schemes.
+# https://html.spec.whatwg.org/multipage/semantics.html#meta-color-scheme
+pub func dom_document_obtain_supported_color_schemes(this: DomDocument*):
+    this.m_supported_color_schemes = none
+
+    # 1. Let candidate elements be the list of all meta elements that meet the following criteria, in tree order:
+    for node in dom_node_subtree(this.dom_node()):
+        let element = as_if_html_meta_element(node) else continue
+        #     * the element is in a document tree;
+        #     * the element has a name attribute, whose value is an ASCII case-insensitive match for color-scheme; and
+        #     * the element has a content attribute.
+
+        # 2. For each element in candidate elements:
+        let content = dom_element_attribute(element.dom_element(), html_attribute_names_content)
+        if dom_element_name_equals_ignoring_ascii_case(element.dom_element(), "color-scheme"):
+            if let content_value = content:
+                # 1. Let parsed be the result of parsing a list of component values given the value of element's content attribute.
+                var context: CssParsingParams = ---
+                css_parsing_params_construct_dom_document(&context, dom_node_document(this.dom_node()))
+                let parsed = parse_css_value(context, ak.string_bytes_as_string_view(&content_value), css_data.PropertyId.color_scheme)
+
+                # 2. If parsed is a valid CSS 'color-scheme' property value, then return parsed.
+                if let parsed_value = parsed:
+                    if css_style_value_is_color_scheme(parsed_value):
+                        this.m_supported_color_schemes = css_color_scheme_style_value_schemes(css_style_value_as_color_scheme(parsed_value))
+                        break
+
+    # 3. Return null.
+
+## Ported from Document.cpp:2030 Web::DOM::Document::obtain_theme_color.
+# https://html.spec.whatwg.org/multipage/semantics.html#meta-theme-color
+pub func dom_document_obtain_theme_color(this: DomDocument*):
+    var theme_color = gfx.color_new_named_color(gfx.ColorNamedColor.transparent)
+
+    # 1. Let candidate elements be the list of all meta elements that meet the following criteria, in tree order:
+    for node in dom_node_subtree(this.dom_node()):
+        let element = as_if_html_meta_element(node) else continue
+        #     * the element is in a document tree;
+        #     * the element has a name attribute, whose value is an ASCII case-insensitive match for theme-color; and
+        #     * the element has a content attribute.
+
+        # 2. For each element in candidate elements:
+        let content = dom_element_attribute(element.dom_element(), html_attribute_names_content)
+        if not dom_element_name_equals_ignoring_ascii_case(element.dom_element(), "theme-color"):
+            continue
+        let content_value = content else continue
+
+        # 1. If element has a media attribute and the value of element's media attribute does not match the environment, then continue.
+        var context: CssParsingParams = ---
+        css_parsing_params_construct_dom_document(&context, dom_node_document(this.dom_node()))
+        let media = dom_element_attribute(element.dom_element(), html_attribute_names_media)
+        if let media_value = media:
+            let query = parse_media_query(context, ak.string_bytes_as_string_view(&media_value)) else continue
+            if not css_media_query_evaluate(query, this):
+                continue
+
+        # 2. Let value be the result of stripping leading and trailing ASCII whitespace from the value of element's content attribute.
+        let content_view = ak.string_bytes_as_string_view(&content_value)
+        let value = ak.string_view_trim(&content_view, web_infra.ascii_whitespace_view())
+
+        # 3. Let color be the result of parsing value.
+        let css_value = parse_css_value(context, value, css_data.PropertyId.color)
+
+        # 4. If color is not failure, then return color.
+        if let parsed_color = css_value:
+            if css_style_value_has_color(parsed_color):
+                var color_resolution_context = CssColorResolutionContext()
+                # NB: Called during theme color computation, layout may be stale.
+                if let html_element = dom_document_html_element(this):
+                    if let html_layout_node = dom_element_unsafe_layout_node(html_element.dom_element()):
+                        color_resolution_context = css_color_resolution_context_for_layout_node_with_style(html_layout_node)
+
+                theme_color = css_style_value_to_color(parsed_color, color_resolution_context) else trap("Optional::value() of an empty color")
+                break
+
+    # 3. Return nothing(the page has no theme color).
+    page_client_page_did_change_theme_color(page_client(dom_document_page(dom_node_document(this.dom_node()))), theme_color)
+
+# mark: Layout nodes, inspected and highlighted nodes ===========================================
+
+## Ported from Document.cpp:2078 Web::DOM::Document::layout_node.
+pub func dom_document_layout_node_const(this: DomDocument*) -> LayoutViewport*?:
+    return (LayoutViewport*?)dom_node_layout_node(this.dom_node())
+
+## Ported from Document.cpp:2083 Web::DOM::Document::layout_node.
+pub func dom_document_layout_node(this: DomDocument*) -> LayoutViewport*?:
+    return (LayoutViewport*?)dom_node_layout_node(this.dom_node())
+
+## Ported from Document.cpp:2088 Web::DOM::Document::unsafe_layout_node.
+pub func dom_document_unsafe_layout_node_const(this: DomDocument*) -> LayoutViewport*?:
+    return (LayoutViewport*?)dom_node_unsafe_layout_node(this.dom_node())
+
+## Ported from Document.cpp:2093 Web::DOM::Document::unsafe_layout_node.
+pub func dom_document_unsafe_layout_node(this: DomDocument*) -> LayoutViewport*?:
+    return (LayoutViewport*?)dom_node_unsafe_layout_node(this.dom_node())
+
+## Ported from Document.cpp:2098 Web::DOM::Document::set_inspected_node.
+pub func dom_document_set_inspected_node(this: DomDocument*, node: DomNode*?):
+    this.m_inspected_node = node
+
+## `layout_node && layout_node->first_paintable()`: the highlighted layout node's first paintable.
+func dom_document_highlighted_first_paintable(this: DomDocument*) -> PaintPaintable*?:
+    let layout_node = dom_document_highlighted_layout_node(this) else return none
+    return layout_node_first_paintable(layout_node)
+
+## Ported from Document.cpp:2103 Web::DOM::Document::set_highlighted_node.
+pub func dom_document_set_highlighted_node(this: DomDocument*, node: DomNode*?, pseudo_element: css_data.PseudoElement?):
+    if this.m_highlighted_node == node and this.m_highlighted_pseudo_element == pseudo_element:
+        return
+
+    if let first_paintable = dom_document_highlighted_first_paintable(this):
+        paint_paintable_set_needs_repaint(first_paintable, InvalidateDisplayList.yes)
+
+    this.m_highlighted_node = node
+    this.m_highlighted_pseudo_element = pseudo_element
+
+    if let first_paintable = dom_document_highlighted_first_paintable(this):
+        paint_paintable_set_needs_repaint(first_paintable, InvalidateDisplayList.yes)
+
+## Ported from Document.cpp:2118 Web::DOM::Document::highlighted_layout_node.
+pub func dom_document_highlighted_layout_node(this: DomDocument*) -> LayoutNode*?:
+    let highlighted_node = this.m_highlighted_node else return none
+
+    # NB: Called during painting inside update_layout().
+    let pseudo_element = this.m_highlighted_pseudo_element
+    if pseudo_element == none or not dom_node_is_element(highlighted_node):
+        return dom_node_unsafe_layout_node(highlighted_node)
+
+    let element = (DomElement*)highlighted_node
+    let pseudo = pseudo_element else trap("unreachable: checked above")
+    return (LayoutNode*?)dom_element_get_pseudo_element_node(element, pseudo)
 
 # mark: Hovering ================================================================================
 
@@ -176,545 +547,3 @@ pub func dom_document_set_hovered_node(this: DomDocument*, node: DomNode*?):
                 var mouse_event_init = UiEventsMouseEventInit()
                 mouse_event_init.related_target = (DomEventTarget*?)old_hovered_node
                 discard(dom_event_target_dispatch_event(entered.dom_event_target(), (DomEvent*)ui_events_mouse_event_create(dom_document_realm(this), ui_events_event_names_mouseenter, mouse_event_init)))
-
-# mark: Collections =============================================================================
-
-## The captures of getElementsByName()'s filter: `[name]`.
-struct DomDocumentGetElementsByNameFilter:
-    var name: ak.FlyString
-
-## getElementsByName()'s filter: HTML elements whose name is `name`.
-func dom_document_get_elements_by_name_filter(context: void*?, node: DomNode*) -> bool:
-    let captures = (DomDocumentGetElementsByNameFilter*)(context else trap("no captures"))
-    if not is_html_element(node):
-        return false
-    let element_name = dom_element_name((DomElement*)node) else return false
-    return ak.fly_string_eq_fly_string(&element_name, &captures.name)
-
-## Ported from Document.cpp:2282 Web::DOM::Document::get_elements_by_name.
-# https://html.spec.whatwg.org/multipage/dom.html#dom-document-getelementsbyname
-pub func dom_document_get_elements_by_name(this: DomDocument*, name: ak.FlyString) -> DomNodeList*:
-    let captures = new DomDocumentGetElementsByNameFilter(name = name) else trap("out of memory")
-    return dom_live_node_list_create(dom_document_realm(this), this.dom_node(), DomLiveNodeListScope.descendants, ak.Function1[DomNode*, bool](call = dom_document_get_elements_by_name_filter, context = captures))
-
-## A document collection over its descendants with `filter` and no sort.
-func dom_document_collection(this: DomDocument*, filter: func(void*?, DomElement*) -> bool) -> DomHtmlCollection*:
-    return dom_html_collection_create(this.dom_parent_node(), DomHtmlCollectionScope.descendants, ak.Function1[DomElement*, bool](call = filter, context = none), ak.Function2[DomElement*, DomElement*, bool]())
-
-## applets()'s filter: nothing.
-func dom_document_applets_filter(context: void*?, element: DomElement*) -> bool:
-    return false
-
-## Ported from Document.cpp:2292 Web::DOM::Document::applets.
-# https://html.spec.whatwg.org/multipage/obsolete.html#dom-document-applets
-pub func dom_document_applets(this: DomDocument*) -> DomHtmlCollection*:
-    if this.m_applets == none:
-        this.m_applets = dom_document_collection(this, dom_document_applets_filter)
-    return this.m_applets else trap("unreachable: set above")
-
-## anchors()'s filter: a elements with a name.
-func dom_document_anchors_filter(context: void*?, element: DomElement*) -> bool:
-    return is_html_anchor_element(element) and dom_element_name(element) != none
-
-## Ported from Document.cpp:2300 Web::DOM::Document::anchors.
-# https://html.spec.whatwg.org/multipage/obsolete.html#dom-document-anchors
-pub func dom_document_anchors(this: DomDocument*) -> DomHtmlCollection*:
-    if this.m_anchors == none:
-        this.m_anchors = dom_document_collection(this, dom_document_anchors_filter)
-    return this.m_anchors else trap("unreachable: set above")
-
-## images()'s filter: img elements.
-func dom_document_images_filter(context: void*?, element: DomElement*) -> bool:
-    return is_html_image_element(element)
-
-## Ported from Document.cpp:2311 Web::DOM::Document::images.
-# https://html.spec.whatwg.org/multipage/dom.html#dom-document-images
-pub func dom_document_images(this: DomDocument*) -> DomHtmlCollection*:
-    if this.m_images == none:
-        this.m_images = dom_document_collection(this, dom_document_images_filter)
-    return this.m_images else trap("unreachable: set above")
-
-## embeds()'s filter: embed elements.
-func dom_document_embeds_filter(context: void*?, element: DomElement*) -> bool:
-    return is_html_embed_element(element)
-
-## Ported from Document.cpp:2322 Web::DOM::Document::embeds.
-# https://html.spec.whatwg.org/multipage/dom.html#dom-document-embeds
-pub func dom_document_embeds(this: DomDocument*) -> DomHtmlCollection*:
-    if this.m_embeds == none:
-        this.m_embeds = dom_document_collection(this, dom_document_embeds_filter)
-    return this.m_embeds else trap("unreachable: set above")
-
-## Ported from Document.cpp:2333 Web::DOM::Document::plugins.
-# https://html.spec.whatwg.org/multipage/dom.html#dom-document-plugins
-pub func dom_document_plugins(this: DomDocument*) -> DomHtmlCollection*:
-    return dom_document_embeds(this)
-
-## links()'s filter: a and area elements with an href.
-func dom_document_links_filter(context: void*?, element: DomElement*) -> bool:
-    return (is_html_anchor_element(element) or is_html_area_element(element)) and dom_element_has_attribute(element, html_attribute_names_href)
-
-## Ported from Document.cpp:2339 Web::DOM::Document::links.
-# https://html.spec.whatwg.org/multipage/dom.html#dom-document-links
-pub func dom_document_links(this: DomDocument*) -> DomHtmlCollection*:
-    if this.m_links == none:
-        this.m_links = dom_document_collection(this, dom_document_links_filter)
-    return this.m_links else trap("unreachable: set above")
-
-## forms()'s filter: form elements.
-func dom_document_forms_filter(context: void*?, element: DomElement*) -> bool:
-    return is_html_form_element(element)
-
-## Ported from Document.cpp:2350 Web::DOM::Document::forms.
-# https://html.spec.whatwg.org/multipage/dom.html#dom-document-forms
-pub func dom_document_forms(this: DomDocument*) -> DomHtmlCollection*:
-    if this.m_forms == none:
-        this.m_forms = dom_document_collection(this, dom_document_forms_filter)
-    return this.m_forms else trap("unreachable: set above")
-
-## scripts()'s filter: script elements.
-func dom_document_scripts_filter(context: void*?, element: DomElement*) -> bool:
-    return is_html_script_element(element)
-
-## Ported from Document.cpp:2361 Web::DOM::Document::scripts.
-# https://html.spec.whatwg.org/multipage/dom.html#dom-document-scripts
-pub func dom_document_scripts(this: DomDocument*) -> DomHtmlCollection*:
-    if this.m_scripts == none:
-        this.m_scripts = dom_document_collection(this, dom_document_scripts_filter)
-    return this.m_scripts else trap("unreachable: set above")
-
-## all()'s filter: every element.
-func dom_document_all_filter(context: void*?, element: DomElement*) -> bool:
-    return true
-
-## Ported from Document.cpp:2372 Web::DOM::Document::all.
-# https://html.spec.whatwg.org/multipage/dom.html#dom-document-all
-pub func dom_document_all(this: DomDocument*) -> HtmlAllCollection*:
-    if this.m_all == none:
-        # The all attribute must return an HTMLAllCollection rooted at the Document node, whose filter matches all elements.
-        this.m_all = html_html_all_collection_create(this.dom_parent_node(), HtmlHtmlAllCollectionScope.descendants, ak.Function1[DomElement*, bool](call = dom_document_all_filter, context = none))
-    return this.m_all else trap("unreachable: set above")
-
-## Ported from Document.cpp:2384 Web::DOM::Document::fonts.
-# https://drafts.csswg.org/css-font-loading/#font-source
-pub func dom_document_fonts(this: DomDocument*) -> CssFontFaceSet*:
-    return this.m_fonts
-
-## Ported from Document.cpp:2390 Web::DOM::Document::clear.
-# https://html.spec.whatwg.org/multipage/obsolete.html#dom-document-clear
-pub func dom_document_clear(this: DomDocument*):
-    # Do nothing
-    return
-
-## Ported from Document.cpp:2396 Web::DOM::Document::capture_events.
-# https://html.spec.whatwg.org/multipage/obsolete.html#dom-document-captureevents
-pub func dom_document_capture_events(this: DomDocument*):
-    # Do nothing
-    return
-
-## Ported from Document.cpp:2402 Web::DOM::Document::release_events.
-# https://html.spec.whatwg.org/multipage/obsolete.html#dom-document-releaseevents
-pub func dom_document_release_events(this: DomDocument*):
-    # Do nothing
-    return
-
-## Ported from Document.cpp:2407 Web::DOM::Document::normal_link_color.
-pub func dom_document_normal_link_color(this: DomDocument*) -> gfx.Color?:
-    return this.m_normal_link_color
-
-## Ported from Document.cpp:2412 Web::DOM::Document::active_link_color.
-pub func dom_document_active_link_color(this: DomDocument*) -> gfx.Color?:
-    return this.m_active_link_color
-
-## Ported from Document.cpp:2417 Web::DOM::Document::visited_link_color.
-pub func dom_document_visited_link_color(this: DomDocument*) -> gfx.Color?:
-    return this.m_visited_link_color
-
-## Ported from Document.cpp:2423 Web::DOM::Document::relevant_settings_object.
-# https://html.spec.whatwg.org/multipage/webappapis.html#relevant-settings-object
-pub func dom_document_relevant_settings_object(this: DomDocument*) -> HtmlEnvironmentSettingsObject*:
-    # Then, the relevant settings object for a platform object o is the environment settings object of the relevant Realm for o.
-    return bind_principal_host_defined_environment_settings_object(dom_document_realm(this))
-
-# mark: Node factories ==========================================================================
-
-## Ported from Document.cpp:2430 Web::DOM::Document::create_element.
-# https://dom.spec.whatwg.org/#dom-document-createelement
-pub func dom_document_create_element(this: DomDocument*, local_name: ak.String, options: StringOrDomElementCreationOptions) -> DomElement*!:
-    # 1. If localName is not a valid element local name, then throw an "InvalidCharacterError" DOMException.
-    if not dom_is_valid_element_local_name(ak.fly_string_from_string(local_name)):
-        return try dom_document_throw(idl_invalid_character_error_create(dom_document_realm(this), ak.utf16_string_from_str("Invalid character in tag name.")))
-
-    # 2. If this is an HTML document, then set localName to localName in ASCII lowercase.
-    let local_name_lower = ak.string_to_ascii_lowercase(&local_name) if dom_document_document_type(this) == DocumentDomDocumentType.html else local_name
-
-    # 3. Let registry and is be the result of flattening element creation options given options and this.
-    let registry_and_is = try dom_document_flatten_element_creation_options(this, options)
-
-    # 4. Let namespace be the HTML namespace, if this is an HTML document or this’s content type is
-    #    "application/xhtml+xml"; otherwise null.
-    var namespace_: ak.FlyString? = none
-    let content_type = dom_document_content_type(this)
-    if dom_document_document_type(this) == DocumentDomDocumentType.html or ak.string_eq_string_view(&content_type, ak.sv("application/xhtml+xml")):
-        namespace_ = namespace_html
-
-    # 5. Return the result of creating an element given this, localName, namespace, null, is, true, and registry.
-    let lower_bytes = ak.string_bytes_as_string_view(&local_name_lower)
-    return try dom_create_element(this, ak.fly_string_from_utf8_without_validation(ak.string_view_bytes(&lower_bytes)), namespace_, none, registry_and_is.is, true, .html_custom_element_registry(registry_and_is.registry))
-
-## Ported from Document.cpp:2456 Web::DOM::Document::create_element_ns.
-# https://dom.spec.whatwg.org/#dom-document-createelementns
-# https://dom.spec.whatwg.org/#internal-createelementns-steps
-pub func dom_document_create_element_ns(this: DomDocument*, namespace_: ak.FlyString?, qualified_name: ak.String, options: StringOrDomElementCreationOptions) -> DomElement*!:
-    # 1. Let (namespace, prefix, localName) be the result of validating and extracting namespace and qualifiedName
-    #    given "element".
-    let extracted_qualified_name = try dom_validate_and_extract(dom_document_realm(this), namespace_, ak.fly_string_from_string(qualified_name), DomValidationContext.element)
-
-    # 2. Let registry and is be the result of flattening element creation options given options and this.
-    let registry_and_is = try dom_document_flatten_element_creation_options(this, options)
-
-    # 3. Return the result of creating an element given document, localName, namespace, prefix, is, true, and registry.
-    return try dom_create_element(this, dom_qualified_name_local_name(&extracted_qualified_name), dom_qualified_name_namespace(&extracted_qualified_name), dom_qualified_name_prefix(&extracted_qualified_name), registry_and_is.is, true, .html_custom_element_registry(registry_and_is.registry))
-
-## Ported from Document.cpp:2469 Web::DOM::Document::create_document_fragment.
-pub func dom_document_create_document_fragment(this: DomDocument*) -> DomDocumentFragment*:
-    return realm_create_dom_document_fragment(dom_document_realm(this), this)
-
-## Ported from Document.cpp:2474 Web::DOM::Document::create_text_node.
-pub func dom_document_create_text_node(this: DomDocument*, data: ak.Utf16String) -> DomText*:
-    return realm_create_dom_text_utf16_string(dom_document_realm(this), this, data)
-
-## Ported from Document.cpp:2480 Web::DOM::Document::create_cdata_section.
-# https://dom.spec.whatwg.org/#dom-document-createcdatasection
-pub func dom_document_create_cdata_section(this: DomDocument*, data: ak.Utf16String) -> DomCdataSection*!:
-    # 1. If this is an HTML document, then throw a "NotSupportedError" DOMException.
-    if dom_document_is_html_document(this):
-        return try dom_document_throw(idl_not_supported_error_create(dom_document_realm(this), ak.utf16_string_from_str("This operation is not supported for HTML documents")))
-
-    # 2. If data contains the string "]]>", then throw an "InvalidCharacterError" DOMException.
-    if ak.utf16_string_base_contains_utf16_view(&data.utf16_string_base, ak.utf16_view_from_ascii(b"]]>")):
-        return try dom_document_throw(idl_invalid_character_error_create(dom_document_realm(this), ak.utf16_string_from_str("String may not contain ']]>'")))
-
-    # 3. Return a new CDATASection node with its data set to data and node document set to this.
-    return realm_create_dom_cdata_section(dom_document_realm(this), this, data)
-
-## Ported from Document.cpp:2494 Web::DOM::Document::create_comment.
-pub func dom_document_create_comment(this: DomDocument*, data: ak.Utf16String) -> DomComment*:
-    return realm_create_dom_comment(dom_document_realm(this), this, data)
-
-## Ported from Document.cpp:2500 Web::DOM::Document::create_processing_instruction.
-# https://dom.spec.whatwg.org/#dom-document-createprocessinginstruction
-pub func dom_document_create_processing_instruction(this: DomDocument*, target: ak.String, data: ak.Utf16String) -> DomProcessingInstruction*!:
-    # 1. If target does not match the Name production, then throw an "InvalidCharacterError" DOMException.
-    if not dom_document_is_valid_name(target):
-        return try dom_document_throw(idl_invalid_character_error_create(dom_document_realm(this), ak.utf16_string_from_str("Invalid character in target name.")))
-
-    # 2. If data contains the string "?>", then throw an "InvalidCharacterError" DOMException.
-    if ak.utf16_string_base_contains_utf16_view(&data.utf16_string_base, ak.utf16_view_from_ascii(b"?>")):
-        return try dom_document_throw(idl_invalid_character_error_create(dom_document_realm(this), ak.utf16_string_from_str("String may not contain '?>'")))
-
-    # 3. Return a new ProcessingInstruction node, with target set to target, data set to data, and node document set to this.
-    return realm_create_dom_processing_instruction(dom_document_realm(this), this, data, target)
-
-## Ported from Document.cpp:2514 Web::DOM::Document::create_range.
-pub func dom_document_create_range(this: DomDocument*) -> DomRange*:
-    return dom_range_create_dom_document(this)
-
-## Ported from Document.cpp:2520 Web::DOM::Document::create_event.
-# https://dom.spec.whatwg.org/#dom-document-createevent
-pub func dom_document_create_event(this: DomDocument*, interface_: ak.StringView) -> DomEvent*!:
-    let realm = dom_document_realm(this)
-    let empty = ak.fly_string_new()
-
-    # NOTE: This is named event here, since we do step 5 and 6 as soon as possible for each case.
-    # 1. Let constructor be null.
-    var event: DomEvent*? = none
-
-    # 2. If interface is an ASCII case-insensitive match for any of the strings in the first column in the following table,
-    #      then set constructor to the interface in the second column on the same row as the matching string:
-    if ak.string_view_equals_ignoring_ascii_case(&interface_, ak.sv("beforeunloadevent")):
-        event = html_before_unload_event_create(realm, empty)
-    elif ak.string_view_equals_ignoring_ascii_case(&interface_, ak.sv("compositionevent")):
-        event = ui_events_composition_event_create(realm, ak.String())
-    elif ak.string_view_equals_ignoring_ascii_case(&interface_, ak.sv("customevent")):
-        event = dom_custom_event_create(realm, empty, DomCustomEventInit()).dom_event()
-    elif ak.string_view_equals_ignoring_ascii_case(&interface_, ak.sv("devicemotionevent")):
-        event = dom_event_create(realm, empty)  # FIXME: Create DeviceMotionEvent
-    elif ak.string_view_equals_ignoring_ascii_case(&interface_, ak.sv("deviceorientationevent")):
-        event = dom_event_create(realm, empty)  # FIXME: Create DeviceOrientationEvent
-    elif ak.string_view_equals_ignoring_ascii_case(&interface_, ak.sv("dragevent")):
-        event = html_drag_event_create(realm, empty)
-    elif ak.string_view_equals_ignoring_ascii_case(&interface_, ak.sv("event")) or ak.string_view_equals_ignoring_ascii_case(&interface_, ak.sv("events")):
-        event = dom_event_create(realm, empty)
-    elif ak.string_view_equals_ignoring_ascii_case(&interface_, ak.sv("focusevent")):
-        event = ui_events_focus_event_create(realm, empty)
-    elif ak.string_view_equals_ignoring_ascii_case(&interface_, ak.sv("hashchangeevent")):
-        event = html_hash_change_event_create(realm, empty, HtmlHashChangeEventInit())
-    elif ak.string_view_equals_ignoring_ascii_case(&interface_, ak.sv("htmlevents")):
-        event = dom_event_create(realm, empty)
-    elif ak.string_view_equals_ignoring_ascii_case(&interface_, ak.sv("keyboardevent")):
-        event = ui_events_keyboard_event_create(realm, ak.String())
-    elif ak.string_view_equals_ignoring_ascii_case(&interface_, ak.sv("messageevent")):
-        event = html_message_event_create(realm, ak.String())
-    elif ak.string_view_equals_ignoring_ascii_case(&interface_, ak.sv("mouseevent")) or ak.string_view_equals_ignoring_ascii_case(&interface_, ak.sv("mouseevents")):
-        event = (DomEvent*)ui_events_mouse_event_create(realm, empty, UiEventsMouseEventInit())
-    elif ak.string_view_equals_ignoring_ascii_case(&interface_, ak.sv("storageevent")):
-        event = html_storage_event_create(realm, empty)
-    elif ak.string_view_equals_ignoring_ascii_case(&interface_, ak.sv("svgevents")):
-        event = dom_event_create(realm, empty)
-    elif ak.string_view_equals_ignoring_ascii_case(&interface_, ak.sv("textevent")):
-        event = ui_events_text_event_create(realm, empty)
-    elif ak.string_view_equals_ignoring_ascii_case(&interface_, ak.sv("touchevent")):
-        event = dom_event_create(realm, empty)  # FIXME: Create TouchEvent
-    elif ak.string_view_equals_ignoring_ascii_case(&interface_, ak.sv("uievent")) or ak.string_view_equals_ignoring_ascii_case(&interface_, ak.sv("uievents")):
-        event = ui_events_ui_event_create(realm, empty)
-
-    # 3. If constructor is null, then throw a "NotSupportedError" DOMException.
-    let created = event else return try dom_document_throw(idl_not_supported_error_create(realm, ak.utf16_string_from_str("No constructor for interface found")))
-
-    # FIXME: 4. If the interface indicated by constructor is not exposed on the relevant global object of this, then throw a "NotSupportedError" DOMException.
-
-    # NOTE: These are done in the if-chain above
-    # 5. Let event be the result of creating an event given constructor.
-    # 6. Initialize event’s type attribute to the empty string.
-    # 7. Initialize event’s timeStamp attribute to the result of calling current high resolution time with this’s relevant global object.
-    # NOTE: This is handled by each constructor.
-
-    # 8. Initialize event’s isTrusted attribute to false.
-    dom_event_set_is_trusted(created, false)
-
-    # 9. Unset event’s initialized flag.
-    dom_event_set_initialized(created, false)
-
-    # 10. Return event.
-    return created
-
-# mark: Scripts =================================================================================
-
-## Ported from Document.cpp:2594 Web::DOM::Document::set_pending_parsing_blocking_script.
-pub func dom_document_set_pending_parsing_blocking_script(this: DomDocument*, script: HtmlScriptElement*?):
-    this.m_pending_parsing_blocking_script = script
-
-## Ported from Document.cpp:2599 Web::DOM::Document::take_pending_parsing_blocking_script.
-pub func dom_document_take_pending_parsing_blocking_script(this: DomDocument*) -> HtmlScriptElement*:
-    let script = this.m_pending_parsing_blocking_script else trap("VERIFY: no pending parsing-blocking script")
-    this.m_pending_parsing_blocking_script = none
-    return script
-
-## Ported from Document.cpp:2607 Web::DOM::Document::set_pending_parsing_blocking_svg_script.
-pub func dom_document_set_pending_parsing_blocking_svg_script(this: DomDocument*, script: SvgScriptElement*?):
-    this.m_pending_parsing_blocking_svg_script = script
-
-## Ported from Document.cpp:2612 Web::DOM::Document::take_pending_parsing_blocking_svg_script.
-pub func dom_document_take_pending_parsing_blocking_svg_script(this: DomDocument*) -> SvgScriptElement*:
-    let script = this.m_pending_parsing_blocking_svg_script else trap("VERIFY: no pending parsing-blocking SVG script")
-    this.m_pending_parsing_blocking_svg_script = none
-    return script
-
-## Ported from Document.cpp:2620 Web::DOM::Document::add_script_to_execute_when_parsing_has_finished.
-pub func dom_document_add_script_to_execute_when_parsing_has_finished(this: DomDocument*, script: HtmlScriptElement*):
-    ak.vector_append_t(&this.m_scripts_to_execute_when_parsing_has_finished, script)
-
-## The scripts of `list` as roots (C++'s Vector<GC::Root<HTMLScriptElement>>), and `list` cleared.
-func dom_document_take_scripts(list: ak.Vector[HtmlScriptElement*]*) -> ak.Vector[HtmlScriptElement*?]:
-    var handles: ak.Vector[HtmlScriptElement*?]
-    for script in ak.vector_span(list):
-        ak.vector_append_t(&handles, script)
-    ak.vector_clear(list)
-    return handles
-
-## Ported from Document.cpp:2625 Web::DOM::Document::take_scripts_to_execute_when_parsing_has_finished.
-pub func dom_document_take_scripts_to_execute_when_parsing_has_finished(this: DomDocument*) -> ak.Vector[HtmlScriptElement*?]:
-    return dom_document_take_scripts(&this.m_scripts_to_execute_when_parsing_has_finished)
-
-## Ported from Document.cpp:2634 Web::DOM::Document::add_script_to_execute_as_soon_as_possible.
-pub func dom_document_add_script_to_execute_as_soon_as_possible(this: DomDocument*, script: HtmlScriptElement*):
-    ak.vector_append_t(&this.m_scripts_to_execute_as_soon_as_possible, script)
-
-## Ported from Document.cpp:2639 Web::DOM::Document::take_scripts_to_execute_as_soon_as_possible.
-pub func dom_document_take_scripts_to_execute_as_soon_as_possible(this: DomDocument*) -> ak.Vector[HtmlScriptElement*?]:
-    return dom_document_take_scripts(&this.m_scripts_to_execute_as_soon_as_possible)
-
-## Ported from Document.cpp:2648 Web::DOM::Document::add_script_to_execute_in_order_as_soon_as_possible.
-pub func dom_document_add_script_to_execute_in_order_as_soon_as_possible(this: DomDocument*, script: HtmlScriptElement*):
-    ak.vector_append_t(&this.m_scripts_to_execute_in_order_as_soon_as_possible, script)
-
-## Ported from Document.cpp:2653 Web::DOM::Document::take_scripts_to_execute_in_order_as_soon_as_possible.
-pub func dom_document_take_scripts_to_execute_in_order_as_soon_as_possible(this: DomDocument*) -> ak.Vector[HtmlScriptElement*?]:
-    return dom_document_take_scripts(&this.m_scripts_to_execute_in_order_as_soon_as_possible)
-
-# mark: Importing and adopting nodes ============================================================
-
-## Ported from Document.cpp:2663 Web::DOM::Document::import_node.
-# https://dom.spec.whatwg.org/#dom-document-importnode
-pub func dom_document_import_node(this: DomDocument*, node: DomNode*, options: BoolOrDomImportNodeOptions) -> DomNode*!:
-    # 1. If node is a document or shadow root, then throw a "NotSupportedError" DOMException.
-    if is_dom_document(node) or is_dom_shadow_root(node):
-        return try dom_document_throw(idl_not_supported_error_create(dom_document_realm(this), ak.utf16_string_from_str("Cannot import a document or shadow root.")))
-
-    # 2. Let subtree be false.
-    var subtree = false
-
-    # 3. Let registry be null.
-    var registry: HtmlCustomElementRegistry*? = none
-
-    match options:
-        # 4. If options is a boolean, then set subtree to options.
-        .bool_(value):
-            subtree = value
-        # 5. Otherwise:
-        .dom_import_node_options(import_options):
-            # 1. Set subtree to the negation of options["selfOnly"].
-            subtree = not import_options.self_only
-
-            # 2. If options["customElementRegistry"] exists, then set registry to it.
-            if import_options.custom_element_registry != none:
-                registry = import_options.custom_element_registry
-
-            # 3. If registry’s is scoped is false and registry is not this’s custom element registry, then throw a
-            #    "NotSupportedError" DOMException.
-            if let given_registry = registry:
-                if not html_custom_element_registry_is_scoped(given_registry) and registry != dom_document_custom_element_registry(this):
-                    return try dom_document_throw(idl_not_supported_error_create(dom_document_realm(this), ak.utf16_string_from_str("'customElementRegistry' in ImportNodeOptions must either be scoped or the document's custom element registry.")))
-
-    # 6. If registry is null, then set registry to the result of looking up a custom element registry given this.
-    if registry == none:
-        registry = html_look_up_a_custom_element_registry(this.dom_node())
-
-    # 7. Return the result of cloning a node given node with document set to this, subtree set to subtree, and
-    #   fallbackRegistry set to registry.
-    return try dom_node_clone_node(node, this, subtree, none, registry)
-
-## The captures of adopt_node's walks: the document and the old document.
-struct DomDocumentAdoptNodeWalk:
-    var this: DomDocument*
-    var old_document: DomDocument*
-
-## adopt_node's first walk: set the node document and the custom element registries.
-func dom_document_adopt_node_set_document(context: void*?, inclusive_descendant: DomNode*) -> TraversalDecision:
-    let captures = (DomDocumentAdoptNodeWalk*)(context else trap("no captures"))
-    let this = captures.this
-
-    # 1. Set inclusiveDescendant’s node document to document.
-    dom_node_set_document_document(inclusive_descendant, this)
-
-    # 2. If inclusiveDescendant is a shadow root and if any of the following are true:
-    #    - inclusiveDescendant’s custom element registry is null and inclusiveDescendant’s keep custom element
-    #      registry null is false; or
-    #    - inclusiveDescendant’s custom element registry is a global custom element registry,
-    #    then set inclusiveDescendant’s custom element registry to document’s effective global custom element
-    #    registry.
-    var shadow_root_needs_registry = false
-    if let shadow_root = as_if_dom_shadow_root(inclusive_descendant):
-        let shadow_root_registry = dom_shadow_root_custom_element_registry(shadow_root)
-        shadow_root_needs_registry = (shadow_root_registry == none and not dom_shadow_root_keep_custom_element_registry_null(shadow_root)) or html_is_a_global_custom_element_registry(shadow_root_registry)
-    if shadow_root_needs_registry:
-        let shadow_root = as_dom_shadow_root(inclusive_descendant)
-        dom_shadow_root_set_custom_element_registry(shadow_root, dom_document_effective_global_custom_element_registry(this))
-
-    # 3. Otherwise, if inclusiveDescendant is an element:
-    elif let element = as_if_dom_element(inclusive_descendant):
-        # FIXME: 1. Set the node document of each attribute in inclusiveDescendant’s attribute list to document.
-
-        # 2. If inclusiveDescendant’s custom element registry is null or inclusiveDescendant’s custom element
-        #    registry’s is scoped is false, then set inclusiveDescendant’s custom element registry to
-        #    document’s effective global custom element registry.
-        var registry_is_scoped = false
-        if let element_registry = dom_element_custom_element_registry(element):
-            registry_is_scoped = html_custom_element_registry_is_scoped(element_registry)
-        if not registry_is_scoped:
-            dom_element_set_custom_element_registry(element, dom_document_effective_global_custom_element_registry(this))
-
-    return TraversalDecision.continue_
-
-## adopt_node's second walk: enqueue adoptedCallback reactions for custom elements.
-func dom_document_adopt_node_enqueue_adopted_callback(context: void*?, inclusive_descendant: DomNode*) -> TraversalDecision:
-    let captures = (DomDocumentAdoptNodeWalk*)(context else trap("no captures"))
-    if let element = as_if_dom_element(inclusive_descendant):
-        if dom_element_is_custom(element):
-            var arguments: ak.Vector[JsValue]
-            ak.vector_append_t(&arguments, js_value_from_object((JsObject*)captures.old_document))
-            ak.vector_append_t(&arguments, js_value_from_object((JsObject*)captures.this))
-
-            dom_element_enqueue_a_custom_element_callback_reaction(element, html_custom_element_reaction_names_adopted_callback, arguments)
-
-    return TraversalDecision.continue_
-
-## adopt_node's third walk: run the adopting steps.
-func dom_document_adopt_node_adopted_from(context: void*?, inclusive_descendant: DomNode*) -> TraversalDecision:
-    let captures = (DomDocumentAdoptNodeWalk*)(context else trap("no captures"))
-    dom_node_adopted_from(inclusive_descendant, captures.old_document)
-    return TraversalDecision.continue_
-
-## Ported from Document.cpp:2707 Web::DOM::Document::adopt_node.
-# https://dom.spec.whatwg.org/#concept-node-adopt
-pub func dom_document_adopt_node(this: DomDocument*, node: DomNode*):
-    # 1. Let oldDocument be node’s node document.
-    let old_document = dom_node_document(node)
-
-    # 2. If node’s parent is non-null, then remove node.
-    if tree_node_parent(node) != none:
-        dom_node_remove(node)
-
-    # 3. If document is not oldDocument, then:
-    if old_document != this:
-        var captures = DomDocumentAdoptNodeWalk(this = this, old_document = old_document)
-
-        # 1. For each inclusiveDescendant in node’s shadow-including inclusive descendants:
-        discard(dom_node_for_each_shadow_including_inclusive_descendant(node, ak.Function1[DomNode*, TraversalDecision](call = dom_document_adopt_node_set_document, context = &captures)))
-
-        # 2. For each inclusiveDescendant in node’s shadow-including inclusive descendants that is custom, in
-        #    shadow-including tree order:
-        #    enqueue a custom element callback reaction with inclusiveDescendant, callback name "adoptedCallback", and
-        #    « oldDocument, document ».
-        discard(dom_node_for_each_shadow_including_inclusive_descendant(node, ak.Function1[DomNode*, TraversalDecision](call = dom_document_adopt_node_enqueue_adopted_callback, context = &captures)))
-
-        # 3. For each inclusiveDescendant in node’s shadow-including inclusive descendants, in shadow-including tree
-        #     order:
-        #    run the adopting steps with inclusiveDescendant and oldDocument.
-        discard(dom_node_for_each_shadow_including_inclusive_descendant(node, ak.Function1[DomNode*, TraversalDecision](call = dom_document_adopt_node_adopted_from, context = &captures)))
-
-        # AD-HOC: Transfer NodeIterators rooted at `node` from old_document to this document.
-        var node_iterators_to_transfer: ak.Vector[DomNodeIterator*]
-        for node_iterator in ak.hash_table_begin(&old_document.m_node_iterators):
-            let iterator = *node_iterator else continue
-            if dom_node_iterator_root(iterator) == node:
-                ak.vector_append_t(&node_iterators_to_transfer, iterator)
-
-        for node_iterator in ak.vector_span(&node_iterators_to_transfer):
-            discard(ak.hash_table_remove_t(&old_document.m_node_iterators, node_iterator))
-            discard(ak.hash_table_set(&this.m_node_iterators, node_iterator))
-
-## Ported from Document.cpp:2792 Web::DOM::Document::adopt_node_binding.
-# https://dom.spec.whatwg.org/#dom-document-adoptnode
-pub func dom_document_adopt_node_binding(this: DomDocument*, node: DomNode*) -> DomNode*!:
-    if is_dom_document(node):
-        return try dom_document_throw(idl_not_supported_error_create(dom_document_realm(this), ak.utf16_string_from_str("Cannot adopt a document into a document")))
-
-    if is_dom_shadow_root(node):
-        return try dom_document_throw(idl_hierarchy_request_error_create(dom_document_realm(this), ak.utf16_string_from_str("Cannot adopt a shadow root into a document")))
-
-    if let fragment = as_if_dom_document_fragment(node):
-        if dom_document_fragment_host(fragment) != none:
-            return node
-
-    dom_document_adopt_node(this, node)
-
-    return node
-
-# mark: Doctype, compatMode and the active element ==============================================
-
-## Ported from Document.cpp:2808 Web::DOM::Document::doctype.
-pub func dom_document_doctype(this: DomDocument*) -> DomDocumentType*?:
-    return (DomDocumentType*?)tree_node_first_child_of_type(this.dom_node(), &dom_document_type_class)
-
-## Ported from Document.cpp:2813 Web::DOM::Document::compat_mode.
-pub func dom_document_compat_mode(this: DomDocument*) -> ak.String:
-    if this.m_quirks_mode == DomQuirksMode.yes:
-        return ak.string_from_str("BackCompat")
-
-    return ak.string_from_str("CSS1Compat")
-
-## Ported from Document.cpp:2824 Web::DOM::Document::update_active_element.
-func dom_document_update_active_element(this: DomDocument*):
-    dom_document_set_active_element(this, dom_calculate_active_element(this.dom_node()))
