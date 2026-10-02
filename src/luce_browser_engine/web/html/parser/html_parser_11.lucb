@@ -1,0 +1,478 @@
+#==============================================================================================
+#
+#   html_parser_11 - HTML::HTMLParser: fragment parsing, the parser factories and HTML
+#                    fragment serialization
+#
+#   DESCRIPTION:
+#       Port of LibWeb/HTML/Parser/HTMLParser.cpp (lines 5059-5510): the HTML fragment parsing
+#       algorithm, create_for_scripting / create_with_open_input_stream /
+#       create_with_uncertain_encoding / create, escaping a string, and the HTML fragment
+#       serialization algorithm.
+#
+#       escape_string is a template over Utf8View and Utf16View in C++: here it is two
+#       functions, html_escape_string_utf8_view and html_escape_string_utf16_view. The
+#       serialize_element lambda is html_parser_serialize_element, given the builder and the
+#       serialization arguments it captures.
+#
+#==============================================================================================
+
+# mark: Fragment parsing ========================================================================
+
+## Ported from HTMLParser.cpp:5060 Web::HTML::HTMLParser::parse_html_fragment.
+# https://html.spec.whatwg.org/multipage/parsing.html#parsing-html-fragments
+pub func html_parser_parse_html_fragment(context_element: DomElement*, markup: ak.StringView, allow_declarative_shadow_roots: HtmlParserAllowDeclarativeShadowRoots = HtmlParserAllowDeclarativeShadowRoots.no, scripting_mode: HtmlParserScriptingMode = HtmlParserScriptingMode.inert) -> ak.Vector[DomNode*?]!:
+    # 1. Assert: scriptingMode is either Inert or Fragment.
+    assert(scripting_mode == HtmlParserScriptingMode.inert or scripting_mode == HtmlParserScriptingMode.fragment)
+
+    let context_document = dom_node_document(context_element.dom_node())
+
+    # 2. Let document be a Document node whose type is "html".
+    let temp_document = dom_document_create_for_fragment_parsing(bind_platform_object_realm(context_element.bind_platform_object()))
+    dom_document_set_document_type(temp_document, DocumentDomDocumentType.html)
+
+    # AD-HOC: We set the about base URL of the document to the same as the context element's document.
+    #         This is required for Document::parse_url() to work inside iframe srcdoc documents.
+    #         Spec issue: https://github.com/whatwg/html/issues/12210
+    dom_document_set_about_base_url(temp_document, dom_document_about_base_url(context_document))
+
+    # 3. Let contextDocument be context's node document.
+
+    # 4. If contextDocument is in quirks mode, then set document's mode to "quirks".
+    if dom_document_in_quirks_mode(context_document):
+        dom_document_set_quirks_mode(temp_document, DomQuirksMode.yes)
+    # 5. Otherwise, if context's node document is in limited-quirks mode, then set document's mode to "limited-quirks".
+    elif dom_document_in_limited_quirks_mode(context_document):
+        dom_document_set_quirks_mode(temp_document, DomQuirksMode.limited)
+
+    # 6. If allowDeclarativeShadowRoots is true, then set document's allow declarative shadow roots to true.
+    if allow_declarative_shadow_roots == HtmlParserAllowDeclarativeShadowRoots.yes:
+        dom_document_set_allow_declarative_shadow_roots(temp_document, true)
+
+    # 7. Create a new HTML parser, and associate it with document.
+    # 8. If contextDocument's scripting is disabled, then set scriptingMode to Disabled.
+    # 9. Set the parser's scripting mode to scriptingMode.
+    var actual_scripting_mode = scripting_mode
+    if dom_node_is_scripting_disabled(context_document.dom_node()):
+        actual_scripting_mode = HtmlParserScriptingMode.disabled
+    let parser = html_parser_create(temp_document, markup, actual_scripting_mode, ak.sv("utf-8"))
+    parser.m_context_element = context_element
+    parser.m_parsing_fragment = true
+
+    # 10. Set the state of the HTML parser's tokenization stage as follows, switching on the context element:
+    # - title
+    # - textarea
+    if html_parser_local_name_is_one_of(context_element, [html_tag_names_title, html_tag_names_textarea]):
+        # Switch the tokenizer to the RCDATA state.
+        html_syntax.html_tokenizer_switch_to_html_parser(&parser.m_tokenizer, html_syntax.HtmlTokenizerState.rcdata)
+    # - style
+    # - xmp
+    # - iframe
+    # - noembed
+    # - noframes
+    elif html_parser_local_name_is_one_of(context_element, [html_tag_names_style, html_tag_names_xmp, html_tag_names_iframe, html_tag_names_noembed, html_tag_names_noframes]):
+        # Switch the tokenizer to the RAWTEXT state.
+        html_syntax.html_tokenizer_switch_to_html_parser(&parser.m_tokenizer, html_syntax.HtmlTokenizerState.rawtext)
+    # - script
+    elif html_parser_local_name_is_one_of(context_element, [html_tag_names_script]):
+        # Switch the tokenizer to the script data state.
+        html_syntax.html_tokenizer_switch_to_html_parser(&parser.m_tokenizer, html_syntax.HtmlTokenizerState.script_data)
+    # - noscript
+    elif html_parser_local_name_is_one_of(context_element, [html_tag_names_noscript]):
+        # If scripting mode is not Disabled, switch the tokenizer to the RAWTEXT state. Otherwise, leave the tokenizer in the data state.
+        if actual_scripting_mode != HtmlParserScriptingMode.disabled:
+            html_syntax.html_tokenizer_switch_to_html_parser(&parser.m_tokenizer, html_syntax.HtmlTokenizerState.rawtext)
+    # - plaintext
+    elif html_parser_local_name_is_one_of(context_element, [html_tag_names_plaintext]):
+        # Switch the tokenizer to the PLAINTEXT state.
+        html_syntax.html_tokenizer_switch_to_html_parser(&parser.m_tokenizer, html_syntax.HtmlTokenizerState.plaintext)
+    # Any other element
+    #     Leave the tokenizer in the data state.
+
+    # 11. Let root be the result of creating an element given document, "html", the HTML namespace, null, null, false,
+    #    and context's custom element registry.
+    let root = dom_create_element(context_document, html_tag_names_html, namespace_html, none, none, false, HtmlCustomElementRegistryOrDomDefault.html_custom_element_registry(dom_element_custom_element_registry(context_element))) else trap("MUST: create_element")
+
+    # 12. Append root to document.
+    discard(dom_node_append_child(temp_document.dom_node(), root.dom_node()) else trap("MUST: append_child"))
+
+    # 13. Set up the HTML parser's stack of open elements so that it contains just the single element root.
+    html_stack_of_open_elements_push(&parser.m_stack_of_open_elements, root)
+
+    # 14. If context is a template element, then push "in template" onto the stack of template insertion modes
+    #     so that it is the new current template insertion mode.
+    if html_parser_local_name_is(context_element, html_tag_names_template):
+        ak.vector_append_t(&parser.m_stack_of_template_insertion_modes, HtmlParserInsertionMode.in_template)
+
+    # FIXME: 15. Create a start tag token whose name is the local name of context and whose attributes are the attributes of context.
+    #            Let this start tag token be the start tag token of context; e.g. for the purposes of determining if it is an HTML integration point.
+
+    # 16. Reset the parser's insertion mode appropriately.
+    html_parser_reset_the_insertion_mode_appropriately(parser)
+
+    # 17. Set the HTML parser's form element pointer to the nearest node to context that is a form element
+    #     (going straight up the ancestor chain, and including the element itself, if it is a form element), if any.
+    #     (If there is no such form element, the form element pointer keeps its initial value, null.)
+    parser.m_form_element = (HtmlFormElement*?)tree_node_first_ancestor_of_type(context_element.dom_node(), &html_form_element_class)
+
+    # 18. Place the input into the input stream for the HTML parser just created. The encoding confidence is irrelevant.
+    # 19. Start the HTML parser and let it run until it has consumed all the characters just inserted into the input stream.
+    html_parser_run_url(parser, dom_document_url(context_document))
+
+    # 20. Return root's children, in tree order.
+    var children: ak.Vector[DomNode*?]
+    while let child = tree_node_first_child(root.dom_node()):
+        discard(dom_node_remove_child(root.dom_node(), child) else trap("MUST: remove_child"))
+        dom_document_adopt_node(context_document, child)
+        ak.vector_append_t(&children, child)
+    return children
+
+# mark: Creating parsers ========================================================================
+
+## The parser's scripting mode for a document (`document.is_scripting_enabled() ? Normal : Disabled`).
+func html_parser_scripting_mode_for(document: DomDocument*) -> HtmlParserScriptingMode:
+    return HtmlParserScriptingMode.normal if dom_node_is_scripting_enabled(document.dom_node()) else HtmlParserScriptingMode.disabled
+
+## Ported from HTMLParser.cpp:5176 Web::HTML::HTMLParser::create_for_scripting.
+pub func html_parser_create_for_scripting(document: DomDocument*) -> HtmlParser*:
+    let scripting_mode = html_parser_scripting_mode_for(document)
+    return realm_create_html_parser_html_parser_script_created_par(bind_platform_object_realm(document.bind_platform_object()), document, scripting_mode, HtmlParserScriptCreatedParser.yes)
+
+## Ported from HTMLParser.cpp:5182 Web::HTML::HTMLParser::create_with_open_input_stream.
+pub func html_parser_create_with_open_input_stream(document: DomDocument*) -> HtmlParser*:
+    let scripting_mode = html_parser_scripting_mode_for(document)
+    return realm_create_html_parser_html_parser_script_created_par(bind_platform_object_realm(document.bind_platform_object()), document, scripting_mode, HtmlParserScriptCreatedParser.no)
+
+## Ported from HTMLParser.cpp:5188 Web::HTML::HTMLParser::create_with_uncertain_encoding.
+pub func html_parser_create_with_uncertain_encoding(document: DomDocument*, input: const ak.ByteBuffer*, maybe_mime_type: MimeType? = none) -> HtmlParser*:
+    let scripting_mode = html_parser_scripting_mode_for(document)
+    let realm = bind_platform_object_realm(document.bind_platform_object())
+    let input_view = ak.string_view_from_bytes(ak.byte_buffer_bytes_const(input))
+    if dom_document_has_encoding(document):
+        let encoding = dom_document_encoding(document) else trap("VERIFY: encoding")
+        let encoding_byte_string = ak.string_to_byte_string(&encoding)
+        return realm_create_html_parser_string_view(realm, document, scripting_mode, input_view, ak.byte_string_view(&encoding_byte_string))
+    let encoding = html_run_encoding_sniffing_algorithm(document, ak.byte_buffer_bytes_const(input), maybe_mime_type)
+    if html_parser_debug:
+        ak.dbgln(f"The encoding sniffing algorithm returned encoding '{(str)ak.byte_string_bytes(&encoding)}'")
+    return realm_create_html_parser_string_view(realm, document, scripting_mode, input_view, ak.byte_string_view(&encoding))
+
+## Ported from HTMLParser.cpp:5198 Web::HTML::HTMLParser::create.
+pub func html_parser_create(document: DomDocument*, input: ak.StringView, scripting_mode: HtmlParserScriptingMode, encoding: ak.StringView) -> HtmlParser*:
+    return realm_create_html_parser_string_view(bind_platform_object_realm(document.bind_platform_object()), document, scripting_mode, input, encoding)
+
+# mark: Serializing HTML fragments ==============================================================
+
+## The common body of escape_string<ViewType>: one code point.
+func html_escape_code_point(builder: ak.StringBuilder*, code_point: u32, attribute_mode: HtmlAttributeMode):
+    # 1. Replace any occurrence of the "&" character by the string "&amp;".
+    if code_point == (u32)'&':
+        ak.string_builder_append(builder, "&amp;")
+    # 2. Replace any occurrences of the U+00A0 NO-BREAK SPACE character by the string "&nbsp;".
+    elif code_point == 0xA0:
+        ak.string_builder_append(builder, "&nbsp;")
+    # 3. Replace any occurrences of the "<" character by the string "&lt;".
+    elif code_point == (u32)'<':
+        ak.string_builder_append(builder, "&lt;")
+    # 4. Replace any occurrences of the ">" character by the string "&gt;".
+    elif code_point == (u32)'>':
+        ak.string_builder_append(builder, "&gt;")
+    # 5. If the algorithm was invoked in the attribute mode, then replace any occurrences of the """ character by the string "&quot;".
+    elif code_point == (u32)'"' and attribute_mode == HtmlAttributeMode.yes:
+        ak.string_builder_append(builder, "&quot;")
+    else:
+        ak.string_builder_append_code_point(builder, code_point)
+
+## Ported from HTMLParser.cpp:5209 Web::HTML::escape_string (ViewType = Utf8View).
+# https://html.spec.whatwg.org/multipage/parsing.html#escapingString
+func html_escape_string_utf8_view(string: ak.Utf8View, attribute_mode: HtmlAttributeMode) -> ak.String:
+    var builder = ak.string_builder_new()
+    var it = ak.utf8_view_begin(&string)
+    while not ak.utf8_code_point_iterator_done(&it):
+        html_escape_code_point(&builder, ak.utf8_code_point_iterator_deref(&it), attribute_mode)
+        discard(ak.utf8_code_point_iterator_inc(&it))
+    return ak.string_builder_to_string_without_validation(&builder)
+
+## Ported from HTMLParser.cpp:5209 Web::HTML::escape_string (ViewType = Utf16View).
+# https://html.spec.whatwg.org/multipage/parsing.html#escapingString
+func html_escape_string_utf16_view(string: ak.Utf16View, attribute_mode: HtmlAttributeMode) -> ak.String:
+    var builder = ak.string_builder_new()
+    var it = ak.utf16_view_begin(&string)
+    while not ak.utf16_code_point_iterator_done(&it):
+        html_escape_code_point(&builder, ak.utf16_code_point_iterator_deref(&it), attribute_mode)
+        discard(ak.utf16_code_point_iterator_inc(&it))
+    return ak.string_builder_to_string_without_validation(&builder)
+
+## `fly_string == "text"`.
+func html_parser_fly_string_is_text(string: ak.FlyString, text: str) -> bool:
+    return ak.fly_string_eq_string_view(&string, ak.sv(text))
+
+## `builder.append(fly_string)`.
+func html_parser_append_fly_string(builder: ak.StringBuilder*, string: ak.FlyString):
+    ak.string_builder_append_string_view(builder, ak.fly_string_bytes_as_string_view(&string))
+
+## `builder.append(string)`.
+func html_parser_append_string(builder: ak.StringBuilder*, string: ak.String):
+    ak.string_builder_append_string_view(builder, ak.string_bytes_as_string_view(&string))
+
+## `builder.append(utf16_string)`.
+func html_parser_append_utf16_string(builder: ak.StringBuilder*, string: ak.Utf16String):
+    ak.string_builder_append_utf16_view(builder, ak.utf16_string_base_utf16_view(&string.utf16_string_base))
+
+## serialize_html_fragment's `serialize_element` lambda (HTMLParser.cpp:5245-5338); it captures the
+## builder and the serialization arguments.
+func html_parser_serialize_element(builder: ak.StringBuilder*, element: DomElement*, serializable_shadow_roots: HtmlParserSerializableShadowRoots, shadow_roots: ak.Vector[DomShadowRoot*?]) -> ak.IterationDecision:
+    # If current node is an element in the HTML namespace, the MathML namespace, or the SVG namespace, then let tagname be current node's local name.
+    # Otherwise, let tagname be current node's qualified name.
+    var tag_name: ak.FlyString
+    let namespace_ = dom_element_namespace_uri(element)
+    if namespace_ != none and dom_fly_string_is_one_of_fly_strings(namespace_ else trap("checked"), [namespace_html, namespace_math_ml, namespace_svg]):
+        tag_name = dom_element_local_name(element)
+    else:
+        tag_name = dom_element_qualified_name(element)
+
+    # Append a U+003C LESS-THAN SIGN character (<), followed by tagname.
+    ak.string_builder_append_u8(builder, '<')
+    html_parser_append_fly_string(builder, tag_name)
+
+    # If current node's is value is not null, and the element does not have an is attribute in its attribute list,
+    # then append the string " is="",
+    # followed by current node's is value escaped as described below in attribute mode,
+    # followed by a U+0022 QUOTATION MARK character (").
+    if let is_value = dom_element_is_value(element):
+        if not dom_element_has_attribute(element, html_attribute_names_is):
+            ak.string_builder_append(builder, " is=\"")
+            html_parser_append_string(builder, html_escape_string_utf8_view(ak.string_code_points(&is_value), HtmlAttributeMode.yes))
+            ak.string_builder_append_u8(builder, '"')
+
+    # For each attribute that the element has,
+    # append a U+0020 SPACE character,
+    # the attribute's serialized name as described below,
+    # a U+003D EQUALS SIGN character (=),
+    # a U+0022 QUOTATION MARK character ("),
+    # the attribute's value, escaped as described below in attribute mode,
+    # and a second U+0022 QUOTATION MARK character (").
+    if let attributes = element.m_attributes:
+        for index in 0..<dom_named_node_map_length(attributes):
+            let attribute = dom_named_node_map_item(attributes, (u32)index) else trap("NamedNodeMap::item in range")
+            ak.string_builder_append_u8(builder, ' ')
+
+            # An attribute's serialized name for the purposes of the previous paragraph must be determined as follows:
+            let attribute_namespace = dom_attr_namespace_uri(attribute)
+            # -> If the attribute has no namespace:
+            if attribute_namespace == none:
+                # The attribute's serialized name is the attribute's local name.
+                html_parser_append_fly_string(builder, dom_attr_local_name(attribute))
+            # -> If the attribute is in the XML namespace:
+            elif dom_node_optional_fly_string_is(attribute_namespace, namespace_xml):
+                # The attribute's serialized name is the string "xml:" followed by the attribute's local name.
+                ak.string_builder_append(builder, "xml:")
+                html_parser_append_fly_string(builder, dom_attr_local_name(attribute))
+            # -> If the attribute is in the XMLNS namespace and the attribute's local name is xmlns:
+            elif dom_node_optional_fly_string_is(attribute_namespace, namespace_xmlns) and html_parser_fly_string_is_text(dom_attr_local_name(attribute), "xmlns"):
+                # The attribute's serialized name is the string "xmlns".
+                ak.string_builder_append(builder, "xmlns")
+            # -> If the attribute is in the XMLNS namespace and the attribute's local name is not xmlns:
+            elif dom_node_optional_fly_string_is(attribute_namespace, namespace_xmlns):
+                # The attribute's serialized name is the string "xmlns:" followed by the attribute's local name.
+                ak.string_builder_append(builder, "xmlns:")
+                html_parser_append_fly_string(builder, dom_attr_local_name(attribute))
+            # -> If the attribute is in the XLink namespace:
+            elif dom_node_optional_fly_string_is(attribute_namespace, namespace_x_link):
+                # The attribute's serialized name is the string "xlink:" followed by the attribute's local name.
+                ak.string_builder_append(builder, "xlink:")
+                html_parser_append_fly_string(builder, dom_attr_local_name(attribute))
+            # -> If the attribute is in some other namespace:
+            else:
+                # The attribute's serialized name is the attribute's qualified name.
+                html_parser_append_fly_string(builder, dom_attr_name(attribute))
+
+            ak.string_builder_append(builder, "=\"")
+            let value = dom_attr_value(attribute)
+            html_parser_append_string(builder, html_escape_string_utf8_view(ak.string_code_points(&value), HtmlAttributeMode.yes))
+            ak.string_builder_append_u8(builder, '"')
+
+    # Append a U+003E GREATER-THAN SIGN character (>).
+    ak.string_builder_append_u8(builder, '>')
+
+    # If current node serializes as void, then continue on to the next child node at this point.
+    if dom_element_serializes_as_void(element):
+        return ak.IterationDecision.continue_
+
+    # Append the value of running the HTML fragment serialization algorithm with current node,
+    # serializableShadowRoots, and shadowRoots (thus recursing into this algorithm for that node),
+    # followed by a U+003C LESS-THAN SIGN character (<),
+    # a U+002F SOLIDUS character (/),
+    # tagname again,
+    # and finally a U+003E GREATER-THAN SIGN character (>).
+    html_parser_append_string(builder, html_parser_serialize_html_fragment(element.dom_node(), serializable_shadow_roots, shadow_roots))
+    ak.string_builder_append(builder, "</")
+    html_parser_append_fly_string(builder, tag_name)
+    ak.string_builder_append_u8(builder, '>')
+
+    return ak.IterationDecision.continue_
+
+## serialize_html_fragment's `should_append_registry_attribute` lambda (HTMLParser.cpp:5395-5413).
+func html_parser_should_append_registry_attribute(shadow: DomShadowRoot*) -> bool:
+    # 1. Let documentRegistry be shadow's node document's custom element registry.
+    let document_registry = dom_document_custom_element_registry(dom_node_document(shadow.dom_node()))
+
+    # 2. Let shadowRegistry be shadow's custom element registry.
+    let shadow_registry = dom_shadow_root_custom_element_registry(shadow)
+
+    # 3. If documentRegistry is null and shadowRegistry is null, then return false.
+    if document_registry == none and shadow_registry == none:
+        return false
+
+    # 4. If documentRegistry is a global custom element registry and shadowRegistry is a global custom
+    #    element registry, then return false.
+    if html_is_a_global_custom_element_registry(document_registry) and html_is_a_global_custom_element_registry(shadow_registry):
+        return false
+
+    # 5. Return true.
+    return true
+
+## Ported from HTMLParser.cpp:5236 Web::HTML::HTMLParser::serialize_html_fragment.
+# https://html.spec.whatwg.org/multipage/parsing.html#html-fragment-serialisation-algorithm
+pub func html_parser_serialize_html_fragment(node: DomNode*, serializable_shadow_roots: HtmlParserSerializableShadowRoots, shadow_roots: ak.Vector[DomShadowRoot*?], fragment_serialization_mode: DomFragmentSerializationMode = DomFragmentSerializationMode.inner) -> ak.String:
+    # NOTE: Steps in this function are jumbled a bit to accommodate the Element.outerHTML API.
+    #       When called with FragmentSerializationMode::Outer, we will serialize the element itself,
+    #       not just its children.
+
+    # 2. Let s be a string, and initialize it to the empty string.
+    var builder = ak.string_builder_new()
+
+    if fragment_serialization_mode == DomFragmentSerializationMode.outer:
+        discard(html_parser_serialize_element(&builder, as_dom_element(node), serializable_shadow_roots, shadow_roots))
+        return ak.string_builder_to_string_without_validation(&builder)
+
+    # The algorithm takes as input a DOM Element, Document, or DocumentFragment referred to as the node.
+    assert(dom_node_is_element(node) or dom_node_is_document(node) or dom_node_is_document_fragment(node))
+    var actual_node = node
+
+    if let element = as_if_dom_element(node):
+        # 1. If the node serializes as void, then return the empty string.
+        #    (NOTE: serializes as void is defined only on elements in the spec)
+        if dom_element_serializes_as_void(element):
+            return ak.string_new()
+
+        # 3. If the node is a template element, then let the node instead be the template element's template contents (a DocumentFragment node).
+        #    (NOTE: This is out of order of the spec to avoid another dynamic cast. The second step just creates a string builder, so it shouldn't matter)
+        if let template_element = as_if_html_template_element(element):
+            actual_node = html_template_element_content(template_element).dom_node()
+
+        # 4. If current node is a shadow host, then:
+        if dom_element_is_shadow_host(element):
+            # 1. Let shadow be current node's shadow root.
+            let shadow = dom_element_shadow_root(element) else trap("VERIFY: shadow root")
+
+            # 2. If one of the following is true:
+            #    - serializableShadowRoots is true and shadow's serializable is true; or
+            #    - shadowRoots contains shadow,
+            var shadow_roots_contains_shadow = false
+            for entry in ak.vector_span_const(&shadow_roots):
+                if entry == shadow:
+                    shadow_roots_contains_shadow = true
+                    break
+            if (serializable_shadow_roots == HtmlParserSerializableShadowRoots.yes and dom_shadow_root_serializable(shadow)) or shadow_roots_contains_shadow:
+                # then:
+                # 1. Append "<template shadowrootmode="".
+                ak.string_builder_append(&builder, "<template shadowrootmode=\"")
+
+                # 2. If shadow's mode is "open", then append "open". Otherwise, append "closed".
+                ak.string_builder_append(&builder, "open" if dom_shadow_root_mode(shadow) == BindShadowRootMode.open else "closed")
+
+                # 3. Append """.
+                ak.string_builder_append_u8(&builder, '"')
+
+                # 4. If shadow's delegates focus is set, then append " shadowrootdelegatesfocus=""".
+                if dom_shadow_root_delegates_focus(shadow):
+                    ak.string_builder_append(&builder, " shadowrootdelegatesfocus=\"\"")
+
+                # 5. If shadow's serializable is set, then append " shadowrootserializable=""".
+                if dom_shadow_root_serializable(shadow):
+                    ak.string_builder_append(&builder, " shadowrootserializable=\"\"")
+
+                # 6. If shadow's clonable is set, then append " shadowrootclonable=""".
+                if dom_shadow_root_clonable(shadow):
+                    ak.string_builder_append(&builder, " shadowrootclonable=\"\"")
+
+                # 7. Let shouldAppendRegistryAttribute be the result of running these steps:
+                let should_append_registry_attribute = html_parser_should_append_registry_attribute(shadow)
+
+                # 8. If shouldAppendRegistryAttribute is true, then append " shadowrootcustomelementregistry=""".
+                if should_append_registry_attribute:
+                    ak.string_builder_append(&builder, " shadowrootcustomelementregistry=\"\"")
+
+                # 9. Append ">".
+                ak.string_builder_append_u8(&builder, '>')
+
+                # 10. Append the value of running the HTML fragment serialization algorithm with shadow,
+                #    serializableShadowRoots, and shadowRoots (thus recursing into this algorithm for that element).
+                html_parser_append_string(&builder, html_parser_serialize_html_fragment(shadow.dom_node(), serializable_shadow_roots, shadow_roots))
+
+                # 11. Append "</template>".
+                ak.string_builder_append(&builder, "</template>")
+
+    # 5. For each child node of the node, in tree order, run the following steps:
+    for current_node in dom_node_children(actual_node):
+        # 1. Let current node be the child node being processed.
+
+        # 2. Append the appropriate string from the following list to s:
+
+        if let element = as_if_dom_element(current_node):
+            # -> If current node is an Element
+            discard(html_parser_serialize_element(&builder, element, serializable_shadow_roots, shadow_roots))
+            continue
+
+        if let text_node = as_if_dom_text(current_node):
+            # -> If current node is a Text node
+            var appended_literally = false
+            if let parent = tree_node_parent(current_node):
+                if let parent_element = as_if_dom_element(parent):
+                    # If the parent of current node is a style, script, xmp, iframe, noembed, noframes, or plaintext element,
+                    # or if the parent of current node is a noscript element and scripting is enabled for the node, then append the value of current node's data IDL attribute literally.
+                    if html_parser_local_name_is_one_of(parent_element, [html_tag_names_style, html_tag_names_script, html_tag_names_xmp, html_tag_names_iframe, html_tag_names_noembed, html_tag_names_noframes, html_tag_names_plaintext]) or (html_parser_local_name_is(parent_element, html_tag_names_noscript) and not dom_node_is_scripting_disabled(parent_element.dom_node())):
+                        html_parser_append_utf16_string(&builder, dom_character_data_data(text_node.dom_character_data()))
+                        appended_literally = true
+            if appended_literally:
+                continue
+
+            # Otherwise, append the value of current node's data IDL attribute, escaped as described below.
+            let data = dom_character_data_data(text_node.dom_character_data())
+            html_parser_append_string(&builder, html_escape_string_utf16_view(ak.utf16_string_base_utf16_view(&data.utf16_string_base), HtmlAttributeMode.no))
+
+        if let comment_node = as_if_dom_comment(current_node):
+            # -> If current node is a Comment
+
+            # Append the literal string "<!--" (U+003C LESS-THAN SIGN, U+0021 EXCLAMATION MARK, U+002D HYPHEN-MINUS, U+002D HYPHEN-MINUS),
+            # followed by the value of current node's data IDL attribute, followed by the literal string "-->" (U+002D HYPHEN-MINUS, U+002D HYPHEN-MINUS, U+003E GREATER-THAN SIGN).
+            ak.string_builder_append(&builder, "<!--")
+            html_parser_append_utf16_string(&builder, dom_character_data_data(comment_node.dom_character_data()))
+            ak.string_builder_append(&builder, "-->")
+            continue
+
+        if let processing_instruction_node = as_if_dom_processing_instruction(current_node):
+            # -> If current node is a ProcessingInstruction
+
+            # Append the literal string "<?" (U+003C LESS-THAN SIGN, U+003F QUESTION MARK), followed by the value of current node's target IDL attribute,
+            # followed by a single U+0020 SPACE character, followed by the value of current node's data IDL attribute, followed by a single U+003E GREATER-THAN SIGN character (>).
+            ak.string_builder_append(&builder, "<?")
+            html_parser_append_string(&builder, dom_processing_instruction_target(processing_instruction_node))
+            ak.string_builder_append_u8(&builder, ' ')
+            html_parser_append_utf16_string(&builder, dom_character_data_data(processing_instruction_node.dom_character_data()))
+            ak.string_builder_append_u8(&builder, '>')
+            continue
+
+        if let document_type_node = as_if_dom_document_type(current_node):
+            # -> If current node is a DocumentType
+
+            # Append the literal string "<!DOCTYPE" (U+003C LESS-THAN SIGN, U+0021 EXCLAMATION MARK, U+0044 LATIN CAPITAL LETTER D, U+004F LATIN CAPITAL LETTER O,
+            # U+0043 LATIN CAPITAL LETTER C, U+0054 LATIN CAPITAL LETTER T, U+0059 LATIN CAPITAL LETTER Y, U+0050 LATIN CAPITAL LETTER P, U+0045 LATIN CAPITAL LETTER E),
+            # followed by a space (U+0020 SPACE), followed by the value of current node's name IDL attribute, followed by the literal string ">" (U+003E GREATER-THAN SIGN).
+            ak.string_builder_append(&builder, "<!DOCTYPE ")
+            html_parser_append_string(&builder, dom_document_type_name(document_type_node))
+            ak.string_builder_append_u8(&builder, '>')
+            continue
+
+    # 6. Return s.
+    return ak.string_builder_to_string(&builder) else trap("MUST: to_string")

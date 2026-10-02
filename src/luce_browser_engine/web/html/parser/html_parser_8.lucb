@@ -1,0 +1,477 @@
+#==============================================================================================
+#
+#   html_parser_8 - HTML::HTMLParser: parser-blocking scripts, the "text" insertion mode and
+#                   the table row, cell and table text insertion modes
+#
+#   DESCRIPTION:
+#       Port of LibWeb/HTML/Parser/HTMLParser.cpp (lines 3443-3931): the asynchronous resume
+#       after a parser-blocking script, the post-parse action, the script nesting level, the
+#       "text" insertion mode (with </script> preparing the script), clearing the stack back to
+#       a table / row / body context, and the "in row", "in cell" and "in table text" modes.
+#
+#==============================================================================================
+
+# mark: Parser-blocking scripts =================================================================
+
+## schedule_resume_check's deferred step (`[this] { m_resume_check_pending = false; ...; resume_after_parser_blocking_script(); }`).
+func html_parser_deferred_resume_check(context: void*?):
+    let this = (HtmlParser*)(context else trap("no parser"))
+    this.m_resume_check_pending = false
+    html_perform_pre_progress_microtask_checkpoint()
+    html_parser_resume_after_parser_blocking_script(this)
+
+## Ported from HTMLParser.cpp:3443 Web::HTML::HTMLParser::schedule_resume_check.
+pub func html_parser_schedule_resume_check(this: HtmlParser*):
+    if this.m_resume_check_pending:
+        return
+    if not this.m_parser_pause_flag:
+        return
+    this.m_resume_check_pending = true
+    let heap = gc.cell_heap(this.cell())
+    platform_event_loop_plugin_deferred_invoke(platform_event_loop_plugin_the(), gc.create_function0(heap, ak.Function0[unit](call = html_parser_deferred_resume_check, context = this)))
+
+## Ported from HTMLParser.cpp:3460 Web::HTML::HTMLParser::resume_after_parser_blocking_script.
+# https://html.spec.whatwg.org/multipage/parsing.html#parsing-main-incdata
+# Async equivalent of "spin the event loop until ... ready to be parser-executed" from the per-iteration block of the
+# "text" insertion mode (steps 4-13). Driven by schedule_resume_check.
+pub func html_parser_resume_after_parser_blocking_script(this: HtmlParser*):
+    if not this.m_parser_pause_flag:
+        return
+    if this.m_aborted or this.m_stop_parsing:
+        return
+
+    let pending = dom_document_pending_parsing_blocking_script(html_parser_document(this))
+    let pending_svg = dom_document_pending_parsing_blocking_svg_script(html_parser_document(this))
+    var ready = false
+    if let script = pending:
+        ready = html_script_element_is_ready_to_be_parser_executed(script)
+    elif let svg_script = pending_svg:
+        ready = svg_script_element_is_ready_to_be_parser_executed(svg_script)
+    else:
+        return
+
+    # 5. If the parser's Document has a style sheet that is blocking scripts or the script's ready to be
+    #    parser-executed is false: spin the event loop until the parser's Document has no style sheet that is blocking
+    #    scripts and the script's ready to be parser-executed becomes true.
+    # The async equivalent: return without taking the script; schedule_resume_check re-fires this method when the
+    # relevant state changes.
+    if dom_document_has_a_style_sheet_that_is_blocking_scripts(html_parser_document(this)):
+        return
+    if not ready:
+        return
+
+    # 3. Start the speculative HTML parser for this instance of the HTML parser.
+    # (Done at the pause point in the corresponding insertion-mode handler, so that speculation runs during the wait.)
+
+    # 4. Block the tokenizer for this instance of the HTML parser, such that the event loop will not run tasks that
+    #    invoke the tokenizer.
+    # (No-op: pausing is expressed by returning from run() and m_parser_pause_flag, not a tokenizer-level block flag.)
+
+    # 6. If this parser has been aborted in the meantime, return.
+    if this.m_aborted:
+        return
+
+    # 7. Stop the speculative HTML parser for this instance of the HTML parser.
+    html_parser_stop_the_speculative_html_parser(this)
+
+    # 8. Unblock the tokenizer for this instance of the HTML parser, such that tasks that invoke the tokenizer can
+    #    again be run. (No-op, see step 4.)
+
+    # 9. Let the insertion point be just before the next input character.
+    html_syntax.html_tokenizer_update_insertion_point(&this.m_tokenizer)
+
+    # 10. Increment the parser's script nesting level by one (it should be zero before this step, so this sets it to
+    #     one).
+    assert(html_parser_script_nesting_level(this) == 0)
+    html_parser_increment_script_nesting_level(this)
+
+    # 1. Let the script be the pending parsing-blocking script.
+    # 2. Set the pending parsing-blocking script to null.
+    # 11. Execute the script element the script.
+    if pending != none:
+        html_script_element_execute_script(dom_document_take_pending_parsing_blocking_script(html_parser_document(this)))
+    else:
+        svg_script_element_execute_pending_parser_blocking_script(dom_document_take_pending_parsing_blocking_svg_script(html_parser_document(this)))
+
+    # 12. Decrement the parser's script nesting level by one.
+    html_parser_decrement_script_nesting_level(this)
+
+    # If the parser's script nesting level is zero (which it always should be at this point), then set the parser pause
+    # flag to false.
+    assert(html_parser_script_nesting_level(this) == 0)
+    this.m_parser_pause_flag = false
+
+    # 13. Let the insertion point be undefined again.
+    html_syntax.html_tokenizer_undefine_insertion_point(&this.m_tokenizer)
+
+    # The spec's "While the pending parsing-blocking script is not null" iteration is realized by run() pausing again
+    # on the next </script> end tag if the executed script set up a new pending blocking script (e.g. via
+    # document.write).
+    html_parser_run_html_tokenizer_stop_at_inserti(this)
+
+    if this.m_parser_pause_flag:
+        return
+
+    html_parser_invoke_post_parse_action(this)
+
+## Ported from HTMLParser.cpp:3542 Web::HTML::HTMLParser::invoke_post_parse_action
+## (`if (auto action = exchange(m_post_parse_action, nullptr)) action();`).
+pub func html_parser_invoke_post_parse_action(this: HtmlParser*):
+    let action = this.m_post_parse_action
+    this.m_post_parse_action = ak.Function0[unit](call = none, context = none)
+    if action.call != none:
+        ak.function0_call(&action)
+
+## Ported from HTMLParser.cpp:3548 Web::HTML::HTMLParser::increment_script_nesting_level.
+pub func html_parser_increment_script_nesting_level(this: HtmlParser*):
+    this.m_script_nesting_level += 1
+
+## Ported from HTMLParser.cpp:3553 Web::HTML::HTMLParser::decrement_script_nesting_level.
+pub func html_parser_decrement_script_nesting_level(this: HtmlParser*):
+    assert(this.m_script_nesting_level != 0)
+    this.m_script_nesting_level -= 1
+
+# mark: The text insertion mode =================================================================
+
+## Ported from HTMLParser.cpp:3560 Web::HTML::HTMLParser::handle_text.
+# https://html.spec.whatwg.org/multipage/parsing.html#parsing-main-incdata
+pub func html_parser_handle_text(this: HtmlParser*, token: html_syntax.HtmlToken*):
+    # -> A character token
+    if html_syntax.html_token_is_character(token):
+        # Insert the token's character.
+        html_parser_insert_character(this, html_syntax.html_token_code_point(token))
+        return
+
+    # -> An end-of-file token
+    if html_syntax.html_token_is_end_of_file(token):
+        # Parse error.
+        html_log_parse_error()
+
+        # If the current node is a script element, then set its already started to true.
+        if html_parser_local_name_is(html_parser_current_element(this), html_tag_names_script):
+            html_script_element_set_already_started(as_html_script_element(html_parser_current_element(this)), true)
+
+        # Pop the current node off the stack of open elements.
+        discard(html_stack_of_open_elements_pop(&this.m_stack_of_open_elements))
+
+        # Switch the insertion mode to the original insertion mode and reprocess the token.
+        this.m_insertion_mode = this.m_original_insertion_mode
+        html_parser_process_using_the_rules_for(this, this.m_insertion_mode, token)
+        return
+
+    # -> An end tag whose tag name is "script"
+    if html_syntax.html_token_is_end_tag(token) and html_parser_tag_name_is(token, html_tag_names_script):
+        # Non-standard: Make sure the <script> element has up-to-date text content before preparing the script.
+        html_parser_flush_character_insertions(this)
+
+        # If the active speculative HTML parser is null and the JavaScript execution context stack is empty, then perform a microtask checkpoint.
+        # The active speculative HTML parser is null here — start/stop are paired around the spin_until below.
+        let vm = js_cell_vm(html_main_thread_event_loop().js_cell())
+        if not vm_has_running_execution_context(vm):
+            html_perform_a_microtask_checkpoint()
+
+        # Let script be the current node (which will be a script element).
+        let script = as_html_script_element(html_parser_current_element(this))
+
+        # Pop the current node off the stack of open elements.
+        discard(html_stack_of_open_elements_pop(&this.m_stack_of_open_elements))
+
+        # Switch the insertion mode to the original insertion mode.
+        this.m_insertion_mode = this.m_original_insertion_mode
+
+        # Let the old insertion point have the same value as the current insertion point.
+        html_syntax.html_tokenizer_store_old_insertion_point(&this.m_tokenizer)
+
+        # Let the insertion point be just before the next input character.
+        html_syntax.html_tokenizer_update_insertion_point(&this.m_tokenizer)
+
+        # Increment the parser's script nesting level by one.
+        html_parser_increment_script_nesting_level(this)
+
+        # https://w3c.github.io/trusted-types/dist/spec/#setting-slot-values-from-parser
+        # Set script’s script text value to its child text content.
+        html_script_element_set_string_text(script, dom_node_child_text_content(script.dom_node()))
+
+        # If the active speculative HTML parser is null, then prepare the script element script.
+        # This might cause some script to execute, which might cause new characters to be inserted into the tokenizer,
+        # and might cause the tokenizer to output more tokens, resulting in a reentrant invocation of the parser.
+        # The active speculative HTML parser is null here (see above).
+        html_script_element_prepare_script_t(script)
+
+        # Decrement the parser's script nesting level by one.
+        html_parser_decrement_script_nesting_level(this)
+
+        # If the parser's script nesting level is zero, then set the parser pause flag to false.
+        if html_parser_script_nesting_level(this) == 0:
+            this.m_parser_pause_flag = false
+
+        # Let the insertion point have the value of the old insertion point.
+        html_syntax.html_tokenizer_restore_old_insertion_point(&this.m_tokenizer)
+
+        # At this stage, if the pending parsing-blocking script is not null, then:
+        if dom_document_pending_parsing_blocking_script(html_parser_document(this)) != none:
+            # -> If the script nesting level is not zero:
+            if html_parser_script_nesting_level(this) != 0:
+                # Set the parser pause flag to true,
+                this.m_parser_pause_flag = true
+                # and abort the processing of any nested invocations of the tokenizer, yielding control back to the caller.
+                # (Tokenization will resume when the caller returns to the "outer" tree construction stage.)
+                return
+
+            # -> Otherwise:
+            # The spec's "While the pending parsing-blocking script is not null" loop and the contained "spin the event
+            # loop" step are implemented asynchronously: pause the parser, schedule a resume check, and yield back to
+            # the caller. The remaining steps (4-13) run from resume_after_parser_blocking_script when the script is
+            # ready.
+
+            # 3. Start the speculative HTML parser for this instance of the HTML parser.
+            html_parser_start_the_speculative_html_parser(this)
+
+            this.m_parser_pause_flag = true
+            html_parser_schedule_resume_check(this)
+
+        return
+
+    # -> Any other end tag
+    if html_syntax.html_token_is_end_tag(token):
+        # Pop the current node off the stack of open elements.
+        discard(html_stack_of_open_elements_pop(&this.m_stack_of_open_elements))
+
+        # Switch the insertion mode to the original insertion mode.
+        this.m_insertion_mode = this.m_original_insertion_mode
+        return
+    trap("TODO")
+
+# mark: Clearing the stack back to a table context ==============================================
+
+## Ported from HTMLParser.cpp:3675 Web::HTML::HTMLParser::clear_the_stack_back_to_a_table_context.
+pub func html_parser_clear_the_stack_back_to_a_table_context(this: HtmlParser*):
+    while not html_parser_local_name_is_one_of(html_parser_current_element(this), [html_tag_names_table, html_tag_names_template, html_tag_names_html]):
+        discard(html_stack_of_open_elements_pop(&this.m_stack_of_open_elements))
+
+    if html_parser_local_name_is(html_parser_current_element(this), html_tag_names_html):
+        assert(this.m_parsing_fragment)
+
+## Ported from HTMLParser.cpp:3684 Web::HTML::HTMLParser::clear_the_stack_back_to_a_table_row_context.
+pub func html_parser_clear_the_stack_back_to_a_table_row_context(this: HtmlParser*):
+    while not html_parser_local_name_is_one_of(html_parser_current_element(this), [html_tag_names_tr, html_tag_names_template, html_tag_names_html]):
+        discard(html_stack_of_open_elements_pop(&this.m_stack_of_open_elements))
+
+    if html_parser_local_name_is(html_parser_current_element(this), html_tag_names_html):
+        assert(this.m_parsing_fragment)
+
+## Ported from HTMLParser.cpp:3693 Web::HTML::HTMLParser::clear_the_stack_back_to_a_table_body_context.
+pub func html_parser_clear_the_stack_back_to_a_table_body_context(this: HtmlParser*):
+    while not html_parser_local_name_is_one_of(html_parser_current_element(this), [html_tag_names_tbody, html_tag_names_tfoot, html_tag_names_thead, html_tag_names_template, html_tag_names_html]):
+        discard(html_stack_of_open_elements_pop(&this.m_stack_of_open_elements))
+
+    if html_parser_local_name_is(html_parser_current_element(this), html_tag_names_html):
+        assert(this.m_parsing_fragment)
+
+# mark: The in row, in cell and in table text insertion modes ===================================
+
+## Ported from HTMLParser.cpp:3703 Web::HTML::HTMLParser::handle_in_row.
+# https://html.spec.whatwg.org/multipage/parsing.html#parsing-main-intr
+pub func html_parser_handle_in_row(this: HtmlParser*, token: html_syntax.HtmlToken*):
+    # -> A start tag whose tag name is one of: "th", "td"
+    if html_syntax.html_token_is_start_tag(token) and html_parser_tag_name_is_one_of(token, [html_tag_names_th, html_tag_names_td]):
+        # Clear the stack back to a table row context.
+        html_parser_clear_the_stack_back_to_a_table_row_context(this)
+
+        # Insert an HTML element for the token, then switch the insertion mode to "in cell".
+        discard(html_parser_insert_html_element(this, token))
+        this.m_insertion_mode = HtmlParserInsertionMode.in_cell
+
+        # Insert a marker at the end of the list of active formatting elements.
+        html_list_of_active_formatting_elements_add_marker(&this.m_list_of_active_formatting_elements)
+        return
+
+    # -> An end tag whose tag name is "tr"
+    if html_syntax.html_token_is_end_tag(token) and html_parser_tag_name_is(token, html_tag_names_tr):
+        # If the stack of open elements does not have a tr element in table scope, this is a parse error; ignore the token.
+        if not html_stack_of_open_elements_has_in_table_scope(&this.m_stack_of_open_elements, html_tag_names_tr):
+            html_log_parse_error()
+            return
+
+        # Otherwise:
+        # 1. Clear the stack back to a table row context.
+        html_parser_clear_the_stack_back_to_a_table_row_context(this)
+
+        # 2. Pop the current node (which will be a tr element) from the stack of open elements.
+        #    Switch the insertion mode to "in table body".
+        discard(html_stack_of_open_elements_pop(&this.m_stack_of_open_elements))
+        this.m_insertion_mode = HtmlParserInsertionMode.in_table_body
+        return
+
+    # -> A start tag whose tag name is one of: "caption", "col", "colgroup", "tbody", "tfoot", "thead", "tr"
+    # -> An end tag whose tag name is "table"
+    if (html_syntax.html_token_is_start_tag(token) and html_parser_tag_name_is_one_of(token, [html_tag_names_caption, html_tag_names_col, html_tag_names_colgroup, html_tag_names_tbody, html_tag_names_tfoot, html_tag_names_thead, html_tag_names_tr])) or (html_syntax.html_token_is_end_tag(token) and html_parser_tag_name_is(token, html_tag_names_table)):
+
+        # If the stack of open elements does not have a tr element in table scope, this is a parse error; ignore the token.
+        if not html_stack_of_open_elements_has_in_table_scope(&this.m_stack_of_open_elements, html_tag_names_tr):
+            html_log_parse_error()
+            return
+
+        # Otherwise:
+        # 1. Clear the stack back to a table row context.
+        html_parser_clear_the_stack_back_to_a_table_row_context(this)
+
+        # 2. Pop the current node (which will be a tr element) from the stack of open elements.
+        #    Switch the insertion mode to "in table body".
+        discard(html_stack_of_open_elements_pop(&this.m_stack_of_open_elements))
+        this.m_insertion_mode = HtmlParserInsertionMode.in_table_body
+
+        # 3. Reprocess the token.
+        html_parser_process_using_the_rules_for(this, this.m_insertion_mode, token)
+        return
+
+    # -> An end tag whose tag name is one of: "tbody", "tfoot", "thead"
+    if html_syntax.html_token_is_end_tag(token) and html_parser_tag_name_is_one_of(token, [html_tag_names_tbody, html_tag_names_tfoot, html_tag_names_thead]):
+        # If the stack of open elements does not have an element in table scope that is an HTML element with the same tag name as the token, this is a parse error; ignore the token.
+        if not html_stack_of_open_elements_has_in_table_scope(&this.m_stack_of_open_elements, html_syntax.html_token_tag_name(token)):
+            html_log_parse_error()
+            return
+
+        # If the stack of open elements does not have a tr element in table scope, ignore the token.
+        if not html_stack_of_open_elements_has_in_table_scope(&this.m_stack_of_open_elements, html_tag_names_tr):
+            return
+
+        # Otherwise:
+        # 1. Clear the stack back to a table row context.
+        html_parser_clear_the_stack_back_to_a_table_row_context(this)
+
+        # 2. Pop the current node (which will be a tr element) from the stack of open elements.
+        #    Switch the insertion mode to "in table body".
+        discard(html_stack_of_open_elements_pop(&this.m_stack_of_open_elements))
+        this.m_insertion_mode = HtmlParserInsertionMode.in_table_body
+
+        # 3. Reprocess the token.
+        html_parser_process_using_the_rules_for(this, this.m_insertion_mode, token)
+        return
+
+    # -> An end tag whose tag name is one of: "body", "caption", "col", "colgroup", "html", "td", "th"
+    if html_syntax.html_token_is_end_tag(token) and html_parser_tag_name_is_one_of(token, [html_tag_names_body, html_tag_names_caption, html_tag_names_col, html_tag_names_colgroup, html_tag_names_html, html_tag_names_td, html_tag_names_th]):
+        # Parse error. Ignore the token.
+        html_log_parse_error()
+        return
+
+    # -> Anything else:
+    #    Process the token using the rules for the "in table" insertion mode.
+    html_parser_process_using_the_rules_for(this, HtmlParserInsertionMode.in_table, token)
+
+## Ported from HTMLParser.cpp:3802 Web::HTML::HTMLParser::close_the_cell.
+pub func html_parser_close_the_cell(this: HtmlParser*):
+    html_parser_generate_implied_end_tags(this)
+    if not html_parser_local_name_is_one_of(html_parser_current_element(this), [html_tag_names_td, html_tag_names_th]):
+        html_log_parse_error()
+    while not html_parser_local_name_is_one_of(html_parser_current_element(this), [html_tag_names_td, html_tag_names_th]):
+        discard(html_stack_of_open_elements_pop(&this.m_stack_of_open_elements))
+    discard(html_stack_of_open_elements_pop(&this.m_stack_of_open_elements))
+    html_list_of_active_formatting_elements_clear_up_to_the_last_marker(&this.m_list_of_active_formatting_elements)
+    this.m_insertion_mode = HtmlParserInsertionMode.in_row
+
+## Ported from HTMLParser.cpp:3816 Web::HTML::HTMLParser::handle_in_cell.
+# https://html.spec.whatwg.org/multipage/parsing.html#parsing-main-intd
+pub func html_parser_handle_in_cell(this: HtmlParser*, token: html_syntax.HtmlToken*):
+    # -> An end tag whose tag name is one of: "td", "th"
+    if html_syntax.html_token_is_end_tag(token) and html_parser_tag_name_is_one_of(token, [html_tag_names_td, html_tag_names_th]):
+        # If the stack of open elements does not have an element in table scope that is an HTML element with the same
+        # tag name as that of the token, then this is a parse error; ignore the token.
+        if not html_stack_of_open_elements_has_in_table_scope(&this.m_stack_of_open_elements, html_syntax.html_token_tag_name(token)):
+            html_log_parse_error()
+            return
+
+        # Otherwise:
+        # 1. Generate implied end tags.
+        html_parser_generate_implied_end_tags(this)
+
+        # 2. Now, if the current node is not an HTML element with the same tag name as the token, then this is a parse error.
+        if not html_parser_local_name_is(html_parser_current_element(this), html_syntax.html_token_tag_name(token)):
+            html_log_parse_error()
+
+        # 3. Pop elements from the stack of open elements until an HTML element with the same tag name as the token
+        #    has been popped from the stack.
+        html_stack_of_open_elements_pop_until_an_element_with_tag_name_has_been_popped(&this.m_stack_of_open_elements, html_syntax.html_token_tag_name(token))
+
+        # 4. Clear the list of active formatting elements up to the last marker.
+        html_list_of_active_formatting_elements_clear_up_to_the_last_marker(&this.m_list_of_active_formatting_elements)
+
+        # 5. Switch the insertion mode to "in row".
+        this.m_insertion_mode = HtmlParserInsertionMode.in_row
+        return
+
+    # -> A start tag whose tag name is one of: "caption", "col", "colgroup", "tbody", "td", "tfoot", "th", "thead", "tr"
+    if html_syntax.html_token_is_start_tag(token) and html_parser_tag_name_is_one_of(token, [html_tag_names_caption, html_tag_names_col, html_tag_names_colgroup, html_tag_names_tbody, html_tag_names_td, html_tag_names_tfoot, html_tag_names_th, html_tag_names_thead, html_tag_names_tr]):
+        # Assert: The stack of open elements has a td or th element in table scope.
+        # FIXME: We're only asserting that we're parsing a fragment in that case, is this still necessary?
+        if not html_stack_of_open_elements_has_in_table_scope(&this.m_stack_of_open_elements, html_tag_names_td) and not html_stack_of_open_elements_has_in_table_scope(&this.m_stack_of_open_elements, html_tag_names_th):
+            assert(this.m_parsing_fragment)
+            html_log_parse_error()
+            return
+
+        # Close the cell (see below) and reprocess the token.
+        html_parser_close_the_cell(this)
+        html_parser_process_using_the_rules_for(this, this.m_insertion_mode, token)
+        return
+
+    # -> An end tag whose tag name is one of: "body", "caption", "col", "colgroup", "html"
+    if html_syntax.html_token_is_end_tag(token) and html_parser_tag_name_is_one_of(token, [html_tag_names_body, html_tag_names_caption, html_tag_names_col, html_tag_names_colgroup, html_tag_names_html]):
+        # Parse error. Ignore the token.
+        html_log_parse_error()
+        return
+
+    # -> An end tag whose tag name is one of: "table", "tbody", "tfoot", "thead", "tr"
+    if html_syntax.html_token_is_end_tag(token) and html_parser_tag_name_is_one_of(token, [html_tag_names_table, html_tag_names_tbody, html_tag_names_tfoot, html_tag_names_thead, html_tag_names_tr]):
+        # If the stack of open elements does not have an element in table scope that is an HTML element with the same
+        # tag name as that of the token, then this is a parse error; ignore the token.
+        if not html_stack_of_open_elements_has_in_table_scope(&this.m_stack_of_open_elements, html_syntax.html_token_tag_name(token)):
+            html_log_parse_error()
+            return
+
+        # Otherwise, close the cell (see below) and reprocess the token.
+        html_parser_close_the_cell(this)
+        html_parser_process_using_the_rules_for(this, this.m_insertion_mode, token)
+        return
+
+    # -> Anything else
+    #    Process the token using the rules for the "in body" insertion mode.
+    html_parser_process_using_the_rules_for(this, HtmlParserInsertionMode.in_body, token)
+
+## Ported from HTMLParser.cpp:3892 Web::HTML::HTMLParser::handle_in_table_text.
+# https://html.spec.whatwg.org/multipage/parsing.html#parsing-main-intabletext
+pub func html_parser_handle_in_table_text(this: HtmlParser*, token: html_syntax.HtmlToken*):
+    if html_syntax.html_token_is_character(token):
+        # -> A character token that is U+0000 NULL
+        if html_syntax.html_token_code_point(token) == 0:
+            # Parse error. Ignore the token.
+            html_log_parse_error()
+            return
+        # -> Any other character token
+        #    Append the character token to the pending table character tokens list.
+        ak.vector_append_t(&this.m_pending_table_character_tokens, *token)
+        return
+
+    # -> Anything else
+    # If any of the tokens in the pending table character tokens list
+    # are character tokens that are not ASCII whitespace, then this is a parse error:
+    # reprocess the character tokens in the pending table character tokens list using
+    # the rules given in the "anything else" entry in the "in table" insertion mode.
+    var any_not_whitespace = false
+    for pending_token in &ak.vector_span(&this.m_pending_table_character_tokens):
+        if not html_syntax.html_token_is_parser_whitespace(pending_token):
+            any_not_whitespace = true
+            break
+    if any_not_whitespace:
+        html_log_parse_error()
+        for pending_token in &ak.vector_span(&this.m_pending_table_character_tokens):
+            this.m_foster_parenting = true
+            html_parser_process_using_the_rules_for(this, HtmlParserInsertionMode.in_body, pending_token)
+            this.m_foster_parenting = false
+    else:
+        # Otherwise, insert the characters given by the pending table character tokens list.
+        for pending_token in &ak.vector_span(&this.m_pending_table_character_tokens):
+            html_parser_insert_character(this, html_syntax.html_token_code_point(pending_token))
+
+    # Switch the insertion mode to the original insertion mode and reprocess the token.
+    this.m_insertion_mode = this.m_original_insertion_mode
+    html_parser_process_using_the_rules_for(this, this.m_insertion_mode, token)

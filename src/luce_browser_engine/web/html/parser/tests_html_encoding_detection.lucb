@@ -1,0 +1,196 @@
+#==============================================================================================
+#
+#   tests_html_encoding_detection - tests of HTMLEncodingDetection and the legacy color parser
+#                                   (region r21)
+#
+#   DESCRIPTION:
+#       Ladybird has no unit tests for these files. The expected values come from a local oracle
+#       that compiles the donor's HTMLEncodingDetection.cpp and parse_legacy_color_value against
+#       the reference build's AK, LibTextCodec and LibGfx (kept beside the scratch drivers, not
+#       committed): BOM sniffing, the prescan (comments, <meta charset>, http-equiv + content,
+#       other tags and their attributes, UTF-16 XML declarations, the 1024-byte limit), the
+#       sniffing fallbacks, extracting an encoding from a meta element's content, and legacy
+#       color values including the non-BMP, overlong and odd-length cases.
+#
+#       Donor quirk (not pinned): parse_legacy_color_value on a string of ASCII whitespace only
+#       fails `input[0]` (a VERIFY in ByteStringImpl) after trimming; the port traps likewise.
+#
+#==============================================================================================
+
+## A ByteString answer as the oracle prints it ("-" for none).
+func encoding_test_text(value: ak.ByteString?) -> ak.String:
+    let string = value else return ak.string_from_str("-")
+    return ak.string_from_utf8(ak.byte_string_view(&string)) else trap("utf-8")
+
+## Asserts that `actual` is `expected`, naming the input when not.
+func encoding_test_expect(actual: ak.String, expected: str, input: const u8[]):
+    if ak.string_eq_string_view(&actual, ak.sv(expected)):
+        return
+    let actual_view = ak.string_bytes_as_string_view(&actual)
+    print(f"input {(str)input}: expected {expected}, got {(str)ak.string_view_bytes(&actual_view)}")
+    assert(false, "encoding detection mismatch")
+
+test "HTMLEncodingDetection: BOM sniffing, the prescan and the sniffing algorithm match the reference build":
+    web_initialize_strings()
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let realm = web_test_create_realm(vm)
+    let document = test_realm_document(realm)
+
+    let rows: (const u8[], str, str, str)[28] = [
+        (b"<!DOCTYPE html><p>hi", "-", "-", "UTF-8"),
+        (b"\xEF\xBB\xBF<p>x", "UTF-8", "-", "UTF-8"),
+        (b"\xFE\xFF\x00<", "UTF-16BE", "-", "UTF-16BE"),
+        (b"\xFF\xFE<\x00", "UTF-16LE", "-", "UTF-16LE"),
+        (b"<meta charset=\"iso-8859-2\">", "-", "ISO-8859-2", "ISO-8859-2"),
+        (b"<META CHARSET=KOI8-R>", "-", "KOI8-R", "KOI8-R"),
+        (b"<meta charset='utf-16le'>", "-", "UTF-8", "UTF-8"),
+        (b"<meta charset=x-user-defined>", "-", "windows-1252", "windows-1252"),
+        (b"<meta http-equiv=\"Content-Type\" content=\"text/html; charset=windows-1251\">", "-", "windows-1251", "windows-1251"),
+        (b"<meta content=\"text/html; charset=shift_jis\" http-equiv=content-type>", "-", "Shift_JIS", "Shift_JIS"),
+        (b"<meta content=\"text/html; charset=shift_jis\">", "-", "-", "UTF-8"),
+        (b"<meta http-equiv=\"content-type\">", "-", "-", "UTF-8"),
+        (b"<!-- <meta charset=koi8-r> --><meta charset=big5>", "-", "Big5", "Big5"),
+        (b"<meta charset=bogus><meta charset=gbk>", "-", "GBK", "GBK"),
+        (b"<?xml version=\"1.0\"?><meta charset=euc-jp>", "-", "EUC-JP", "EUC-JP"),
+        (b"<p title='<meta charset=koi8-r>'>", "-", "-", "UTF-8"),
+        (b"<meta/charset=latin1>", "-", "windows-1252", "windows-1252"),
+        (b"<meta charset=\"  utf-8\">", "-", "UTF-8", "UTF-8"),
+        (b"<metax charset=koi8-r><meta charset=iso-8859-5>", "-", "ISO-8859-5", "ISO-8859-5"),
+        (b"</meta charset=koi8-r>", "-", "-", "UTF-8"),
+        (b"<meta charset=koi8-r charset=big5>", "-", "KOI8-R", "KOI8-R"),
+        (b"<meta content=\"charset=euc-kr\" content=\"charset=koi8-r\" http-equiv=Content-Type>", "-", "EUC-KR", "EUC-KR"),
+        (b"<\x00?\x00x\x00m\x00l\x00", "-", "utf-16le", "utf-16le"),
+        (b"\x00<\x00?\x00x\x00m\x00l", "-", "utf-16be", "utf-16be"),
+        (b"caf\xE9", "-", "-", "windows-1252"),
+        (b"caf\xC3\xA9", "-", "-", "UTF-8"),
+        (b"<!--", "-", "-", "UTF-8"),
+        (b"<meta charset=", "-", "-", "UTF-8"),
+    ]
+    for row in rows:
+        encoding_test_expect(encoding_test_text(html_run_bom_sniff(row.0)), row.1, row.0)
+        encoding_test_expect(encoding_test_text(html_run_prescan_byte_stream_algorithm(document, row.0)), row.2, row.0)
+        encoding_test_expect(encoding_test_text(html_run_encoding_sniffing_algorithm(document, row.0)), row.3, row.0)
+
+test "HTMLEncodingDetection: the prescan stops at 1024 bytes":
+    web_initialize_strings()
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let realm = web_test_create_realm(vm)
+    let document = test_realm_document(realm)
+
+    let meta = "<meta charset=koi8-r>"
+    let cases: (usize, str)[3] = [(990, "KOI8-R"), (1000, "KOI8-R"), (1010, "-")]
+    for case in cases:
+        var builder = ak.string_builder_new()
+        ak.string_builder_append_repeated_u8(&builder, ' ', case.0)
+        ak.string_builder_append(&builder, meta)
+        let input = ak.string_builder_string_view(&builder)
+        let bytes = ak.string_view_bytes(&input)
+        encoding_test_expect(encoding_test_text(html_run_prescan_byte_stream_algorithm(document, bytes)), case.1, bytes)
+
+test "HTMLEncodingDetection: the transport layer's charset wins over the prescan":
+    web_initialize_strings()
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let realm = web_test_create_realm(vm)
+    let document = test_realm_document(realm)
+
+    let input = b"<meta charset=koi8-r>"
+    encoding_test_expect(encoding_test_text(html_run_encoding_sniffing_algorithm(document, input, mime_type_parse(ak.sv("text/html; charset=iso-8859-2")))), "ISO-8859-2", input)
+    # A charset that is not an encoding, or none at all, falls through to the prescan.
+    encoding_test_expect(encoding_test_text(html_run_encoding_sniffing_algorithm(document, input, mime_type_parse(ak.sv("text/html; charset=bogus")))), "KOI8-R", input)
+    encoding_test_expect(encoding_test_text(html_run_encoding_sniffing_algorithm(document, input, mime_type_parse(ak.sv("text/html")))), "KOI8-R", input)
+    # A BOM wins over everything.
+    let bom_input = b"\xEF\xBB\xBF<meta charset=koi8-r>"
+    encoding_test_expect(encoding_test_text(html_run_encoding_sniffing_algorithm(document, bom_input, mime_type_parse(ak.sv("text/html; charset=iso-8859-2")))), "UTF-8", bom_input)
+
+test "HTMLEncodingDetection: extracting a character encoding from a meta element":
+    let rows: (str, str)[12] = [
+        ("text/html; charset=utf-8", "UTF-8"),
+        ("text/html;charset=\"ISO-8859-2\"", "ISO-8859-2"),
+        ("text/html;charset='koi8-r'", "KOI8-R"),
+        ("charset = windows-1252 ; foo", "windows-1252"),
+        ("charsetx=utf-8", "-"),
+        ("nothing here", "-"),
+        ("charset", "-"),
+        ("charset=", "-"),
+        ("charset=\"unterminated", "-"),
+        ("CHARSET=Big5", "Big5"),
+        ("foo charset bar charset=shift_jis", "Shift_JIS"),
+        ("charset=bogus", "-"),
+    ]
+    for row in rows:
+        var answer = ak.string_from_str("-")
+        if let encoding = html_extract_character_encoding_from_meta_element(ak.byte_string_from_str(row.0)):
+            answer = ak.string_from_utf8(encoding) else trap("utf-8")
+        encoding_test_expect(answer, row.1, row.0.bytes)
+
+test "HTMLEncodingDetection: prescan_get_attribute reads names, quoted and unquoted values":
+    web_initialize_strings()
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let realm = web_test_create_realm(vm)
+    let document = test_realm_document(realm)
+
+    let input = b" A=1 /b = 'X y' c=\"Q\" d e/>"
+    var position: usize = 0
+    let expected: (str, str)[5] = [("a", "1"), ("b", "x y"), ("c", "q"), ("d", ""), ("e", "")]
+    for pair in expected:
+        let attribute = html_prescan_get_attribute(document, input, &position) else trap("an attribute")
+        assert(test_fly_is(dom_attr_name(attribute), pair.0))
+        assert(test_string_is(dom_attr_value(attribute), pair.1))
+    assert(html_prescan_get_attribute(document, input, &position) == none)
+
+# mark: Legacy color values =====================================================================
+
+## A color as the oracle prints it: rrggbbaa in hex, or "-".
+func color_test_text(color: gfx.Color?) -> ak.String:
+    let value = color else return ak.string_from_str("-")
+    let digits = "0123456789abcdef"
+    var builder = ak.string_builder_new()
+    let channels: u8[4] = [gfx.color_red(&value), gfx.color_green(&value), gfx.color_blue(&value), gfx.color_alpha(&value)]
+    for channel in channels:
+        ak.string_builder_append_u8(&builder, digits.bytes[channel >> 4])
+        ak.string_builder_append_u8(&builder, digits.bytes[channel & 15])
+    return ak.string_builder_to_string_without_validation(&builder)
+
+test "parse_legacy_color_value matches the reference build":
+    let rows: (const u8[], str)[32] = [
+        (b"chucknorris", "c00000ff"),
+        (b"#abc", "aabbccff"),
+        (b"#ABC", "aabbccff"),
+        (b"red", "ff0000ff"),
+        (b"RED", "ff0000ff"),
+        (b"LightGoldenRodYellow", "fafad2ff"),
+        (b"transparent", "-"),
+        (b" Transparent ", "-"),
+        (b"  #0F0  ", "00ff00ff"),
+        (b"sick", "00c000ff"),
+        (b"#123456789", "124578ff"),
+        (b"#", "000000ff"),
+        (b"#1", "010000ff"),
+        (b"#12", "010200ff"),
+        (b"#1234", "123400ff"),
+        (b"#12345", "123450ff"),
+        (b"#1234567", "124570ff"),
+        (b"#abcd", "abcd00ff"),
+        (b"zz", "000000ff"),
+        (b"f", "0f0000ff"),
+        (b"123", "010203ff"),
+        (b"1234", "123400ff"),
+        (b"0", "000000ff"),
+        (b"#0000000000000000001", "000010ff"),
+        (b"#zzz", "000000ff"),
+        (b"rgb(255,0,0)", "002500ff"),
+        (b"currentColor", "c0e000ff"),
+        (b"ff\xF0\x9F\x98\x80ff", "ff00ffff"),
+        (b"#ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff12", "ffffffff"),
+        (b"abcdefghijklmnopqrstuvwxyz", "bc0000ff"),
+        (b"#00000000ff00000000ff00000000ff", "ffffffff"),
+        (b"\xC3\xA9t\xC3\xA9", "000000ff"),
+    ]
+    for row in rows:
+        encoding_test_expect(color_test_text(html_parse_legacy_color_value(ak.string_view_from_bytes(row.0))), row.1, row.0)
+    # The empty string is a failure.
+    assert(html_parse_legacy_color_value(ak.sv("")) == none)

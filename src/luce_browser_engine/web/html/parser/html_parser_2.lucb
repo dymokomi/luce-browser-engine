@@ -1,0 +1,522 @@
+#==============================================================================================
+#
+#   html_parser_2 - HTML::HTMLParser: the insertion-mode switch, quirks, the first insertion
+#                   modes and creating and inserting elements
+#
+#   DESCRIPTION:
+#       Port of LibWeb/HTML/Parser/HTMLParser.cpp (lines 558-1132): process_using_the_rules_for,
+#       which_quirks_mode, the "initial", "before html" and "before head" insertion modes, the
+#       current / adjusted current node, the appropriate place for inserting a node (foster
+#       parenting, template contents), creating an element for a token, inserting a foreign or
+#       an HTML element, and inserting a comment.
+#
+#       C++'s `goto AnythingElse` into the "anything else" block is a flag that skips the
+#       entries between the goto and that block. Tokens passed as `HTMLToken const&` are
+#       pointers; a temporary token (`HTMLToken::make_start_tag(...)`) is a local first.
+#
+#==============================================================================================
+
+# mark: Dispatch and quirks =====================================================================
+
+## Ported from HTMLParser.cpp:558 Web::HTML::HTMLParser::process_using_the_rules_for.
+pub func html_parser_process_using_the_rules_for(this: HtmlParser*, mode: HtmlParserInsertionMode, token: html_syntax.HtmlToken*):
+    match mode:
+        .initial: html_parser_handle_initial(this, token)
+        .before_html: html_parser_handle_before_html(this, token)
+        .before_head: html_parser_handle_before_head(this, token)
+        .in_head: html_parser_handle_in_head(this, token)
+        .in_head_noscript: html_parser_handle_in_head_noscript(this, token)
+        .after_head: html_parser_handle_after_head(this, token)
+        .in_body: html_parser_handle_in_body(this, token)
+        .after_body: html_parser_handle_after_body(this, token)
+        .after_after_body: html_parser_handle_after_after_body(this, token)
+        .text: html_parser_handle_text(this, token)
+        .in_table: html_parser_handle_in_table(this, token)
+        .in_table_body: html_parser_handle_in_table_body(this, token)
+        .in_row: html_parser_handle_in_row(this, token)
+        .in_cell: html_parser_handle_in_cell(this, token)
+        .in_table_text: html_parser_handle_in_table_text(this, token)
+        .in_caption: html_parser_handle_in_caption(this, token)
+        .in_column_group: html_parser_handle_in_column_group(this, token)
+        .in_template: html_parser_handle_in_template(this, token)
+        .in_frameset: html_parser_handle_in_frameset(this, token)
+        .after_frameset: html_parser_handle_after_frameset(this, token)
+        .after_after_frameset: html_parser_handle_after_after_frameset(this, token)
+        _: trap("VERIFY_NOT_REACHED")
+
+## Ported from HTMLParser.cpp:629 Web::HTML::HTMLParser::which_quirks_mode.
+pub func html_parser_which_quirks_mode(this: HtmlParser*, doctype_token: const html_syntax.HtmlToken*) -> DomQuirksMode:
+    let doctype_data = html_syntax.html_token_doctype_data(doctype_token)
+    if doctype_data.force_quirks:
+        return DomQuirksMode.yes
+
+    # NOTE: The tokenizer puts the name into lower case for us.
+    if not ak.string_eq_string_view(&doctype_data.name, ak.sv("html")):
+        return DomQuirksMode.yes
+
+    let public_identifier = &doctype_data.public_identifier
+    let system_identifier = &doctype_data.system_identifier
+
+    if ak.string_equals_ignoring_ascii_case_string_view(public_identifier, ak.sv("-//W3O//DTD W3 HTML Strict 3.0//EN//")):
+        return DomQuirksMode.yes
+
+    if ak.string_equals_ignoring_ascii_case_string_view(public_identifier, ak.sv("-/W3C/DTD HTML 4.0 Transitional/EN")):
+        return DomQuirksMode.yes
+
+    if ak.string_equals_ignoring_ascii_case_string_view(public_identifier, ak.sv("HTML")):
+        return DomQuirksMode.yes
+
+    if ak.string_equals_ignoring_ascii_case_string_view(system_identifier, ak.sv("http://www.ibm.com/data/dtd/v11/ibmxhtml1-transitional.dtd")):
+        return DomQuirksMode.yes
+
+    for public_id in html_s_quirks_public_ids:
+        if ak.string_starts_with_bytes(public_identifier, ak.sv(public_id), ak.CaseSensitivity.case_insensitive):
+            return DomQuirksMode.yes
+
+    if doctype_data.missing_system_identifier:
+        if ak.string_starts_with_bytes(public_identifier, ak.sv("-//W3C//DTD HTML 4.01 Frameset//"), ak.CaseSensitivity.case_insensitive):
+            return DomQuirksMode.yes
+
+        if ak.string_starts_with_bytes(public_identifier, ak.sv("-//W3C//DTD HTML 4.01 Transitional//"), ak.CaseSensitivity.case_insensitive):
+            return DomQuirksMode.yes
+
+    if ak.string_starts_with_bytes(public_identifier, ak.sv("-//W3C//DTD XHTML 1.0 Frameset//"), ak.CaseSensitivity.case_insensitive):
+        return DomQuirksMode.limited
+
+    if ak.string_starts_with_bytes(public_identifier, ak.sv("-//W3C//DTD XHTML 1.0 Transitional//"), ak.CaseSensitivity.case_insensitive):
+        return DomQuirksMode.limited
+
+    if not doctype_data.missing_system_identifier:
+        if ak.string_starts_with_bytes(public_identifier, ak.sv("-//W3C//DTD HTML 4.01 Frameset//"), ak.CaseSensitivity.case_insensitive):
+            return DomQuirksMode.limited
+
+        if ak.string_starts_with_bytes(public_identifier, ak.sv("-//W3C//DTD HTML 4.01 Transitional//"), ak.CaseSensitivity.case_insensitive):
+            return DomQuirksMode.limited
+
+    return DomQuirksMode.no
+
+# mark: The initial and before html insertion modes =============================================
+
+## Ported from HTMLParser.cpp:684 Web::HTML::HTMLParser::handle_initial.
+# https://html.spec.whatwg.org/multipage/parsing.html#the-initial-insertion-mode
+pub func html_parser_handle_initial(this: HtmlParser*, token: html_syntax.HtmlToken*):
+    # -> A character token that is one of U+0009 CHARACTER TABULATION, U+000A LINE FEED (LF),
+    #    U+000C FORM FEED (FF), U+000D CARRIAGE RETURN (CR), or U+0020 SPACE
+    if html_syntax.html_token_is_character(token) and html_syntax.html_token_is_parser_whitespace(token):
+        return
+
+    # -> A comment token
+    if html_syntax.html_token_is_comment(token):
+        # Insert a comment as the last child of the Document object.
+        let comment = html_parser_create_comment(this, token)
+        discard(dom_node_append_child(html_parser_document(this).dom_node(), comment.dom_node()) else trap("MUST: append_child"))
+        return
+
+    # -> A DOCTYPE token
+    if html_syntax.html_token_is_doctype(token):
+        # If the DOCTYPE token's name is not "html", or the token's public identifier is not missing,
+        # or the token's system identifier is neither missing nor "about:legacy-compat", then there is a parse error.
+        let doctype_data = html_syntax.html_token_doctype_data(token)
+        if not ak.string_eq_string_view(&doctype_data.name, ak.sv("html")) or not doctype_data.missing_public_identifier or (not doctype_data.missing_system_identifier and not ak.string_eq_string_view(&doctype_data.system_identifier, ak.sv("about:legacy-compat"))):
+            html_log_parse_error()
+
+        # Append a DocumentType node to the Document node, with its name set to the name given in the DOCTYPE token,
+        # or the empty string if the name was missing; its public ID set to the public identifier given in the DOCTYPE token,
+        # or the empty string if the public identifier was missing; and its system ID set to the system identifier
+        # given in the DOCTYPE token, or the empty string if the system identifier was missing.
+
+        let doctype = realm_create_dom_document_type(html_parser_realm(this), html_parser_document(this))
+        dom_document_type_set_name(doctype, doctype_data.name)
+        dom_document_type_set_public_id(doctype, doctype_data.public_identifier)
+        dom_document_type_set_system_id(doctype, doctype_data.system_identifier)
+        discard(dom_node_append_child(html_parser_document(this).dom_node(), doctype.dom_node()) else trap("MUST: append_child"))
+
+        # Then, if the document is not an iframe srcdoc document, and the parser cannot change the mode flag is false,
+        # and the DOCTYPE token matches one of the conditions in the following list, then set the Document to quirks mode:
+        # [...]
+        # Otherwise, if the document is not an iframe srcdoc document, and the parser cannot change the mode flag is false,
+        # and the DOCTYPE token matches one of the conditions in the following list, then set the Document to limited-quirks mode:
+        # [...]
+        if not dom_document_parser_cannot_change_the_mode(html_parser_document(this)):
+            dom_document_set_quirks_mode(html_parser_document(this), html_parser_which_quirks_mode(this, token))
+
+        # Then, switch the insertion mode to "before html".
+        this.m_insertion_mode = HtmlParserInsertionMode.before_html
+        return
+    # -> Anything else
+
+    # FIXME: If the document is not an iframe srcdoc document, then this is a parse error
+
+    html_log_parse_error()
+
+    # if the parser cannot change the mode flag is false, set the Document to quirks mode.
+    if not dom_document_parser_cannot_change_the_mode(html_parser_document(this)):
+        dom_document_set_quirks_mode(html_parser_document(this), DomQuirksMode.yes)
+
+    # In any case, switch the insertion mode to "before html"
+    this.m_insertion_mode = HtmlParserInsertionMode.before_html
+    # then reprocess the token.
+    html_parser_process_using_the_rules_for(this, HtmlParserInsertionMode.before_html, token)
+
+## Ported from HTMLParser.cpp:749 Web::HTML::HTMLParser::handle_before_html.
+# https://html.spec.whatwg.org/multipage/parsing.html#the-before-html-insertion-mode
+pub func html_parser_handle_before_html(this: HtmlParser*, token: html_syntax.HtmlToken*):
+    # -> A DOCTYPE token
+    if html_syntax.html_token_is_doctype(token):
+        # Parse error. Ignore the token.
+        html_log_parse_error()
+        return
+
+    # -> A comment token
+    if html_syntax.html_token_is_comment(token):
+        # Insert a comment as the last child of the Document object.
+        let comment = html_parser_create_comment(this, token)
+        discard(dom_node_append_child(html_parser_document(this).dom_node(), comment.dom_node()) else trap("MUST: append_child"))
+        return
+
+    # -> A character token that is one of U+0009 CHARACTER TABULATION, U+000A LINE FEED (LF), U+000C FORM FEED (FF), U+000D CARRIAGE RETURN (CR), or U+0020 SPACE
+    if html_syntax.html_token_is_character(token) and html_syntax.html_token_is_parser_whitespace(token):
+        # Ignore the token.
+        return
+
+    # -> A start tag whose tag name is "html"
+    if html_syntax.html_token_is_start_tag(token) and html_parser_tag_name_is(token, html_tag_names_html):
+        # Create an element for the token in the HTML namespace, with the Document as the intended parent. Append it to the Document object. Put this element in the stack of open elements.
+        let element = html_parser_create_element_for(this, token, namespace_html, html_parser_document(this).dom_node())
+        discard(dom_node_append_child(html_parser_document(this).dom_node(), element.dom_node()) else trap("MUST: append_child"))
+        html_stack_of_open_elements_push(&this.m_stack_of_open_elements, element)
+
+        # Switch the insertion mode to "before head".
+        this.m_insertion_mode = HtmlParserInsertionMode.before_head
+        return
+
+    # -> An end tag whose tag name is one of: "head", "body", "html", "br"
+    #    Act as described in the "anything else" entry below. (goto AnythingElse)
+    let anything_else = html_syntax.html_token_is_end_tag(token) and html_parser_tag_name_is_one_of(token, [html_tag_names_head, html_tag_names_body, html_tag_names_html, html_tag_names_br])
+
+    # -> Any other end tag
+    if not anything_else and html_syntax.html_token_is_end_tag(token):
+        # Parse error. Ignore the token.
+        html_log_parse_error()
+        return
+
+    # -> Anything else
+    # AnythingElse:
+    # Create an html element whose node document is the Document object. Append it to the Document object. Put this element in the stack of open elements.
+
+    # AD-HOC: First check if we've already inserted a <html> element into the document.
+    #         This can happen by mixing document.write() and DOM manipulation.
+    let html_element = dom_document_document_element(html_parser_document(this))
+    if html_element != none and dom_node_is_html_html_element((html_element else trap("checked")).dom_node()):
+        html_stack_of_open_elements_push(&this.m_stack_of_open_elements, html_element else trap("checked"))
+    else:
+        let element = dom_create_element(html_parser_document(this), html_tag_names_html, namespace_html) else trap("FIXME: should propagate errors")
+        discard(dom_node_append_child(html_parser_document(this).dom_node(), element.dom_node()) else trap("MUST: append_child"))
+        html_stack_of_open_elements_push(&this.m_stack_of_open_elements, element)
+
+    # Switch the insertion mode to "before head", then reprocess the token.
+    this.m_insertion_mode = HtmlParserInsertionMode.before_head
+    html_parser_process_using_the_rules_for(this, HtmlParserInsertionMode.before_head, token)
+
+# mark: The current node and the insertion location =============================================
+
+## Ported from HTMLParser.cpp:818 Web::HTML::HTMLParser::current_node.
+pub func html_parser_current_node(this: HtmlParser*) -> DomElement*?:
+    if html_stack_of_open_elements_is_empty(&this.m_stack_of_open_elements):
+        return none
+    return html_stack_of_open_elements_current_node(&this.m_stack_of_open_elements)
+
+## Ported from HTMLParser.cpp:826 Web::HTML::HTMLParser::adjusted_current_node.
+# https://html.spec.whatwg.org/multipage/parsing.html#adjusted-current-node
+pub func html_parser_adjusted_current_node(this: HtmlParser*) -> DomElement*?:
+    # The adjusted current node is the context element if the parser was created as part of the
+    # HTML fragment parsing algorithm and the stack of open elements has only one element in it
+    # (fragment case); otherwise, the adjusted current node is the current node.
+
+    if this.m_parsing_fragment and ak.vector_size(&this.m_stack_of_open_elements.m_elements) == 1:
+        return this.m_context_element else trap("VERIFY: context element")
+
+    return html_parser_current_node(this)
+
+## Ported from HTMLParser.cpp:838 Web::HTML::HTMLParser::node_before_current_node.
+pub func html_parser_node_before_current_node(this: HtmlParser*) -> DomElement*?:
+    let elements = &this.m_stack_of_open_elements.m_elements
+    if ak.vector_size(elements) < 2:
+        return none
+    return *ak.vector_at(elements, ak.vector_size(elements) - 2)
+
+## `*current_node()`: the current node, which the caller knows exists.
+func html_parser_current_element(this: HtmlParser*) -> DomElement*:
+    return html_parser_current_node(this) else trap("VERIFY: current node")
+
+## Ported from HTMLParser.cpp:846 Web::HTML::HTMLParser::find_appropriate_place_for_inserting_node.
+# https://html.spec.whatwg.org/multipage/parsing.html#appropriate-place-for-inserting-a-node
+pub func html_parser_find_appropriate_place_for_inserting_node(this: HtmlParser*, override_target: DomElement*? = none) -> HtmlParserAdjustedInsertionLocation:
+    # 1. If there was an override target specified, then let target be the override target.
+    #    Otherwise, let target be the current node.
+    let target = override_target else html_parser_current_element(this)
+    var adjusted_insertion_location = HtmlParserAdjustedInsertionLocation(parent = none, insert_before_sibling = none)
+
+    # 2. Determine the adjusted insertion location using the first matching steps from the following list:
+
+    # `-> If foster parenting is enabled and target is a table, tbody, tfoot, thead, or tr element
+    if this.m_foster_parenting and html_parser_local_name_is_one_of(target, [html_tag_names_table, html_tag_names_tbody, html_tag_names_tfoot, html_tag_names_thead, html_tag_names_tr]):
+        # 1. Let last template be the last template element in the stack of open elements, if any.
+        let last_template = html_stack_of_open_elements_last_element_with_tag_name(&this.m_stack_of_open_elements, html_tag_names_template)
+        # 2. Let last table be the last table element in the stack of open elements, if any.
+        let last_table = html_stack_of_open_elements_last_element_with_tag_name(&this.m_stack_of_open_elements, html_tag_names_table)
+        # 3. If there is a last template and either there is no last table,
+        #    or there is one, but last template is lower (more recently added) than last table in the stack of open elements,
+        if last_template.element != none and (last_table.element == none or last_template.index > last_table.index):
+            # then: let adjusted insertion location be inside last template's template contents, after its last child
+            # (if any), and abort these steps.
+
+            # NOTE: This returns the template content, so no need to check the parent is a template.
+            let template_element = as_html_template_element(last_template.element else trap("checked"))
+            return HtmlParserAdjustedInsertionLocation(parent = html_template_element_content(template_element).dom_node(), insert_before_sibling = none)
+        # 4. If there is no last table, then let adjusted insertion location be inside the first element in the stack
+        #    of open elements (the html element), after its last child (if any), and abort these steps. (fragment case)
+        if last_table.element == none:
+            assert(this.m_parsing_fragment)
+            # Guaranteed not to be a template element (it will be the html element),
+            # so no need to check the parent is a template.
+            return HtmlParserAdjustedInsertionLocation(parent = (*ak.vector_first(&this.m_stack_of_open_elements.m_elements)).dom_node(), insert_before_sibling = none)
+        let last_table_element = last_table.element else trap("checked")
+        # 5. If last table has a parent node, then let adjusted insertion location be inside last table's parent node,
+        #    immediately before last table, and abort these steps.
+        if let parent_node = dom_node_parent_node(last_table_element.dom_node()):
+            return HtmlParserAdjustedInsertionLocation(parent = parent_node, insert_before_sibling = last_table_element.dom_node())
+
+        # 6. Let previous element be the element immediately above last table in the stack of open elements.
+        let previous_element = html_stack_of_open_elements_element_immediately_above(&this.m_stack_of_open_elements, last_table_element)
+
+        # 7. Let adjusted insertion location be inside previous element, after its last child (if any).
+        adjusted_insertion_location = HtmlParserAdjustedInsertionLocation(parent = (DomNode*?)previous_element, insert_before_sibling = none)
+    else:
+        # `-> Otherwise
+        #     Let adjusted insertion location be inside target, after its last child (if any).
+        adjusted_insertion_location = HtmlParserAdjustedInsertionLocation(parent = target.dom_node(), insert_before_sibling = none)
+
+    # 3. If the adjusted insertion location is inside a template element,
+    #    let it instead be inside the template element's template contents, after its last child (if any).
+    if let template_element = as_if_html_template_element(adjusted_insertion_location.parent else trap("VERIFY: adjusted insertion location")):
+        adjusted_insertion_location = HtmlParserAdjustedInsertionLocation(parent = html_template_element_content(template_element).dom_node(), insert_before_sibling = none)
+
+    # 4. Return the adjusted insertion location.
+    return adjusted_insertion_location
+
+# mark: Creating and inserting elements =========================================================
+
+## Ported from HTMLParser.cpp:904 Web::HTML::HTMLParser::create_element_for.
+# https://html.spec.whatwg.org/multipage/parsing.html#create-an-element-for-the-token
+pub func html_parser_create_element_for(this: HtmlParser*, token: html_syntax.HtmlToken*, namespace_: ak.FlyString?, intended_parent: DomNode*) -> DomElement*:
+    # 1. If the active speculative HTML parser is not null, then return the result of creating a speculative mock element given namespace, token's tag name, and token's attributes.
+    # The active speculative HTML parser runs synchronously to completion, so it is null whenever the real
+    # parser invokes this algorithm. The speculative parser produces mock elements via its own path.
+
+    # 2. Otherwise, optionally create a speculative mock element given namespace, token's tag name, and token's attributes.
+    # We deliberately skip step 2 — the active speculative parser already issues these fetches, so doing it
+    # again here would be redundant.
+
+    # 3. Let document be intendedParent's node document.
+    let document = dom_node_document(intended_parent)
+
+    # 4. Let localName be token's tag name.
+    let local_name = html_syntax.html_token_tag_name(token)
+
+    # 5. Let is be the value of the "is" attribute in token, if such an attribute exists; otherwise null.
+    let is_value = html_syntax.html_token_attribute(token, html_attribute_names_is)
+
+    # 6. Let registry be the result of looking up a custom element registry given intendedParent.
+    let registry = html_look_up_a_custom_element_registry(intended_parent)
+
+    # 7. Let definition be the result of looking up a custom element definition given registry, namespace, localName,
+    #    and is.
+    let definition = html_look_up_a_custom_element_definition(registry, namespace_, local_name, is_value)
+
+    # 8. Let willExecuteScript be true if definition is non-null and the parser was not created as part of the HTML
+    #    fragment parsing algorithm; otherwise false.
+    let will_execute_script = definition != none and not this.m_parsing_fragment
+
+    # 9. If willExecuteScript is true:
+    if will_execute_script:
+        # 1. Increment document's throw-on-dynamic-markup-insertion counter.
+        dom_document_increment_throw_on_dynamic_markup_insertion_counter(document)
+
+        # 2. If the JavaScript execution context stack is empty, then perform a microtask checkpoint.
+        let vm = js_cell_vm(html_main_thread_event_loop().js_cell())
+        if not vm_has_running_execution_context(vm):
+            html_perform_a_microtask_checkpoint()
+
+        # 3. Push a new element queue onto document's relevant agent's custom element reactions stack.
+        ak.vector_append_t(&html_relevant_similar_origin_window_agent((JsObject*)document).custom_element_reactions_stack.element_queue_stack, ak.Vector[gc.Weak[DomElement]]())
+
+    # 10. Let element be the result of creating an element given document, localName, namespace, null, is,
+    #     willExecuteScript, and registry.
+    let element = dom_create_element(document, local_name, namespace_, none, is_value, will_execute_script, HtmlCustomElementRegistryOrDomDefault.html_custom_element_registry(registry)) else trap("FIXME: should propagate errors")
+
+    # AD-HOC: See AD-HOC comment on Element.m_had_duplicate_attribute_during_tokenization about why this is done.
+    if html_syntax.html_token_had_duplicate_attribute(token):
+        dom_element_set_had_duplicate_attribute_during_tokenization(element)
+
+    # AD-HOC: Let <link> elements know which document they were originally parsed for.
+    #         This is used for the render-blocking logic.
+    if ak.fly_string_eq_fly_string(&local_name, &html_tag_names_link) and dom_node_optional_fly_string_is(namespace_, namespace_html):
+        let link_element = as_html_link_element(element)
+        html_link_element_set_parser_document(link_element, document)
+        html_link_element_set_was_enabled_when_created_by_parser(link_element, not html_syntax.html_token_has_attribute(token, html_attribute_names_disabled))
+
+    # 11. Append each attribute in the given token to element.
+    if let attributes = html_syntax.html_token_tag_attributes(token):
+        for attribute in &ak.vector_span(attributes):
+            var qualified_name: DomQualifiedName = ---
+            dom_qualified_name_construct(&qualified_name, attribute.local_name, attribute.prefix, attribute.namespace_)
+            let dom_attribute = realm_create_dom_attr(html_parser_realm(this), document, qualified_name, attribute.value, element)
+            dom_element_append_attribute_dom_attr(element, dom_attribute)
+
+    # AD-HOC: The muted attribute on media elements is only set if the muted content attribute is present when the element is first created.
+    if dom_node_is_html_media_element(element.dom_node()) and dom_node_optional_fly_string_is(namespace_, namespace_html):
+        # https://html.spec.whatwg.org/multipage/media.html#user-interface:attr-media-muted
+        # When a media element is created, if the element has a muted content attribute specified, then the muted IDL
+        # attribute should be set to true; otherwise, the user agents may set the value to the user's preferred value.
+        if dom_element_has_attribute(element, html_attribute_names_muted):
+            let media_element = as_html_media_element(element)
+            html_media_element_set_muted(media_element, true)
+
+    # 12. If willExecuteScript is true:
+    if will_execute_script:
+        # 1. Let queue be the result of popping from document's relevant agent's custom element reactions stack.
+        #    (This will be the same element queue as was pushed above.)
+        var queue = ak.vector_take_last(&html_relevant_similar_origin_window_agent((JsObject*)document).custom_element_reactions_stack.element_queue_stack)
+
+        # 2. Invoke custom element reactions in queue.
+        bind_invoke_custom_element_reactions(&queue)
+
+        # 3. Decrement document's throw-on-dynamic-markup-insertion counter.
+        dom_document_decrement_throw_on_dynamic_markup_insertion_counter(document)
+
+    # FIXME: 13. If element has an xmlns attribute in the XMLNS namespace whose value is not exactly the same as the element's namespace, that is a parse error.
+    #            Similarly, if element has an xmlns:xlink attribute in the XMLNS namespace whose value is not the XLink Namespace, that is a parse error.
+
+    if let html_element = as_if_html_element(element):
+        let form_associated = &html_element.form_associated_element
+        if html_form_associated_element_is_form_associated_element(form_associated) and not html_element_is_form_associated_custom_element(html_element):
+            # 14. If element is a resettable element and not a form-associated custom element, then invoke its reset algorithm.
+            #     (This initializes the element's value and checkedness based on the element's attributes.)
+            if html_form_associated_element_is_resettable(form_associated):
+                html_form_associated_element_reset_algorithm(form_associated)
+
+            # 15. If element is a form-associated element and not a form-associated custom element, the form element pointer
+            #     is not null, there is no template element on the stack of open elements, element is either not listed or
+            #     doesn't have a form attribute, and the intendedParent is in the same tree as the element pointed to by the
+            #     form element pointer, then associate element with the form element pointed to by the form element pointer
+            #     and set element's parser inserted flag.
+            if let form_element = this.m_form_element:
+                if not html_stack_of_open_elements_contains_template_element(&this.m_stack_of_open_elements) and (not html_form_associated_element_is_listed(form_associated) or not dom_element_has_attribute(element, html_attribute_names_form)) and tree_node_root(intended_parent) == tree_node_root(form_element.dom_node()):
+                    html_form_associated_element_set_form(form_associated, form_element)
+                    html_form_associated_element_set_parser_inserted(form_associated)
+
+    # 16. Return element.
+    return element
+
+## Ported from HTMLParser.cpp:1027 Web::HTML::HTMLParser::insert_foreign_element.
+# https://html.spec.whatwg.org/multipage/parsing.html#insert-a-foreign-element
+pub func html_parser_insert_foreign_element(this: HtmlParser*, token: html_syntax.HtmlToken*, namespace_: ak.FlyString?, only_add_to_element_stack: HtmlParserOnlyAddToElementStack) -> DomElement*:
+    # 1. Let the adjustedInsertionLocation be the appropriate place for inserting a node.
+    let adjusted_insertion_location = html_parser_find_appropriate_place_for_inserting_node(this)
+
+    # 2. Let element be the result of creating an element for the token given token, namespace, and the element in
+    #    which the adjustedInsertionLocation finds itself.
+    let element = html_parser_create_element_for(this, token, namespace_, adjusted_insertion_location.parent else trap("VERIFY: adjusted insertion location"))
+
+    # 3. If onlyAddToElementStack is false, then run insert an element at the adjusted insertion location with element.
+    if only_add_to_element_stack == HtmlParserOnlyAddToElementStack.no:
+        html_parser_insert_an_element_at_the_adjusted_insertion_location(this, element)
+
+    # 4. Push element onto the stack of open elements so that it is the new current node.
+    html_stack_of_open_elements_push(&this.m_stack_of_open_elements, element)
+
+    # 5. Return element.
+    return element
+
+## Ported from HTMLParser.cpp:1049 Web::HTML::HTMLParser::insert_html_element.
+# https://html.spec.whatwg.org/multipage/parsing.html#insert-an-html-element
+pub func html_parser_insert_html_element(this: HtmlParser*, token: html_syntax.HtmlToken*) -> DomElement*:
+    # To insert an HTML element given a token token: insert a foreign element given token, the HTML namespace, and
+    # false.
+    return html_parser_insert_foreign_element(this, token, namespace_html, HtmlParserOnlyAddToElementStack.no)
+
+## `insert_html_element(HTMLToken::make_start_tag(tag_name))`: insert an HTML element for a start tag
+## token with no attributes.
+func html_parser_insert_html_element_for_tag_name(this: HtmlParser*, tag_name: ak.FlyString) -> DomElement*:
+    var start_tag = html_syntax.html_token_make_start_tag(tag_name)
+    return html_parser_insert_html_element(this, &start_tag)
+
+# mark: The before head insertion mode and comments =============================================
+
+## Ported from HTMLParser.cpp:1057 Web::HTML::HTMLParser::handle_before_head.
+# https://html.spec.whatwg.org/multipage/parsing.html#the-before-head-insertion-mode
+pub func html_parser_handle_before_head(this: HtmlParser*, token: html_syntax.HtmlToken*):
+    # -> A character token that is one of U+0009 CHARACTER TABULATION, U+000A LINE FEED (LF), U+000C FORM FEED (FF),
+    #    U+000D CARRIAGE RETURN (CR), or U+0020 SPACE
+    if html_syntax.html_token_is_character(token) and html_syntax.html_token_is_parser_whitespace(token):
+        # Ignore the token.
+        return
+
+    # -> A comment token
+    if html_syntax.html_token_is_comment(token):
+        # Insert a comment.
+        html_parser_insert_comment(this, token)
+        return
+
+    # -> A DOCTYPE token
+    if html_syntax.html_token_is_doctype(token):
+        # Parse error. Ignore the token.
+        html_log_parse_error()
+        return
+
+    # -> A start tag whose tag name is "html"
+    if html_syntax.html_token_is_start_tag(token) and html_parser_tag_name_is(token, html_tag_names_html):
+        # Process the token using the rules for the "in body" insertion mode.
+        html_parser_process_using_the_rules_for(this, HtmlParserInsertionMode.in_body, token)
+        return
+
+    # -> A start tag whose tag name is "head"
+    if html_syntax.html_token_is_start_tag(token) and html_parser_tag_name_is(token, html_tag_names_head):
+        # Insert an HTML element for the token.
+        let element = html_parser_insert_html_element(this, token)
+
+        # Set the head element pointer to the newly created head element.
+        this.m_head_element = as_html_head_element(element)
+
+        # Switch the insertion mode to "in head".
+        this.m_insertion_mode = HtmlParserInsertionMode.in_head
+        return
+
+    # -> An end tag whose tag name is one of: "head", "body", "html", "br"
+    #    Act as described in the "anything else" entry below. (goto AnythingElse)
+    let anything_else = html_syntax.html_token_is_end_tag(token) and html_parser_tag_name_is_one_of(token, [html_tag_names_head, html_tag_names_body, html_tag_names_html, html_tag_names_br])
+
+    # -> Any other end tag
+    if not anything_else and html_syntax.html_token_is_end_tag(token):
+        # Parse error. Ignore the token.
+        html_log_parse_error()
+        return
+
+    # -> Anything else
+    # AnythingElse:
+    # 1. Insert an HTML element for a "head" start tag token with no attributes.
+    # 2. Set the head element pointer to the newly created head element.
+    this.m_head_element = as_html_head_element(html_parser_insert_html_element_for_tag_name(this, html_tag_names_head))
+
+    # 3. Switch the insertion mode to "in head".
+    this.m_insertion_mode = HtmlParserInsertionMode.in_head
+
+    # 4. Reprocess the current token.
+    html_parser_process_using_the_rules_for(this, HtmlParserInsertionMode.in_head, token)
+
+## Ported from HTMLParser.cpp:1128 Web::HTML::HTMLParser::insert_comment.
+pub func html_parser_insert_comment(this: HtmlParser*, token: html_syntax.HtmlToken*):
+    let adjusted_insertion_location = html_parser_find_appropriate_place_for_inserting_node(this)
+    let parent = adjusted_insertion_location.parent else trap("VERIFY: adjusted insertion location")
+    dom_node_insert_before(parent, html_parser_create_comment(this, token).dom_node(), adjusted_insertion_location.insert_before_sibling)

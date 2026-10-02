@@ -1,0 +1,182 @@
+#==============================================================================================
+#
+#   incremental_document_parser - HTML::IncrementalDocumentParser: feeding a fetched body to
+#                                 the HTML parser as it arrives
+#
+#   DESCRIPTION:
+#       Port of LibWeb/HTML/Parser/IncrementalDocumentParser.cpp (lines 1-189). It waits for the
+#       body's sniff bytes, picks the encoding, decodes each chunk with a streaming decoder and
+#       pumps the parser. Fetch::Infrastructure::Body is phase 2 (opaque in the skeleton): its
+#       wait_for_sniff_bytes and incrementally_read are closure stubs, and the body is not a cell
+#       that visit_edges can visit yet. The C++ lambdas capture only the parser, which is their
+#       context here.
+#
+#==============================================================================================
+
+## Ported from IncrementalDocumentParser.cpp:21 Web::HTML::IncrementalDocumentParser::create.
+pub func html_incremental_document_parser_create(document: DomDocument*, body: FetchBody*, url: web_url.Url, mime_type: MimeType?) -> HtmlIncrementalDocumentParser*:
+    return realm_create_html_incremental_document_parser(bind_platform_object_realm(document.bind_platform_object()), document, body, url, mime_type)
+
+## Ported from IncrementalDocumentParser.cpp:26 Web::HTML::IncrementalDocumentParser::IncrementalDocumentParser.
+pub func html_incremental_document_parser_construct(this: HtmlIncrementalDocumentParser*, document: DomDocument*, body: FetchBody*, url: web_url.Url, mime_type: MimeType?):
+    this.m_document = document
+    this.m_body = body
+    this.m_url = url
+    this.m_mime_type = mime_type
+    this.m_source = ak.string_builder_new()
+
+## Ported from IncrementalDocumentParser.cpp:34 Web::HTML::IncrementalDocumentParser::visit_edges (override).
+pub func html_incremental_document_parser_visit_edges_impl(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (HtmlIncrementalDocumentParser*)base
+    gc.cell_visit_edges_impl(base, visitor)
+    gc.cell_visitor_visit_t_2(visitor, this.m_document)
+    # visitor.visit(m_body): Fetch::Infrastructure::Body is opaque (not a cell) until phase 2.
+    gc.cell_visitor_visit_t(visitor, this.m_parser)
+
+## start's `[parser](ReadonlyBytes sniff_bytes) { parser->initialize_parser(sniff_bytes); }`.
+func html_incremental_document_parser_on_sniff_bytes(context: void*?, sniff_bytes: const u8[]):
+    html_incremental_document_parser_initialize_parser((HtmlIncrementalDocumentParser*)(context else trap("no parser")), sniff_bytes)
+
+## Ported from IncrementalDocumentParser.cpp:42 Web::HTML::IncrementalDocumentParser::start.
+pub func html_incremental_document_parser_start(this: HtmlIncrementalDocumentParser*):
+    # https://html.spec.whatwg.org/multipage/document-lifecycle.html#read-html
+    # The user agent may wait for more bytes of the resource to be available while determining the
+    # encoding. Body::wait_for_sniff_bytes waits until its sniff-byte threshold is available, or
+    # until the stream closes.
+    #
+    # FIXME: The spec allows starting the parse after 500 ms or 1024 bytes, whichever comes first.
+    # We only honor the byte threshold.
+    let heap = gc.cell_heap(this.cell())
+    fetch_body_wait_for_sniff_bytes(this.m_body, gc.create_function1(heap, ak.Function1[const u8[], unit](call = html_incremental_document_parser_on_sniff_bytes, context = this)))
+
+## Ported from IncrementalDocumentParser.cpp:57 Web::HTML::IncrementalDocumentParser::initialize_parser.
+pub func html_incremental_document_parser_initialize_parser(this: HtmlIncrementalDocumentParser*, sniff_bytes: const u8[]):
+    if this.m_parser != none:
+        return
+
+    # https://html.spec.whatwg.org/multipage/parsing.html#parsing-with-a-known-character-encoding
+    # https://html.spec.whatwg.org/multipage/parsing.html#determining-the-character-encoding
+    var encoding: ak.ByteString = ---
+    if dom_document_has_encoding(this.m_document):
+        let document_encoding = dom_document_encoding(this.m_document) else trap("VERIFY: encoding")
+        encoding = ak.string_to_byte_string(&document_encoding)
+    else:
+        encoding = html_run_encoding_sniffing_algorithm(this.m_document, sniff_bytes, this.m_mime_type)
+    if html_parser_debug:
+        ak.dbgln(f"The incremental HTML parser selected encoding '{(str)ak.byte_string_bytes(&encoding)}'")
+
+    let decoder = text_codec.decoder_for(ak.byte_string_view(&encoding)) else trap("VERIFY: decoder.has_value()")
+
+    let standardized_encoding = text_codec.get_standardized_encoding(ak.byte_string_view(&encoding)) else trap("VERIFY: standardized_encoding.has_value()")
+    let streaming_decoder = new text_codec.StreamingDecoder(m_decoder = decoder) else trap("out of memory")
+    text_codec.streaming_decoder_construct(streaming_decoder, decoder)
+    this.m_decoder = streaming_decoder
+
+    # https://html.spec.whatwg.org/multipage/parsing.html#determining-the-character-encoding
+    # The document's character encoding must immediately be set to the value returned from this
+    # algorithm, at the same time as the user agent uses the returned value to select the decoder
+    # to use for the input byte stream.
+    let encoding_string = ak.string_from_utf8(standardized_encoding) else trap("MUST: String::from_utf8")
+    dom_document_set_encoding(this.m_document, encoding_string)
+
+    # FIXME: Implement the spec's "change the encoding while parsing" algorithm.
+    dom_document_set_url(this.m_document, this.m_url)
+    this.m_parser = html_parser_create_with_open_input_stream(this.m_document)
+
+    html_incremental_document_parser_start_incremental_read(this)
+
+## start_incremental_read's `[parser](ByteBuffer bytes) mutable { parser->process_body_chunk(move(bytes)); }`.
+func html_incremental_document_parser_on_body_chunk(context: void*?, bytes: ak.ByteBuffer):
+    html_incremental_document_parser_process_body_chunk((HtmlIncrementalDocumentParser*)(context else trap("no parser")), bytes)
+
+## start_incremental_read's `[parser] { parser->process_end_of_body(); }`.
+func html_incremental_document_parser_on_end_of_body(context: void*?):
+    html_incremental_document_parser_process_end_of_body((HtmlIncrementalDocumentParser*)(context else trap("no parser")))
+
+## start_incremental_read's `[parser](JS::Value error) { parser->process_body_error(error); }`.
+func html_incremental_document_parser_on_body_error(context: void*?, body_error: JsValue):
+    html_incremental_document_parser_process_body_error((HtmlIncrementalDocumentParser*)(context else trap("no parser")), body_error)
+
+## Ported from IncrementalDocumentParser.cpp:89 Web::HTML::IncrementalDocumentParser::start_incremental_read.
+pub func html_incremental_document_parser_start_incremental_read(this: HtmlIncrementalDocumentParser*):
+    let heap = gc.cell_heap(this.cell())
+    fetch_body_incrementally_read(this.m_body, gc.create_function1(heap, ak.Function1[ak.ByteBuffer, unit](call = html_incremental_document_parser_on_body_chunk, context = this)), gc.create_function0(heap, ak.Function0[unit](call = html_incremental_document_parser_on_end_of_body, context = this)), gc.create_function1(heap, ak.Function1[JsValue, unit](call = html_incremental_document_parser_on_body_error, context = this)), realm_global_object(bind_platform_object_realm(this.m_document.bind_platform_object())))
+
+## Ported from IncrementalDocumentParser.cpp:105 Web::HTML::IncrementalDocumentParser::should_continue.
+pub func html_incremental_document_parser_should_continue(this: HtmlIncrementalDocumentParser*) -> bool:
+    # NOTE: document.open() replaces m_document->parser() without aborting the old parser, so we have to stop feeding
+    #       bytes once we're no longer the document's active parser.
+    let parser = this.m_parser else return false
+    return not html_parser_aborted(parser) and dom_document_parser(this.m_document) == parser
+
+## Ported from IncrementalDocumentParser.cpp:112 Web::HTML::IncrementalDocumentParser::append_decoded.
+pub func html_incremental_document_parser_append_decoded(this: HtmlIncrementalDocumentParser*, decoded: ak.StringView):
+    ak.string_builder_append_string_view(&this.m_source, decoded)
+    html_syntax.html_tokenizer_append_to_input_stream(html_parser_tokenizer(this.m_parser else trap("VERIFY: parser")), decoded)
+
+## Ported from IncrementalDocumentParser.cpp:118 Web::HTML::IncrementalDocumentParser::process_body_chunk.
+pub func html_incremental_document_parser_process_body_chunk(this: HtmlIncrementalDocumentParser*, bytes: ak.ByteBuffer):
+    if not html_incremental_document_parser_should_continue(this):
+        return
+
+    # https://html.spec.whatwg.org/multipage/document-lifecycle.html#read-html
+    # Each task that the networking task source places on the task queue while fetching runs must
+    # fill the parser's input byte stream with the fetched bytes and cause the HTML parser to
+    # perform the appropriate processing of the input stream.
+    let decoded = text_codec.streaming_decoder_to_utf8(this.m_decoder else trap("VERIFY: decoder"), ak.byte_buffer_bytes_const(&bytes)) else trap("FIXME: should propagate errors")
+    html_incremental_document_parser_append_decoded(this, ak.string_bytes_as_string_view(&decoded))
+    html_incremental_document_parser_pump(this)
+
+## Ported from IncrementalDocumentParser.cpp:132 Web::HTML::IncrementalDocumentParser::process_end_of_body.
+pub func html_incremental_document_parser_process_end_of_body(this: HtmlIncrementalDocumentParser*):
+    if not html_incremental_document_parser_should_continue(this):
+        return
+
+    let decoded = text_codec.streaming_decoder_finish(this.m_decoder else trap("VERIFY: decoder")) else trap("FIXME: should propagate errors")
+    html_incremental_document_parser_append_decoded(this, ak.string_bytes_as_string_view(&decoded))
+
+    # https://html.spec.whatwg.org/multipage/document-lifecycle.html#read-html
+    # When no more bytes are available, have the parser process the implied EOF character.
+    dom_document_set_source(this.m_document, ak.string_builder_to_string_without_validation(&this.m_source))
+    html_syntax.html_tokenizer_close_input_stream(html_parser_tokenizer(this.m_parser else trap("VERIFY: parser")))
+    html_incremental_document_parser_pump(this)
+
+## Ported from IncrementalDocumentParser.cpp:147 Web::HTML::IncrementalDocumentParser::process_body_error.
+pub func html_incremental_document_parser_process_body_error(this: HtmlIncrementalDocumentParser*, arg0: JsValue):
+    ak.dbgln("FIXME: Load html page with an error if incremental read of body failed.")
+    html_parser_the_end(this.m_document, this.m_parser)
+
+## register_deferred_start's `[parser] { parser->pump(); }`.
+func html_incremental_document_parser_deferred_pump(context: void*?):
+    html_incremental_document_parser_pump((HtmlIncrementalDocumentParser*)(context else trap("no parser")))
+
+## Ported from IncrementalDocumentParser.cpp:153 Web::HTML::IncrementalDocumentParser::register_deferred_start.
+pub func html_incremental_document_parser_register_deferred_start(this: HtmlIncrementalDocumentParser*):
+    if dom_document_has_deferred_parser_start(this.m_document):
+        return
+
+    let heap = gc.cell_heap(this.cell())
+    dom_document_set_deferred_parser_start(this.m_document, gc.create_function0(heap, ak.Function0[unit](call = html_incremental_document_parser_deferred_pump, context = this)))
+
+## Ported from IncrementalDocumentParser.cpp:164 Web::HTML::IncrementalDocumentParser::pump.
+pub func html_incremental_document_parser_pump(this: HtmlIncrementalDocumentParser*):
+    if not html_incremental_document_parser_should_continue(this):
+        return
+
+    if not dom_document_ready_to_run_scripts(this.m_document):
+        html_incremental_document_parser_register_deferred_start(this)
+        return
+
+    let parser = this.m_parser else trap("VERIFY: parser")
+    if html_parser_stopped(parser):
+        return
+
+    # FIXME: Process link headers (read-html step 3, third paragraph) after the first parser pass.
+    if html_syntax.html_tokenizer_is_input_stream_closed(html_parser_tokenizer(parser)):
+        html_parser_run_until_completion(parser)
+        return
+
+    if html_parser_is_paused(parser):
+        return
+
+    html_parser_run_html_tokenizer_stop_at_inserti(parser)

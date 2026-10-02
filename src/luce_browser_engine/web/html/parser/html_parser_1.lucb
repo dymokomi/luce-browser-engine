@@ -1,0 +1,538 @@
+#==============================================================================================
+#
+#   html_parser_1 - HTML::HTMLParser: construction, the run loop, "the end" and its state
+#
+#   DESCRIPTION:
+#       Port of LibWeb/HTML/Parser/HTMLParser.cpp (lines 1-557): the parse-error log, the
+#       quirks public identifiers (a constant in types_html_parser), the MathML text and HTML
+#       integration points, the two constructors, visit_edges and initialize, run() (the
+#       tree-construction dispatcher), run(URL), run_until_completion, "the end" and the
+#       HTMLParserEndState machine that waits for scripts and the load event.
+#
+#       The tokenizer reaches its parser through the hook of DESIGN.md §4.1.3
+#       (html_syntax.html_tokenizer_set_parser): the parser passes itself and
+#       html_parser_adjusted_current_node_is_foreign, the one question the tokenizer asks.
+#       The C++ lambdas that capture only `this` pass the cell itself as their context; the
+#       others allocate their captures with `new` (DESIGN.md §2.7).
+#
+#       The port helpers at the top spell C++'s FlyString comparisons (`a == b`,
+#       `is_one_of(...)`, `Optional<FlyString> == FlyString`) once for the whole parser.
+#
+#==============================================================================================
+
+## AK/Debug.h's HTML_PARSER_DEBUG (0 in the reference build).
+let html_parser_debug: bool = false
+
+# mark: Port helpers ============================================================================
+
+## `element.namespace_uri() == namespace_` (an Optional<FlyString> compared with a FlyString).
+func html_parser_element_namespace_is(element: DomElement*, namespace_: ak.FlyString) -> bool:
+    return dom_node_optional_fly_string_is(dom_element_namespace_uri(element), namespace_)
+
+## `element.local_name() == name`.
+func html_parser_local_name_is(element: DomElement*, name: ak.FlyString) -> bool:
+    let local_name = dom_element_local_name(element)
+    return ak.fly_string_eq_fly_string(&local_name, &name)
+
+## `element.local_name().is_one_of(names...)`.
+func html_parser_local_name_is_one_of(element: DomElement*, names: const ak.FlyString[]) -> bool:
+    return dom_fly_string_is_one_of_fly_strings(dom_element_local_name(element), names)
+
+## `token.tag_name() == name`.
+func html_parser_tag_name_is(token: const html_syntax.HtmlToken*, name: ak.FlyString) -> bool:
+    let tag_name = html_syntax.html_token_tag_name(token)
+    return ak.fly_string_eq_fly_string(&tag_name, &name)
+
+## `token.tag_name().is_one_of(names...)`.
+func html_parser_tag_name_is_one_of(token: const html_syntax.HtmlToken*, names: const ak.FlyString[]) -> bool:
+    return dom_fly_string_is_one_of_fly_strings(html_syntax.html_token_tag_name(token), names)
+
+## `list.contains_slow(name)` for a Vector<FlyString>.
+func html_parser_fly_string_list_contains(list: const ak.Vector[ak.FlyString]*, name: ak.FlyString) -> bool:
+    return dom_fly_string_is_one_of_fly_strings(name, ak.vector_span_const(list))
+
+## `elements.remove_first_matching([&](auto& entry) { return entry.ptr() == element; })`.
+func html_parser_remove_first_element(elements: ak.Vector[DomElement*]*, element: DomElement*):
+    for i in 0..<ak.vector_size(elements):
+        if *ak.vector_at(elements, i) == element:
+            ak.vector_remove(elements, i)
+            return
+
+## `realm().create<DOM::Comment>(document(), Utf16String::from_utf8(token.comment()))`.
+func html_parser_create_comment(this: HtmlParser*, token: html_syntax.HtmlToken*) -> DomComment*:
+    let comment = html_syntax.html_token_comment(token)
+    return realm_create_dom_comment(html_parser_realm(this), html_parser_document(this), ak.utf16_string_from_utf8_string(&comment))
+
+# mark: HTMLParser.cpp ==========================================================================
+
+## Ported from HTMLParser.cpp:63 Web::HTML::log_parse_error.
+func html_log_parse_error(location: io.Location = luce.location):
+    if html_parser_debug:
+        ak.dbgln(f"Parse error! {location.function} @ {location.file}:{location.line}")
+
+## Ported from HTMLParser.cpp:127 Web::HTML::is_mathml_text_integration_point.
+# https://html.spec.whatwg.org/multipage/parsing.html#mathml-text-integration-point
+func html_is_mathml_text_integration_point(element: DomElement*) -> bool:
+    # A node is a MathML text integration point if it is one of the following elements:
+    # - A MathML mi element
+    # - A MathML mo element
+    # - A MathML mn element
+    # - A MathML ms element
+    # - A MathML mtext element
+    return html_parser_local_name_is_one_of(element, [math_ml_tag_names_mi, math_ml_tag_names_mo, math_ml_tag_names_mn, math_ml_tag_names_ms, math_ml_tag_names_mtext])
+
+## Ported from HTMLParser.cpp:139 Web::HTML::is_html_integration_point.
+# https://html.spec.whatwg.org/multipage/parsing.html#html-integration-point
+func html_is_html_integration_point(element: DomElement*) -> bool:
+    # A node is an HTML integration point if it is one of the following elements:
+    # - A MathML annotation-xml element whose start tag token had an attribute with the name "encoding" whose value was an ASCII case-insensitive match for the string "text/html"
+    # - A MathML annotation-xml element whose start tag token had an attribute with the name "encoding" whose value was an ASCII case-insensitive match for the string "application/xhtml+xml"
+    if html_parser_element_namespace_is(element, namespace_math_ml) and html_parser_local_name_is(element, math_ml_tag_names_annotation_xml):
+        if let encoding = dom_element_attribute(element, ak.fly_string_from_str("encoding")):
+            if ak.string_equals_ignoring_ascii_case_string_view(&encoding, ak.sv("text/html")) or ak.string_equals_ignoring_ascii_case_string_view(&encoding, ak.sv("application/xhtml+xml")):
+                return true
+
+    # - An SVG foreignObject element
+    # - An SVG desc element
+    # - An SVG title element
+    if html_parser_element_namespace_is(element, namespace_svg) and html_parser_local_name_is_one_of(element, [svg_tag_names_foreign_object, svg_tag_names_desc, svg_tag_names_title]):
+        return true
+
+    return false
+
+## The tokenizer's question to its parser (DESIGN.md §4.1.3, HTMLTokenizer.cpp:491):
+## `m_parser->adjusted_current_node() && m_parser->adjusted_current_node()->namespace_uri() != Namespace::HTML`.
+func html_parser_adjusted_current_node_is_foreign(parser: void*) -> bool:
+    let this = (HtmlParser*)parser
+    let node = html_parser_adjusted_current_node(this) else return false
+    return not html_parser_element_namespace_is(node, namespace_html)
+
+## The constructors' `set_on_element_popped([this](DOM::Element& element) { handle_element_popped(element); })`.
+func html_parser_on_element_popped(context: void*?, element: DomElement*):
+    html_parser_handle_element_popped((HtmlParser*)(context else trap("no parser")), element)
+
+## Ported from HTMLParser.cpp:162 Web::HTML::HTMLParser::HTMLParser.
+pub func html_parser_construct_string_view(this: HtmlParser*, document: DomDocument*, scripting_mode: HtmlParserScriptingMode, input: ak.StringView, encoding: ak.StringView):
+    html_parser_init_fields(this)
+    html_syntax.html_tokenizer_construct_string_view(&this.m_tokenizer, input, ak.byte_string_from_string_view(encoding))
+    this.m_scripting_mode = scripting_mode
+    this.m_character_insertion_builder = ak.string_builder_new_mode(ak.StringBuilderMode.utf16)
+    this.m_document = document
+
+    html_syntax.html_tokenizer_set_parser(&this.m_tokenizer, html_parser_adjusted_current_node_is_foreign, this)
+    dom_document_set_parser(document, this)
+    html_stack_of_open_elements_set_on_element_popped(&this.m_stack_of_open_elements, ak.Function1[DomElement*, unit](call = html_parser_on_element_popped, context = this))
+    let standardized_encoding = text_codec.get_standardized_encoding(encoding) else trap("VERIFY: standardized_encoding.has_value()")
+    let encoding_string = ak.string_from_utf8(standardized_encoding) else trap("MUST: String::from_utf8")
+    dom_document_set_encoding(document, encoding_string)
+
+## Ported from HTMLParser.cpp:177 Web::HTML::HTMLParser::HTMLParser.
+pub func html_parser_construct_html_parser_script_created_par(this: HtmlParser*, document: DomDocument*, scripting_mode: HtmlParserScriptingMode, script_created: HtmlParserScriptCreatedParser):
+    html_parser_init_fields(this)
+    html_syntax.html_tokenizer_construct(&this.m_tokenizer)
+    this.m_scripting_mode = scripting_mode
+    this.m_script_created = script_created == HtmlParserScriptCreatedParser.yes
+    this.m_character_insertion_builder = ak.string_builder_new_mode(ak.StringBuilderMode.utf16)
+    this.m_document = document
+
+    dom_document_set_parser(document, this)
+    html_syntax.html_tokenizer_set_parser(&this.m_tokenizer, html_parser_adjusted_current_node_is_foreign, this)
+    html_stack_of_open_elements_set_on_element_popped(&this.m_stack_of_open_elements, ak.Function1[DomElement*, unit](call = html_parser_on_element_popped, context = this))
+
+## Ported from HTMLParser.cpp:193 Web::HTML::HTMLParser::visit_edges (override).
+pub func html_parser_visit_edges_impl(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (HtmlParser*)base
+    gc.cell_visit_edges_impl(base, visitor)
+    gc.cell_visitor_visit_t(visitor, this.m_document)
+    gc.cell_visitor_visit_t(visitor, this.m_head_element)
+    gc.cell_visitor_visit_t(visitor, this.m_form_element)
+    gc.cell_visitor_visit_t(visitor, this.m_context_element)
+    gc.cell_visitor_visit_t(visitor, this.m_active_speculative_html_parser)
+    gc.cell_visitor_visit_t(visitor, this.m_character_insertion_node)
+
+    html_stack_of_open_elements_visit_edges(&this.m_stack_of_open_elements, visitor)
+    html_list_of_active_formatting_elements_visit_edges(&this.m_list_of_active_formatting_elements, visitor)
+    html_syntax.html_tokenizer_visit_edges(&this.m_tokenizer, visitor)
+
+## Ported from HTMLParser.cpp:208 Web::HTML::HTMLParser::initialize (override).
+pub func html_parser_initialize_impl(base: JsCell*, realm: Realm*):
+    js_cell_initialize_impl(base, realm)
+
+## Ported from HTMLParser.cpp:213 Web::HTML::HTMLParser::run.
+pub func html_parser_run_html_tokenizer_stop_at_inserti(this: HtmlParser*, stop_at_insertion_point: html_syntax.HtmlTokenizerStopAtInsertionPoint = html_syntax.HtmlTokenizerStopAtInsertionPoint.no):
+    this.m_stop_parsing = false
+
+    while true:
+        if this.m_parser_pause_flag:
+            break
+
+        var token = html_syntax.html_tokenizer_next_token(&this.m_tokenizer, stop_at_insertion_point) else break
+
+        if html_parser_debug:
+            let token_string = html_syntax.html_token_to_string(&token)
+            let token_view = ak.string_bytes_as_string_view(&token_string)
+            ak.dbgln(f"[{html_parser_insertion_mode_name(this)}] {(str)ak.string_view_bytes(&token_view)}")
+
+        if this.m_next_line_feed_can_be_ignored:
+            this.m_next_line_feed_can_be_ignored = false
+            if html_syntax.html_token_is_character(&token) and html_syntax.html_token_code_point(&token) == (u32)'\n':
+                continue
+
+        # https://html.spec.whatwg.org/multipage/parsing.html#tree-construction-dispatcher
+        # As each token is emitted from the tokenizer, the user agent must follow the appropriate steps from the following list, known as the tree construction dispatcher:
+        if html_parser_dispatches_to_html_content(this, &token):
+            # -> If the stack of open elements is empty
+            # -> If the adjusted current node is an element in the HTML namespace
+            # -> If the adjusted current node is a MathML text integration point and the token is a start tag whose tag name is neither "mglyph" nor "malignmark"
+            # -> If the adjusted current node is a MathML text integration point and the token is a character token
+            # -> If the adjusted current node is a MathML annotation-xml element and the token is a start tag whose tag name is "svg"
+            # -> If the adjusted current node is an HTML integration point and the token is a start tag
+            # -> If the adjusted current node is an HTML integration point and the token is a character token
+            # -> If the token is an end-of-file token
+
+            # Process the token according to the rules given in the section corresponding to the current insertion mode in HTML content.
+            html_parser_process_using_the_rules_for(this, this.m_insertion_mode, &token)
+        else:
+            # -> Otherwise
+
+            # Process the token according to the rules given in the section for parsing tokens in foreign content.
+            html_parser_process_using_the_rules_for_foreign_content(this, &token)
+
+        if html_syntax.html_token_is_end_of_file(&token) and html_syntax.html_tokenizer_is_eof_inserted(&this.m_tokenizer):
+            break
+
+        if this.m_stop_parsing:
+            if html_parser_debug:
+                ak.dbgln(f"Stop parsing{" fragment" if this.m_parsing_fragment else ""}! :^)")
+            break
+
+    html_parser_flush_character_insertions(this)
+
+    html_syntax.html_tokenizer_parser_did_run(&this.m_tokenizer)
+
+## run()'s tree construction dispatcher condition (HTMLParser.cpp:237-243), evaluated in the C++
+## order with its short-circuits.
+func html_parser_dispatches_to_html_content(this: HtmlParser*, token: html_syntax.HtmlToken*) -> bool:
+    if html_stack_of_open_elements_is_empty(&this.m_stack_of_open_elements):
+        return true
+    let node = html_parser_adjusted_current_node(this) else trap("VERIFY: adjusted current node")
+    if html_parser_element_namespace_is(node, namespace_html):
+        return true
+    if html_is_mathml_text_integration_point(node) and html_syntax.html_token_is_start_tag(token) and not html_parser_tag_name_is(token, math_ml_tag_names_mglyph) and not html_parser_tag_name_is(token, math_ml_tag_names_malignmark):
+        return true
+    if html_is_mathml_text_integration_point(node) and html_syntax.html_token_is_character(token):
+        return true
+    if html_parser_element_namespace_is(node, namespace_math_ml) and html_parser_local_name_is(node, math_ml_tag_names_annotation_xml) and html_syntax.html_token_is_start_tag(token) and html_parser_tag_name_is(token, svg_tag_names_svg):
+        return true
+    if html_is_html_integration_point(node) and (html_syntax.html_token_is_start_tag(token) or html_syntax.html_token_is_character(token)):
+        return true
+    return html_syntax.html_token_is_end_of_file(token)
+
+## Ported from HTMLParser.cpp:276 Web::HTML::HTMLParser::run.
+pub func html_parser_run_url(this: HtmlParser*, url: web_url.Url, stop_at_insertion_point: html_syntax.HtmlTokenizerStopAtInsertionPoint = html_syntax.HtmlTokenizerStopAtInsertionPoint.no):
+    let document = this.m_document else trap("VERIFY: document")
+    dom_document_set_url(document, url)
+    dom_document_set_source(document, html_syntax.html_tokenizer_source(&this.m_tokenizer))
+    html_parser_run_until_completion(this, stop_at_insertion_point)
+
+## run_until_completion's `m_post_parse_action = [this] { the_end(*m_document, this); }`.
+func html_parser_run_until_completion_the_end(context: void*?):
+    let this = (HtmlParser*)(context else trap("no parser"))
+    html_parser_the_end(this.m_document else trap("VERIFY: document"), this)
+
+## Ported from HTMLParser.cpp:283 Web::HTML::HTMLParser::run_until_completion.
+pub func html_parser_run_until_completion(this: HtmlParser*, stop_at_insertion_point: html_syntax.HtmlTokenizerStopAtInsertionPoint = html_syntax.HtmlTokenizerStopAtInsertionPoint.no):
+    this.m_post_parse_action = ak.Function0[unit](call = html_parser_run_until_completion_the_end, context = this)
+    html_parser_run_html_tokenizer_stop_at_inserti(this, stop_at_insertion_point)
+    if not this.m_parser_pause_flag:
+        html_parser_invoke_post_parse_action(this)
+
+## Ported from HTMLParser.cpp:292 Web::HTML::HTMLParser::the_end.
+# https://html.spec.whatwg.org/multipage/parsing.html#the-end
+pub func html_parser_the_end(document: DomDocument*, parser: HtmlParser*? = none):
+    # Once the user agent stops parsing the document, the user agent must run the following steps:
+
+    # NOTE: This is a static method because the spec sometimes wants us to "act as if the user agent had stopped
+    #       parsing document" which means running these steps without an HTML Parser. That makes it awkward to call,
+    #       but it's preferable to duplicating so much code.
+
+    if let p = parser:
+        assert(p.m_document == document)
+
+    # The entirety of "the end" should be a no-op for HTML fragment parsers, because:
+    # - the temporary document is not accessible, making the DOMContentLoaded event and "ready for post load tasks" do
+    #   nothing, making the parser not re-entrant from document.{open,write,close} and document.readyState inaccessible
+    # - there is no Window associated with it and no associated browsing context with the temporary document (meaning
+    #   the Window load event is skipped and making the load timing info inaccessible)
+    # - scripts are not able to be prepared, meaning the script queues are empty.
+    # However, the unconditional "spin the event loop" invocations cause two issues:
+    # - Microtask timing is changed, as "spin the event loop" performs an unconditional microtask checkpoint, causing
+    #   things to happen out of order. For example, YouTube sets the innerHTML of a <template> element in the constructor
+    #   of the ytd-app custom element _before_ setting up class attributes. Since custom elements use microtasks to run
+    #   callbacks, this causes custom element callbacks that rely on attributes setup by the constructor to run before
+    #   the attributes are set up, causing unhandled exceptions.
+    # - Load event delaying can spin forever, e.g. if the fragment contains an <img> element which stops delaying the
+    #   load event from an element task. Since tasks are not considered runnable if they're from a document with no
+    #   browsing context (i.e. the temporary document made for innerHTML), the <img> element will forever delay the load
+    #   event and cause an infinite loop.
+    # We can avoid these issues and also avoid doing unnecessary work by simply skipping "the end" for HTML fragment
+    # parsers.
+    # See the message of the commit that added this for more details.
+    if let p = parser:
+        if p.m_parsing_fragment:
+            return
+
+    # 1. If the active speculative HTML parser is not null, then stop the speculative HTML parser and return.
+    if let p = parser:
+        if p.m_active_speculative_html_parser != none:
+            html_parser_stop_the_speculative_html_parser(p)
+            return
+
+    # 2. Set the insertion point to undefined.
+    if let p = parser:
+        html_syntax.html_tokenizer_undefine_insertion_point(&p.m_tokenizer)
+
+    # 3. Update the current document readiness to "interactive".
+    dom_document_update_readiness(document, HtmlDocumentReadyState.interactive)
+
+    # 4. Pop all the nodes off the stack of open elements.
+    if let p = parser:
+        while not html_stack_of_open_elements_is_empty(&p.m_stack_of_open_elements):
+            discard(html_stack_of_open_elements_pop(&p.m_stack_of_open_elements))
+
+    # AD-HOC: Skip remaining steps when there's no browsing context.
+    # This happens when parsing HTML via DOMParser or similar mechanisms.
+    # Note: This diverges from the spec, which expects more steps to follow.
+    if dom_document_browsing_context(document) == none:
+        # Parsed via DOMParser, no need to wait for load events.
+        dom_document_update_readiness(document, HtmlDocumentReadyState.complete)
+        return
+
+    # Steps 5-11 are handled by the HTMLParserEndState state machine.
+    let state = html_parser_end_state_create(document, parser)
+    dom_document_set_html_parser_end_state(document, state)
+    html_parser_end_state_schedule_progress_check(state)
+
+## Ported from HTMLParser.cpp:365 Web::HTML::perform_pre_progress_microtask_checkpoint.
+# Perform a microtask checkpoint matching spin_until's pre-check semantics: pending microtasks (e.g. image load-event
+# delayer creation from update_the_image_data step 8) must be drained before checking parser progress. The empty-queue
+# fast path avoids the save/clear/restore of the execution context stack and notify_about_rejected_promises when there
+# is nothing to drain.
+func html_perform_pre_progress_microtask_checkpoint():
+    let event_loop = html_main_thread_event_loop()
+    if html_event_loop_microtask_queue_empty(event_loop):
+        return
+    let vm = js_cell_vm(event_loop.js_cell())
+    vm_save_execution_context_stack(vm)
+    vm_clear_execution_context_stack(vm)
+    html_event_loop_perform_a_microtask_checkpoint(event_loop)
+    vm_restore_execution_context_stack(vm)
+
+# mark: HTMLParserEndState ======================================================================
+
+## Ported from HTMLParser.cpp:377 Web::HTML::HTMLParserEndState::create
+## (`document->heap().allocate<HTMLParserEndState>(document, parser)`).
+pub func html_parser_end_state_create(document: DomDocument*, parser: HtmlParser*?) -> HtmlParserEndState*:
+    let heap = gc.cell_heap(document.cell())
+    let this = (HtmlParserEndState*)web_heap_allocate_cell(heap, &html_parser_end_state_class)
+    gc.heap_defer_gc(heap)
+    html_parser_end_state_construct(this, document, parser)
+    gc.heap_undefer_gc(heap)
+    return this
+
+## The end state's timeout handler (`[this] { if (m_phase != Phase::Completed) dbgln(...); }`).
+func html_parser_end_state_timed_out(context: void*?):
+    let this = (HtmlParserEndState*)(context else trap("no end state"))
+    if this.m_phase != HtmlParserEndStatePhase.completed:
+        ak.dbgln(f"HTMLParserEndState: timed out in phase {(i32)this.m_phase}")
+
+## Ported from HTMLParser.cpp:382 Web::HTML::HTMLParserEndState::HTMLParserEndState.
+pub func html_parser_end_state_construct(this: HtmlParserEndState*, document: DomDocument*, parser: HtmlParser*?):
+    let heap = gc.cell_heap(this.cell())
+    this.m_phase = HtmlParserEndStatePhase.waiting_for_deferred_scripts
+    this.m_check_pending = false
+    this.m_document = document
+    this.m_parser = parser
+    this.m_timeout = platform_timer_create_single_shot(heap, html_the_end_timeout_ms, gc.create_function0(heap, ak.Function0[unit](call = html_parser_end_state_timed_out, context = this)))
+    platform_timer_start(this.m_timeout)
+
+## Ported from HTMLParser.cpp:393 Web::HTML::HTMLParserEndState::visit_edges (override).
+pub func html_parser_end_state_visit_edges_impl(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (HtmlParserEndState*)base
+    gc.cell_visit_edges_impl(base, visitor)
+    gc.cell_visitor_visit_t_2(visitor, this.m_document)
+    gc.cell_visitor_visit_t(visitor, this.m_parser)
+    gc.cell_visitor_visit_t_2(visitor, this.m_timeout)
+
+## schedule_progress_check's deferred step (`[this] { perform_pre_progress_microtask_checkpoint(); check_progress(); m_check_pending = false; }`).
+func html_parser_end_state_deferred_progress_check(context: void*?):
+    let this = (HtmlParserEndState*)(context else trap("no end state"))
+    html_perform_pre_progress_microtask_checkpoint()
+    html_parser_end_state_check_progress(this)
+    this.m_check_pending = false
+
+## Ported from HTMLParser.cpp:401 Web::HTML::HTMLParserEndState::schedule_progress_check.
+pub func html_parser_end_state_schedule_progress_check(this: HtmlParserEndState*):
+    if this.m_phase == HtmlParserEndStatePhase.completed:
+        return
+    if this.m_check_pending:
+        return
+    this.m_check_pending = true
+    let heap = gc.cell_heap(this.cell())
+    platform_event_loop_plugin_deferred_invoke(platform_event_loop_plugin_the(), gc.create_function0(heap, ak.Function0[unit](call = html_parser_end_state_deferred_progress_check, context = this)))
+
+## Ported from HTMLParser.cpp:415 Web::HTML::HTMLParserEndState::check_progress. The C++ switch
+## falls through from each phase to the next; here each phase's steps run when the phase is at
+## most that one.
+func html_parser_end_state_check_progress(this: HtmlParserEndState*):
+    # AD-HOC: Bail out if the document is no longer fully active (e.g. navigated away from).
+    if not dom_document_is_fully_active(this.m_document):
+        html_parser_end_state_complete(this)
+        return
+
+    if this.m_phase == HtmlParserEndStatePhase.waiting_for_deferred_scripts:
+        # 5. While the list of scripts that will execute when the document has finished parsing is not empty:
+        let scripts = dom_document_scripts_to_execute_when_parsing_has_finished(this.m_document)
+        while not ak.vector_is_empty(scripts):
+            let first_script = *ak.vector_first(scripts)
+
+            # 1. Spin the event loop until the first script in the list of scripts that will execute when the document has finished parsing
+            #    has its "ready to be parser-executed" flag set and the parser's Document has no style sheet that is blocking scripts.
+            if not html_script_element_is_ready_to_be_parser_executed(first_script) or dom_document_has_a_style_sheet_that_is_blocking_scripts(this.m_document):
+                return
+
+            # 2. Execute the first script in the list of scripts that will execute when the document has finished parsing.
+            html_script_element_execute_script(first_script)
+
+            # 3. Remove the first script element from the list of scripts that will execute when the document has finished parsing (i.e. shift out the first entry in the list).
+            discard(ak.vector_take_first(scripts))
+
+        html_parser_end_state_advance_to_asap_scripts_phase(this)
+        # [[fallthrough]]
+
+    if this.m_phase == HtmlParserEndStatePhase.waiting_for_asap_scripts:
+        # 7. Spin the event loop until the set of scripts that will execute as soon as possible and the list of scripts
+        #    that will execute in order as soon as possible are empty.
+        if not ak.vector_is_empty(dom_document_scripts_to_execute_as_soon_as_possible(this.m_document)) or not ak.vector_is_empty(dom_document_scripts_to_execute_in_order_as_soon_as_possible(this.m_document)):
+            return
+
+        this.m_phase = HtmlParserEndStatePhase.waiting_for_load_event_delay
+        # [[fallthrough]]
+
+    if this.m_phase == HtmlParserEndStatePhase.waiting_for_load_event_delay:
+        # 8. Spin the event loop until there is nothing that delays the load event in the Document.
+        if dom_document_anything_is_delaying_the_load_event(this.m_document):
+            return
+
+        this.m_phase = HtmlParserEndStatePhase.completed
+        # [[fallthrough]]
+
+    # case Phase::Completed:
+    html_parser_end_state_complete(this)
+
+## advance_to_asap_scripts_phase's DOMContentLoaded task (`[document = m_document] { ... }`).
+func html_parser_end_state_dom_content_loaded_task(context: void*?):
+    let document = (DomDocument*)(context else trap("no document"))
+    # 1. Set the Document's load timing info's DOM content loaded event start time to the current high resolution time given the Document's relevant global object.
+    dom_document_load_timing_info(document).dom_content_loaded_event_start_time = high_resolution_time_current_high_resolution_time(html_relevant_global_object((JsObject*)document))
+
+    # 2. Fire an event named DOMContentLoaded at the Document object, with its bubbles attribute initialized to true.
+    let content_loaded_event = dom_event_create(bind_platform_object_realm(document.bind_platform_object()), html_event_names_dom_content_loaded)
+    dom_event_set_bubbles(content_loaded_event, true)
+    discard(dom_event_target_dispatch_event(document.dom_event_target(), content_loaded_event))
+
+    # 3. Set the Document's load timing info's DOM content loaded event end time to the current high resolution time given the Document's relevant global object.
+    dom_document_load_timing_info(document).dom_content_loaded_event_end_time = high_resolution_time_current_high_resolution_time(html_relevant_global_object((JsObject*)document))
+
+    # FIXME: 4. Enable the client message queue of the ServiceWorkerContainer object whose associated service worker client is the Document object's relevant settings object.
+
+    # FIXME: 5. Invoke WebDriver BiDi DOM content loaded with the Document's browsing context, and a new WebDriver BiDi navigation status whose id is the Document object's navigation id, status is "pending", and url is the Document object's URL.
+
+## Ported from HTMLParser.cpp:468 Web::HTML::HTMLParserEndState::advance_to_asap_scripts_phase.
+func html_parser_end_state_advance_to_asap_scripts_phase(this: HtmlParserEndState*):
+    # AD-HOC: We need to scroll to the fragment on page load somewhere.
+    # But a script that ran in step 5 above may have scrolled the page already,
+    # so only do this if there is an actual fragment to avoid resetting the scroll position unexpectedly.
+    # Spec bug: https://github.com/whatwg/html/issues/10914
+    let indicated_part = dom_document_determine_the_indicated_part(this.m_document)
+    var indicated_part_is_an_element = false
+    match indicated_part:
+        .dom_element(element): indicated_part_is_an_element = element != none
+        _: indicated_part_is_an_element = false
+    if indicated_part_is_an_element:
+        dom_document_scroll_to_the_fragment(this.m_document)
+
+    # 6. Queue a global task on the DOM manipulation task source given the Document's relevant global object to run the following substeps:
+    let heap = gc.cell_heap(this.m_document.cell())
+    discard(html_queue_global_task(HtmlTaskSource.dom_manipulation, (JsObject*)this.m_document, gc.create_function0(heap, ak.Function0[unit](call = html_parser_end_state_dom_content_loaded_task, context = this.m_document))))
+
+    this.m_phase = HtmlParserEndStatePhase.waiting_for_asap_scripts
+
+## complete()'s task captures (`[document = m_document, parser = m_parser]`).
+struct HtmlParserEndStateCompleteTask:
+    var document: DomDocument*
+    var parser: HtmlParser*?
+
+## complete()'s load task.
+func html_parser_end_state_complete_task(context: void*?):
+    let captures = (HtmlParserEndStateCompleteTask*)(context else trap("no captures"))
+    let document = captures.document
+
+    # 1. Update the current document readiness to "complete".
+    dom_document_update_readiness(document, HtmlDocumentReadyState.complete)
+
+    # AD-HOC: We need to wait until the document ready state is complete before detaching the parser, otherwise the DOM complete time will not be set correctly.
+    if captures.parser != none:
+        dom_document_detach_parser(document)
+
+    # 2. If the Document object's browsing context is null, then abort these steps.
+    if dom_document_browsing_context(document) == none:
+        return
+
+    # 3. Let window be the Document's relevant global object.
+    let window = as_html_window((gc.Cell*)html_relevant_global_object((JsObject*)document))
+
+    # 4. Set the Document's load timing info's load event start time to the current high resolution time given window.
+    dom_document_load_timing_info(document).load_event_start_time = high_resolution_time_current_high_resolution_time((JsObject*)window)
+
+    # 5. Fire an event named load at window, with legacy target override flag set.
+    # FIXME: The legacy target override flag is currently set by a virtual override of dispatch_event()
+    #        We should reorganize this so that the flag appears explicitly here instead.
+    discard(dom_event_target_dispatch_event(window.dom_event_target(), dom_event_create(bind_platform_object_realm(document.bind_platform_object()), html_event_names_load)))
+
+    # FIXME: 6. Invoke WebDriver BiDi load complete with the Document's browsing context, and a new WebDriver BiDi navigation status whose id is the Document object's navigation id, status is "complete", and url is the Document object's URL.
+
+    # FIXME: 7. Set the Document object's navigation id to null.
+
+    # 8. Set the Document's load timing info's load event end time to the current high resolution time given window.
+    dom_document_load_timing_info(document).load_event_end_time = high_resolution_time_current_high_resolution_time((JsObject*)window)
+
+    # 9. Assert: Document's page showing is false.
+    assert(not dom_document_page_showing(document))
+
+    # 10. Set the Document's page showing to true.
+    dom_document_set_page_showing(document, true)
+
+    # 11. Fire a page transition event named pageshow at window with false.
+    html_window_fire_a_page_transition_event(window, html_event_names_pageshow, false)
+
+    # 12. Completely finish loading the Document.
+    dom_document_completely_finish_loading(document)
+
+    # FIXME: 13. Queue the navigation timing entry for the Document.
+
+## Ported from HTMLParser.cpp:500 Web::HTML::HTMLParserEndState::complete.
+func html_parser_end_state_complete(this: HtmlParserEndState*):
+    this.m_phase = HtmlParserEndStatePhase.completed
+    platform_timer_stop(this.m_timeout)
+    dom_document_set_html_parser_end_state(this.m_document, none)
+
+    # 9. Queue a global task on the DOM manipulation task source given the Document's relevant global object to run the following steps:
+    let heap = gc.cell_heap(this.m_document.cell())
+    let captures = new HtmlParserEndStateCompleteTask(document = this.m_document, parser = this.m_parser) else trap("out of memory")
+    discard(html_queue_global_task(HtmlTaskSource.dom_manipulation, (JsObject*)this.m_document, gc.create_function0(heap, ak.Function0[unit](call = html_parser_end_state_complete_task, context = captures))))
+
+    # FIXME: 10. If the Document's print when loaded flag is set, then run the printing steps.
+
+    # 11. The Document is now ready for post-load tasks.
+    dom_document_set_ready_for_post_load_tasks(this.m_document, true)

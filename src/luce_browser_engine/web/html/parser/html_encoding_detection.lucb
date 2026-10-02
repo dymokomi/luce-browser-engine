@@ -1,0 +1,481 @@
+#==============================================================================================
+#
+#   html_encoding_detection - HTML::HTMLEncodingDetection: determining a document's character
+#                             encoding from its bytes
+#
+#   DESCRIPTION:
+#       Port of LibWeb/HTML/Parser/HTMLEncodingDetection.cpp (lines 1-516): the prescan helpers,
+#       extracting a character encoding from a meta element, getting an attribute while
+#       sniffing, the prescan of the byte stream, BOM sniffing and the encoding sniffing
+#       algorithm. prescan_get_attribute's `goto spaces` and `goto value` are a flag that skips
+#       the spaces step when the name loop ended on '='.
+#
+#==============================================================================================
+
+# mark: Prescan helpers =========================================================================
+
+## Ported from HTMLEncodingDetection.cpp:21 Web::HTML::prescan_should_abort.
+func html_prescan_should_abort(input: const u8[], position: usize) -> bool:
+    return position >= input.length or position >= 1024
+
+## Ported from HTMLEncodingDetection.cpp:26 Web::HTML::is_whitespace.
+func html_is_whitespace(byte: u8) -> bool:
+    return byte == '\t' or byte == '\n' or byte == 0x0C or byte == '\r' or byte == ' '
+
+## Ported from HTMLEncodingDetection.cpp:31 Web::HTML::is_whitespace_or_slash.
+func html_is_whitespace_or_slash(byte: u8) -> bool:
+    return html_is_whitespace(byte) or byte == '/'
+
+## Ported from HTMLEncodingDetection.cpp:36 Web::HTML::is_whitespace_or_end_chevron.
+func html_is_whitespace_or_end_chevron(byte: u8) -> bool:
+    return html_is_whitespace(byte) or byte == '>'
+
+## Ported from HTMLEncodingDetection.cpp:41 Web::HTML::prescan_skip_whitespace_and_slashes.
+func html_prescan_skip_whitespace_and_slashes(input: const u8[], position: usize*) -> bool:
+    while not html_prescan_should_abort(input, *position) and html_is_whitespace_or_slash(input[*position]):
+        *position += 1
+    return not html_prescan_should_abort(input, *position)
+
+# mark: Meta elements ===========================================================================
+
+## extract_character_encoding_from_meta_element's consume_until predicate
+## (`Infra::is_ascii_whitespace(c) || c == ';'`).
+struct HtmlIsAsciiWhitespaceOrSemicolon: ak.CharPredicate:
+    var unused: u8
+
+    func matches(ch: u8) -> bool:
+        return web_infra.is_ascii_whitespace((u32)ch) or ch == ';'
+
+## Ported from HTMLEncodingDetection.cpp:49 Web::HTML::extract_character_encoding_from_meta_element.
+# https://html.spec.whatwg.org/multipage/urls-and-fetching.html#algorithm-for-extracting-a-character-encoding-from-a-meta-element
+pub func html_extract_character_encoding_from_meta_element(string: ak.ByteString) -> ak.StringView?:
+    # Checking for "charset" is case insensitive, as is getting an encoding.
+    # Therefore, stick to lowercase from the start for simplicity.
+    let lowercase_string = ak.byte_string_to_lowercase(&string)
+    var lexer = ak.generic_lexer_new(ak.byte_string_view(&lowercase_string))
+    let is_ascii_whitespace = DomElementIsAsciiWhitespace(unused = 0)
+
+    while true:
+        let remaining = ak.generic_lexer_remaining(&lexer)
+        let charset_index = ak.string_view_find_string_view(&remaining, ak.sv("charset")) else return none
+
+        # 7 is the length of "charset".
+        ak.generic_lexer_ignore(&lexer, charset_index + 7)
+
+        ak.generic_lexer_ignore_while(&lexer, &is_ascii_whitespace)
+
+        if ak.generic_lexer_peek(&lexer) != '=':
+            continue
+
+        break
+
+    # Ignore the '='.
+    ak.generic_lexer_ignore(&lexer)
+
+    ak.generic_lexer_ignore_while(&lexer, &is_ascii_whitespace)
+
+    if ak.generic_lexer_is_eof(&lexer):
+        return none
+
+    if ak.generic_lexer_consume_specific_t_char_type(&lexer, '"'):
+        let remaining = ak.generic_lexer_remaining(&lexer)
+        let matching_double_quote = ak.string_view_find_u8(&remaining, '"') else return none
+
+        let encoding = ak.string_view_substring_view_usize(&remaining, 0, matching_double_quote)
+        return text_codec.get_standardized_encoding(encoding)
+
+    if ak.generic_lexer_consume_specific_t_char_type(&lexer, '\''):
+        let remaining = ak.generic_lexer_remaining(&lexer)
+        let matching_single_quote = ak.string_view_find_u8(&remaining, '\'') else return none
+
+        let encoding = ak.string_view_substring_view_usize(&remaining, 0, matching_single_quote)
+        return text_codec.get_standardized_encoding(encoding)
+
+    let stop = HtmlIsAsciiWhitespaceOrSemicolon(unused = 0)
+    let encoding = ak.generic_lexer_consume_until_tt_predicate(&lexer, &stop)
+    return text_codec.get_standardized_encoding(encoding)
+
+# mark: Getting an attribute ====================================================================
+
+## `DOM::Attr::create(document, MUST(attribute_name.to_string()), value)`.
+func html_prescan_create_attribute(document: DomDocument*, attribute_name: ak.StringBuilder*, value: ak.String) -> DomAttr*:
+    let name = ak.string_builder_to_string(attribute_name) else trap("MUST: to_string")
+    return dom_attr_create_fly_string(document, ak.fly_string_from_string(name), value)
+
+## Ported from HTMLEncodingDetection.cpp:109 Web::HTML::prescan_get_attribute.
+# https://html.spec.whatwg.org/multipage/parsing.html#concept-get-attributes-when-sniffing
+pub func html_prescan_get_attribute(document: DomDocument*, input: const u8[], position: usize*) -> DomAttr*?:
+    # 1. If the byte at position is one of 0x09 (HT), 0x0A (LF), 0x0C (FF), 0x0D (CR), 0x20 (SP), or 0x2F (/),
+    #    then advance position to the next byte and redo this step.
+    if not html_prescan_skip_whitespace_and_slashes(input, position):
+        return none
+
+    # 2. If the byte at position is 0x3E (>), then abort the get an attribute algorithm. There isn't one.
+    if input[*position] == '>':
+        return none
+
+    # 3. Otherwise, the byte at position is the start of the attribute name. Let attribute name and attribute value be the empty string.
+    # 4. Process the byte at position as follows:
+    var attribute_name = ak.string_builder_new()
+    var go_to_value = false
+    while true:
+        # -> If it is 0x3D (=), and the attribute name is longer than the empty string
+        if input[*position] == '=' and not ak.string_builder_is_empty(&attribute_name):
+            # Advance position to the next byte and jump to the step below labeled value.
+            *position += 1
+            go_to_value = true
+            break
+        # -> If it is 0x09 (HT), 0x0A (LF), 0x0C (FF), 0x0D (CR), or 0x20 (SP)
+        if html_is_whitespace(input[*position]):
+            # Jump to the step below labeled spaces.
+            break
+        # -> If it is 0x2F (/) or 0x3E (>)
+        if input[*position] == '/' or input[*position] == '>':
+            # Abort the get an attribute algorithm. The attribute's name is the value of attribute name, its value is the empty string.
+            return html_prescan_create_attribute(document, &attribute_name, ak.string_new())
+        # -> If it is in the range 0x41 (A) to 0x5A (Z)
+        if input[*position] >= 'A' and input[*position] <= 'Z':
+            # Append the code point b+0x20 to attribute name (where b is the value of the byte at position). (This converts the input to lowercase.)
+            ak.string_builder_append_code_point(&attribute_name, (u32)input[*position] + 0x20)
+        # -> Anything else
+        else:
+            # Append the code point with the same value as the byte at position to attribute name.
+            # (It doesn't actually matter how bytes outside the ASCII range are handled here,
+            # since only ASCII bytes can contribute to the detection of a character encoding.)
+            ak.string_builder_append_code_point(&attribute_name, (u32)input[*position])
+
+        # 5. Advance position to the next byte and return to the previous step.
+        *position += 1
+        if html_prescan_should_abort(input, *position):
+            return none
+
+    if not go_to_value:
+        # spaces:
+        # 6. Spaces: If the byte at position is one of 0x09 (HT), 0x0A (LF), 0x0C (FF), 0x0D (CR), or 0x20 (SP),
+        #    then advance position to the next byte, then, repeat this step.
+        if not html_prescan_skip_whitespace_and_slashes(input, position):
+            return none
+
+        # 7. If the byte at position is not 0x3D (=), abort the get an attribute algorithm.
+        #    The attribute's name is the value of attribute name, its value is the empty string.
+        if input[*position] != '=':
+            return html_prescan_create_attribute(document, &attribute_name, ak.string_new())
+
+        # 8. Advance position past the 0x3D (=) byte.
+        *position += 1
+
+    # value:
+    # 9. Value: If the byte at position is one of 0x09 (HT), 0x0A (LF), 0x0C (FF), 0x0D (CR), or 0x20 (SP),
+    #    then advance position to the next byte, then, repeat this step.
+    if not html_prescan_skip_whitespace_and_slashes(input, position):
+        return none
+
+    var attribute_value = ak.string_builder_new()
+    # 10. Process the byte at position as follows:
+
+    # -> If it is 0x22 (") or 0x27 (')
+    if input[*position] == '"' or input[*position] == '\'':
+        # 1. Let b be the value of the byte at position.
+        let quote_character = input[*position]
+
+        # 2. Quote loop: Advance position to the next byte.
+        *position += 1
+
+        while not html_prescan_should_abort(input, *position):
+            # 3. If the value of the byte at position is the value of b, then advance position to the next byte
+            #    and abort the "get an attribute" algorithm.
+            #    The attribute's name is the value of attribute name, and its value is the value of attribute value.
+            if input[*position] == quote_character:
+                *position += 1
+                let value = ak.string_builder_to_string(&attribute_value) else trap("MUST: to_string")
+                return html_prescan_create_attribute(document, &attribute_name, value)
+
+            # 4. Otherwise, if the value of the byte at position is in the range 0x41 (A) to 0x5A (Z),
+            #    then append a code point to attribute value whose value is 0x20 more than the value of the byte at position.
+            if input[*position] >= 'A' and input[*position] <= 'Z':
+                ak.string_builder_append_code_point(&attribute_value, (u32)input[*position] + 0x20)
+            # 5. Otherwise, append a code point to attribute value whose value is the same as the value of the byte at position.
+            else:
+                ak.string_builder_append_code_point(&attribute_value, (u32)input[*position])
+
+            # 6. Return to the step above labeled quote loop.
+            *position += 1
+        return none
+
+    # -> If it is 0x3E (>)
+    if input[*position] == '>':
+        # Abort the get an attribute algorithm. The attribute's name is the value of attribute name, its value is the empty string.
+        return html_prescan_create_attribute(document, &attribute_name, ak.string_new())
+
+    # -> If it is in the range 0x41 (A) to 0x5A (Z)
+    if input[*position] >= 'A' and input[*position] <= 'Z':
+        # Append a code point b+0x20 to attribute value (where b is the value of the byte at position).
+        ak.string_builder_append_code_point(&attribute_value, (u32)input[*position] + 0x20)
+        # Advance position to the next byte.
+        *position += 1
+    # -> Anything else
+    else:
+        # Append a code point with the same value as the byte at position to attribute value.
+        ak.string_builder_append_code_point(&attribute_value, (u32)input[*position])
+        # Advance position to the next byte.
+        *position += 1
+
+    if html_prescan_should_abort(input, *position):
+        return none
+
+    # 11. Process the byte at position as follows:
+    while not html_prescan_should_abort(input, *position):
+        # -> If it is 0x09 (HT), 0x0A (LF), 0x0C (FF), 0x0D (CR), 0x20 (SP), or 0x3E (>)
+        if html_is_whitespace_or_end_chevron(input[*position]):
+            # Abort the get an attribute algorithm. The attribute's name is the value of attribute name and its value is the value of attribute value.
+            let value = ak.string_builder_to_string(&attribute_value) else trap("MUST: to_string")
+            return html_prescan_create_attribute(document, &attribute_name, value)
+
+        # -> If it is in the range 0x41 (A) to 0x5A (Z)
+        if input[*position] >= 'A' and input[*position] <= 'Z':
+            # Append a code point b+0x20 to attribute value (where b is the value of the byte at position).
+            ak.string_builder_append_code_point(&attribute_value, (u32)input[*position] + 0x20)
+        # -> Anything else
+        else:
+            # Append a code point with the same value as the byte at position to attribute value.
+            ak.string_builder_append_code_point(&attribute_value, (u32)input[*position])
+
+        # 12. Advance position to the next byte and return to the previous step.
+        *position += 1
+    return none
+
+# mark: Prescanning the byte stream =============================================================
+
+## Ported from HTMLEncodingDetection.cpp:263 Web::HTML::run_prescan_byte_stream_algorithm.
+# https://html.spec.whatwg.org/multipage/parsing.html#prescan-a-byte-stream-to-determine-its-encoding
+pub func html_run_prescan_byte_stream_algorithm(document: DomDocument*, input: const u8[]) -> ak.ByteString?:
+    # 1. Let position be a pointer to a byte in the input byte stream, initially pointing at the first byte.
+    var position: usize = 0
+
+    # 2. Prescan for UTF-16 XML declarations: If position points to:
+    if not html_prescan_should_abort(input, position + 5):
+        # * A sequence of bytes starting with: 0x3C, 0x0, 0x3F, 0x0, 0x78, 0x0 (case-sensitive UTF-16 little-endian '<?x')
+        #       Return UTF-16LE.
+        let utf16_le: u8[6] = [0x3C, 0x0, 0x3F, 0x0, 0x78, 0x0]
+        if html_prescan_bytes_equal(input[position..<position + 6], utf16_le):
+            return ak.byte_string_from_str("utf-16le")
+
+        # * A sequence of bytes starting with: 0x0, 0x3C, 0x0, 0x3F, 0x0, 0x78 (case-sensitive UTF-16 big-endian '<?x')
+        #       Return UTF-16BE.
+        let utf16_be: u8[6] = [0x0, 0x3C, 0x0, 0x3F, 0x0, 0x78]
+        if html_prescan_bytes_equal(input[position..<position + 6], utf16_be):
+            return ak.byte_string_from_str("utf-16be")
+
+    # NOTE: For historical reasons, the prefix is two bytes longer than in Appendix F of XML and the encoding name is
+    #       not checked.
+
+    # 3. Loop: If position points to:
+    while not html_prescan_should_abort(input, position):
+        # * A sequence of bytes starting with: 0x3C 0x21 0x2D 0x2D (`<!--`)
+        if not html_prescan_should_abort(input, position + 5) and input[position] == '<' and input[position + 1] == '!' and input[position + 2] == '-' and input[position + 3] == '-':
+            # Advance the position pointer so that it points at the first 0x3E byte which is preceded by two 0x2D bytes
+            # (i.e. at the end of an ASCII '-->' sequence) and comes after the 0x3C byte that was found. (The two 0x2D
+            # bytes can be the same as those in the '<!--' sequence.)
+            position += 2
+            while not html_prescan_should_abort(input, position + 3):
+                if input[position] == '-' and input[position + 1] == '-' and input[position + 2] == '>':
+                    position += 2
+                    break
+                position += 1
+
+        # * A sequence of bytes starting with: 0x3C, 0x4D or 0x6D, 0x45 or 0x65, 0x54 or 0x74, 0x41 or 0x61, and one of
+        #   0x09, 0x0A, 0x0C, 0x0D, 0x20, 0x2F (case-insensitive ASCII '<meta' followed by a space or slash)
+        elif not html_prescan_should_abort(input, position + 6) and input[position] == '<' and (input[position + 1] == 'M' or input[position + 1] == 'm') and (input[position + 2] == 'E' or input[position + 2] == 'e') and (input[position + 3] == 'T' or input[position + 3] == 't') and (input[position + 4] == 'A' or input[position + 4] == 'a') and html_is_whitespace_or_slash(input[position + 5]):
+            # 1. Advance the position pointer so that it points at the next 0x09, 0x0A, 0x0C, 0x0D, 0x20, or 0x2F byte
+            #    (the one in sequence of characters matched above).
+            position += 6
+
+            # 2. Let attribute list be an empty list of strings.
+            var attribute_list: ak.Vector[ak.FlyString]
+
+            # 3. Let got pragma be false.
+            var got_pragma = false
+
+            # 4. Let need pragma be null.
+            var need_pragma: bool? = none
+
+            # 5. Let charset be the null value (which, for the purposes of this algorithm, is distinct from an
+            #    unrecognized encoding or the empty string).
+            var charset: ak.ByteString? = none
+
+            while true:
+                # 6. Attributes: Get an attribute and its value. If no attribute was sniffed, then jump to the
+                #    processing step below.
+                let attribute = html_prescan_get_attribute(document, input, &position) else break
+
+                # 7. If the attribute's name is already in attribute list, then return to the step labeled attributes.
+                if html_parser_fly_string_list_contains(&attribute_list, dom_attr_name(attribute)):
+                    continue
+
+                # 8. Add the attribute's name to attribute list.
+                let attribute_name = dom_attr_name(attribute)
+                ak.vector_append_t(&attribute_list, dom_attr_name(attribute))
+
+                # 9. Run the appropriate step from the following list, if one applies:
+                #    * If the attribute's name is "http-equiv"
+                if ak.fly_string_eq_fly_string(&attribute_name, &html_attribute_names_http_equiv):
+                    # If the attribute's value is "content-type", then set got pragma to true.
+                    let value = dom_attr_value(attribute)
+                    got_pragma = ak.string_eq_string_view(&value, ak.sv("content-type"))
+
+                #    * If the attribute's name is "content"
+                elif ak.fly_string_eq_fly_string(&attribute_name, &html_attribute_names_content):
+                    # Apply the algorithm for extracting a character encoding from a meta element, giving the
+                    # attribute's value as the string to parse. If a character encoding is returned, and if charset is
+                    # still set to null, let charset be the encoding returned, and set need pragma to true.
+                    let value = dom_attr_value(attribute)
+                    let encoding = html_extract_character_encoding_from_meta_element(ak.string_to_byte_string(&value))
+                    if encoding != none and charset == none:
+                        charset = ak.byte_string_from_string_view(encoding else trap("checked"))
+                        need_pragma = true
+
+                #    * If the attribute's name is "charset"
+                elif ak.fly_string_eq_fly_string(&attribute_name, &html_attribute_names_charset):
+                    # Let charset be the result of getting an encoding from the attribute's value, and set need pragma
+                    # to false.
+                    let value = dom_attr_value(attribute)
+                    if let maybe_charset = text_codec.get_standardized_encoding(ak.string_bytes_as_string_view(&value)):
+                        charset = ak.byte_string_from_string_view(maybe_charset)
+                        need_pragma = false
+
+                # 10. Return to the step labeled attributes.
+
+            # 11. Processing: If need pragma is null, then jump to the step below labeled next byte.
+            let actual_need_pragma = need_pragma else continue
+
+            # 12. If need pragma is true but got pragma is false, then jump to the step below labeled next byte.
+            if actual_need_pragma and not got_pragma:
+                continue
+
+            # 13. If charset is failure, then jump to the step below labeled next byte.
+            let actual_charset = charset else continue
+
+            # 14. If charset is UTF-16BE/LE, then set charset to UTF-8.
+            # NB: https://encoding.spec.whatwg.org/#common-infrastructure-for-utf-16be-and-utf-16le
+            if ak.byte_string_eq_string_view(&actual_charset, ak.sv("UTF-16BE")) or ak.byte_string_eq_string_view(&actual_charset, ak.sv("UTF-16LE")):
+                return ak.byte_string_from_str("UTF-8")
+
+            # 15. If charset is x-user-defined, then set charset to windows-1252.
+            if ak.byte_string_eq_string_view(&actual_charset, ak.sv("x-user-defined")):
+                return ak.byte_string_from_str("windows-1252")
+
+            # 16. Return charset.
+            return actual_charset
+
+        # * A sequence of bytes starting with a 0x3C byte (<), optionally a 0x2F byte (/), and finally a byte in the
+        #   range 0x41-0x5A or 0x61-0x7A (A-Z or a-z)
+        elif not html_prescan_should_abort(input, position + 3) and input[position] == '<' and ((input[position + 1] == '/' and ak.is_ascii_alpha((u32)input[position + 2])) or ak.is_ascii_alpha((u32)input[position + 1])):
+            # 1. Advance the position pointer so that it points at the next 0x09 (HT), 0x0A (LF), 0x0C (FF), 0x0D (CR),
+            #    0x20 (SP), or 0x3E (>) byte.
+            while not html_prescan_should_abort(input, position) and not html_is_whitespace_or_end_chevron(input[position]):
+                position += 1
+
+            # 2. Repeatedly get an attribute until no further attributes can be found, then jump to the step below
+            #    labeled next byte.
+            while true:
+                if html_prescan_get_attribute(document, input, &position) == none:
+                    break
+            continue
+
+        # * A sequence of bytes starting with: 0x3C 0x21 (`<!`)
+        # * A sequence of bytes starting with: 0x3C 0x2F (`</`)
+        # * A sequence of bytes starting with: 0x3C 0x3F (`<?`)
+        elif not html_prescan_should_abort(input, position + 1) and input[position] == '<' and (input[position + 1] == '!' or input[position + 1] == '/' or input[position + 1] == '?'):
+            # Advance the position pointer so that it points at the first 0x3E byte (>) that comes after the 0x3C byte
+            # that was found.
+            position += 2
+            while not html_prescan_should_abort(input, position) and input[position] != '>':
+                position += 1
+
+        # * Any other byte
+        #   Do nothing with that byte.
+
+        # 4. Next byte: Move position so it points at the next byte in the input byte stream, and return to the step
+        #    above labeled loop.
+        position += 1
+    return none
+
+## `input.slice(position, 6) == Array<u8, 6> { ... }`.
+func html_prescan_bytes_equal(bytes: const u8[], expected: const u8[]) -> bool:
+    if bytes.length != expected.length:
+        return false
+    for i in 0..<bytes.length:
+        if bytes[i] != expected[i]:
+            return false
+    return true
+
+# mark: Sniffing ================================================================================
+
+## Ported from HTMLEncodingDetection.cpp:440 Web::HTML::run_bom_sniff.
+# https://encoding.spec.whatwg.org/#bom-sniff
+pub func html_run_bom_sniff(input: const u8[]) -> ak.ByteString?:
+    if input.length >= 3:
+        # 1. Let BOM be the result of peeking 3 bytes from ioQueue, converted to a byte sequence.
+        # 2. For each of the rows in the table below, starting with the first one and going down, if BOM starts with the bytes given in the first column, then return the encoding given in the cell in the second column of that row. Otherwise, return null.
+        # Byte order mark  Encoding
+        # 0xEF 0xBB 0xBF   UTF-8
+        # 0xFE 0xFF        UTF-16BE
+        # 0xFF 0xFE        UTF-16LE
+        if input[0] == 0xEF and input[1] == 0xBB and input[2] == 0xBF:
+            return ak.byte_string_from_str("UTF-8")
+        if input[0] == 0xFE and input[1] == 0xFF:
+            return ak.byte_string_from_str("UTF-16BE")
+        if input[0] == 0xFF and input[1] == 0xFE:
+            return ak.byte_string_from_str("UTF-16LE")
+    return none
+
+## Ported from HTMLEncodingDetection.cpp:463 Web::HTML::run_encoding_sniffing_algorithm.
+# https://html.spec.whatwg.org/multipage/parsing.html#determining-the-character-encoding
+pub func html_run_encoding_sniffing_algorithm(document: DomDocument*, input: const u8[], maybe_mime_type: MimeType? = none) -> ak.ByteString:
+    # 1. If the result of BOM sniffing is an encoding, return that encoding with confidence certain.
+    # FIXME: There is no concept of decoding certainty yet.
+    if let bom = html_run_bom_sniff(input):
+        return bom
+    # 2. FIXME: If the user has explicitly instructed the user agent to override the document's character encoding with a specific encoding,
+    #    optionally return that encoding with the confidence certain.
+
+    # 3. FIXME: The user agent may wait for more bytes of the resource to be available, either in this step or at any later step in this algorithm.
+    #    For instance, a user agent might wait 500ms or 1024 bytes, whichever came first. In general preparsing the source to find the encoding improves performance,
+    #    as it reduces the need to throw away the data structures used when parsing upon finding the encoding information. However, if the user agent delays too long
+    #    to obtain data to determine the encoding, then the cost of the delay could outweigh any performance improvements from the preparse.
+
+    # 4. If the transport layer specifies a character encoding, and it is supported, return that encoding with the confidence certain.
+    if maybe_mime_type != none:
+        # FIXME: This is awkward because lecacy_extract_an_encoding can not fail
+        let maybe_transport_encoding = fetch_legacy_extract_an_encoding(maybe_mime_type, ak.sv("invalid"))
+        if not ak.string_view_eq_string_view(&maybe_transport_encoding, ak.sv("invalid")):
+            return ak.byte_string_from_string_view(maybe_transport_encoding)
+
+    # 5. Optionally, prescan the byte stream to determine its encoding, with the end condition being when the user agent decides that scanning further bytes would not
+    #    be efficient. User agents are encouraged to only prescan the first 1024 bytes. User agents may decide that scanning any bytes is not efficient, in which case
+    #    these substeps are entirely skipped.
+    #    The aforementioned algorithm returns either a character encoding or failure. If it returns a character encoding, then return the same encoding, with confidence tentative.
+    if let prescan = html_run_prescan_byte_stream_algorithm(document, input):
+        return prescan
+
+    # 6. FIXME: If the HTML parser for which this algorithm is being run is associated with a Document d whose container document is non-null, then:
+    # 1. Let parentDocument be d's container document.
+    # 2. If parentDocument's origin is same origin with d's origin and parentDocument's character encoding is not UTF-16BE/LE, then return parentDocument's character
+    #    encoding, with the confidence tentative.
+
+    # 7. Otherwise, if the user agent has information on the likely encoding for this page, e.g. based on the encoding of the page when it was last visited, then return
+    #    that encoding, with the confidence tentative.
+
+    # 8. FIXME: The user agent may attempt to autodetect the character encoding from applying frequency analysis or other algorithms to the data stream. Such algorithms
+    #    may use information about the resource other than the resource's contents, including the address of the resource. If autodetection succeeds in determining a
+    #    character encoding, and that encoding is a supported encoding, then return that encoding, with the confidence tentative. [UNIVCHARDET]
+    var view: ak.Utf8View = ---
+    ak.utf8_view_construct_string_view(&view, ak.string_view_from_bytes(input))
+    if not ak.utf8_view_validate_allow_lonely_surrogates(&view):
+        # FIXME: As soon as Locale is supported, this should sometimes return a different encoding based on the locale.
+        return ak.byte_string_from_str("windows-1252")
+
+    # 9. Otherwise, return an implementation-defined or user-specified default character encoding, with the confidence tentative.
+    #    In controlled environments or in environments where the encoding of documents can be prescribed (for example, for user agents intended for dedicated use in new
+    #    networks), the comprehensive UTF-8 encoding is suggested.
+    return ak.byte_string_from_str("UTF-8")
