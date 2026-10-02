@@ -1,0 +1,440 @@
+#==============================================================================================
+#
+#   range_1 - DOM::Range: live ranges, boundary points, setting and comparing
+#
+#   DESCRIPTION:
+#       Port of LibWeb/DOM/Range.cpp (lines 1-475): the live-range set, creation, the
+#       associated selection, the relative position of boundary points, set the start or end
+#       (setStart/setEnd/setStartBefore/...), compareBoundaryPoints, select / selectNode /
+#       selectNodeContents, collapse, cloneRange and commonAncestorContainer. range_2 and
+#       range_3 hold the rest of Range.cpp and the inline functions of Range.h.
+#
+#       The live-range set is a C++ function-local static on the C heap; its storage stays in
+#       `memory.heap` and its entries do not keep ranges alive: a range leaves it in finalize
+#       (DESIGN.md §3.3 rule 4).
+#
+#==============================================================================================
+
+# mark: Live ranges and creation ================================================================
+
+## Range::live_ranges()'s `static HashTable<Range*> ranges`.
+var dom_range_s_live_ranges: ak.HashTable[DomRange*?, ak.PtrTraits[DomRange]]
+
+## Ported from Range.cpp:38 Web::DOM::Range::live_ranges.
+pub func dom_range_live_ranges() -> ak.HashTable[DomRange*?, ak.PtrTraits[DomRange]]*:
+    return &dom_range_s_live_ranges
+
+## Ported from Range.cpp:44 Web::DOM::Range::create.
+pub func dom_range_create_html_window(window: HtmlWindow*) -> DomRange*:
+    return dom_range_create_dom_document(html_window_associated_document(window))
+
+## Ported from Range.cpp:49 Web::DOM::Range::create.
+pub func dom_range_create_dom_document(document: DomDocument*) -> DomRange*:
+    let realm = bind_platform_object_realm(document.bind_platform_object())
+    return realm_create_dom_range_dom_document(realm, document)
+
+## Ported from Range.cpp:55 Web::DOM::Range::create.
+pub func dom_range_create_dom_node(start_container: DomNode*, start_offset: u32, end_container: DomNode*, end_offset: u32) -> DomRange*:
+    let realm = bind_platform_object_realm(start_container.bind_platform_object())
+    return realm_create_dom_range_dom_node(realm, start_container, start_offset, end_container, end_offset)
+
+## Ported from Range.cpp:61 Web::DOM::Range::construct_impl.
+pub func dom_range_construct_impl(realm: Realm*) -> DomRange*!:
+    let window = as_html_window((gc.Cell*)realm_global_object(realm))
+    return dom_range_create_html_window(window)
+
+## Ported from Range.cpp:67 Web::DOM::Range::Range.
+pub func dom_range_construct_dom_document(this: DomRange*, document: DomDocument*):
+    dom_range_construct_dom_node(this, document.dom_node(), 0, document.dom_node(), 0)
+
+## Ported from Range.cpp:72 Web::DOM::Range::Range.
+pub func dom_range_construct_dom_node(this: DomRange*, start_container: DomNode*, start_offset: u32, end_container: DomNode*, end_offset: u32):
+    dom_abstract_range_construct(this.dom_abstract_range(), start_container, start_offset, end_container, end_offset)
+    assert((usize)start_offset <= dom_node_length(start_container))
+    assert((usize)end_offset <= dom_node_length(end_container))
+
+    with memory.heap:
+        discard(ak.hash_table_set(&dom_range_s_live_ranges, (DomRange*?)this))
+
+## Ported from Range.cpp:83 Web::DOM::Range::finalize (override).
+pub func dom_range_finalize_impl(base: gc.Cell*):
+    let this = (DomRange*)base
+    # Base::finalize(): PlatformObject inherits GC::Cell's, which does nothing.
+    with memory.heap:
+        discard(ak.hash_table_remove_t(&dom_range_s_live_ranges, (DomRange*?)this))
+
+## Ported from Range.cpp:89 Web::DOM::Range::initialize (override).
+pub func dom_range_initialize_impl(base: JsCell*, realm: Realm*):
+    web_set_prototype_for_interface(base, realm, BindInterfaceName.range)
+    dom_abstract_range_initialize_impl(base, realm)
+
+## Ported from Range.cpp:95 Web::DOM::Range::visit_edges (override).
+pub func dom_range_visit_edges_impl(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (DomRange*)base
+    dom_abstract_range_visit_edges_impl(base, visitor)
+    gc.cell_visitor_visit_cell(visitor, (gc.Cell*?)this.m_associated_selection)  # opaque in phase 1
+
+# mark: The associated selection ================================================================
+
+## Ported from Range.cpp:101 Web::DOM::Range::set_associated_selection.
+pub func dom_range_set_associated_selection(this: DomRange*, selection: SelectionSelection*?):
+    this.m_associated_selection = selection
+    dom_range_update_associated_selection(this)
+
+## Ported from Range.cpp:107 Web::DOM::Range::update_associated_selection.
+func dom_range_update_associated_selection(this: DomRange*):
+    if this.m_associated_selection == none:
+        return
+
+    let document = dom_node_document(this.abstract_range.m_start_container)
+    dom_document_reset_cursor_blink_cycle(document)
+
+    # NB: Called during selection update after range change.
+    if let viewport = dom_document_unsafe_paintable(document):
+        paint_viewport_paintable_recompute_selection_states(viewport, this)
+        paint_paintable_set_needs_repaint(viewport.paint_paintable(), InvalidateDisplayList.yes)
+
+    # https://w3c.github.io/selection-api/#selectionchange-event
+    # When the selection is dissociated with its range, associated with a new range, or the associated range's boundary
+    # point is mutated either by the user or the content script, the user agent must schedule a selectionchange event
+    # on document.
+    dom_schedule_a_selectionchange_event(document.dom_node(), document)
+
+## Ported from Range.cpp:129 Web::DOM::Range::root.
+# https://dom.spec.whatwg.org/#concept-range-root
+func dom_range_root(this: DomRange*) -> DomNode*:
+    # The root of a live range is the root of its start node.
+    return tree_node_root(this.abstract_range.m_start_container)
+
+# mark: Boundary points =========================================================================
+
+## Ported from Range.cpp:136 Web::DOM::position_of_boundary_point_relative_to_other_boundary_point.
+# https://dom.spec.whatwg.org/#concept-range-bp-position
+pub func dom_position_of_boundary_point_relative_to_other_boundary_point(a: DomBoundaryPoint, b: DomBoundaryPoint) -> DomRelativeBoundaryPointPosition:
+    # 1. Assert: nodeA and nodeB have the same root.
+    #    NOTE: Nodes may not share the same root if they belong to different shadow trees,
+    #          so we assert that they share the same shadow-including root instead.
+    assert(dom_node_shadow_including_root(a.node) == dom_node_shadow_including_root(b.node))
+
+    # 2. If nodeA is nodeB, then return equal if offsetA is offsetB, before if offsetA is less than offsetB, and after if offsetA is greater than offsetB.
+    if a.node == b.node:
+        if a.offset == b.offset:
+            return DomRelativeBoundaryPointPosition.equal
+
+        if a.offset < b.offset:
+            return DomRelativeBoundaryPointPosition.before
+
+        return DomRelativeBoundaryPointPosition.after
+
+    # 3. If nodeA is following nodeB, then if the position of (nodeB, offsetB) relative to (nodeA, offsetA) is before, return after, and if it is after, return before.
+    if tree_node_is_following(a.node, b.node):
+        let relative_position = dom_position_of_boundary_point_relative_to_other_boundary_point(b, a)
+
+        if relative_position == DomRelativeBoundaryPointPosition.before:
+            return DomRelativeBoundaryPointPosition.after
+
+        if relative_position == DomRelativeBoundaryPointPosition.after:
+            return DomRelativeBoundaryPointPosition.before
+
+    # 4. If nodeA is an ancestor of nodeB:
+    if tree_node_is_ancestor_of(a.node, b.node):
+        # 1. Let child be nodeB.
+        var child = b.node
+
+        # 2. While child is not a child of nodeA, set child to its parent.
+        while not tree_node_is_parent_of(a.node, child):
+            let parent = tree_node_parent(child) else trap("VERIFY: parent")
+            child = parent
+
+        # 3. If child’s index is less than offsetA, then return after.
+        if tree_node_index(child) < (usize)a.offset:
+            return DomRelativeBoundaryPointPosition.after
+
+    # 5. Return before.
+    return DomRelativeBoundaryPointPosition.before
+
+## `Utf16String::formatted("Node does not contain a child at offset {}", offset)`.
+func dom_range_no_child_at_offset_message(offset: u32) -> ak.Utf16String:
+    var builder = ak.string_builder_new_mode(ak.StringBuilderMode.utf16)
+    ak.string_builder_append(&builder, "Node does not contain a child at offset ")
+    let number = ak.string_number_u64((u64)offset)
+    ak.string_builder_append_string_view(&builder, ak.string_bytes_as_string_view(&number))
+    return ak.string_builder_to_utf16_string(&builder)
+
+## Ported from Range.cpp:187 Web::DOM::Range::set_start_or_end.
+# https://dom.spec.whatwg.org/#concept-range-bp-set
+func dom_range_set_start_or_end(this: DomRange*, node: DomNode*, offset: u32, start_or_end: DomRangeStartOrEnd) -> !:
+    # To set the start or end of a range to a boundary point (node, offset), run these steps:
+    let realm = bind_platform_object_realm(this.bind_platform_object())
+
+    # 1. If node is a doctype, then throw an "InvalidNodeTypeError" DOMException.
+    if is_dom_document_type(node):
+        try idl_throw(.idl_dom_exception(idl_invalid_node_type_error_create(realm, ak.utf16_string_from_str("Node cannot be a DocumentType."))))
+
+    # 2. If offset is greater than node’s length, then throw an "IndexSizeError" DOMException.
+    if (usize)offset > dom_node_length(node):
+        try idl_throw(.idl_dom_exception(idl_index_size_error_create(realm, dom_range_no_child_at_offset_message(offset))))
+
+    # 3. Let bp be the boundary point (node, offset).
+    let bp = DomBoundaryPoint(node = node, offset = offset)
+
+    if start_or_end == DomRangeStartOrEnd.start:
+        # -> If these steps were invoked as "set the start"
+
+        # 1. If range’s root is not equal to node’s root, or if bp is after the range’s end, set range’s end to bp.
+        if dom_range_root(this) != tree_node_root(node) or dom_position_of_boundary_point_relative_to_other_boundary_point(bp, dom_abstract_range_end(this.dom_abstract_range())) == DomRelativeBoundaryPointPosition.after:
+            this.abstract_range.m_end_container = node
+            this.abstract_range.m_end_offset = offset
+
+        # 2. Set range’s start to bp.
+        this.abstract_range.m_start_container = node
+        this.abstract_range.m_start_offset = offset
+    else:
+        # -> If these steps were invoked as "set the end"
+        assert(start_or_end == DomRangeStartOrEnd.end)
+
+        # 1. If range’s root is not equal to node’s root, or if bp is before the range’s start, set range’s start to bp.
+        if dom_range_root(this) != tree_node_root(node) or dom_position_of_boundary_point_relative_to_other_boundary_point(bp, dom_abstract_range_start(this.dom_abstract_range())) == DomRelativeBoundaryPointPosition.before:
+            this.abstract_range.m_start_container = node
+            this.abstract_range.m_start_offset = offset
+
+        # 2. Set range’s end to bp.
+        this.abstract_range.m_end_container = node
+        this.abstract_range.m_end_offset = offset
+
+    dom_range_update_associated_selection(this)
+
+## Ported from Range.cpp:233 Web::DOM::Range::set_start.
+# https://dom.spec.whatwg.org/#dom-range-setstart
+pub func dom_range_set_start(this: DomRange*, node: DomNode*, offset: u32) -> !:
+    # The setStart(node, offset) method steps are to set the start of this to boundary point (node, offset).
+    try dom_range_set_start_or_end(this, node, offset, DomRangeStartOrEnd.start)
+
+## Ported from Range.cpp:240 Web::DOM::Range::set_end.
+# https://dom.spec.whatwg.org/#dom-range-setend
+pub func dom_range_set_end(this: DomRange*, node: DomNode*, offset: u32) -> !:
+    # The setEnd(node, offset) method steps are to set the end of this to boundary point (node, offset).
+    try dom_range_set_start_or_end(this, node, offset, DomRangeStartOrEnd.end)
+
+## Ported from Range.cpp:247 Web::DOM::Range::set_start_before.
+# https://dom.spec.whatwg.org/#dom-range-setstartbefore
+pub func dom_range_set_start_before(this: DomRange*, node: DomNode*) -> !:
+    # 1. Let parent be node’s parent.
+    # 2. If parent is null, then throw an "InvalidNodeTypeError" DOMException.
+    let parent = tree_node_parent(node)
+    if parent == none:
+        try idl_throw(.idl_dom_exception(idl_invalid_node_type_error_create(bind_platform_object_realm(this.bind_platform_object()), ak.utf16_string_from_str("Given node has no parent."))))
+
+    # 3. Set the start of this to boundary point (parent, node’s index).
+    try dom_range_set_start_or_end(this, parent else trap("unreachable"), (u32)tree_node_index(node), DomRangeStartOrEnd.start)
+
+## Ported from Range.cpp:261 Web::DOM::Range::set_start_after.
+# https://dom.spec.whatwg.org/#dom-range-setstartafter
+pub func dom_range_set_start_after(this: DomRange*, node: DomNode*) -> !:
+    # 1. Let parent be node’s parent.
+    # 2. If parent is null, then throw an "InvalidNodeTypeError" DOMException.
+    let parent = tree_node_parent(node)
+    if parent == none:
+        try idl_throw(.idl_dom_exception(idl_invalid_node_type_error_create(bind_platform_object_realm(this.bind_platform_object()), ak.utf16_string_from_str("Given node has no parent."))))
+
+    # 3. Set the start of this to boundary point (parent, node’s index plus 1).
+    try dom_range_set_start_or_end(this, parent else trap("unreachable"), (u32)(tree_node_index(node) + 1), DomRangeStartOrEnd.start)
+
+## Ported from Range.cpp:275 Web::DOM::Range::set_end_before.
+# https://dom.spec.whatwg.org/#dom-range-setendbefore
+pub func dom_range_set_end_before(this: DomRange*, node: DomNode*) -> !:
+    # 1. Let parent be node’s parent.
+    # 2. If parent is null, then throw an "InvalidNodeTypeError" DOMException.
+    let parent = tree_node_parent(node)
+    if parent == none:
+        try idl_throw(.idl_dom_exception(idl_invalid_node_type_error_create(bind_platform_object_realm(this.bind_platform_object()), ak.utf16_string_from_str("Given node has no parent."))))
+
+    # 3. Set the end of this to boundary point (parent, node’s index).
+    try dom_range_set_start_or_end(this, parent else trap("unreachable"), (u32)tree_node_index(node), DomRangeStartOrEnd.end)
+
+## Ported from Range.cpp:289 Web::DOM::Range::set_end_after.
+# https://dom.spec.whatwg.org/#dom-range-setendafter
+pub func dom_range_set_end_after(this: DomRange*, node: DomNode*) -> !:
+    # 1. Let parent be node’s parent.
+    # 2. If parent is null, then throw an "InvalidNodeTypeError" DOMException.
+    let parent = tree_node_parent(node)
+    if parent == none:
+        try idl_throw(.idl_dom_exception(idl_invalid_node_type_error_create(bind_platform_object_realm(this.bind_platform_object()), ak.utf16_string_from_str("Given node has no parent."))))
+
+    # 3. Set the end of this to boundary point (parent, node’s index plus 1).
+    try dom_range_set_start_or_end(this, parent else trap("unreachable"), (u32)(tree_node_index(node) + 1), DomRangeStartOrEnd.end)
+
+# mark: Comparing ===============================================================================
+
+## Range::HowToCompareBoundaryPoints (an unnamed C++ enum of WebIDL::UnsignedShort constants).
+let dom_range_start_to_start: u16 = 0
+let dom_range_start_to_end: u16 = 1
+let dom_range_end_to_end: u16 = 2
+let dom_range_end_to_start: u16 = 3
+
+## Ported from Range.cpp:303 Web::DOM::Range::compare_boundary_points.
+# https://dom.spec.whatwg.org/#dom-range-compareboundarypoints
+pub func dom_range_compare_boundary_points(this: DomRange*, how: u16, source_range: DomRange*) -> i16!:
+    let realm = bind_platform_object_realm(this.bind_platform_object())
+
+    # 1. If how is not one of
+    #      - START_TO_START,
+    #      - START_TO_END,
+    #      - END_TO_END, and
+    #      - END_TO_START,
+    #    then throw a "NotSupportedError" DOMException.
+    if how != dom_range_start_to_start and how != dom_range_start_to_end and how != dom_range_end_to_end and how != dom_range_end_to_start:
+        var message = ak.string_builder_new_mode(ak.StringBuilderMode.utf16)
+        ak.string_builder_append(&message, "Expected 'how' to be one of START_TO_START (0), START_TO_END (1), END_TO_END (2) or END_TO_START (3), got ")
+        let number = ak.string_number_u64((u64)how)
+        ak.string_builder_append_string_view(&message, ak.string_bytes_as_string_view(&number))
+        try idl_throw(.idl_dom_exception(idl_not_supported_error_create(realm, ak.string_builder_to_utf16_string(&message))))
+
+    # 2. If this’s root is not the same as sourceRange’s root, then throw a "WrongDocumentError" DOMException.
+    if dom_range_root(this) != dom_range_root(source_range):
+        try idl_throw(.idl_dom_exception(idl_wrong_document_error_create(realm, ak.utf16_string_from_str("This range is not in the same tree as the source range."))))
+
+    var this_point_node: DomNode*? = none
+    var this_point_offset: u32 = 0
+
+    var other_point_node: DomNode*? = none
+    var other_point_offset: u32 = 0
+
+    # 3. If how is:
+    match how:
+        0:
+            # -> START_TO_START:
+            #    Let this point be this’s start. Let other point be sourceRange’s start.
+            this_point_node = this.abstract_range.m_start_container
+            this_point_offset = this.abstract_range.m_start_offset
+
+            other_point_node = source_range.abstract_range.m_start_container
+            other_point_offset = source_range.abstract_range.m_start_offset
+        1:
+            # -> START_TO_END:
+            #    Let this point be this’s end. Let other point be sourceRange’s start.
+            this_point_node = this.abstract_range.m_end_container
+            this_point_offset = this.abstract_range.m_end_offset
+
+            other_point_node = source_range.abstract_range.m_start_container
+            other_point_offset = source_range.abstract_range.m_start_offset
+        2:
+            # -> END_TO_END:
+            #    Let this point be this’s end. Let other point be sourceRange’s end.
+            this_point_node = this.abstract_range.m_end_container
+            this_point_offset = this.abstract_range.m_end_offset
+
+            other_point_node = source_range.abstract_range.m_end_container
+            other_point_offset = source_range.abstract_range.m_end_offset
+        3:
+            # -> END_TO_START:
+            #    Let this point be this’s start. Let other point be sourceRange’s end.
+            this_point_node = this.abstract_range.m_start_container
+            this_point_offset = this.abstract_range.m_start_offset
+
+            other_point_node = source_range.abstract_range.m_end_container
+            other_point_offset = source_range.abstract_range.m_end_offset
+        _:
+            trap("VERIFY_NOT_REACHED")
+
+    let this_point = this_point_node else trap("VERIFY: this point")
+    let other_point = other_point_node else trap("VERIFY: other point")
+
+    # 4. If the position of this point relative to other point is
+    let relative_position = dom_position_of_boundary_point_relative_to_other_boundary_point(DomBoundaryPoint(node = this_point, offset = this_point_offset), DomBoundaryPoint(node = other_point, offset = other_point_offset))
+    match relative_position:
+        .before:
+            # -> before
+            #    Return −1.
+            return -1
+        .equal:
+            # -> equal
+            #    Return 0.
+            return 0
+        .after:
+            # -> after
+            #    Return 1.
+            return 1
+        _:
+            trap("VERIFY_NOT_REACHED")
+
+# mark: Selecting and collapsing ================================================================
+
+## Ported from Range.cpp:390 Web::DOM::Range::select.
+# https://dom.spec.whatwg.org/#concept-range-select
+func dom_range_select(this: DomRange*, node: DomNode*) -> !:
+    # 1. Let parent be node’s parent.
+    # 2. If parent is null, then throw an "InvalidNodeTypeError" DOMException.
+    let parent = tree_node_parent(node)
+    if parent == none:
+        try idl_throw(.idl_dom_exception(idl_invalid_node_type_error_create(bind_platform_object_realm(this.bind_platform_object()), ak.utf16_string_from_str("Given node has no parent."))))
+    let parent_node = parent else trap("unreachable")
+
+    # 3. Let index be node’s index.
+    let index = tree_node_index(node)
+
+    # 4. Set range’s start to boundary point (parent, index).
+    this.abstract_range.m_start_container = parent_node
+    this.abstract_range.m_start_offset = (u32)index
+
+    # 5. Set range’s end to boundary point (parent, index plus 1).
+    this.abstract_range.m_end_container = parent_node
+    this.abstract_range.m_end_offset = (u32)(index + 1)
+
+    dom_range_update_associated_selection(this)
+
+## Ported from Range.cpp:415 Web::DOM::Range::select_node.
+# https://dom.spec.whatwg.org/#dom-range-selectnode
+pub func dom_range_select_node(this: DomRange*, node: DomNode*) -> !:
+    # The selectNode(node) method steps are to select node within this.
+    try dom_range_select(this, node)
+
+## Ported from Range.cpp:422 Web::DOM::Range::collapse.
+# https://dom.spec.whatwg.org/#dom-range-collapse
+pub func dom_range_collapse(this: DomRange*, to_start: bool):
+    # The collapse(toStart) method steps are to, if toStart is true, set end to start; otherwise set start to end.
+    if to_start:
+        this.abstract_range.m_end_container = this.abstract_range.m_start_container
+        this.abstract_range.m_end_offset = this.abstract_range.m_start_offset
+    else:
+        this.abstract_range.m_start_container = this.abstract_range.m_end_container
+        this.abstract_range.m_start_offset = this.abstract_range.m_end_offset
+    dom_range_update_associated_selection(this)
+
+## Ported from Range.cpp:436 Web::DOM::Range::select_node_contents.
+# https://dom.spec.whatwg.org/#dom-range-selectnodecontents
+pub func dom_range_select_node_contents(this: DomRange*, node: DomNode*) -> !:
+    # 1. If node is a doctype, throw an "InvalidNodeTypeError" DOMException.
+    if is_dom_document_type(node):
+        try idl_throw(.idl_dom_exception(idl_invalid_node_type_error_create(bind_platform_object_realm(this.bind_platform_object()), ak.utf16_string_from_str("Node cannot be a DocumentType."))))
+
+    # 2. Let length be the length of node.
+    let length = dom_node_length(node)
+
+    # 3. Set start to the boundary point (node, 0).
+    this.abstract_range.m_start_container = node
+    this.abstract_range.m_start_offset = 0
+
+    # 4. Set end to the boundary point (node, length).
+    this.abstract_range.m_end_container = node
+    this.abstract_range.m_end_offset = (u32)length
+
+    dom_range_update_associated_selection(this)
+
+## Ported from Range.cpp:457 Web::DOM::Range::clone_range.
+pub func dom_range_clone_range(this: DomRange*) -> DomRange*:
+    let realm = bind_platform_object_realm(this.bind_platform_object())
+    return realm_create_dom_range_dom_node(realm, this.abstract_range.m_start_container, this.abstract_range.m_start_offset, this.abstract_range.m_end_container, this.abstract_range.m_end_offset)
+
+## Ported from Range.cpp:463 Web::DOM::Range::common_ancestor_container.
+# https://dom.spec.whatwg.org/#dom-range-commonancestorcontainer
+pub func dom_range_common_ancestor_container(this: DomRange*) -> DomNode*:
+    # 1. Let container be start node.
+    var container = this.abstract_range.m_start_container
+
+    # 2. While container is not an inclusive ancestor of end node, let container be container’s parent.
+    while not tree_node_is_inclusive_ancestor_of(container, this.abstract_range.m_end_container):
+        container = tree_node_parent(container) else trap("VERIFY: container's parent")
+
+    # 3. Return container.
+    return container
