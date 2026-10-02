@@ -1,0 +1,474 @@
+#==============================================================================================
+#
+#   dump_1 - Dump: the session history, DOM tree and layout tree dumps
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibWeb/Dump.cpp (lines 1-427) with dump_indent of Dump.h
+#       (lines 33-36). The layout tree dump is the first part of a Layout test's expected text
+#       (DESIGN.md §6.2), so every byte is written as the C++ writes it: numbers and CSSPixels
+#       through AK's formatter (DESIGN.md §2.11), Gfx::Point and Gfx::Rect as "[x,y]" and
+#       "[x,y wxh]" (their AK::Formatters), a URL as its serialization. The C++ `static` indent
+#       counters are module variables.
+#
+#       Copyright (c) 2018-2023, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2021, the SerenityOS developers.
+#       Copyright (c) 2021-2025, Sam Atkins <sam@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Formatting ==============================================================================
+
+## `builder.appendff(fmtstr, arguments...)`: AK's formatter over type-erased arguments.
+func dump_appendff(builder: ak.StringBuilder*, fmtstr: str, arguments: const ak.TypeErasedParameter[]):
+    ak.vformat_arguments(builder, ak.sv(fmtstr), arguments) else trap("MUST: StringBuilder::appendff")
+
+## A FlyString as a `{}` argument (Formatter<FlyString> is Formatter<StringView>).
+func dump_arg_fly_string(string: const ak.FlyString*) -> ak.TypeErasedParameter:
+    return ak.arg_string_view(ak.fly_string_bytes_as_string_view(string))
+
+## A String as a `{}` argument.
+func dump_arg_string(string: const ak.String*) -> ak.TypeErasedParameter:
+    return ak.arg_string_view(ak.string_bytes_as_string_view(string))
+
+## A CSSPixels as a `{}` argument: Formatter<CSSPixels> formats to_double() as a double.
+func dump_arg_css_pixels(value: gfx.CssPixels) -> ak.TypeErasedParameter:
+    return ak.arg_f64(gfx.css_pixels_to_double_const(&value))
+
+## `{}` of a CSSPixelPoint: Formatter<Gfx::Point<T>>'s "[{},{}]".
+func dump_append_css_pixel_point(builder: ak.StringBuilder*, point: gfx.CssPixelPoint):
+    dump_appendff(builder, "[{},{}]", [dump_arg_css_pixels(point.m_x), dump_arg_css_pixels(point.m_y)])
+
+## `{}` of a CSSPixelRect: Formatter<Gfx::Rect<T>>'s "[{},{} {}x{}]".
+func dump_append_css_pixel_rect(builder: ak.StringBuilder*, rect: gfx.CssPixelRect):
+    dump_appendff(builder, "[{},{} {}x{}]", [dump_arg_css_pixels(gfx.css_pixel_rect_x(&rect)), dump_arg_css_pixels(gfx.css_pixel_rect_y(&rect)),
+        dump_arg_css_pixels(gfx.css_pixel_rect_width(&rect)), dump_arg_css_pixels(gfx.css_pixel_rect_height(&rect))])
+
+## `{}` of a URL::URL: Formatter<URL::URL> writes its serialization.
+func dump_append_url(builder: ak.StringBuilder*, url: const web_url.Url*):
+    let serialized = web_url.url_serialize(url)
+    ak.string_builder_append_string_view(builder, ak.string_bytes_as_string_view(&serialized))
+
+## `{}` of a Utf16String: Formatter<Utf16String> writes its text.
+func dump_append_utf16_string(builder: ak.StringBuilder*, string: const ak.Utf16String*):
+    ak.string_builder_append_utf16_view(builder, ak.utf16_string_base_utf16_view(&string.utf16_string_base))
+
+## GC_CELL's class_name(): the class's own name, which its ClassInfo records.
+func dump_class_name(cell: gc.Cell*) -> ak.StringView:
+    return ak.sv(cell.vtable.class_info.name)
+
+## `dbgln("{}", builder.string_view())`.
+func dump_dbgln(builder: ak.StringBuilder*):
+    let view = ak.string_builder_string_view(builder)
+    ak.dbgln((str)ak.string_view_bytes(&view))
+
+## Ported from Libraries/LibWeb/Dump.h:33 Web::dump_indent.
+pub func dump_indent(builder: ak.StringBuilder*, indent_levels: i32):
+    ak.string_builder_append_repeated_string_view(builder, ak.sv("  "), (usize)indent_levels)
+
+# mark: Session history =========================================================================
+
+## Ported from Libraries/LibWeb/Dump.cpp:59 Web::dump_session_history_entry.
+func dump_session_history_entry(builder: ak.StringBuilder*, session_history_entry: HtmlSessionHistoryEntry*, indent_levels: i32):
+    dump_indent(builder, indent_levels)
+    let step = match html_session_history_entry_step(session_history_entry):
+        .i32_(value) => value
+        _ => trap("VERIFY: Variant::get<int>")
+    dump_appendff(builder, "step=({}) url=(", [ak.arg_i64(step)])
+    let url = html_session_history_entry_url(session_history_entry)
+    dump_append_url(builder, &url)
+    ak.string_builder_append(builder, ")\n")
+    let document_state = html_session_history_entry_document_state(session_history_entry) else trap("VERIFY: document state")
+    for nested_history in ak.vector_span_const(html_document_state_nested_histories(document_state)):
+        for nested_she in ak.vector_span_const(&nested_history.entries):
+            dump_session_history_entry(builder, nested_she, indent_levels + 1)
+
+## Ported from Libraries/LibWeb/Dump.cpp:70 Web::dump_tree.
+pub func dump_tree_html_traversable_navigable(traversable: HtmlTraversableNavigable*):
+    var builder = ak.string_builder_new()
+    for she in ak.vector_span_const(html_traversable_navigable_session_history_entries(traversable)):
+        dump_session_history_entry(&builder, she, 0)
+    dump_dbgln(&builder)
+
+# mark: DOM tree ================================================================================
+
+## Ported from Libraries/LibWeb/Dump.cpp:79 Web::dump_tree.
+pub func dump_tree_dom_node(node: DomNode*):
+    var builder = ak.string_builder_new()
+    dump_tree_string_builder_dom_node(&builder, node)
+    dump_dbgln(&builder)
+
+## dump_tree(StringBuilder&, DOM::Node const&)'s `static int indent`.
+var dump_tree_dom_node_indent: i32
+
+## The `namespace_prefix` lambda of dump_tree(StringBuilder&, DOM::Node const&).
+func dump_tree_namespace_prefix(node: DomNode*, element: DomElement*) -> ak.FlyString:
+    let namespace_uri = dom_element_namespace_uri(element)
+    let uri = namespace_uri else return ak.fly_string_from_str("")
+    if dom_node_is_default_namespace(dom_node_document(node).dom_node(), ak.fly_string_to_string_const(&uri)):
+        return ak.fly_string_from_str("")
+    if ak.fly_string_eq_fly_string(&uri, &namespace_html):
+        return ak.fly_string_from_str("html:")
+    if ak.fly_string_eq_fly_string(&uri, &namespace_svg):
+        return ak.fly_string_from_str("svg:")
+    if ak.fly_string_eq_fly_string(&uri, &namespace_math_ml):
+        return ak.fly_string_from_str("mathml:")
+    return uri
+
+## The lambda dump_tree(StringBuilder&, DOM::Node const&) passes to Element::for_each_attribute.
+struct DumpTreeAttribute:
+    var builder: ak.StringBuilder*
+
+    static func call(context: void*?, name: const ak.FlyString*, value: const ak.String*):
+        let captures = (DumpTreeAttribute*)(context else trap("for_each_attribute: no captures"))
+        dump_appendff(captures.builder, " {}={}", [dump_arg_fly_string(name), dump_arg_string(value)])
+
+## Ported from Libraries/LibWeb/Dump.cpp:86 Web::dump_tree.
+pub func dump_tree_string_builder_dom_node(builder: ak.StringBuilder*, node: DomNode*):
+    # for (int i = 0; i < indent; ++i) builder.append("  "sv);
+    ak.string_builder_append_repeated_string_view(builder, ak.sv("  "), (usize)dump_tree_dom_node_indent)
+    let element_or_none = as_if_dom_element(node)
+    if let element = element_or_none:
+        let namespace_prefix = dump_tree_namespace_prefix(node, element)
+
+        let local_name = dom_element_local_name(element)
+        dump_appendff(builder, "<{}{}", [dump_arg_fly_string(&namespace_prefix), dump_arg_fly_string(&local_name)])
+        var captures = DumpTreeAttribute(builder = builder)
+        dom_element_for_each_attribute_function2(element, ak.Function2[const ak.FlyString*, const ak.String*, unit](call = DumpTreeAttribute.call, context = &captures))
+        ak.string_builder_append(builder, ">\n")
+        if let pseudo_element = dom_element_use_pseudo_element(element):
+            ak.string_builder_append_repeated_string_view(builder, ak.sv("  "), (usize)dump_tree_dom_node_indent)
+            dump_appendff(builder, "  (pseudo-element: {})\n", [ak.arg_string_view(css_data.pseudo_element_name(pseudo_element))])
+    elif let text = as_if_dom_text(node):
+        let data = dom_character_data_data(text.dom_character_data())
+        ak.string_builder_append(builder, "\"")
+        dump_append_utf16_string(builder, &data)
+        ak.string_builder_append(builder, "\"\n")
+    else:
+        let node_name = dom_node_node_name(node)
+        dump_appendff(builder, "{}\n", [dump_arg_fly_string(&node_name)])
+    dump_tree_dom_node_indent += 1
+    if let element = element_or_none:
+        if let shadow_root = dom_element_shadow_root(element):
+            dump_tree_string_builder_dom_node(builder, shadow_root.dom_node())
+    if let image = as_if_html_image_element(node):
+        if let image_data = html_image_request_image_data(html_image_element_current_request(image)):
+            if let svg_data = as_if_svg_decoded_image_data(image_data):
+                dump_tree_dom_node_indent += 1
+                ak.string_builder_append_repeated_string_view(builder, ak.sv("  "), (usize)dump_tree_dom_node_indent)
+                ak.string_builder_append(builder, "(SVG-as-image isolated context)\n")
+                dump_tree_string_builder_dom_node(builder, svg_decoded_image_data_svg_document(svg_data).dom_node())
+                dump_tree_dom_node_indent -= 1
+    if let template_element = as_if_html_template_element(node):
+        ak.string_builder_append_repeated_string_view(builder, ak.sv("  "), (usize)dump_tree_dom_node_indent)
+        ak.string_builder_append(builder, "(template content)\n")
+        dump_tree_string_builder_dom_node(builder, html_template_element_content(template_element).dom_node())
+        ak.string_builder_append(builder, "(template normal subtree)\n")
+    if let parent_node = as_if_dom_parent_node(node):
+        for child in dom_node_children(parent_node.dom_node()):
+            dump_tree_string_builder_dom_node(builder, child)
+    dump_tree_dom_node_indent -= 1
+
+# mark: Layout tree =============================================================================
+
+## Ported from Libraries/LibWeb/Dump.cpp:149 Web::dump_tree.
+pub func dump_tree_layout_node(layout_node: LayoutNode*, show_cascaded_properties: bool = false):
+    var builder = ak.string_builder_new()
+    dump_tree_string_builder_layout_node(&builder, layout_node, show_cascaded_properties, true)
+    dump_dbgln(&builder)
+
+## dump_tree(StringBuilder&, Layout::Node const&, ...)'s `static size_t indent`.
+var dump_tree_layout_node_indent: usize
+
+## The terminal colors of the layout tree dump: all empty unless the dump is interactive.
+struct DumpTreeColors:
+    var nonbox_color_on: str
+    var box_color_on: str
+    var svg_box_color_on: str
+    var positioned_color_on: str
+    var floating_color_on: str
+    var inline_color_on: str
+    var fragment_color_on: str
+    var flex_color_on: str
+    var table_color_on: str
+    var formatting_context_color_on: str
+    var color_off: str
+
+## `as_if<DOM::Element>(node)` for a node that may be null.
+func dump_as_if_element(node: DomNode*?) -> DomElement*?:
+    if let dom_node = node:
+        return as_if_dom_element(dom_node)
+    return none
+
+## The `dump_position` lambda of dump_tree(StringBuilder&, Layout::Node const&, ...).
+func dump_tree_dump_position(builder: ak.StringBuilder*, layout_node: LayoutNode*):
+    let paintable_box: PaintPaintableBox*? = match layout_node_first_paintable(layout_node):
+        .some(paintable) => as_if_paint_paintable_box(paintable)
+        .none => none
+    if let box = paintable_box:
+        ak.string_builder_append(builder, "at ")
+        let absolute_rect = paint_paintable_box_absolute_rect(box)
+        dump_append_css_pixel_point(builder, gfx.css_pixel_rect_location(&absolute_rect))
+    else:
+        ak.string_builder_append(builder, "(not painted)")
+
+## The `dump_box_model` lambda of dump_tree(StringBuilder&, Layout::Node const&, ...).
+func dump_tree_dump_box_model(builder: ak.StringBuilder*, layout_node: LayoutNode*):
+    let paintable = layout_node_first_paintable(layout_node) else return
+    let paintable_box = as_if_paint_paintable_box(paintable) else return
+    let box_model = paint_paintable_box_box_model(paintable_box)
+    # Dump the horizontal box properties
+    dump_appendff(builder, " [{}+{}+{} {} {}+{}+{}]", [
+        dump_arg_css_pixels(box_model.margin.left),
+        dump_arg_css_pixels(box_model.border.left),
+        dump_arg_css_pixels(box_model.padding.left),
+        dump_arg_css_pixels(paint_paintable_box_content_width(paintable_box)),
+        dump_arg_css_pixels(box_model.padding.right),
+        dump_arg_css_pixels(box_model.border.right),
+        dump_arg_css_pixels(box_model.margin.right),
+    ])
+
+    # And the vertical box properties
+    dump_appendff(builder, " [{}+{}+{} {} {}+{}+{}]", [
+        dump_arg_css_pixels(box_model.margin.top),
+        dump_arg_css_pixels(box_model.border.top),
+        dump_arg_css_pixels(box_model.padding.top),
+        dump_arg_css_pixels(paint_paintable_box_content_height(paintable_box)),
+        dump_arg_css_pixels(box_model.padding.bottom),
+        dump_arg_css_pixels(box_model.border.bottom),
+        dump_arg_css_pixels(box_model.margin.bottom),
+    ])
+
+## The `dump_fragment` lambda of dump_tree(StringBuilder&, Layout::Node const&, ...).
+func dump_tree_dump_fragment(builder: ak.StringBuilder*, colors: const DumpTreeColors*, fragment: const PaintPaintableFragment*, fragment_index: usize):
+    ak.string_builder_append_repeated_string_view(builder, ak.sv("  "), dump_tree_layout_node_indent)
+    let fragment_layout_node = paint_paintable_fragment_layout_node(fragment)
+    dump_appendff(builder, "  {}frag {}{} from {} ", [
+        ak.arg_str(colors.fragment_color_on),
+        ak.arg_u64((u64)fragment_index),
+        ak.arg_str(colors.color_off),
+        ak.arg_string_view(dump_class_name(fragment_layout_node.cell())),
+    ])
+    dump_appendff(builder, "start: {}, length: {}, rect: ", [
+        ak.arg_u64((u64)paint_paintable_fragment_start_offset(fragment)),
+        ak.arg_u64((u64)paint_paintable_fragment_length_in_code_units(fragment)),
+    ])
+    dump_append_css_pixel_rect(builder, paint_paintable_fragment_absolute_rect(fragment))
+    dump_appendff(builder, " baseline: {}\n", [dump_arg_css_pixels(paint_paintable_fragment_baseline(fragment))])
+    if paint_paintable_fragment_length_in_code_units(fragment) > 0:
+        ak.string_builder_append_repeated_string_view(builder, ak.sv("  "), dump_tree_layout_node_indent)
+        ak.string_builder_append(builder, "      \"")
+        ak.string_builder_append_utf16_view(builder, paint_paintable_fragment_text(fragment))
+        ak.string_builder_append(builder, "\"\n")
+
+## A property name and its serialized value (the `NameAndValue` struct of the cascaded dump).
+struct DumpTreeNameAndValue:
+    var name: ak.FlyString
+    var value: ak.String
+
+## The lambda the cascaded dump passes to ComputedProperties::for_each_property.
+struct DumpTreeComputedProperty:
+    var properties: ak.Vector[DumpTreeNameAndValue]*
+
+    mutating func call(property_id: css_data.PropertyId, value: CssStyleValue*):
+        ak.vector_append_t(self.properties, DumpTreeNameAndValue(name = css_data.string_from_property_id(property_id),
+            value = css_style_value_to_string(value, css_syntax.SerializationMode.normal)))
+
+## The comparator `[](auto& a, auto& b) { return a.name < b.name; }` of the cascaded dump.
+func dump_tree_name_less_than(context: void*?, a: const DumpTreeNameAndValue*, b: const DumpTreeNameAndValue*) -> bool:
+    return ak.fly_string_cmp(&a.name, &b.name) < 0
+
+## Ported from Libraries/LibWeb/Dump.cpp:156 Web::dump_tree.
+pub func dump_tree_string_builder_layout_node(builder: ak.StringBuilder*, layout_node: LayoutNode*, show_cascaded_properties: bool = false, interactive: bool = false):
+    ak.string_builder_append_repeated_string_view(builder, ak.sv("  "), dump_tree_layout_node_indent)
+    let dom_node = layout_node_dom_node(layout_node)
+
+    var tag_name = ak.fly_string_new()
+    if layout_node_is_anonymous(layout_node):
+        tag_name = ak.fly_string_from_str("(anonymous)")
+    elif let element = dump_as_if_element(dom_node):
+        tag_name = dom_element_local_name(element)
+    else:
+        let node = dom_node else trap("dump_tree: a layout node without a DOM node")
+        tag_name = dom_node_node_name(node)
+
+    var identifier = ak.string_new()
+    if let element = dump_as_if_element(dom_node):
+        var identifier_builder = ak.string_builder_new()
+        if let id = dom_element_id(element):
+            if not ak.fly_string_is_empty(&id):
+                ak.string_builder_append_u8(&identifier_builder, '#')
+                ak.string_builder_append_string_view(&identifier_builder, ak.fly_string_bytes_as_string_view(&id))
+        let class_names = dom_element_class_names(element)
+        for class_name in ak.vector_span_const(&class_names):
+            ak.string_builder_append_u8(&identifier_builder, '.')
+            ak.string_builder_append_string_view(&identifier_builder, ak.fly_string_bytes_as_string_view(&class_name))
+        identifier = ak.string_builder_to_string(&identifier_builder) else trap("MUST: StringBuilder::to_string")
+
+    var colors = DumpTreeColors(nonbox_color_on = "", box_color_on = "", svg_box_color_on = "", positioned_color_on = "",
+        floating_color_on = "", inline_color_on = "", fragment_color_on = "", flex_color_on = "", table_color_on = "",
+        formatting_context_color_on = "", color_off = "")
+
+    if interactive:
+        colors.nonbox_color_on = "\u{1b}[33m"
+        colors.box_color_on = "\u{1b}[34m"
+        colors.svg_box_color_on = "\u{1b}[31m"
+        colors.positioned_color_on = "\u{1b}[31;1m"
+        colors.floating_color_on = "\u{1b}[32;1m"
+        colors.inline_color_on = "\u{1b}[36;1m"
+        colors.fragment_color_on = "\u{1b}[35;1m"
+        colors.flex_color_on = "\u{1b}[34;1m"
+        colors.table_color_on = "\u{1b}[91;1m"
+        colors.formatting_context_color_on = "\u{1b}[37;1m"
+        colors.color_off = "\u{1b}[0m"
+
+    if not is_layout_box(layout_node):
+        dump_appendff(builder, "{}{}{} <{}{}{}{}> ", [
+            ak.arg_str(colors.nonbox_color_on),
+            ak.arg_string_view(dump_class_name(layout_node.cell())),
+            ak.arg_str(colors.color_off),
+            dump_arg_fly_string(&tag_name),
+            ak.arg_str(colors.nonbox_color_on),
+            dump_arg_string(&identifier),
+            ak.arg_str(colors.color_off),
+        ])
+
+        dump_tree_dump_position(builder, layout_node)
+        dump_tree_dump_box_model(builder, layout_node)
+    else:
+        dump_tree_dump_box(builder, as_layout_box(layout_node), &colors, &tag_name, &identifier, show_cascaded_properties, interactive)
+
+    if let potential_continuation_node = as_if_layout_node_with_style_and_box_model_metrics(layout_node):
+        if layout_node_with_style_and_box_model_metrics_continuation_of_node(potential_continuation_node) != none:
+            ak.string_builder_append(builder, " continuation")
+
+    ak.string_builder_append(builder, "\n")
+
+    if let image_element = dump_as_if_image_element(dom_node):
+        if let image_data = html_image_request_image_data(html_image_element_current_request(image_element)):
+            if is_svg_decoded_image_data(image_data):
+                let svg_data = as_svg_decoded_image_data(image_data)
+                # NB: Called from debug dump code, no layout guarantee.
+                if let svg_layout_node = dom_node_unsafe_layout_node(svg_decoded_image_data_svg_document(svg_data).dom_node()):
+                    dump_tree_layout_node_indent += 1
+                    ak.string_builder_append_repeated_string_view(builder, ak.sv("  "), dump_tree_layout_node_indent)
+                    ak.string_builder_append(builder, "(SVG-as-image isolated context)\n")
+
+                    dump_tree_string_builder_layout_node(builder, svg_layout_node, show_cascaded_properties, interactive)
+                    dump_tree_layout_node_indent -= 1
+
+    if let block_container = as_if_layout_block_container(layout_node):
+        if layout_node_children_are_inline(layout_node):
+            if let paintable_with_lines = layout_block_container_paintable_with_lines(block_container):
+                let fragments = paint_paintable_with_lines_fragments(paintable_with_lines)
+                for fragment_index in 0..<ak.vector_size(fragments):
+                    dump_tree_dump_fragment(builder, &colors, ak.vector_at(fragments, fragment_index), fragment_index)
+
+    if is_layout_inline_node(layout_node) and layout_node_first_paintable(layout_node) != none:
+        let inline_node = as_layout_inline_node(layout_node)
+        for paintable in ak.intrusive_list_begin(layout_node_paintables(inline_node.layout_node())):
+            let paintable_with_lines = (PaintPaintableWithLines*)paintable
+            let fragments = paint_paintable_with_lines_fragments(paintable_with_lines)
+            for fragment_index in 0..<ak.vector_size(fragments):
+                dump_tree_dump_fragment(builder, &colors, ak.vector_at(fragments, fragment_index), fragment_index)
+
+    if show_cascaded_properties:
+        if let element = dump_as_if_element(dom_node):
+            if let computed_properties = dom_element_computed_properties(element):
+                var properties: ak.Vector[DumpTreeNameAndValue]
+                var callback = DumpTreeComputedProperty(properties = &properties)
+                css_computed_properties_for_each_property(computed_properties, &callback)
+                ak.quick_sort_t_collection_t_less_than(ak.vector_span(&properties), ak.Function2[const DumpTreeNameAndValue*, const DumpTreeNameAndValue*, bool](call = dump_tree_name_less_than, context = none))
+
+                for property in ak.vector_span_const(&properties):
+                    ak.string_builder_append_repeated_string_view(builder, ak.sv("    "), dump_tree_layout_node_indent)
+                    dump_appendff(builder, "  ({}: {})\n", [dump_arg_fly_string(&property.name), dump_arg_string(&property.value)])
+
+    dump_tree_layout_node_indent += 1
+    for child in layout_node_children(layout_node):
+        dump_tree_string_builder_layout_node(builder, child, show_cascaded_properties, interactive)
+    dump_tree_layout_node_indent -= 1
+
+## `is<HTML::HTMLImageElement>(*layout_node.dom_node())` for a node that may be null, as the element.
+func dump_as_if_image_element(node: DomNode*?) -> HtmlImageElement*?:
+    if let dom_node = node:
+        return as_if_html_image_element(dom_node)
+    return none
+
+## The Layout::Box branch of dump_tree(StringBuilder&, Layout::Node const&, ...).
+func dump_tree_dump_box(builder: ak.StringBuilder*, box: LayoutBox*, colors: const DumpTreeColors*, tag_name: const ak.FlyString*, identifier: const ak.String*, show_cascaded_properties: bool, interactive: bool):
+    let layout_node = box.layout_node()
+    let color_on = colors.svg_box_color_on if is_layout_svg_box(box) else colors.box_color_on
+
+    dump_appendff(builder, "{}{}{} <{}{}{}{}> ", [
+        ak.arg_str(color_on),
+        ak.arg_string_view(dump_class_name(box.cell())),
+        ak.arg_str(colors.color_off),
+        ak.arg_str(color_on),
+        dump_arg_fly_string(tag_name),
+        ak.arg_str(colors.color_off),
+        dump_arg_string(identifier),
+    ])
+
+    dump_tree_dump_position(builder, layout_node)
+
+    if layout_node_is_positioned(layout_node):
+        dump_appendff(builder, " {}positioned{}", [ak.arg_str(colors.positioned_color_on), ak.arg_str(colors.color_off)])
+    if layout_node_is_floating(layout_node):
+        dump_appendff(builder, " {}floating{}", [ak.arg_str(colors.floating_color_on), ak.arg_str(colors.color_off)])
+    if layout_node_is_inline_block(layout_node):
+        dump_appendff(builder, " {}inline-block{}", [ak.arg_str(colors.inline_color_on), ak.arg_str(colors.color_off)])
+    if layout_node_is_inline_table(layout_node):
+        dump_appendff(builder, " {}inline-table{}", [ak.arg_str(colors.inline_color_on), ak.arg_str(colors.color_off)])
+    # box.display() is read once: it is a getter of the computed style.
+    let display = layout_node_display(layout_node)
+    if css_display_is_flex_inside(&display):
+        let computed_values = layout_node_with_style_computed_values(box.layout_node_with_style())
+        let direction = match css_computed_values_flex_direction(&computed_values.computed_values):
+            .column => "column"
+            .column_reverse => "column-reverse"
+            .row => "row"
+            .row_reverse => "row-reverse"
+            _ => ""
+        dump_appendff(builder, " {}flex-container({}){}", [ak.arg_str(colors.flex_color_on), ak.arg_str(direction), ak.arg_str(colors.color_off)])
+    if layout_node_is_flex_item(layout_node):
+        dump_appendff(builder, " {}flex-item{}", [ak.arg_str(colors.flex_color_on), ak.arg_str(colors.color_off)])
+    if css_display_is_table_inside(&display):
+        dump_appendff(builder, " {}table-box{}", [ak.arg_str(colors.table_color_on), ak.arg_str(colors.color_off)])
+    if css_display_is_table_row_group(&display):
+        dump_appendff(builder, " {}table-row-group{}", [ak.arg_str(colors.table_color_on), ak.arg_str(colors.color_off)])
+    if css_display_is_table_column_group(&display):
+        dump_appendff(builder, " {}table-column-group{}", [ak.arg_str(colors.table_color_on), ak.arg_str(colors.color_off)])
+    if css_display_is_table_header_group(&display):
+        dump_appendff(builder, " {}table-header-group{}", [ak.arg_str(colors.table_color_on), ak.arg_str(colors.color_off)])
+    if css_display_is_table_footer_group(&display):
+        dump_appendff(builder, " {}table-footer-group{}", [ak.arg_str(colors.table_color_on), ak.arg_str(colors.color_off)])
+    if css_display_is_table_row(&display):
+        dump_appendff(builder, " {}table-row{}", [ak.arg_str(colors.table_color_on), ak.arg_str(colors.color_off)])
+    if css_display_is_table_cell(&display):
+        dump_appendff(builder, " {}table-cell{}", [ak.arg_str(colors.table_color_on), ak.arg_str(colors.color_off)])
+
+    dump_tree_dump_box_model(builder, layout_node)
+
+    if let formatting_context_type = layout_formatting_context_formatting_context_type_created_by_box(box):
+        # switch: Block, Flex, Grid, Table and SVG are named; the others are not.
+        let named = match formatting_context_type:
+            .block, .flex, .grid, .table, .svg => true
+            _ => false
+        if named:
+            dump_appendff(builder, " [{}{}{}]", [ak.arg_str(colors.formatting_context_color_on), ak.arg_string_view(layout_formatting_context_type_name(formatting_context_type)), ak.arg_str(colors.color_off)])
+
+    dump_appendff(builder, " children: {}", [ak.arg_str("inline" if layout_node_children_are_inline(layout_node) else "not-inline")])
+
+    if is_layout_navigable_container_viewport(box):
+        let frame_box = as_layout_navigable_container_viewport(box)
+        if let document = html_navigable_container_content_document_without_origin_check(layout_navigable_container_viewport_dom_node(frame_box)):
+            ak.string_builder_append(builder, " (url: ")
+            let url = dom_document_url(document)
+            dump_append_url(builder, &url)
+            ak.string_builder_append(builder, ")")
+            ak.string_builder_append(builder, "\n")
+            if let nested_layout_root = dom_document_layout_node(document):
+                dump_tree_layout_node_indent += 1
+                dump_tree_string_builder_layout_node(builder, nested_layout_root.layout_node(), show_cascaded_properties, interactive)
+                dump_tree_layout_node_indent -= 1
