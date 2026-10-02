@@ -1,0 +1,464 @@
+#==============================================================================================
+#
+#   element_1 - DOM::Element: construction, edges, attribute getters, hyperlinks, setAttribute
+#
+#   DESCRIPTION:
+#       Port of LibWeb/DOM/Element.cpp (lines 132-539): the constructor, the structural-flag
+#       setters that notify the parent, initialize and visit_edges, getAttribute and friends,
+#       an element's target and noopener, following hyperlinks, getAttributeNode,
+#       setAttribute, and the name validity checks with validate-and-extract.
+#
+#==============================================================================================
+
+# mark: Helpers =================================================================================
+
+## `realm()` of an element: its platform object's realm.
+func dom_element_realm(this: DomElement*) -> Realm*:
+    return bind_platform_object_realm(this.bind_platform_object())
+
+## `document()` of an element: its node document.
+func dom_element_document(this: DomElement*) -> DomDocument*:
+    return dom_node_document(this.dom_node())
+
+## `Infra::is_ascii_whitespace` as the predicate of `StringView::split_view_if`.
+struct DomElementIsAsciiWhitespace: ak.CharPredicate:
+    var unused: u8
+
+    func matches(ch: u8) -> bool:
+        return web_infra.is_ascii_whitespace((u32)ch)
+
+## `namespace_uri() == Namespace::HTML && document().document_type() == Document::Type::HTML`.
+func dom_element_is_html_element_in_html_document(this: DomElement*) -> bool:
+    return dom_node_optional_fly_string_is(dom_element_namespace_uri(this), namespace_html) and dom_document_document_type(dom_element_document(this)) == DocumentDomDocumentType.html
+
+## `Optional<FlyString> == "text"sv`: present and equal to the text.
+func dom_element_optional_fly_string_is_text(a: ak.FlyString?, text: str) -> bool:
+    let a_value = a else return false
+    return ak.fly_string_eq_string_view(&a_value, ak.sv(text))
+
+# mark: Construction ============================================================================
+
+## Ported from Element.cpp:134 Web::DOM::Element::Element.
+pub func dom_element_construct(this: DomElement*, document: DomDocument*, qualified_name: DomQualifiedName):
+    dom_parent_node_construct_dom_document(this.dom_parent_node(), document, DomNodeType.element_node)
+    # The mixin bases follow the primary base: SlottableMixin and Animatable have implicit
+    # constructors; ARIAMixin's is defaulted. Their vtables are Element's until a derived
+    # class's constructor moves them on (C++'s vptr of each base subobject, DESIGN.md §2.5).
+    aria_mixin_construct(&this.aria_mixin)
+    this.slottable_mixin.vtable = &dom_element_slottable_mixin_vtable
+    this.aria_mixin.vtable = &dom_element_aria_mixin_vtable
+    this.animatable.vtable = &dom_element_animatable_vtable
+    dom_element_init_fields(this)
+    this.m_qualified_name = qualified_name
+
+## Ported from Element.cpp:142 Web::DOM::Element::set_affected_by_last_child_pseudo_class.
+pub func dom_element_set_affected_by_last_child_pseudo_class(this: DomElement*, value: bool):
+    this.m_affected_by_last_child_pseudo_class = value
+    if value:
+        if let parent_node = tree_node_parent(this.dom_node()):
+            if let parent = as_if_dom_parent_node(parent_node):
+                dom_parent_node_set_has_child_affected_by_backward_structural_changes(parent, true)
+
+## Ported from Element.cpp:151 Web::DOM::Element::set_affected_by_backward_positional_pseudo_class.
+pub func dom_element_set_affected_by_backward_positional_pseudo_class(this: DomElement*, value: bool):
+    this.m_affected_by_backward_positional_pseudo_class = value
+    if value:
+        if let parent_node = tree_node_parent(this.dom_node()):
+            if let parent = as_if_dom_parent_node(parent_node):
+                dom_parent_node_set_has_child_affected_by_backward_structural_changes(parent, true)
+
+## Ported from Element.cpp:160 Web::DOM::Element::initialize (override).
+pub func dom_element_initialize_impl(base: JsCell*, realm: Realm*):
+    # WEB_SET_PROTOTYPE_FOR_INTERFACE(Element): the prototype comes with the bindings (phase 3).
+    # Base::initialize(realm): ParentNode and Node inherit EventTarget's.
+    dom_event_target_initialize_impl(base, realm)
+
+## Ported from Element.cpp:166 Web::DOM::Element::visit_edges (override).
+pub func dom_element_visit_edges_impl(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (DomElement*)base
+    dom_parent_node_visit_edges_impl(base, visitor)
+    dom_slottable_mixin_visit_edges(&this.slottable_mixin, visitor)
+    animations_animatable_visit_edges(&this.animatable, visitor)
+    aria_mixin_visit_edges(&this.aria_mixin, visitor)
+
+    gc.cell_visitor_visit_t(visitor, this.m_attributes)
+    gc.cell_visitor_visit_t(visitor, this.m_inline_style)
+    gc.cell_visitor_visit_t(visitor, this.m_class_list)
+    gc.cell_visitor_visit_t(visitor, this.m_shadow_root)
+    gc.cell_visitor_visit_t(visitor, this.m_part_list)
+    gc.cell_visitor_visit_cell(visitor, (gc.Cell*?)this.m_custom_element_registry)  # opaque in phase 1
+    gc.cell_visitor_visit_cell(visitor, (gc.Cell*?)this.m_custom_element_definition)  # opaque in phase 1
+    gc.cell_visitor_visit_cell(visitor, (gc.Cell*?)this.m_custom_state_set)  # opaque in phase 1
+    gc.cell_visitor_visit_t(visitor, this.m_cascaded_properties)
+    gc.cell_visitor_visit_t(visitor, this.m_computed_properties)
+    gc.cell_visitor_visit_cell(visitor, (gc.Cell*?)this.m_computed_style_map_cache)  # opaque in phase 1
+    gc.cell_visitor_visit_cell(visitor, (gc.Cell*?)this.m_attribute_style_map)  # opaque in phase 1
+    if let pseudo_element_data = this.m_pseudo_element_data:
+        for entry in ak.hash_map_begin(pseudo_element_data):
+            gc.cell_visitor_visit_t_2(visitor, entry.value)
+    if let registered_intersection_observers = this.m_registered_intersection_observers:
+        for observer in ak.vector_span(registered_intersection_observers):
+            gc.cell_visitor_visit_cell(visitor, (gc.Cell*?)observer)  # opaque in phase 1
+    if let counters_set = this.m_counters_set:
+        css_counters_set_visit_edges(counters_set, visitor)
+
+# mark: Getting attributes ======================================================================
+
+## Ported from Element.cpp:199 Web::DOM::Element::get_attribute.
+# https://dom.spec.whatwg.org/#dom-element-getattribute
+pub func dom_element_get_attribute(this: DomElement*, name: ak.FlyString) -> ak.String?:
+    # 1. Let attr be the result of getting an attribute given qualifiedName and this.
+    let attributes = this.m_attributes else return none
+    let attribute = dom_named_node_map_get_attribute(attributes, name)
+
+    # 2. If attr is null, return null.
+    let attr = attribute else return none
+
+    # 3. Return attr’s value.
+    return dom_attr_value(attr)
+
+## Ported from Element.cpp:215 Web::DOM::Element::get_attribute_ns.
+# https://dom.spec.whatwg.org/#dom-element-getattributens
+pub func dom_element_get_attribute_ns(this: DomElement*, namespace_: ak.FlyString?, name: ak.FlyString) -> ak.String?:
+    # 1. Let attr be the result of getting an attribute given namespace, localName, and this.
+    let attributes = this.m_attributes else return none
+    let attribute = dom_named_node_map_get_attribute_ns(attributes, namespace_, name)
+
+    # 2. If attr is null, return null.
+    let attr = attribute else return none
+
+    # 3. Return attr’s value.
+    return dom_attr_value(attr)
+
+## Ported from Element.cpp:231 Web::DOM::Element::get_attribute_value.
+# https://dom.spec.whatwg.org/#concept-element-attributes-get-value
+pub func dom_element_get_attribute_value(this: DomElement*, local_name: ak.FlyString, namespace_: ak.FlyString? = none) -> ak.String:
+    # 1. Let attr be the result of getting an attribute given namespace, localName, and element.
+    let attributes = this.m_attributes else return ak.string_new()
+    let attribute = dom_named_node_map_get_attribute_ns(attributes, namespace_, local_name)
+
+    # 2. If attr is null, then return the empty string.
+    let attr = attribute else return ak.string_new()
+
+    # 3. Return attr’s value.
+    return dom_attr_value(attr)
+
+# mark: Hyperlinks ==============================================================================
+
+## Ported from Element.cpp:247 Web::DOM::Element::get_an_elements_target.
+# https://html.spec.whatwg.org/multipage/semantics.html#get-an-element's-target
+pub func dom_element_get_an_elements_target(this: DomElement*, target: ak.String? = none) -> ak.String:
+    # To get an element's target, given an a, area, or form element element, and an optional string-or-null target (default null), run these steps:
+    var result = target
+
+    # 1. If target is null, then:
+    if result == none:
+        # 1. If element has a target attribute, then set target to that attribute's value.
+        if let maybe_target = dom_element_attribute(this, html_attribute_names_target):
+            result = maybe_target
+        # 2. Otherwise, if element's node document contains a base element with a target attribute,
+        #    set target to the value of the target attribute of the first such base element.
+        elif let base_element = dom_document_first_base_element_with_target_in_tree_order(dom_element_document(this)):
+            result = dom_element_attribute(base_element.dom_element(), html_attribute_names_target)
+
+    # 2. If target is not null, and contains an ASCII tab or newline and a U+003C (<), then set target to "_blank".
+    if let value = result:
+        let view = ak.string_bytes_as_string_view(&value)
+        if ak.string_view_contains_string_view(&view, ak.sv("\t\n\r")) and ak.string_contains_u32(&value, (u32)'<'):
+            result = ak.string_from_str("_blank")
+
+    # 3. Return target.
+    return result else ak.string_new()
+
+## Ported from Element.cpp:273 Web::DOM::Element::get_an_elements_noopener.
+# https://html.spec.whatwg.org/multipage/links.html#get-an-element's-noopener
+pub func dom_element_get_an_elements_noopener(this: DomElement*, url: web_url.Url, target: ak.StringView) -> HtmlNoOpener:
+    # To get an element's noopener, given an a, area, or form element element, a URL record url, and a string target,
+    # perform the following steps. They return a boolean.
+    let rel_value = dom_element_get_attribute_value(this, html_attribute_names_rel)
+    let rel = web_unicode.string_to_lowercase(&rel_value) else trap("MUST: String::to_lowercase")
+    let rel_view = ak.string_bytes_as_string_view(&rel)
+    let predicate = DomElementIsAsciiWhitespace(unused = 0)
+    var link_types = ak.string_view_split_view_if(&rel_view, &predicate)
+
+    # 1. If element's link types include the noopener or noreferrer keyword, then return true.
+    if dom_element_string_views_contain(&link_types, "noopener") or dom_element_string_views_contain(&link_types, "noreferrer"):
+        return HtmlNoOpener.yes
+
+    # 2. If element's link types do not include the opener keyword and
+    #    target is an ASCII case-insensitive match for "_blank", then return true.
+    if not dom_element_string_views_contain(&link_types, "opener") and ak.string_view_equals_ignoring_ascii_case(&target, ak.sv("_blank")):
+        return HtmlNoOpener.yes
+
+    # 3. If url's blob URL entry is not null:
+    if let blob_url_entry = web_url.url_blob_url_entry(&url):
+        # 1. Let blobOrigin be url's blob URL entry's environment's origin.
+        let blob_origin = blob_url_entry.environment.origin
+
+        # 2. Let topLevelOrigin be element's relevant settings object's top-level origin.
+        let top_level_origin = html_relevant_settings_object_dom_node(this.dom_node()).environment.top_level_origin
+
+        # 3. If blobOrigin is not same site with topLevelOrigin, then return true.
+        if not web_url.origin_is_same_site(&blob_origin, top_level_origin else trap("VERIFY: top-level origin")):
+            return HtmlNoOpener.yes
+
+    # 4. Return false.
+    return HtmlNoOpener.no
+
+## `Vector<StringView>::contains_slow("text"sv)`.
+func dom_element_string_views_contain(views: const ak.Vector[ak.StringView]*, text: str) -> bool:
+    for i in 0..<ak.vector_size(views):
+        if ak.string_view_eq_string_view(ak.vector_at_const(views, i), ak.sv(text)):
+            return true
+    return false
+
+## Ported from Element.cpp:307 Web::DOM::Element::cannot_navigate.
+# https://html.spec.whatwg.org/multipage/links.html#cannot-navigate
+pub func dom_element_cannot_navigate(this: DomElement*) -> bool:
+    # An element element cannot navigate if one of the following is true:
+
+    # - element's node document is not fully active
+    if not dom_document_is_fully_active(dom_element_document(this)):
+        return true
+
+    # - element is not an a element and is not connected.
+    return not (dom_node_is_html_anchor_element(this.dom_node()) or dom_node_is_svg_a_element(this.dom_node())) and not dom_node_is_connected(this.dom_node())
+
+## Ported from Element.cpp:320 Web::DOM::Element::follow_the_hyperlink.
+# https://html.spec.whatwg.org/multipage/links.html#following-hyperlinks-2
+pub func dom_element_follow_the_hyperlink(this: DomElement*, hyperlink_suffix: ak.String?, user_involvement: HtmlUserNavigationInvolvement = HtmlUserNavigationInvolvement.none_):
+    # 1. If subject cannot navigate, then return.
+    if dom_element_cannot_navigate(this):
+        return
+
+    # 2. Let targetAttributeValue be the empty string.
+    var target_attribute_value = ak.string_new()
+
+    # 3. If subject is an a or area element, then set targetAttributeValue to the result of getting an element's target given subject.
+    if dom_node_is_html_anchor_element(this.dom_node()) or dom_node_is_html_area_element(this.dom_node()) or dom_node_is_svg_a_element(this.dom_node()):
+        target_attribute_value = dom_element_get_an_elements_target(this)
+
+    # 4. Let urlRecord be the result of encoding-parsing a URL given subject's href attribute value, relative to subject's node document.
+    let href = dom_element_get_attribute_value(this, html_attribute_names_href)
+    let url_record = dom_document_encoding_parse_url(dom_element_document(this), ak.string_bytes_as_string_view(&href))
+
+    # 5. If urlRecord is failure, then return.
+    let url = url_record else return
+
+    # 6. Let noopener be the result of getting an element's noopener with subject, urlRecord, and targetAttributeValue.
+    let noopener = dom_element_get_an_elements_noopener(this, url, ak.string_bytes_as_string_view(&target_attribute_value))
+
+    # 7. Let targetNavigable be the first return value of applying the rules for choosing a navigable given
+    #    targetAttributeValue, subject's node navigable, and noopener.
+    let navigable = dom_document_navigable(dom_element_document(this)) else trap("follow_the_hyperlink: no navigable")
+    let target_navigable = html_navigable_choose_a_navigable(navigable, ak.string_bytes_as_string_view(&target_attribute_value), noopener).navigable
+
+    # 8. If targetNavigable is null, then return.
+    if target_navigable == none:
+        return
+
+    # 9. Let urlString be the result of applying the URL serializer to urlRecord.
+    var url_string = web_url.url_serialize(&url)
+
+    # 10. If hyperlinkSuffix is non-null, then append it to urlString.
+    if let suffix = hyperlink_suffix:
+        var builder = ak.string_builder_new()
+        ak.string_builder_append_string_view(&builder, ak.string_bytes_as_string_view(&url_string))
+        ak.string_builder_append_string_view(&builder, ak.string_bytes_as_string_view(&suffix))
+        url_string = ak.string_builder_to_string(&builder) else trap("MUST: String::formatted")
+
+    # 11. Let referrerPolicy be the current state of subject's referrerpolicy content attribute.
+    let referrer_policy_attribute = dom_element_attribute(this, html_attribute_names_referrerpolicy) else ak.string_new()
+    let referrer_policy = referrer_policy_from_string(ak.string_bytes_as_string_view(&referrer_policy_attribute)) else ReferrerPolicyReferrerPolicy.empty_string
+
+    # FIXME: 12. If subject's link types includes the noreferrer keyword, then set referrerPolicy to "no-referrer".
+
+    # 13. Navigate targetNavigable to urlString using subject's node document, with referrerPolicy set to referrerPolicy and userInvolvement set to userInvolvement.
+    let parsed = web_url.parser_basic_parse(ak.string_bytes_as_string_view(&url_string))
+    assert(parsed != none)
+    discard(referrer_policy)
+    discard(user_involvement)
+    # Navigable::NavigateParams is opaque in phase 1 (navigation is phase 2).
+    trap("unported (P2): Navigable::navigate from Element::follow_the_hyperlink (NavigateParams is opaque)")
+
+# mark: Attribute nodes and setAttribute ========================================================
+
+## Ported from Element.cpp:370 Web::DOM::Element::get_attribute_node.
+# https://dom.spec.whatwg.org/#dom-element-getattributenode
+pub func dom_element_get_attribute_node(this: DomElement*, name: ak.FlyString) -> DomAttr*?:
+    # The getAttributeNode(qualifiedName) method steps are to return the result of getting an attribute given qualifiedName and this.
+    let attributes = this.m_attributes else return none
+    return dom_named_node_map_get_attribute(attributes, name)
+
+## Ported from Element.cpp:379 Web::DOM::Element::get_attribute_node_ns.
+# https://dom.spec.whatwg.org/#dom-element-getattributenodens
+pub func dom_element_get_attribute_node_ns(this: DomElement*, namespace_: ak.FlyString?, name: ak.FlyString) -> DomAttr*?:
+    # The getAttributeNodeNS(namespace, localName) method steps are to return the result of getting an attribute given namespace, localName, and this.
+    let attributes = this.m_attributes else return none
+    return dom_named_node_map_get_attribute_ns(attributes, namespace_, name)
+
+## Ported from Element.cpp:388 Web::DOM::Element::set_attribute_for_bindings.
+# https://dom.spec.whatwg.org/#dom-element-setattribute
+pub func dom_element_set_attribute_for_bindings(this: DomElement*, qualified_name: ak.FlyString, value: TrustedTypesTrustedHtmlOrTrustedTypesTrustedScriptOrTrustedTypesTrustedScriptUrlOrUtf16String) -> !:
+    var name = qualified_name
+
+    # 1. If qualifiedName is not a valid attribute local name, then throw an "InvalidCharacterError" DOMException.
+    if not dom_is_valid_attribute_local_name(name):
+        try idl_throw(.idl_dom_exception(idl_invalid_character_error_create(dom_element_realm(this), ak.utf16_string_from_str("Attribute name must not be empty or contain invalid characters"))))
+
+    # 2. If this is in the HTML namespace and its node document is an HTML document, then set qualifiedName to
+    #    qualifiedName in ASCII lowercase.
+    if dom_element_is_html_element_in_html_document(this):
+        name = ak.fly_string_to_ascii_lowercase(&name)
+
+    # 3. Let verifiedValue be the result of calling get Trusted Types-compliant attribute value
+    #    with qualifiedName, null, this, and value.
+    let verified_value = try trusted_types_get_trusted_types_compliant_attribute_value(name, none, this, value)
+
+    # 4. Let attribute be the first attribute in this’s attribute list whose qualified name is qualifiedName, and null otherwise.
+    let attributes = dom_element_attributes(this) else trap("Element::attributes() is never null")
+    let attribute = dom_named_node_map_get_attribute(attributes, name)
+
+    # 5. If attribute is non-null, then change attribute to verifiedValue and return.
+    if let existing = attribute:
+        dom_attr_change_attribute(existing, ak.utf16_string_base_to_utf8_but_should_be_ported_to_utf16(&verified_value.utf16_string_base))
+        return
+
+    # 6. Set attribute to a new attribute whose local name is qualifiedName, value is verifiedValue,
+    #    and node document is this’s node document.
+    let new_attribute = dom_attr_create_fly_string(dom_element_document(this), name, ak.utf16_string_base_to_utf8_but_should_be_ported_to_utf16(&verified_value.utf16_string_base))
+
+    # 7. Append attribute to this.
+    dom_named_node_map_append_attribute(attributes, new_attribute)
+
+## Ported from Element.cpp:423 Web::DOM::Element::set_attribute_for_bindings.
+# https://dom.spec.whatwg.org/#dom-element-setattribute
+pub func dom_element_set_attribute_for_bindings_2(this: DomElement*, qualified_name: ak.FlyString, value: TrustedTypesTrustedHtmlOrTrustedTypesTrustedScriptOrTrustedTypesTrustedScriptUrlOrString) -> !:
+    let converted = match value:
+        .trusted_types_trusted_html(trusted_type) => TrustedTypesTrustedHtmlOrTrustedTypesTrustedScriptOrTrustedTypesTrustedScriptUrlOrUtf16String.trusted_types_trusted_html(trusted_type)
+        .trusted_types_trusted_script(trusted_type) => TrustedTypesTrustedHtmlOrTrustedTypesTrustedScriptOrTrustedTypesTrustedScriptUrlOrUtf16String.trusted_types_trusted_script(trusted_type)
+        .trusted_types_trusted_script_url(trusted_type) => TrustedTypesTrustedHtmlOrTrustedTypesTrustedScriptOrTrustedTypesTrustedScriptUrlOrUtf16String.trusted_types_trusted_script_url(trusted_type)
+        .string(string) => TrustedTypesTrustedHtmlOrTrustedTypesTrustedScriptOrTrustedTypesTrustedScriptUrlOrUtf16String.utf16_string(ak.utf16_string_from_utf8_string(&string))
+    try dom_element_set_attribute_for_bindings(this, qualified_name, converted)
+
+# mark: Name validity ===========================================================================
+
+## The characters a valid namespace prefix must not contain: ASCII whitespace, U+0000 NULL, U+002F (/), U+003E (>).
+let dom_invalid_namespace_prefix_characters: u32[8] = [0x09, 0x0a, 0x0c, 0x0d, 0x20, 0x00, 0x2f, 0x3e]
+
+## The characters a valid attribute local name must not contain: ASCII whitespace, U+0000 NULL, U+002F (/), U+003D (=), U+003E (>).
+let dom_invalid_attribute_local_name_characters: u32[9] = [0x09, 0x0a, 0x0c, 0x0d, 0x20, 0x00, 0x2f, 0x3d, 0x3e]
+
+## Ported from Element.cpp:432 Web::DOM::is_valid_namespace_prefix.
+# https://dom.spec.whatwg.org/#valid-namespace-prefix
+pub func dom_is_valid_namespace_prefix(prefix: ak.FlyString) -> bool:
+    # A string is a valid namespace prefix if its length is at least 1 and it does not contain ASCII whitespace, U+0000 NULL, U+002F (/), or U+003E (>).
+    let code_points = ak.fly_string_code_points(&prefix)
+    return not ak.fly_string_is_empty(&prefix) and not ak.utf8_view_contains_any_of(&code_points, dom_invalid_namespace_prefix_characters)
+
+## Ported from Element.cpp:440 Web::DOM::is_valid_attribute_local_name.
+# https://dom.spec.whatwg.org/#valid-attribute-local-name
+pub func dom_is_valid_attribute_local_name(local_name: ak.FlyString) -> bool:
+    # A string is a valid attribute local name if its length is at least 1 and it does not contain ASCII whitespace, U+0000 NULL, U+002F (/), U+003D (=), or U+003E (>).
+    let code_points = ak.fly_string_code_points(&local_name)
+    return not ak.fly_string_is_empty(&local_name) and not ak.utf8_view_contains_any_of(&code_points, dom_invalid_attribute_local_name_characters)
+
+## Ported from Element.cpp:448 Web::DOM::is_valid_element_local_name.
+# https://dom.spec.whatwg.org/#valid-element-local-name
+pub func dom_is_valid_element_local_name(name: ak.FlyString) -> bool:
+    # 1. If name’s length is 0, then return false.
+    if ak.fly_string_is_empty(&name):
+        return false
+
+    # 2. If name’s 0th code point is an ASCII alpha, then:
+    let code_points = ak.fly_string_code_points(&name)
+    let begin = ak.utf8_view_begin(&code_points)
+    let first_code_point = ak.utf8_code_point_iterator_peek(&begin) else trap("VERIFY: a code point")
+    if ak.is_ascii_alpha(first_code_point):
+        # 1. If name contains ASCII whitespace, U+0000 NULL, U+002F (/), or U+003E (>), then return false.
+        if ak.utf8_view_contains_any_of(&code_points, dom_invalid_namespace_prefix_characters):
+            return false
+
+        # 2. Return true.
+        return true
+
+    # 3. If name’s 0th code point is not U+003A (:), U+005F (_), or in the range U+0080 to U+10FFFF, inclusive, then return false.
+    if not (first_code_point == 0x003a or first_code_point == 0x005f) and (first_code_point < 0x0080 or first_code_point > 0x10ffff):
+        return false
+
+    # 4. If name’s subsequent code points, if any, are not ASCII alphas, ASCII digits, U+002D (-), U+002E (.), U+003A (:), U+005F (_), or in the range U+0080 to U+10FFFF, inclusive, then return false.
+    let subsequent = ak.utf8_view_unicode_substring_view(&code_points, 1)
+    var iterator = ak.utf8_view_begin(&subsequent)
+    while not ak.utf8_code_point_iterator_done(&iterator):
+        let code_point = ak.utf8_code_point_iterator_deref(&iterator)
+        discard(ak.utf8_code_point_iterator_inc(&iterator))
+        if not ak.is_ascii_alpha(code_point) and not ak.is_ascii_digit(code_point) and not (code_point == 0x002d or code_point == 0x002e or code_point == 0x003a or code_point == 0x005f) and (code_point < 0x0080 or code_point > 0x10ffff):
+            return false
+
+    # 5. Return true.
+    return true
+
+## Ported from Element.cpp:481 Web::DOM::validate_and_extract.
+# https://dom.spec.whatwg.org/#validate-and-extract
+pub func dom_validate_and_extract(realm: Realm*, namespace_: ak.FlyString?, qualified_name: ak.FlyString, context: DomValidationContext) -> DomQualifiedName!:
+    # To validate and extract a namespace and qualifiedName, run these steps:
+    var namespace_value = namespace_
+
+    # 1. If namespace is the empty string, then set it to null.
+    if let value = namespace_value:
+        if ak.fly_string_is_empty(&value):
+            namespace_value = none
+
+    # 2. Let prefix be null.
+    var prefix: ak.FlyString? = none
+
+    # 3. Let localName be qualifiedName.
+    var local_name = qualified_name
+
+    # 4. If qualifiedName contains a U+003A (:):
+    let qualified_name_view = ak.fly_string_bytes_as_string_view(&qualified_name)
+    if let colon_position = ak.string_view_find_u8(&qualified_name_view, ':'):
+        # 1. Set prefix to the part of qualifiedName before the first U+003A (:).
+        let prefix_value = ak.fly_string_from_utf8(ak.string_view_substring_view_usize(&qualified_name_view, 0, colon_position)) else trap("MUST: FlyString::from_utf8")
+        prefix = prefix_value
+
+        # 2. Set localName to the part of qualifiedName after the first U+003A (:).
+        local_name = ak.fly_string_from_utf8(ak.string_view_substring_view(&qualified_name_view, colon_position + 1)) else trap("MUST: FlyString::from_utf8")
+
+        # 3. If prefix is not a valid namespace prefix, then throw an "InvalidCharacterError" DOMException.
+        if not dom_is_valid_namespace_prefix(prefix_value):
+            try idl_throw(.idl_dom_exception(idl_invalid_character_error_create(realm, ak.utf16_string_from_str("Prefix not a valid namespace prefix."))))
+
+    # 5. Assert: prefix is either null or a valid namespace prefix.
+    if let prefix_value = prefix:
+        assert(dom_is_valid_namespace_prefix(prefix_value))
+
+    # 6. If context is "attribute" and localName is not a valid attribute local name, then throw an "InvalidCharacterError" DOMException.
+    if context == DomValidationContext.attribute and not dom_is_valid_attribute_local_name(local_name):
+        try idl_throw(.idl_dom_exception(idl_invalid_character_error_create(realm, ak.utf16_string_from_str("Local name not a valid attribute local name."))))
+
+    # 7. If context is "element" and localName is not a valid element local name, then throw an "InvalidCharacterError" DOMException.
+    if context == DomValidationContext.element and not dom_is_valid_element_local_name(local_name):
+        try idl_throw(.idl_dom_exception(idl_invalid_character_error_create(realm, ak.utf16_string_from_str("Local name not a valid element local name."))))
+
+    # 8. If prefix is non-null and namespace is null, then throw a "NamespaceError" DOMException.
+    if prefix != none and namespace_value == none:
+        try idl_throw(.idl_dom_exception(idl_namespace_error_create(realm, ak.utf16_string_from_str("Prefix is non-null and namespace is null."))))
+
+    # 9. If prefix is "xml" and namespace is not the XML namespace, then throw a "NamespaceError" DOMException.
+    if dom_element_optional_fly_string_is_text(prefix, "xml") and not dom_node_optional_fly_string_is(namespace_value, namespace_xml):
+        try idl_throw(.idl_dom_exception(idl_namespace_error_create(realm, ak.utf16_string_from_str("Prefix is 'xml' and namespace is not the XML namespace."))))
+
+    # 10. If either qualifiedName or prefix is "xmlns" and namespace is not the XMLNS namespace, then throw a "NamespaceError" DOMException.
+    let qualified_name_or_prefix_is_xmlns = ak.fly_string_eq_string_view(&qualified_name, ak.sv("xmlns")) or dom_element_optional_fly_string_is_text(prefix, "xmlns")
+    if qualified_name_or_prefix_is_xmlns and not dom_node_optional_fly_string_is(namespace_value, namespace_xmlns):
+        try idl_throw(.idl_dom_exception(idl_namespace_error_create(realm, ak.utf16_string_from_str("Either qualifiedName or prefix is 'xmlns' and namespace is not the XMLNS namespace."))))
+
+    # 11. If namespace is the XMLNS namespace and neither qualifiedName nor prefix is "xmlns", then throw a "NamespaceError" DOMException.
+    if dom_node_optional_fly_string_is(namespace_value, namespace_xmlns) and not qualified_name_or_prefix_is_xmlns:
+        try idl_throw(.idl_dom_exception(idl_namespace_error_create(realm, ak.utf16_string_from_str("Namespace is the XMLNS namespace and neither qualifiedName nor prefix is 'xmlns'."))))
+
+    # 12. Return (namespace, prefix, localName).
+    var result: DomQualifiedName = ---
+    dom_qualified_name_construct(&result, local_name, prefix, namespace_value)
+    return result

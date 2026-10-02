@@ -1,0 +1,454 @@
+#==============================================================================================
+#
+#   element_3 - DOM::Element: style recomputation, token lists, shadow roots, selectors
+#
+#   DESCRIPTION:
+#       Port of LibWeb/DOM/Element.cpp (lines 920-1334): recomputing an element's style and
+#       its inherited style, classList and part, attaching a shadow root (with the valid
+#       shadow host names), attachShadow, the shadowRoot getter, matches() and closest().
+#
+#==============================================================================================
+
+# mark: Style recomputation =====================================================================
+
+## `DOM::AbstractElement { element, pseudo_element }`.
+func dom_element_abstract_element(element: DomElement*, pseudo_element: css_data.PseudoElement? = none) -> DomAbstractElement:
+    var abstract_element: DomAbstractElement = ---
+    dom_abstract_element_construct(&abstract_element, element, pseudo_element)
+    return abstract_element
+
+## The captures of Element::recompute_style's anchor-name lambdas.
+struct DomElementRecomputeStyleAnchorNames:
+    var this: DomElement*
+    var anchor_names: DomAnchorNameMap*
+
+## `[&](FlyString const& name) { anchor_names.unregister_name(name, *this); }`.
+func dom_element_recompute_style_unregister_anchor_name(context: void*?, name: const ak.FlyString*):
+    let captures = (DomElementRecomputeStyleAnchorNames*)(context else trap("no captures"))
+    dom_anchor_name_map_unregister_name(captures.anchor_names, *name, captures.this)
+
+## `[&](FlyString const& name) { anchor_names.register_name(name, *this); }`.
+func dom_element_recompute_style_register_anchor_name(context: void*?, name: const ak.FlyString*):
+    let captures = (DomElementRecomputeStyleAnchorNames*)(context else trap("no captures"))
+    dom_anchor_name_map_register_name(captures.anchor_names, *name, captures.this)
+
+## Element::recompute_style's lambda run on each shadow-including inclusive descendant when the
+## non-animated display changes to or from none.
+func dom_element_recompute_style_display_changed_steps(context: void*?, node: DomNode*) -> TraversalDecision:
+    let element = as_if_dom_element(node) else return TraversalDecision.continue_
+    dom_element_play_or_cancel_animations_after_display_property_change(element)
+    return TraversalDecision.continue_
+
+## Element::recompute_style's `recompute_pseudo_element_style` lambda.
+func dom_element_recompute_pseudo_element_style(this: DomElement*, style_computer: CssStyleComputer*, pseudo_element: css_data.PseudoElement, did_change_custom_properties: bool*, invalidation: CssRequiredInvalidationAfterStyleChange*):
+    css_style_computer_push_ancestor(style_computer, this)
+
+    let pseudo_element_style = dom_element_computed_properties(this, pseudo_element)
+    let new_pseudo_element_style = css_style_computer_compute_pseudo_element_style_if_needed(style_computer, dom_element_abstract_element(this, pseudo_element), did_change_custom_properties)
+
+    # TODO: Can we be smarter about invalidation?
+    if pseudo_element_style != none and new_pseudo_element_style != none:
+        var abstract_element = dom_element_abstract_element(this, pseudo_element)
+        css_required_invalidation_after_style_change_or_assign(invalidation, dom_compute_required_invalidation(pseudo_element_style else trap("unreachable"), new_pseudo_element_style else trap("unreachable"), dom_document_font_computer(dom_element_document(this)), dom_element_get_pseudo_element_node(this, pseudo_element), &abstract_element))
+    elif pseudo_element_style != none or new_pseudo_element_style != none:
+        *invalidation = css_required_invalidation_after_style_change_full()
+
+    dom_element_set_computed_properties(this, pseudo_element, new_pseudo_element_style)
+    css_style_computer_pop_ancestor(style_computer, this)
+
+## Ported from Element.cpp:920 Web::DOM::Element::recompute_style.
+pub func dom_element_recompute_style(this: DomElement*, did_change_custom_properties: bool*) -> CssRequiredInvalidationAfterStyleChange:
+    assert(tree_node_parent(this.dom_node()) != none)
+
+    let counters = dom_document_style_invalidation_counters(dom_element_document(this))
+    counters.element_style_recomputations += 1
+
+    this.m_style_uses_attr_css_function = false
+    this.m_style_uses_var_css_function = false
+    this.m_style_uses_tree_counting_function = false
+    this.m_style_uses_if_css_function = false
+    this.m_style_uses_inherit_css_function = false
+    this.m_affected_by_has_pseudo_class_in_subject_position = false
+    this.m_affected_by_has_pseudo_class_in_non_subject_position = false
+    this.m_affected_by_has_pseudo_class_with_relative_selector_that_has_sibling_combinator = false
+    this.m_affected_by_direct_sibling_combinator = false
+    this.m_affected_by_indirect_sibling_combinator = false
+    this.m_affected_by_first_child_pseudo_class = false
+    this.m_affected_by_last_child_pseudo_class = false
+    this.m_affected_by_forward_positional_pseudo_class = false
+    this.m_affected_by_backward_positional_pseudo_class = false
+    this.m_sibling_invalidation_distance = 0
+
+    let style_computer = dom_document_style_computer(dom_element_document(this))
+    let new_computed_properties = css_style_computer_compute_style(style_computer, dom_element_abstract_element(this), did_change_custom_properties)
+
+    # Tables must not inherit -libweb-* values for text-align.
+    # FIXME: Find the spec for this.
+    if is_html_table_element(this):
+        let text_align = css_computed_properties_text_align(new_computed_properties)
+        if text_align == css_data.TextAlign.libweb_left or text_align == css_data.TextAlign.libweb_center or text_align == css_data.TextAlign.libweb_right:
+            css_computed_properties_set_property(new_computed_properties, css_data.PropertyId.text_align, css_keyword_style_value_create(css_data.Keyword.start).css_style_value())
+
+    var had_list_marker = false
+
+    var invalidation: CssRequiredInvalidationAfterStyleChange
+    if let old_computed_properties = this.m_computed_properties:
+        var abstract_element = dom_element_abstract_element(this)
+        invalidation = dom_compute_required_invalidation(old_computed_properties, new_computed_properties, dom_document_font_computer(dom_element_document(this)), dom_element_unsafe_layout_node(this), &abstract_element)
+        let old_display = css_computed_properties_display(old_computed_properties)
+        had_list_marker = css_display_is_list_item(&old_display)
+    else:
+        invalidation = css_required_invalidation_after_style_change_full()
+
+    # https://drafts.csswg.org/css-anchor-position-1/#determining
+    # Update the anchor name registry when anchor-name changes.
+    # FIXME: The tree root should be determined by the stylesheet origin, not the element's position in the tree.
+    if dom_node_is_connected(this.dom_node()):
+        var anchor_names: DomAnchorNameMap*? = none
+        if let shadow_root = as_if_dom_shadow_root(tree_node_root(this.dom_node())):
+            anchor_names = dom_shadow_root_anchor_name_map(shadow_root)
+        else:
+            anchor_names = dom_document_anchor_name_map(dom_element_document(this))
+        var captures = DomElementRecomputeStyleAnchorNames(this = this, anchor_names = anchor_names else trap("unreachable"))
+        if let old_computed_properties = this.m_computed_properties:
+            css_computed_properties_for_each_anchor_name(old_computed_properties, ak.Function1[const ak.FlyString*, unit](call = dom_element_recompute_style_unregister_anchor_name, context = &captures))
+        css_computed_properties_for_each_anchor_name(new_computed_properties, ak.Function1[const ak.FlyString*, unit](call = dom_element_recompute_style_register_anchor_name, context = &captures))
+
+    var old_non_animated_display_is_none = true
+    if let old_computed_properties = this.m_computed_properties:
+        let old_display = css_display_style_value_display(css_style_value_as_display(css_computed_properties_property(old_computed_properties, css_data.PropertyId.display, CssComputedPropertiesWithAnimationsApplied.no)))
+        old_non_animated_display_is_none = css_display_is_none(&old_display)
+    let new_display = css_display_style_value_display(css_style_value_as_display(css_computed_properties_property(new_computed_properties, css_data.PropertyId.display, CssComputedPropertiesWithAnimationsApplied.no)))
+    let new_non_animated_display_is_none = css_display_is_none(&new_display)
+
+    dom_element_set_computed_properties(this, none, new_computed_properties)
+
+    if old_non_animated_display_is_none != new_non_animated_display_is_none:
+        discard(dom_node_for_each_shadow_including_inclusive_descendant(this.dom_node(), ak.Function1[DomNode*, TraversalDecision](call = dom_element_recompute_style_display_changed_steps, context = none)))
+
+    # Any document change that can cause this element's style to change, could also affect its pseudo-elements.
+    dom_element_recompute_pseudo_element_style(this, style_computer, css_data.PseudoElement.before, did_change_custom_properties, &invalidation)
+    dom_element_recompute_pseudo_element_style(this, style_computer, css_data.PseudoElement.after, did_change_custom_properties, &invalidation)
+    dom_element_recompute_pseudo_element_style(this, style_computer, css_data.PseudoElement.selection, did_change_custom_properties, &invalidation)
+    if this.m_rendered_in_top_layer:
+        dom_element_recompute_pseudo_element_style(this, style_computer, css_data.PseudoElement.backdrop, did_change_custom_properties, &invalidation)
+    let current_display = css_computed_properties_display(this.m_computed_properties else trap("computed properties were just set"))
+    if had_list_marker or css_display_is_list_item(&current_display):
+        dom_element_recompute_pseudo_element_style(this, style_computer, css_data.PseudoElement.marker, did_change_custom_properties, &invalidation)
+
+    if css_required_invalidation_after_style_change_is_none(&invalidation):
+        counters.element_style_noop_recomputations += 1
+        return invalidation
+
+    if not invalidation.rebuild_layout_tree:
+        if let layout_node = dom_element_unsafe_layout_node(this):
+            # If we're keeping the layout tree, we can just apply the new style to the existing layout tree.
+            layout_node_with_style_apply_style(layout_node, this.m_computed_properties else trap("computed properties were just set"))
+            if invalidation.repaint:
+                dom_node_set_needs_repaint(this.dom_node())
+
+            # Do the same for pseudo-elements.
+            for i in 0..<(u8)css_data.PseudoElement.known_pseudo_element_count:
+                let pseudo_element_type = (css_data.PseudoElement)i
+                let pseudo_element = dom_element_get_pseudo_element(this, pseudo_element_type) else continue
+                if dom_pseudo_element_unsafe_layout_node(pseudo_element) == none:
+                    continue
+
+                let pseudo_element_style = dom_element_computed_properties(this, pseudo_element_type) else continue
+
+                if let node_with_style = dom_pseudo_element_unsafe_layout_node(pseudo_element):
+                    layout_node_with_style_apply_style(node_with_style, pseudo_element_style)
+                    if invalidation.repaint:
+                        if let first_paintable = layout_node_first_paintable(node_with_style.layout_node()):
+                            paint_paintable_set_needs_repaint(first_paintable, InvalidateDisplayList.yes)
+
+    return invalidation
+
+## A `HashMap<size_t, RefPtr<CSS::StyleValue const>>` entry of recompute_inherited_style: a property
+## index beside its old value.
+struct DomElementPropertyValueAffectedByInheritedStyle:
+    var property_index: u16
+    var old_value: CssStyleValue*?
+
+## Ported from Element.cpp:1057 Web::DOM::Element::recompute_inherited_style.
+pub func dom_element_recompute_inherited_style(this: DomElement*) -> CssRequiredInvalidationAfterStyleChange:
+    let counters = dom_document_style_invalidation_counters(dom_element_document(this))
+    counters.element_inherited_style_recomputations += 1
+
+    let maybe_computed_properties = dom_element_computed_properties(this)
+    let cascaded_properties = this.m_cascaded_properties else trap("VERIFY: m_cascaded_properties")
+    let computed_properties = maybe_computed_properties else trap("VERIFY: computed_properties")
+
+    var invalidation: CssRequiredInvalidationAfterStyleChange
+
+    # HashMap<size_t, RefPtr<StyleValue const>> keyed by the property index: the indices are visited in
+    # increasing order and each at most once, so a Vector of pairs keeps the same contents.
+    var property_values_affected_by_inherited_style: ak.Vector[DomElementPropertyValueAffectedByInheritedStyle]
+    for i in (u16)css_data.first_longhand_property_id..=(u16)css_data.last_longhand_property_id:
+        let property_id = (css_data.PropertyId)i
+        # FIXME: We should use the specified value rather than the cascaded value as the cascaded value may include
+        #        unresolved CSS-wide keywords (e.g. 'initial' or 'inherit') rather than the resolved value.
+        let preabsolutized_value = css_cascaded_properties_property(cascaded_properties, property_id)
+        let old_value: CssStyleValue*? = css_computed_properties_property(computed_properties, property_id)
+
+        if let value = preabsolutized_value:
+            # A property needs updating if:
+            # - It uses relative units as it might have been affected by a change in ancestor element style.
+            #   FIXME: Consider other style values that rely on relative lengths (e.g. CalculatedStyleValue,
+            #          StyleValues which contain lengths (e.g. StyleValueList)) - maybe we can use
+            #          `is_computationally_independent()`
+            # - font-weight is `bolder` or `lighter`
+            # - font-size is `larger` or `smaller`
+            # FIXME: Consider any other properties that rely on inherited values for computation.
+            var needs_updating = false
+            if css_style_value_is_length(value):
+                let length = css_length_style_value_length(css_style_value_as_length(value))
+                needs_updating = css_length_is_font_relative(&length)
+            if not needs_updating and property_id == css_data.PropertyId.font_weight:
+                let keyword = css_style_value_to_keyword(value)
+                needs_updating = keyword == css_data.Keyword.bolder or keyword == css_data.Keyword.lighter
+            if not needs_updating and property_id == css_data.PropertyId.font_size:
+                let keyword = css_style_value_to_keyword(value)
+                needs_updating = keyword == css_data.Keyword.larger or keyword == css_data.Keyword.smaller
+            if needs_updating:
+                css_computed_properties_set_property_without_modifying_flags(computed_properties, property_id, value)
+                ak.vector_append_t(&property_values_affected_by_inherited_style, DomElementPropertyValueAffectedByInheritedStyle(property_index = i, old_value = old_value))
+
+        if not css_computed_properties_is_property_inherited(computed_properties, property_id):
+            continue
+
+        var animated_property_values = css_computed_properties_animated_property_values(computed_properties)
+        if css_computed_properties_is_animated_property_inherited(computed_properties, property_id) or not ak.hash_map_contains_k(&animated_property_values, property_id):
+            if let new_animated_value = css_style_computer_get_animated_inherit_value(property_id, dom_element_abstract_element(this)):
+                css_computed_properties_set_animated_property(computed_properties, property_id, new_animated_value.value, new_animated_value.is_result_of_transition, CssComputedPropertiesInherited.yes)
+            elif ak.hash_map_contains_k(&animated_property_values, property_id):
+                css_computed_properties_remove_animated_property(computed_properties, property_id)
+
+        let new_value = css_style_computer_get_non_animated_inherit_value(property_id, dom_element_abstract_element(this))
+        css_computed_properties_set_property(computed_properties, property_id, new_value, CssComputedPropertiesInherited.yes)
+        css_required_invalidation_after_style_change_or_assign(&invalidation, css_compute_property_invalidation(property_id, old_value, css_computed_properties_property(computed_properties, property_id)))
+
+    if css_required_invalidation_after_style_change_is_none(&invalidation) and ak.vector_is_empty(&property_values_affected_by_inherited_style):
+        counters.element_inherited_style_noop_recomputations += 1
+        return invalidation
+
+    let abstract_element = dom_element_abstract_element(this)
+
+    css_style_computer_compute_property_values(dom_document_style_computer(dom_element_document(this)), computed_properties, abstract_element)
+
+    for entry in ak.vector_span(&property_values_affected_by_inherited_style):
+        let property_id = (css_data.PropertyId)entry.property_index
+        let new_value = css_computed_properties_property(computed_properties, property_id)
+        css_required_invalidation_after_style_change_or_assign(&invalidation, css_compute_property_invalidation(property_id, entry.old_value, new_value))
+
+    if css_required_invalidation_after_style_change_is_none(&invalidation):
+        counters.element_inherited_style_noop_recomputations += 1
+        return invalidation
+
+    # NB: unsafe_layout_node() because we're applying recomputed inherited styles during
+    #     style recalculation, before layout has been updated.
+    if let layout_node = dom_element_unsafe_layout_node(this):
+        layout_node_with_style_apply_style(layout_node, computed_properties)
+    if invalidation.repaint:
+        dom_node_set_needs_repaint(this.dom_node())
+    return invalidation
+
+# mark: Token lists =============================================================================
+
+## Ported from Element.cpp:1137 Web::DOM::Element::class_list.
+pub func dom_element_class_list(this: DomElement*) -> DomTokenList*:
+    if this.m_class_list == none:
+        this.m_class_list = dom_token_list_create(this, html_attribute_names_class)
+    return this.m_class_list else trap("unreachable")
+
+## Ported from Element.cpp:1145 Web::DOM::Element::part_list.
+# https://drafts.csswg.org/css-shadow-1/#dom-element-part
+pub func dom_element_part_list(this: DomElement*) -> DomTokenList*:
+    # The part attribute’s getter must return a DOMTokenList object whose associated element is the context object and
+    # whose associated attribute’s local name is part.
+    if this.m_part_list == none:
+        this.m_part_list = dom_token_list_create(this, html_attribute_names_part)
+    return this.m_part_list else trap("unreachable")
+
+# mark: Shadow roots ============================================================================
+
+## The names other than valid custom element names that a valid shadow host name may be.
+let dom_valid_shadow_host_names: str[18] = ["article", "aside", "blockquote", "body", "div", "footer", "h1", "h2", "h3", "h4", "h5", "h6", "header", "main", "nav", "p", "section", "span"]
+
+## Ported from Element.cpp:1155 Web::DOM::is_valid_shadow_host_name.
+# https://dom.spec.whatwg.org/#valid-shadow-host-name
+func dom_is_valid_shadow_host_name(name: ak.FlyString) -> bool:
+    # A valid shadow host name is:
+    # - a valid custom element name
+    # - "article", "aside", "blockquote", "body", "div", "footer", "h1", "h2", "h3", "h4", "h5", "h6", "header", "main", "nav", "p", "section", or "span"
+    if not html_is_valid_custom_element_name(ak.fly_string_to_string_const(&name)) and not dom_fly_string_is_one_of(name, dom_valid_shadow_host_names):
+        return false
+    return true
+
+## `FlyString::is_one_of(...)`: equal to one of the given strings.
+func dom_fly_string_is_one_of(name: ak.FlyString, strings: const str[]) -> bool:
+    for string in strings:
+        if ak.fly_string_eq_string_view(&name, ak.sv(string)):
+            return true
+    return false
+
+## Ported from Element.cpp:1168 Web::DOM::Element::attach_a_shadow_root.
+# https://dom.spec.whatwg.org/#concept-attach-a-shadow-root
+pub func dom_element_attach_a_shadow_root(this: DomElement*, mode: BindShadowRootMode, clonable: bool, serializable: bool, delegates_focus: bool, slot_assignment: BindSlotAssignmentMode, registry: HtmlCustomElementRegistry*?) -> !:
+    # 1. If element’s namespace is not the HTML namespace, then throw a "NotSupportedError" DOMException.
+    if not dom_node_optional_fly_string_is(dom_element_namespace_uri(this), namespace_html):
+        try idl_throw(.idl_dom_exception(idl_not_supported_error_create(dom_element_realm(this), ak.utf16_string_from_str("Element's namespace is not the HTML namespace"))))
+
+    # 2. If element’s local name is not a valid shadow host name, then throw a "NotSupportedError" DOMException.
+    if not dom_is_valid_shadow_host_name(dom_element_local_name(this)):
+        try idl_throw(.idl_dom_exception(idl_not_supported_error_create(dom_element_realm(this), ak.utf16_string_from_str("Element's local name is not a valid shadow host name"))))
+
+    # 3. If element’s local name is a valid custom element name, or element’s is value is not null:
+    let local_name = dom_element_local_name(this)
+    if html_is_valid_custom_element_name(ak.fly_string_to_string_const(&local_name)) or this.m_is_value != none:
+        # 1. Let definition be the result of looking up a custom element definition given element’s custom element
+        #    registry, its namespace, its local name, and its is value.
+        let definition = html_look_up_a_custom_element_definition(dom_element_custom_element_registry(this), dom_element_namespace_uri(this), local_name, this.m_is_value)
+
+        # 2. If definition is non-null and definition’s disable shadow is true, then throw a "NotSupportedError"
+        #    DOMException.
+        if let found = definition:
+            if html_custom_element_definition_disable_shadow(found):
+                try idl_throw(.idl_dom_exception(idl_not_supported_error_create(dom_element_realm(this), ak.utf16_string_from_str("Cannot attach a shadow root to a custom element that has disabled shadow roots"))))
+
+    # 4. If element is a shadow host:
+    if dom_element_is_shadow_host(this):
+        # 1. Let currentShadowRoot be element’s shadow root.
+        let current_shadow_root = dom_element_shadow_root(this) else trap("a shadow host has a shadow root")
+
+        # 2. If any of the following are true:
+        # - currentShadowRoot’s declarative is false; or
+        # - currentShadowRoot’s mode is not mode,
+        # then throw a "NotSupportedError" DOMException.
+        if not dom_shadow_root_declarative(current_shadow_root) or dom_shadow_root_mode(current_shadow_root) != mode:
+            try idl_throw(.idl_dom_exception(idl_not_supported_error_create(dom_element_realm(this), ak.utf16_string_from_str("Element already is a shadow host"))))
+
+        # 3. Otherwise:
+        #    1. Remove all of currentShadowRoot’s children, in tree order.
+        dom_node_remove_all_children(current_shadow_root.dom_node())
+
+        #    2. Set currentShadowRoot’s declarative to false.
+        dom_shadow_root_set_declarative(current_shadow_root, false)
+
+        #    3. Return.
+        return
+
+    # 5. Let shadow be a new shadow root whose node document is element’s node document, host is this, and mode is
+    #    mode.
+    let shadow = realm_create_dom_shadow_root(dom_element_realm(this), dom_element_document(this), this, mode)
+
+    # 6. Set shadow’s delegates focus to delegatesFocus.
+    dom_shadow_root_set_delegates_focus(shadow, delegates_focus)
+
+    # 7. If element’s custom element state is "precustomized" or "custom", then set shadow’s available to element
+    #    internals to true.
+    if this.m_custom_element_state == DomCustomElementState.precustomized or this.m_custom_element_state == DomCustomElementState.custom:
+        dom_shadow_root_set_available_to_element_internals(shadow, true)
+
+    # 8. Set shadow’s slot assignment to slotAssignment.
+    dom_shadow_root_set_slot_assignment(shadow, slot_assignment)
+
+    # 9. Set shadow’s declarative to false.
+    dom_shadow_root_set_declarative(shadow, false)
+
+    # 10. Set shadow’s clonable to clonable.
+    dom_shadow_root_set_clonable(shadow, clonable)
+
+    # 11. Set shadow’s serializable to serializable.
+    dom_shadow_root_set_serializable(shadow, serializable)
+
+    # 12. Set shadow’s custom element registry to registry.
+    dom_shadow_root_set_custom_element_registry(shadow, registry)
+
+    # 13. Set element’s shadow root to shadow.
+    dom_element_set_shadow_root(this, shadow)
+
+## Ported from Element.cpp:1247 Web::DOM::Element::attach_shadow.
+# https://dom.spec.whatwg.org/#dom-element-attachshadow
+pub func dom_element_attach_shadow(this: DomElement*, init: DomShadowRootInit) -> DomShadowRoot*!:
+    # 1. Let registry be this’s node document’s custom element registry.
+    var registry = dom_document_custom_element_registry(dom_element_document(this))
+
+    # 2. If init["customElementRegistry"] exists, then set registry to it.
+    if init.custom_element_registry != none:
+        registry = init.custom_element_registry
+
+    # 3. If registry is non-null, registry’s is scoped is false, and registry is not this’s node document’s custom
+    #    element registry, then throw a "NotSupportedError" DOMException.
+    if let registry_value = registry:
+        if not html_custom_element_registry_is_scoped(registry_value) and registry != dom_document_custom_element_registry(dom_element_document(this)):
+            return try idl_throw(.idl_dom_exception(idl_not_supported_error_create(dom_element_realm(this), ak.utf16_string_from_str("'customElementRegistry' in ShadowRootInit must either be scoped or the document's custom element registry."))))
+
+    # 4. Run attach a shadow root with this, init["mode"], init["clonable"], init["serializable"],
+    #    init["delegatesFocus"], init["slotAssignment"], and registry.
+    try dom_element_attach_a_shadow_root(this, init.mode, init.clonable, init.serializable, init.delegates_focus, init.slot_assignment, registry)
+
+    # 5. Return this’s shadow root.
+    return dom_element_shadow_root(this) else trap("attach a shadow root sets the shadow root")
+
+## Ported from Element.cpp:1270 Web::DOM::Element::shadow_root_for_bindings.
+# https://dom.spec.whatwg.org/#dom-element-shadowroot
+pub func dom_element_shadow_root_for_bindings(this: DomElement*) -> DomShadowRoot*?:
+    # 1. Let shadow be this’s shadow root.
+    let shadow = this.m_shadow_root
+
+    # 2. If shadow is null or its mode is "closed", then return null.
+    let shadow_value = shadow else return none
+    if dom_shadow_root_mode(shadow_value) == BindShadowRootMode.closed:
+        return none
+
+    # 3. Return shadow.
+    return shadow_value
+
+# mark: Selectors ===============================================================================
+
+## Ported from Element.cpp:1284 Web::DOM::Element::matches.
+# https://dom.spec.whatwg.org/#dom-element-matches
+pub func dom_element_matches(this: DomElement*, selectors: ak.StringView) -> bool!:
+    # 1. Let s be the result of parse a selector from selectors.
+    let maybe_selectors = dom_document_parse_or_cache_selector_list(dom_element_document(this), selectors)
+
+    # 2. If s is failure, then throw a "SyntaxError" DOMException.
+    var selector_list = maybe_selectors else return try idl_throw(.idl_dom_exception(idl_syntax_error_create(dom_element_realm(this), ak.utf16_string_from_str("Failed to parse selector"))))
+
+    # 3. If the result of match a selector against an element, using s, this, and scoping root this, returns success, then return true; otherwise, return false.
+    for s in ak.vector_span(&selector_list):
+        var context: SelectorEngineMatchContext
+        if selector_engine_matches(*s, dom_element_abstract_element(this), none, &context, this.dom_parent_node()):
+            return true
+    return false
+
+## Element::closest's `matches_selectors` lambda.
+func dom_element_closest_matches_selectors(this: DomElement*, selector_list: ak.Vector[CssSelector*]*, element: DomElement*) -> bool:
+    # 4. For each element in elements, if match a selector against an element, using s, element, and scoping root this, returns success, return element.
+    for selector in ak.vector_span(selector_list):
+        var context: SelectorEngineMatchContext
+        if selector_engine_matches(*selector, dom_element_abstract_element(element), none, &context, this.dom_parent_node()):
+            return true
+    return false
+
+## Ported from Element.cpp:1303 Web::DOM::Element::closest.
+# https://dom.spec.whatwg.org/#dom-element-closest
+pub func dom_element_closest(this: DomElement*, selectors: ak.StringView) -> DomElement*?!:
+    # 1. Let s be the result of parse a selector from selectors.
+    let maybe_selectors = dom_document_parse_or_cache_selector_list(dom_element_document(this), selectors)
+
+    # 2. If s is failure, then throw a "SyntaxError" DOMException.
+    var selector_list = maybe_selectors else return try idl_throw(.idl_dom_exception(idl_syntax_error_create(dom_element_realm(this), ak.utf16_string_from_str("Failed to parse selector"))))
+
+    # 3. Let elements be this’s inclusive ancestors that are elements, in reverse tree order.
+    var element: DomElement*? = this
+    while let current = element:
+        element = dom_node_parent_element(current.dom_node())
+        if not dom_element_closest_matches_selectors(this, &selector_list, current):
+            continue
+
+        return current
+
+    # 5. Return null.
+    return none

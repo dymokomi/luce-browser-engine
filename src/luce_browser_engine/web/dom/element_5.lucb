@@ -1,0 +1,654 @@
+#==============================================================================================
+#
+#   element_5 - DOM::Element: tree hooks, pseudo-element nodes, pseudo-classes, scrolling
+#
+#   DESCRIPTION:
+#       Port of LibWeb/DOM/Element.cpp (lines 1685-2347): the inserted, removed-from,
+#       moved-from and children-changed steps, the pseudo-element layout nodes, the
+#       :enabled/:disabled/:checked/:placeholder-shown/:link/:local-link matchers, the JSON
+#       serialization of children, tabIndex, potential scrollability, scrollTop/scrollLeft
+#       (get and set), scrollWidth/scrollHeight and "actually disabled".
+#
+#==============================================================================================
+
+# mark: Tree hooks ==============================================================================
+
+## Ported from Element.cpp:1685 Web::DOM::Element::inserted (override).
+pub func dom_element_inserted_impl(base: DomNode*):
+    let this = (DomElement*)base
+    # Base::inserted(): ParentNode inherits Node's.
+    dom_node_inserted_impl(base)
+
+    if dom_node_is_connected(base):
+        if this.m_id != none:
+            dom_document_element_with_id_was_added(dom_element_document(this), this)
+        if this.m_name != none:
+            dom_document_element_with_name_was_added(dom_element_document(this), this)
+
+    dom_element_play_or_cancel_animations_after_display_property_change(this)
+
+## Ported from Element.cpp:1699 Web::DOM::Element::removed_from (override).
+pub func dom_element_removed_from_impl(base: DomNode*, is_subtree_root: DomNodeIsSubtreeRoot, old_ancestor: DomNode*?, old_root: DomNode*):
+    let this = (DomElement*)base
+    # Base::removed_from(): ParentNode inherits Node's.
+    dom_node_removed_from_impl(base, is_subtree_root, old_ancestor, old_root)
+
+    if let id = this.m_id:
+        if let old_shadow_root = as_if_dom_shadow_root(old_root):
+            dom_element_by_id_map_remove(dom_shadow_root_element_by_id(old_shadow_root), id, this)
+
+    if dom_node_is_connected(old_root):
+        if this.m_id != none:
+            dom_document_element_with_id_was_removed(dom_element_document(this), this)
+        if this.m_name != none:
+            dom_document_element_with_name_was_removed(dom_element_document(this), this)
+        if let computed_properties = this.m_computed_properties:
+            var anchor_names: DomAnchorNameMap*? = none
+            if let old_shadow_root = as_if_dom_shadow_root(old_root):
+                anchor_names = dom_shadow_root_anchor_name_map(old_shadow_root)
+            else:
+                anchor_names = dom_document_anchor_name_map(dom_element_document(this))
+            var captures = DomElementRecomputeStyleAnchorNames(this = this, anchor_names = anchor_names else trap("unreachable"))
+            css_computed_properties_for_each_anchor_name(computed_properties, ak.Function1[const ak.FlyString*, unit](call = dom_element_recompute_style_unregister_anchor_name, context = &captures))
+
+    dom_element_play_or_cancel_animations_after_display_property_change(this)
+    dom_element_exit_fullscreen_on_element_removal(this)
+
+## Ported from Element.cpp:1725 Web::DOM::Element::moved_from (override).
+pub func dom_element_moved_from_impl(base: DomNode*, is_subtree_root: DomNodeIsSubtreeRoot, old_ancestor: DomNode*?):
+    # Base::moved_from(): ParentNode inherits Node's.
+    dom_node_moved_from_impl(base, is_subtree_root, old_ancestor)
+
+## Ported from Element.cpp:1730 Web::DOM::Element::children_changed (override).
+pub func dom_element_children_changed_impl(base: DomNode*, metadata: DomNodeChildrenChangedMetadata):
+    let this = (DomElement*)base
+    dom_node_children_changed_impl(base, metadata)
+    dom_node_set_needs_style_update(base, true)
+
+    if dom_element_child_style_uses_tree_counting_function(this):
+        # for_each_child_of_type<Element>
+        for child in dom_node_children(base):
+            let element = as_if_dom_element(child) else continue
+            dom_node_set_needs_style_update(element.dom_node(), true)
+            dom_node_set_child_needs_style_update(base, true)
+
+# mark: Pseudo-element layout nodes =============================================================
+
+## Ported from Element.cpp:1745 Web::DOM::Element::set_pseudo_element_node.
+pub func dom_element_set_pseudo_element_node(this: DomElement*, pseudo_element: css_data.PseudoElement, pseudo_element_node: LayoutNodeWithStyle*?):
+    let existing_pseudo_element = dom_element_get_pseudo_element(this, pseudo_element)
+    if existing_pseudo_element == none and pseudo_element_node == none:
+        return
+
+    if not css_selector_pseudo_element_selector_is_known_pseudo_element_type(pseudo_element):
+        return
+
+    dom_pseudo_element_set_layout_node(dom_element_ensure_pseudo_element(this, pseudo_element), pseudo_element_node)
+
+## Ported from Element.cpp:1758 Web::DOM::Element::get_pseudo_element_node.
+pub func dom_element_get_pseudo_element_node(this: DomElement*, pseudo_element: css_data.PseudoElement) -> LayoutNodeWithStyle*?:
+    if let element_data = dom_element_get_pseudo_element(this, pseudo_element):
+        return dom_pseudo_element_layout_node(element_data)
+    return none
+
+## Ported from Element.cpp:1765 Web::DOM::Element::affected_by_pseudo_class.
+pub func dom_element_affected_by_pseudo_class(this: DomElement*, pseudo_class: css_data.PseudoClass) -> bool:
+    if let computed_properties = this.m_computed_properties:
+        if css_computed_properties_has_attempted_match_against_pseudo_class(computed_properties, pseudo_class):
+            return true
+    if let pseudo_element_data = this.m_pseudo_element_data:
+        for entry in ak.hash_map_begin(pseudo_element_data):
+            let computed_properties = dom_pseudo_element_computed_properties(entry.value) else continue
+            if css_computed_properties_has_attempted_match_against_pseudo_class(computed_properties, pseudo_class):
+                return true
+    return false
+
+# mark: Pseudo-class matching ===================================================================
+
+## Ported from Element.cpp:1782 Web::DOM::Element::matches_enabled_pseudo_class.
+# https://html.spec.whatwg.org/multipage/semantics-other.html#selector-enabled
+pub func dom_element_matches_enabled_pseudo_class(this: DomElement*) -> bool:
+    # The :enabled pseudo-class must match any button, input, select, textarea, optgroup, option, fieldset element, or form-associated custom element that is not actually disabled.
+    var is_form_associated_custom_element = false
+    if let html_element = as_if_html_element(this):
+        is_form_associated_custom_element = html_element_is_form_associated_custom_element(html_element)
+    return (is_html_button_element(this) or is_html_input_element(this) or is_html_select_element(this) or is_html_text_area_element(this) or is_html_opt_group_element(this) or is_html_option_element(this) or is_html_field_set_element(this) or is_form_associated_custom_element) and not dom_element_is_actually_disabled(this)
+
+## Ported from Element.cpp:1791 Web::DOM::Element::matches_disabled_pseudo_class.
+# https://html.spec.whatwg.org/multipage/semantics-other.html#selector-disabled
+pub func dom_element_matches_disabled_pseudo_class(this: DomElement*) -> bool:
+    # The :disabled pseudo-class must match any element that is actually disabled.
+    return dom_element_is_actually_disabled(this)
+
+## Ported from Element.cpp:1798 Web::DOM::Element::matches_checked_pseudo_class.
+# https://html.spec.whatwg.org/multipage/semantics-other.html#selector-checked
+pub func dom_element_matches_checked_pseudo_class(this: DomElement*) -> bool:
+    # The :checked pseudo-class must match any element falling into one of the following categories:
+    # - input elements whose type attribute is in the Checkbox state and whose checkedness state is true
+    # - input elements whose type attribute is in the Radio Button state and whose checkedness state is true
+    if let input_element = as_if_html_input_element(this):
+        match html_input_element_type_state(input_element):
+            .checkbox, .radio_button: return html_input_element_checked(input_element)
+            _: return false
+
+    # - option elements whose selectedness is true
+    if let option_element = as_if_html_option_element(this):
+        return html_option_element_selected(option_element)
+    return false
+
+## Ported from Element.cpp:1820 Web::DOM::Element::matches_unchecked_pseudo_class.
+pub func dom_element_matches_unchecked_pseudo_class(this: DomElement*) -> bool:
+    # AD-HOC: There is no spec for this yet, so it's based on the spec for :checked, assuming that :unchecked applies to the same cases but with a `false` value.
+    if let input_element = as_if_html_input_element(this):
+        match html_input_element_type_state(input_element):
+            .checkbox, .radio_button: return not html_input_element_checked(input_element)
+            _: return false
+
+    if let option_element = as_if_html_option_element(this):
+        return not html_option_element_selected(option_element)
+    return false
+
+## Ported from Element.cpp:1840 Web::DOM::Element::matches_placeholder_shown_pseudo_class.
+# https://html.spec.whatwg.org/multipage/semantics-other.html#selector-placeholder-shown
+pub func dom_element_matches_placeholder_shown_pseudo_class(this: DomElement*) -> bool:
+    #  The :placeholder-shown pseudo-class must match any element falling into one of the following categories:
+    # - input elements that have a placeholder attribute whose value is currently being presented to the user.
+    if is_html_input_element(this) and dom_element_has_attribute(this, html_attribute_names_placeholder):
+        let input_element = as_html_input_element(this)
+        return html_input_element_placeholder_element(input_element) != none and html_input_element_placeholder_value(input_element) != none
+    # - textarea elements that have a placeholder attribute whose value is currently being presented to the user.
+    if is_html_text_area_element(this) and dom_element_has_attribute(this, html_attribute_names_placeholder):
+        let textarea_element = as_html_text_area_element(this)
+        return html_text_area_element_placeholder_element(textarea_element) != none and html_text_area_element_placeholder_value(textarea_element) != none
+    return false
+
+## Ported from Element.cpp:1857 Web::DOM::Element::matches_link_pseudo_class.
+# https://html.spec.whatwg.org/multipage/semantics-other.html#selector-link
+pub func dom_element_matches_link_pseudo_class(this: DomElement*) -> bool:
+    # All a elements that have an href attribute, and all area elements that have an href attribute, must match one of :link and :visited.
+    if not is_html_anchor_element(this) and not is_html_area_element(this) and not dom_node_is_svg_a_element(this.dom_node()):  # is<SVG::SVGAElement> (SVGAElement is not in phase 1)
+        return false
+    return dom_element_has_attribute(this, html_attribute_names_href)
+
+## Ported from Element.cpp:1865 Web::DOM::Element::matches_local_link_pseudo_class.
+pub func dom_element_matches_local_link_pseudo_class(this: DomElement*) -> bool:
+    # The :local-link pseudo-class allows authors to style hyperlinks based on the users current location
+    # within a site. It represents an element that is the source anchor of a hyperlink whose target’s
+    # absolute URL matches the element’s own document URL. If the hyperlink’s target includes a fragment
+    # URL, then the fragment URL of the current URL must also match; if it does not, then the fragment
+    # URL portion of the current URL is not taken into account in the comparison.
+    if not dom_element_matches_link_pseudo_class(this):
+        return false
+    let document_url = dom_document_url(dom_element_document(this))
+    let maybe_href = dom_element_attribute(this, html_attribute_names_href)
+    let href = maybe_href else return false
+    let target_url = dom_document_encoding_parse_url(dom_element_document(this), ak.string_bytes_as_string_view(&href))
+    let target = target_url else return false
+    if web_url.url_fragment(&target) != none:
+        return web_url.url_equals(&document_url, target, web_url.ExcludeFragment.no)
+    return web_url.url_equals(&document_url, target, web_url.ExcludeFragment.yes)
+
+## Ported from Element.cpp:1886 Web::DOM::Element::has_pseudo_elements.
+pub func dom_element_has_pseudo_elements(this: DomElement*) -> bool:
+    if let pseudo_element_data = this.m_pseudo_element_data:
+        for entry in ak.hash_map_begin(pseudo_element_data):
+            if dom_pseudo_element_layout_node(entry.value) != none:
+                return true
+    return false
+
+## Ported from Element.cpp:1897 Web::DOM::Element::clear_pseudo_element_nodes.
+pub func dom_element_clear_pseudo_element_nodes(this: DomElement*):
+    if let pseudo_element_data = this.m_pseudo_element_data:
+        for entry in ak.hash_map_begin(pseudo_element_data):
+            dom_pseudo_element_set_layout_node(entry.value, none)
+
+## Ported from Element.cpp:1906 Web::DOM::Element::clear_pseudo_element_layout_nodes.
+pub func dom_element_clear_pseudo_element_layout_nodes(this: DomElement*):
+    if let pseudo_element_data = this.m_pseudo_element_data:
+        for entry in ak.hash_map_begin(pseudo_element_data):
+            dom_pseudo_element_set_layout_node(entry.value, none)
+
+# mark: JSON serialization ======================================================================
+
+## Element::serialize_children_as_json's `serialize_pseudo_element` lambda.
+func dom_element_serialize_pseudo_element_as_json(this: DomElement*, children: ak.JsonArraySerializer[ak.StringBuilder]*, pseudo_element_type: css_data.PseudoElement, pseudo_element: DomPseudoElement*):
+    # FIXME: Find a way to make these still inspectable? (eg, `::before { display: none }`)
+    if dom_pseudo_element_layout_node(pseudo_element) == none:
+        return
+    var object = ak.json_array_serializer_add_object(children) else trap("MUST: add_object")
+    var name_builder = ak.string_builder_new()
+    ak.string_builder_append_string_view(&name_builder, ak.sv("::"))
+    ak.string_builder_append_string_view(&name_builder, css_data.pseudo_element_name(pseudo_element_type))
+    let name = ak.string_builder_to_string(&name_builder) else trap("MUST: String::formatted")
+    ak.json_object_serializer_add_string(&object, ak.sv("name"), name) else trap("MUST: add")
+    ak.json_object_serializer_add_string_view(&object, ak.sv("type"), ak.sv("pseudo-element")) else trap("MUST: add")
+    ak.json_object_serializer_add_i64(&object, ak.sv("parent-id"), dom_node_unique_id(this.dom_node())) else trap("MUST: add")
+    ak.json_object_serializer_add_i32(&object, ak.sv("pseudo-element"), (i32)(u8)pseudo_element_type) else trap("MUST: add")
+    ak.json_object_serializer_finish(&object) else trap("MUST: finish")
+
+## `m_pseudo_element_data->get(type)`.
+func dom_element_pseudo_element_data_get(this: DomElement*, type_: css_data.PseudoElement) -> DomPseudoElement*?:
+    let pseudo_element_data = this.m_pseudo_element_data else return none
+    let value = ak.hash_map_get_k(pseudo_element_data, type_) else return none
+    return *value
+
+## Ported from Element.cpp:1915 Web::DOM::Element::serialize_children_as_json.
+pub func dom_element_serialize_children_as_json(this: DomElement*, element_object: ak.JsonObjectSerializer[ak.StringBuilder]*):
+    let has_pseudo_elements = dom_element_has_pseudo_elements(this)
+    if not dom_element_is_shadow_host(this) and not dom_node_has_child_nodes(this.dom_node()) and not has_pseudo_elements:
+        return
+
+    var children = ak.json_object_serializer_add_array(element_object, ak.sv("children")) else trap("MUST: add_array")
+
+    if has_pseudo_elements:
+        if let backdrop = dom_element_pseudo_element_data_get(this, css_data.PseudoElement.backdrop):
+            dom_element_serialize_pseudo_element_as_json(this, &children, css_data.PseudoElement.backdrop, backdrop)
+        if let marker = dom_element_pseudo_element_data_get(this, css_data.PseudoElement.marker):
+            dom_element_serialize_pseudo_element_as_json(this, &children, css_data.PseudoElement.marker, marker)
+        if let before = dom_element_pseudo_element_data_get(this, css_data.PseudoElement.before):
+            dom_element_serialize_pseudo_element_as_json(this, &children, css_data.PseudoElement.before, before)
+
+    if dom_element_is_shadow_host(this):
+        let shadow_root = dom_element_shadow_root(this) else trap("a shadow host has a shadow root")
+        discard(dom_node_serialize_child_as_json(this.dom_node(), &children, shadow_root.dom_node()))
+
+    # for_each_child(add_child)
+    for child in dom_node_children(this.dom_node()):
+        if dom_node_serialize_child_as_json(this.dom_node(), &children, child) == ak.IterationDecision.break_:
+            break
+
+    if has_pseudo_elements:
+        if let after = dom_element_pseudo_element_data_get(this, css_data.PseudoElement.after):
+            dom_element_serialize_pseudo_element_as_json(this, &children, css_data.PseudoElement.after, after)
+
+        # Any other pseudo-elements, as a catch-all.
+        let pseudo_element_data = this.m_pseudo_element_data else trap("has_pseudo_elements implies pseudo-element data")
+        for entry in ak.hash_map_begin(pseudo_element_data):
+            let type_ = entry.key
+            if type_ == css_data.PseudoElement.after or type_ == css_data.PseudoElement.backdrop or type_ == css_data.PseudoElement.before or type_ == css_data.PseudoElement.marker:
+                continue
+            dom_element_serialize_pseudo_element_as_json(this, &children, type_, entry.value)
+
+    ak.json_array_serializer_finish(&children) else trap("MUST: finish")
+
+# mark: tabIndex ================================================================================
+
+## Ported from Element.cpp:1972 Web::DOM::Element::default_tab_index_value (virtual).
+# https://html.spec.whatwg.org/multipage/interaction.html#dom-tabindex
+pub func dom_element_default_tab_index_value_impl(this: DomElement*) -> i32:
+    # The default value is 0 if the element is an a, area, button, frame, iframe, input, object, select, textarea, or SVG a element, or is a summary element that is a summary for its parent details.
+    # The default value is −1 otherwise.
+    # Note: The varying default value based on element type is a historical artifact.
+    return -1
+
+## Ported from Element.cpp:1981 Web::DOM::Element::tab_index.
+# https://html.spec.whatwg.org/multipage/interaction.html#dom-tabindex
+pub func dom_element_tab_index(this: DomElement*) -> i32:
+    let tabindex = dom_element_get_attribute_value(this, html_attribute_names_tabindex)
+    let maybe_table_index = html_parse_integer(ak.string_bytes_as_string_view(&tabindex))
+
+    let table_index = maybe_table_index else return dom_element_default_tab_index_value(this)
+    return table_index
+
+## Ported from Element.cpp:1991 Web::DOM::Element::set_tab_index.
+# https://html.spec.whatwg.org/multipage/interaction.html#dom-tabindex
+pub func dom_element_set_tab_index(this: DomElement*, tab_index: i32):
+    dom_element_set_attribute_value(this, html_attribute_names_tabindex, ak.string_number_i64(tab_index))
+
+# mark: Scrolling ===============================================================================
+
+## Ported from Element.cpp:1997 Web::DOM::Element::is_potentially_scrollable.
+# https://drafts.csswg.org/cssom-view/#potentially-scrollable
+pub func dom_element_is_potentially_scrollable(this: DomElement*, treat_overflow_clip_on_body_parent_as_overflow_hidden: DomElementTreatOverflowClipOnBodyParentAsOverflowHidden = DomElementTreatOverflowClipOnBodyParentAsOverflowHidden.no) -> bool:
+    # NOTE: Ensure that layout is up-to-date before looking at metrics.
+    dom_document_update_layout(dom_element_document(this), DomUpdateLayoutReason.element_is_potentially_scrollable)
+
+    # NB: Since this should always be the body element, the body element must have a <html> element parent. See Document::body().
+    let parent_element = dom_node_parent_element(this.dom_node()) else trap("VERIFY: parent_element()")
+
+    # An element body (which will be the body element) is potentially scrollable if all of the following conditions are true:
+    assert(is_html_body_element(this) or is_html_frame_set_element(this))
+
+    # - body has an associated box.
+    if dom_element_layout_node(this) == none:
+        return false
+
+    # - body’s parent element’s computed value of the overflow-x or overflow-y properties is neither visible nor clip.
+    let parent_computed_properties = dom_element_computed_properties(parent_element) else trap("VERIFY: parent computed properties")
+    if css_computed_properties_overflow_x(parent_computed_properties) == css_data.Overflow.visible or css_computed_properties_overflow_y(parent_computed_properties) == css_data.Overflow.visible:
+        return false
+    # NOTE: When treating 'overflow:clip' as 'overflow:hidden', we can never fail this condition
+    if treat_overflow_clip_on_body_parent_as_overflow_hidden == DomElementTreatOverflowClipOnBodyParentAsOverflowHidden.no and (css_computed_properties_overflow_x(parent_computed_properties) == css_data.Overflow.clip or css_computed_properties_overflow_y(parent_computed_properties) == css_data.Overflow.clip):
+        return false
+
+    # - body’s computed value of the overflow-x or overflow-y properties is neither visible nor clip.
+    let computed_properties = dom_element_computed_properties(this) else trap("VERIFY: computed properties")
+    let overflow_x = css_computed_properties_overflow_x(computed_properties)
+    let overflow_y = css_computed_properties_overflow_y(computed_properties)
+    if overflow_x == css_data.Overflow.visible or overflow_x == css_data.Overflow.clip or overflow_y == css_data.Overflow.visible or overflow_y == css_data.Overflow.clip:
+        return false
+
+    return true
+
+## Ported from Element.cpp:2026 Web::DOM::Element::is_scroll_container.
+pub func dom_element_is_scroll_container(this: DomElement*) -> bool:
+    # NB: We should only call this if we know that computed_properties has already been computed
+    let computed_properties = dom_element_computed_properties(this) else trap("VERIFY: computed_properties()")
+
+    if dom_element_is_document_element(this):
+        return true
+
+    return layout_overflow_value_makes_box_a_scroll_container(css_computed_properties_overflow_x(computed_properties)) or layout_overflow_value_makes_box_a_scroll_container(css_computed_properties_overflow_y(computed_properties))
+
+## `document.body() == this`.
+func dom_element_is_the_body(this: DomElement*, document: DomDocument*) -> bool:
+    let body = dom_document_body(document) else return false
+    return body.dom_element() == this
+
+## Ported from Element.cpp:2039 Web::DOM::Element::scroll_top.
+# https://drafts.csswg.org/cssom-view/#dom-element-scrolltop
+pub func dom_element_scroll_top(this: DomElement*) -> f64:
+    # 1. Let document be the element’s node document.
+    let document = dom_element_document(this)
+
+    # 2. If document is not the active document, return zero and terminate these steps.
+    if not dom_document_is_active(document):
+        return 0.0
+
+    # 3. Let window be the value of document’s defaultView attribute.
+    # FIXME: The specification expects defaultView to be a Window object, but defaultView actually returns a WindowProxy object.
+    let maybe_window = dom_document_window(document)
+
+    # 4. If window is null, return zero and terminate these steps.
+    let window = maybe_window else return 0.0
+
+    # 5. If the element is the root element and document is in quirks mode, return zero and terminate these steps.
+    if dom_document_document_element(document) == this and dom_document_in_quirks_mode(document):
+        return 0.0
+
+    # 6. If the element is the root element return the value of scrollY on window.
+    if dom_document_document_element(document) == this:
+        return html_window_scroll_y(window)
+
+    # NOTE: Ensure that layout is up-to-date before looking at metrics.
+    dom_document_update_layout(document, DomUpdateLayoutReason.element_scroll_top)
+
+    # 7. If the element is the body element, document is in quirks mode, and the element is not potentially scrollable, return the value of scrollY on window.
+    if dom_element_is_the_body(this, document) and dom_document_in_quirks_mode(document) and not dom_element_is_potentially_scrollable(this):
+        return html_window_scroll_y(window)
+
+    # 8. If the element does not have any associated box, return zero and terminate these steps.
+    let paintable_box = dom_node_paintable_box(this.dom_node()) else return 0.0
+
+    # 9. Return the y-coordinate of the scrolling area at the alignment point with the top of the padding edge of the element.
+    # FIXME: Is this correct?
+    let scroll_offset = paint_paintable_box_scroll_offset(paintable_box)
+    let y = gfx.css_pixel_point_y(&scroll_offset)
+    return gfx.css_pixels_to_double_const(&y)
+
+## Ported from Element.cpp:2081 Web::DOM::Element::scroll_left.
+# https://drafts.csswg.org/cssom-view/#dom-element-scrollleft
+pub func dom_element_scroll_left(this: DomElement*) -> f64:
+    # 1. Let document be the element’s node document.
+    let document = dom_element_document(this)
+
+    # 2. If document is not the active document, return zero and terminate these steps.
+    if not dom_document_is_active(document):
+        return 0.0
+
+    # 3. Let window be the value of document’s defaultView attribute.
+    # FIXME: The specification expects defaultView to be a Window object, but defaultView actually returns a WindowProxy object.
+    let maybe_window = dom_document_window(document)
+
+    # 4. If window is null, return zero and terminate these steps.
+    let window = maybe_window else return 0.0
+
+    # 5. If the element is the root element and document is in quirks mode, return zero and terminate these steps.
+    if dom_document_document_element(document) == this and dom_document_in_quirks_mode(document):
+        return 0.0
+
+    # 6. If the element is the root element return the value of scrollX on window.
+    if dom_document_document_element(document) == this:
+        return html_window_scroll_x(window)
+
+    # NOTE: Ensure that layout is up-to-date before looking at metrics.
+    dom_document_update_layout(document, DomUpdateLayoutReason.element_scroll_left)
+
+    # 7. If the element is the body element, document is in quirks mode, and the element is not potentially scrollable, return the value of scrollX on window.
+    if dom_element_is_the_body(this, document) and dom_document_in_quirks_mode(document) and not dom_element_is_potentially_scrollable(this):
+        return html_window_scroll_x(window)
+
+    # 8. If the element does not have any associated box, return zero and terminate these steps.
+    let paintable_box = dom_node_paintable_box(this.dom_node()) else return 0.0
+
+    # 9. Return the x-coordinate of the scrolling area at the alignment point with the left of the padding edge of the element.
+    # FIXME: Is this correct?
+    let scroll_offset = paint_paintable_box_scroll_offset(paintable_box)
+    let x = gfx.css_pixel_point_x(&scroll_offset)
+    return gfx.css_pixels_to_double_const(&x)
+
+## Ported from Element.cpp:2123 Web::DOM::Element::set_scroll_left.
+# https://drafts.csswg.org/cssom-view/#dom-element-scrollleft
+pub func dom_element_set_scroll_left(this: DomElement*, x: f64):
+    # 1. Let x be the given value.
+
+    # 2. Normalize non-finite values for x.
+    let normalized_x = html_normalize_non_finite_values_f64(x)
+
+    # 3. Let document be the element’s node document.
+    let document = dom_element_document(this)
+
+    # 4. If document is not the active document, terminate these steps.
+    if not dom_document_is_active(document):
+        return
+
+    # 5. Let window be the value of document’s defaultView attribute.
+    # FIXME: The specification expects defaultView to be a Window object, but defaultView actually returns a WindowProxy object.
+    let maybe_window = dom_document_window(document)
+
+    # 6. If window is null, terminate these steps.
+    let window = maybe_window else return
+
+    # 7. If the element is the root element and document is in quirks mode, terminate these steps.
+    if dom_document_document_element(document) == this and dom_document_in_quirks_mode(document):
+        return
+
+    # 8. If the element is the root element invoke scroll() on window with x as first argument and scrollY on window as second argument, and terminate these steps.
+    if dom_document_document_element(document) == this:
+        discard(html_window_scroll_f64(window, normalized_x, html_window_scroll_y(window)))
+        return
+
+    # NOTE: Ensure that layout is up-to-date before looking at metrics or scrolling the page.
+    dom_document_update_layout(document, DomUpdateLayoutReason.element_set_scroll_left)
+
+    # 9. If the element is the body element, document is in quirks mode, and the element is not potentially scrollable, invoke scroll() on window with x as first argument and scrollY on window as second argument, and terminate these steps.
+    if dom_element_is_the_body(this, document) and dom_document_in_quirks_mode(document) and not dom_element_is_potentially_scrollable(this):
+        discard(html_window_scroll_f64(window, normalized_x, html_window_scroll_y(window)))
+        return
+
+    # 10. If the element does not have any associated box, the element has no associated scrolling box, or the element has no overflow, terminate these steps.
+    let paintable_box = dom_node_paintable_box(this.dom_node()) else return
+
+    if not layout_node_with_style_is_scroll_container(paint_paintable_box_layout_node_with_style_and_box_metrics(paintable_box).layout_node_with_style()):
+        return
+
+    # FIXME: or the element has no overflow.
+
+    # 11. Scroll the element to x,scrollTop, with the scroll behavior being "auto".
+    # FIXME: Implement this in terms of calling "scroll the element".
+    var scroll_offset = paint_paintable_box_scroll_offset(paintable_box)
+    gfx.css_pixel_point_set_x(&scroll_offset, gfx.css_pixels_nearest_value_for_f64(normalized_x))
+    discard(paint_paintable_box_set_scroll_offset(paintable_box, scroll_offset))
+
+## Ported from Element.cpp:2180 Web::DOM::Element::set_scroll_top.
+pub func dom_element_set_scroll_top(this: DomElement*, y: f64):
+    # 1. Let y be the given value.
+
+    # 2. Normalize non-finite values for y.
+    let normalized_y = html_normalize_non_finite_values_f64(y)
+
+    # 3. Let document be the element’s node document.
+    let document = dom_element_document(this)
+
+    # 4. If document is not the active document, terminate these steps.
+    if not dom_document_is_active(document):
+        return
+
+    # 5. Let window be the value of document’s defaultView attribute.
+    # FIXME: The specification expects defaultView to be a Window object, but defaultView actually returns a WindowProxy object.
+    let maybe_window = dom_document_window(document)
+
+    # 6. If window is null, terminate these steps.
+    let window = maybe_window else return
+
+    # 7. If the element is the root element and document is in quirks mode, terminate these steps.
+    if dom_document_document_element(document) == this and dom_document_in_quirks_mode(document):
+        return
+
+    # 8. If the element is the root element invoke scroll() on window with scrollX on window as first argument and y as second argument, and terminate these steps.
+    if dom_document_document_element(document) == this:
+        discard(html_window_scroll_f64(window, html_window_scroll_x(window), normalized_y))
+        return
+
+    # NOTE: Ensure that layout is up-to-date before looking at metrics or scrolling the page.
+    dom_document_update_layout(document, DomUpdateLayoutReason.element_set_scroll_top)
+
+    # 9. If the element is the body element, document is in quirks mode, and the element is not potentially scrollable, invoke scroll() on window with scrollX as first argument and y as second argument, and terminate these steps.
+    if dom_element_is_the_body(this, document) and dom_document_in_quirks_mode(document) and not dom_element_is_potentially_scrollable(this):
+        discard(html_window_scroll_f64(window, html_window_scroll_x(window), normalized_y))
+        return
+
+    # 10. If the element does not have any associated box, the element has no associated scrolling box, or the element has no overflow, terminate these steps.
+    let paintable_box = dom_node_paintable_box(this.dom_node()) else return
+
+    if not layout_node_with_style_is_scroll_container(paint_paintable_box_layout_node_with_style_and_box_metrics(paintable_box).layout_node_with_style()):
+        return
+
+    # FIXME: or the element has no overflow.
+
+    # 11. Scroll the element to scrollLeft,y, with the scroll behavior being "auto".
+    # FIXME: Implement this in terms of calling "scroll the element".
+    var scroll_offset = paint_paintable_box_scroll_offset(paintable_box)
+    gfx.css_pixel_point_set_y(&scroll_offset, gfx.css_pixels_nearest_value_for_f64(normalized_y))
+    discard(paint_paintable_box_set_scroll_offset(paintable_box, scroll_offset))
+
+## Ported from Element.cpp:2238 Web::DOM::Element::scroll_width.
+# https://drafts.csswg.org/cssom-view/#dom-element-scrollwidth
+pub func dom_element_scroll_width(this: DomElement*) -> i32:
+    # 1. Let document be the element’s node document.
+    let document = dom_element_document(this)
+
+    # 2. If document is not the active document, return zero and terminate these steps.
+    if not dom_document_is_active(document):
+        return 0
+
+    # NOTE: Ensure that layout is up-to-date before looking at metrics.
+    dom_document_update_layout(document, DomUpdateLayoutReason.element_scroll_width)
+    let viewport_paintable = dom_document_paintable(document) else trap("VERIFY: document.paintable()")
+    assert(dom_node_paintable_box(document.dom_node()) != none)
+    let viewport_scrolling_area = paint_paintable_box_scrollable_overflow_rect(viewport_paintable.paint_paintable_box()) else trap("VERIFY: scrollable_overflow_rect()")
+
+    # 3. Let viewport width be the width of the viewport excluding the width of the scroll bar, if any,
+    #    or zero if there is no viewport.
+    let viewport_rect = dom_document_viewport_rect(document)
+    let viewport_rect_width = gfx.css_pixel_rect_width(&viewport_rect)
+    let viewport_width = gfx.css_pixels_to_int_const(&viewport_rect_width)
+    let viewport_scrolling_area_rect_width = gfx.css_pixel_rect_width(&viewport_scrolling_area)
+    let viewport_scrolling_area_width = gfx.css_pixels_to_int_const(&viewport_scrolling_area_rect_width)
+
+    # 4. If the element is the root element and document is not in quirks mode
+    #    return max(viewport scrolling area width, viewport width).
+    if dom_document_document_element(document) == this and not dom_document_in_quirks_mode(document):
+        return ak.max(viewport_scrolling_area_width, viewport_width)
+
+    # 5. If the element is the body element, document is in quirks mode and the element is not potentially scrollable,
+    #    return max(viewport scrolling area width, viewport width).
+    if dom_element_is_the_body(this, document) and dom_document_in_quirks_mode(document) and not dom_element_is_potentially_scrollable(this):
+        return ak.max(viewport_scrolling_area_width, viewport_width)
+
+    # 6. If the element does not have any associated box return zero and terminate these steps.
+    let paintable_box = dom_node_paintable_box(this.dom_node()) else return 0
+
+    # 7. Return the width of the element’s scrolling area.
+    if let scrollable_overflow_rect = paint_paintable_box_scrollable_overflow_rect(paintable_box):
+        let width = gfx.css_pixel_rect_width(&scrollable_overflow_rect)
+        return gfx.css_pixels_to_int_const(&width)
+
+    return 0
+
+## Ported from Element.cpp:2278 Web::DOM::Element::scroll_height.
+# https://drafts.csswg.org/cssom-view/#dom-element-scrollheight
+pub func dom_element_scroll_height(this: DomElement*) -> i32:
+    # 1. Let document be the element’s node document.
+    let document = dom_element_document(this)
+
+    # 2. If document is not the active document, return zero and terminate these steps.
+    if not dom_document_is_active(document):
+        return 0
+
+    # NOTE: Ensure that layout is up-to-date before looking at metrics.
+    dom_document_update_layout(document, DomUpdateLayoutReason.element_scroll_height)
+    let viewport_paintable = dom_document_paintable(document) else trap("VERIFY: document.paintable()")
+    assert(dom_node_paintable_box(document.dom_node()) != none)
+    let viewport_scrolling_area = paint_paintable_box_scrollable_overflow_rect(viewport_paintable.paint_paintable_box()) else trap("VERIFY: scrollable_overflow_rect()")
+
+    # 3. Let viewport height be the height of the viewport excluding the height of the scroll bar, if any,
+    #    or zero if there is no viewport.
+    let viewport_rect = dom_document_viewport_rect(document)
+    let viewport_rect_height = gfx.css_pixel_rect_height(&viewport_rect)
+    let viewport_height = gfx.css_pixels_to_int_const(&viewport_rect_height)
+    let viewport_scrolling_area_rect_height = gfx.css_pixel_rect_height(&viewport_scrolling_area)
+    let viewport_scrolling_area_height = gfx.css_pixels_to_int_const(&viewport_scrolling_area_rect_height)
+
+    # 4. If the element is the root element and document is not in quirks mode
+    #    return max(viewport scrolling area height, viewport height).
+    if dom_document_document_element(document) == this and not dom_document_in_quirks_mode(document):
+        return ak.max(viewport_scrolling_area_height, viewport_height)
+
+    # 5. If the element is the body element, document is in quirks mode and the element is not potentially scrollable,
+    #    return max(viewport scrolling area height, viewport height).
+    if dom_element_is_the_body(this, document) and dom_document_in_quirks_mode(document) and not dom_element_is_potentially_scrollable(this):
+        return ak.max(viewport_scrolling_area_height, viewport_height)
+
+    # 6. If the element does not have any associated box return zero and terminate these steps.
+    let paintable_box = dom_node_paintable_box(this.dom_node()) else return 0
+
+    # 7. Return the height of the element’s scrolling area.
+    if let scrollable_overflow_rect = paint_paintable_box_scrollable_overflow_rect(paintable_box):
+        let height = gfx.css_pixel_rect_height(&scrollable_overflow_rect)
+        return gfx.css_pixels_to_int_const(&height)
+    return 0
+
+# mark: Disabled ================================================================================
+
+## Ported from Element.cpp:2318 Web::DOM::Element::is_actually_disabled.
+# https://html.spec.whatwg.org/multipage/semantics-other.html#concept-element-disabled
+pub func dom_element_is_actually_disabled(this: DomElement*) -> bool:
+    # An element is said to be actually disabled if it is one of the following:
+    # - a button element that is disabled
+    # - an input element that is disabled
+    # - a select element that is disabled
+    # - a textarea element that is disabled
+    if is_html_button_element(this) or is_html_input_element(this) or is_html_select_element(this) or is_html_text_area_element(this):
+        let form_associated_element = as_if_form_associated_element(this) else trap("as<HTML::FormAssociatedElement> failed")
+        return not html_form_associated_element_enabled(form_associated_element)
+
+    # - an optgroup element that has a disabled attribute
+    if is_html_opt_group_element(this):
+        return dom_element_has_attribute(this, html_attribute_names_disabled)
+
+    # - an option element that is disabled
+    if let option_element = as_if_html_option_element(this):
+        return html_option_element_disabled(option_element)
+
+    # - a fieldset element that is a disabled fieldset
+    if let field_set_element = as_if_html_field_set_element(this):
+        return html_field_set_element_is_disabled(field_set_element)
+
+    # - a form-associated custom element that is disabled
+    if let html_element = as_if_html_element(this):
+        if html_element_is_form_associated_custom_element(html_element):
+            let form_associated_element = as_if_form_associated_element(this) else trap("HTMLElement is a FormAssociatedElement")
+            return not html_form_associated_element_enabled(form_associated_element)
+
+    return false

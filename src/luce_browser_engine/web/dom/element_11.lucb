@@ -1,0 +1,567 @@
+#==============================================================================================
+#
+#   element_11 - DOM::Element: viewport proximity, list ordinals, translation, directionality
+#
+#   DESCRIPTION:
+#       Port of LibWeb/DOM/Element.cpp (lines 3735-4245 and 4534-4563): proximity to the
+#       viewport, relevance to the user and skipping contents, the list owner and ordinal
+#       values (with the for_each_numbered_item_owned_by_list_owner template), ID-reference
+#       lookups, intersection observer registration, scroll offsets, the translation mode,
+#       the directionality algorithms, and prefetching inline-style images.
+#
+#==============================================================================================
+
+# mark: Viewport proximity and relevance ========================================================
+
+## Ported from Element.cpp:3736 Web::DOM::Element::determine_proximity_to_the_viewport.
+# https://drafts.csswg.org/css-contain/#proximity-to-the-viewport
+pub func dom_element_determine_proximity_to_the_viewport(this: DomElement*):
+    # An element that has content-visibility: auto is in one of three states when it comes to its proximity to the viewport:
+
+    # - The element is close to the viewport: In this state, the element is considered "on-screen": its paint
+    #   containment box's overflow clip edge intersects with the viewport, or a user-agent defined margin around the
+    #   viewport.
+    var viewport_rect = dom_document_viewport_rect(dom_element_document(this))
+    # NOTE: This margin is meant to allow the user agent to begin preparing for an element to be in the
+    # viewport soon. A margin of 50% is suggested as a reasonable default.
+    gfx.css_pixel_rect_inflate_css_pixels_css_pixels(&viewport_rect, gfx.css_pixel_rect_width(&viewport_rect), gfx.css_pixel_rect_height(&viewport_rect))
+    # FIXME: We don't have paint containment or the overflow clip edge yet, so this is just using the absolute rect for now.
+    let paintable_box = dom_node_paintable_box(this.dom_node()) else trap("determine_proximity_to_the_viewport: no paintable box")
+    let absolute_rect = paint_paintable_box_absolute_rect(paintable_box)
+    if gfx.css_pixel_rect_intersects_css_pixel_rect(&absolute_rect, viewport_rect):
+        this.m_proximity_to_the_viewport = DomProximityToTheViewport.close_to_the_viewport
+
+    # FIXME: If a filter (see [FILTER-EFFECTS-1]) with non local effects includes the element as part of its input, the user
+    #        agent should also treat the element as relevant to the user when the filter’s output can affect the rendering
+    #        within the viewport (or within the user-agent defined margin around the viewport), even if the element itself is
+    #        still off-screen.
+
+    # - The element is far away from the viewport: In this state, the element’s proximity to the viewport has been
+    #   computed and is not close to the viewport.
+    this.m_proximity_to_the_viewport = DomProximityToTheViewport.far_away_from_the_viewport
+
+    # - The element’s proximity to the viewport is not determined: In this state, the computation to determine the
+    #   element’s proximity to the viewport has not been done since the last time the element was connected.
+    # NOTE: This function is what does the computation to determine the element’s proximity to the viewport, so this is not the case.
+
+## Ported from Element.cpp:3766 Web::DOM::Element::is_relevant_to_the_user.
+# https://drafts.csswg.org/css-contain/#relevant-to-the-user
+pub func dom_element_is_relevant_to_the_user(this: DomElement*) -> bool:
+    # An element is relevant to the user if any of the following conditions are true:
+
+    # The element is close to the viewport.
+    if this.m_proximity_to_the_viewport == DomProximityToTheViewport.close_to_the_viewport:
+        return true
+
+    # Either the element or its contents are focused, as described in the focus section of the HTML spec.
+    if let focused_area = dom_document_focused_area(dom_element_document(this)):
+        if tree_node_is_inclusive_ancestor_of(this.dom_node(), focused_area):
+            return true
+
+    # Either the element or its contents are selected, where selection is described in the selection API.
+    let selection = dom_document_get_selection(dom_element_document(this)) else trap("get_selection() is non-null")
+    if selection_selection_contains_node(selection, this.dom_node(), true):
+        return true
+
+    var has_relevant_contents = false
+    # for_each_in_inclusive_subtree_of_type<Element>
+    for node in dom_node_inclusive_subtree(this.dom_node()):
+        let element = as_if_dom_element(node) else continue
+
+        # Either the element or its contents are placed in the top layer.
+        if dom_element_in_top_layer(element):
+            has_relevant_contents = true
+            break
+
+        # The element has a flat tree descendant that is captured in a view transition.
+        # FIXME: for_each_in_inclusive_subtree_of_type() doesn't walk the flat tree. For example, it doesn't walk from a slot to its assigned slottable.
+        if element != this and dom_element_captured_in_a_view_transition(element):
+            has_relevant_contents = true
+            break
+    if has_relevant_contents:
+        return true
+
+    # NOTE: none of the above conditions are true, so the element is not relevant to the user.
+    return false
+
+## Ported from Element.cpp:3808 Web::DOM::Element::skips_its_contents.
+# https://drafts.csswg.org/css-contain-2/#skips-its-contents
+pub func dom_element_skips_its_contents(this: DomElement*) -> bool:
+    let computed_properties = dom_element_computed_properties(this) else trap("skips_its_contents: no computed properties")
+
+    # https://drafts.csswg.org/css-contain-2/#valdef-content-visibility-hidden
+    # The element skips its contents.
+    if css_computed_properties_content_visibility(computed_properties) == css_data.ContentVisibility.hidden:
+        return true
+
+    # https://drafts.csswg.org/css-contain-2/#valdef-content-visibility-auto
+    # If the element is not relevant to the user, it also skips its contents.
+    if css_computed_properties_content_visibility(computed_properties) == css_data.ContentVisibility.auto and not dom_element_is_relevant_to_the_user(this):
+        return true
+
+    return false
+
+# mark: List owners and ordinals ================================================================
+
+## Element::number_of_owned_list_items's lambda: count each owned item (the context is the counter).
+func dom_element_number_of_owned_list_items_count(context: void*?, item: DomElement*) -> ak.IterationDecision:
+    let number_of_owned_li_elements = (ak.Checked[i32]*)(context else trap("no counter"))
+    discard(ak.checked_inc_i32(number_of_owned_li_elements))
+    return ak.IterationDecision.continue_
+
+## Ported from Element.cpp:3824 Web::DOM::Element::number_of_owned_list_items.
+pub func dom_element_number_of_owned_list_items(this: DomElement*) -> i32:
+    var number_of_owned_li_elements = ak.Checked[i32](m_value = 0, m_overflow = false)
+    dom_element_for_each_numbered_item_owned_by_list_owner_const(this, ak.Function1[DomElement*, ak.IterationDecision](call = dom_element_number_of_owned_list_items_count, context = &number_of_owned_li_elements))
+
+    return ak.checked_value(&number_of_owned_li_elements)
+
+## Ported from Element.cpp:3836 Web::DOM::Element::list_owner.
+# https://html.spec.whatwg.org/multipage/grouping-content.html#list-owner
+pub func dom_element_list_owner(this: DomElement*) -> DomElement*?:
+    # Any element whose computed value of 'display' is 'list-item' has a list owner, which is determined as follows:
+    if not this.m_is_contained_in_list_subtree:
+        let computed_properties = dom_element_computed_properties(this) else return none
+        let display = css_computed_properties_display(computed_properties)
+        if not css_display_is_list_item(&display):
+            return none
+
+    # 1. If the element is not being rendered, return null; the element has no list owner.
+    # NB: unsafe_layout_node() because list ordinal computation happens during style recalculation
+    #     when layout is inherently stale.
+    if dom_element_unsafe_layout_node(this) == none:
+        return none
+
+    # 2. Let ancestor be the element's parent.
+    var ancestor = dom_node_parent_element(this.dom_node())
+
+    # AC-HOC: There may not be any parent element in a shadow tree.
+    if ancestor == none:
+        return none
+
+    # 3. If the element has an ol, ul, or menu ancestor, set ancestor to the closest such ancestor element.
+    # for_each_ancestor
+    var walk = tree_node_parent(this.dom_node())
+    while let node = walk:
+        if dom_node_is_html_ol_ul_menu_element(node):
+            ancestor = (DomElement*)node
+            break
+        walk = tree_node_parent(node)
+
+    # 4. Return the closest inclusive ancestor of ancestor that produces a CSS box.
+    # ancestor->for_each_inclusive_ancestor
+    var inclusive_walk: DomNode*? = (ancestor else trap("unreachable")).dom_node()
+    while let node = inclusive_walk:
+        # NB: unsafe_paintable_box() because this runs during list ordinal computation as part of
+        #     style recalculation, when layout is inherently stale.
+        if is_dom_element(node) and dom_node_unsafe_paintable_box(node) != none:
+            ancestor = (DomElement*)node
+            break
+        inclusive_walk = tree_node_parent(node)
+    return ancestor
+
+## The captures of Element::maybe_invalidate_ordinals_for_list_owner's lambda.
+struct DomElementMaybeInvalidateOrdinalsForListOwner:
+    var skip_node: (DomElement*?)?
+
+## Element::maybe_invalidate_ordinals_for_list_owner's lambda.
+func dom_element_maybe_invalidate_ordinals_for_list_owner_item(context: void*?, item: DomElement*) -> ak.IterationDecision:
+    let captures = (DomElementMaybeInvalidateOrdinalsForListOwner*)(context else trap("no captures"))
+    if let skip_node = captures.skip_node:
+        if item == skip_node:
+            return ak.IterationDecision.continue_
+
+    item.m_ordinal_value = none
+
+    # Invalidate just the first ordinal in the list of numbered items.
+    # NOTE: This works since this item is the first accessed (preorder) when rendering the list.
+    #       It will trigger a recalculation of all ordinals on the [first] call to ordinal_value().
+    return ak.IterationDecision.break_
+
+## Ported from Element.cpp:3877 Web::DOM::Element::maybe_invalidate_ordinals_for_list_owner.
+## `skip_node` is C++'s Optional<Element*>: absent, or present holding a possibly null element.
+pub func dom_element_maybe_invalidate_ordinals_for_list_owner(this: DomElement*, skip_node: (DomElement*?)? = none):
+    if let owner = dom_element_list_owner(this):
+        var captures = DomElementMaybeInvalidateOrdinalsForListOwner(skip_node = skip_node)
+        dom_element_for_each_numbered_item_owned_by_list_owner(owner, ak.Function1[DomElement*, ak.IterationDecision](call = dom_element_maybe_invalidate_ordinals_for_list_owner_item, context = &captures))
+
+## The captures of Element::ordinal_value's lambda.
+struct DomElementOrdinalValueNumbering:
+    var numbering: ak.Checked[i32]
+    var reversed: bool
+
+## Element::ordinal_value's lambda: assign each owned item its ordinal value.
+func dom_element_ordinal_value_item(context: void*?, item: DomElement*) -> ak.IterationDecision:
+    let captures = (DomElementOrdinalValueNumbering*)(context else trap("no captures"))
+
+    # 4. Let item be the ith of owner's owned list items, in tree order. [Not necessary]
+    # 5. If item is an li element that has a value attribute, then:
+    let value_attribute = dom_element_get_attribute(item, html_attribute_names_value)
+    if dom_node_is_html_li_element(item.dom_node()):
+        if let value = value_attribute:
+            # 1. Let parsed be the result of parsing the value of the attribute as an integer.
+            let parsed = html_parse_integer(ak.string_bytes_as_string_view(&value))
+
+            # 2. If parsed is not an error, then set numbering to parsed.
+            if let parsed_value = parsed:
+                captures.numbering = ak.Checked[i32](m_value = parsed_value, m_overflow = false)
+
+    # 6. The ordinal value of item is numbering.
+    item.m_ordinal_value = ak.checked_value(&captures.numbering)
+
+    # 7. If owner is an ol element, and owner has a reversed attribute, decrement numbering by 1; otherwise, increment numbering by 1.
+    if captures.reversed:
+        discard(ak.checked_dec_i32(&captures.numbering))
+    else:
+        discard(ak.checked_inc_i32(&captures.numbering))
+
+    # 8. Increment i by 1. [Not necessary]
+    # 9. Go to the step labeled loop.
+    return ak.IterationDecision.continue_
+
+## Ported from Element.cpp:3894 Web::DOM::Element::ordinal_value.
+# https://html.spec.whatwg.org/multipage/grouping-content.html#ordinal-value
+pub func dom_element_ordinal_value(this: DomElement*) -> i32:
+    if let ordinal_value = this.m_ordinal_value:
+        return ordinal_value
+
+    let owner = dom_element_list_owner(this) else return 1
+
+    # 1. Let i be 1. [Not necessary]
+    # 2. If owner is an ol element, let numbering be owner's starting value. Otherwise, let numbering be 1.
+    var captures = DomElementOrdinalValueNumbering(numbering = ak.Checked[i32](m_value = 1, m_overflow = false), reversed = false)
+
+    if let ol_element = as_if_html_htmlo_list_element(owner):
+        let starting_value = html_htmlo_list_element_starting_value(ol_element)
+        captures.numbering = ak.Checked[i32](m_value = ak.checked_value(&starting_value), m_overflow = false)
+        captures.reversed = dom_element_has_attribute(owner, html_attribute_names_reversed)
+
+    # 3. Loop : If i is greater than the number of list items that owner owns, then return; all of owner's owned list items have been assigned ordinal values.
+    # NOTE: We use `owner->for_each_numbered_item_in_list` to iterate through the owner's list of owned elements.
+    #       As a result, we don't need `i` as counter (spec) in the list of children, with no material consequences.
+    dom_element_for_each_numbered_item_owned_by_list_owner(owner, ak.Function1[DomElement*, ak.IterationDecision](call = dom_element_ordinal_value_item, context = &captures))
+
+    return this.m_ordinal_value else 1
+
+## Ported from Element.cpp:3947 Web::DOM::Element::id_reference_exists (override).
+pub func dom_element_id_reference_exists_impl(base: AriaMixin*, id_reference: ak.String) -> bool:
+    let this = dom_element_from_aria_mixin(base)
+    return dom_parent_node_get_element_by_id(dom_element_document(this).dom_parent_node(), ak.fly_string_from_string(id_reference)) != none
+
+# mark: Intersection observers and scroll offsets ===============================================
+
+## Ported from Element.cpp:3952 Web::DOM::Element::register_intersection_observer.
+pub func dom_element_register_intersection_observer(this: DomElement*, observer: IntersectionObserverIntersectionObserver*):
+    if this.m_registered_intersection_observers == none:
+        this.m_registered_intersection_observers = new ak.Vector[IntersectionObserverIntersectionObserver*] else trap("out of memory")
+    ak.vector_append_t(this.m_registered_intersection_observers else trap("unreachable"), observer)
+
+## Ported from Element.cpp:3959 Web::DOM::Element::unregister_intersection_observer.
+pub func dom_element_unregister_intersection_observer(this: DomElement*, observer: IntersectionObserverIntersectionObserver*):
+    let observers = this.m_registered_intersection_observers else return
+    # remove_first_matching([&observer](auto const& entry) { return entry == observer; })
+    for i in 0..<ak.vector_size(observers):
+        if *ak.vector_at(observers, i) == observer:
+            ak.vector_remove(observers, i)
+            break
+
+## Ported from Element.cpp:3968 Web::DOM::Element::scroll_offset.
+pub func dom_element_scroll_offset(this: DomElement*, pseudo_element_type: css_data.PseudoElement?) -> gfx.CssPixelPoint:
+    if let type_ = pseudo_element_type:
+        if let pseudo_element = dom_element_get_pseudo_element(this, type_):
+            return dom_pseudo_element_scroll_offset(pseudo_element)
+        var zero: gfx.CssPixelPoint
+        return zero
+    return this.m_scroll_offset
+
+## Ported from Element.cpp:3978 Web::DOM::Element::set_scroll_offset.
+pub func dom_element_set_scroll_offset(this: DomElement*, pseudo_element_type: css_data.PseudoElement?, offset: gfx.CssPixelPoint):
+    if let type_ = pseudo_element_type:
+        if let pseudo_element = dom_element_get_pseudo_element(this, type_):
+            dom_pseudo_element_set_scroll_offset(pseudo_element, offset)
+    else:
+        this.m_scroll_offset = offset
+
+# mark: Translation mode and directionality =====================================================
+
+## Ported from Element.cpp:3989 Web::DOM::Element::translation_mode.
+# https://html.spec.whatwg.org/multipage/dom.html#translation-mode
+pub func dom_element_translation_mode(this: DomElement*) -> DomElementTranslationMode:
+    # Each element (even non-HTML elements) has a translation mode, which is in either the translate-enabled state or
+    # the no-translate state.
+
+    # If an HTML element's translate attribute is in the Yes state, then the element's translation mode is in the
+    # translate-enabled state;
+    # NOTE: The attribute is in the Yes state if the attribute is present and its value is the empty string or is a
+    #       ASCII-case-insensitive match for "yes".
+    let maybe_translate_attribute = dom_element_attribute(this, html_attribute_names_translate)
+    if let translate_attribute = maybe_translate_attribute:
+        if ak.string_is_empty(&translate_attribute) or dom_element_string_equals_ignoring_ascii_case(&translate_attribute, "yes"):
+            return DomElementTranslationMode.translate_enabled
+
+    # otherwise, if the element's translate attribute is in the No state, then the element's translation mode is in
+    # the no-translate state.
+    if let translate_attribute = maybe_translate_attribute:
+        if dom_element_string_equals_ignoring_ascii_case(&translate_attribute, "no"):
+            return DomElementTranslationMode.no_translate
+
+    # Otherwise, either the element's translate attribute is in the Inherit state, or the element is not an HTML
+    # element and thus does not have a translate attribute; in either case, the element's translation mode is in the
+    # same state as its parent element's, if any.
+    if let parent = dom_node_parent_element(this.dom_node()):
+        return dom_element_translation_mode(parent)
+
+    # or in the translate-enabled state, if the element's parent element is null
+    return DomElementTranslationMode.translate_enabled
+
+## Ported from Element.cpp:4019 Web::DOM::Element::directionality.
+# https://html.spec.whatwg.org/multipage/dom.html#the-directionality
+pub func dom_element_directionality(this: DomElement*) -> DomElementDirectionality:
+    # The directionality of an element (any element, not just an HTML element) is either 'ltr' or 'rtl'.
+    # To compute the directionality given an element element, switch on element's dir attribute state:
+    let maybe_dir = dom_element_dir(this)
+    if let dir = maybe_dir:
+        match dir:
+            # -> ltr
+            .ltr:
+                # Return 'ltr'.
+                return DomElementDirectionality.ltr
+            # -> rtl
+            .rtl:
+                # Return 'rtl'.
+                return DomElementDirectionality.rtl
+            # -> auto
+            .auto:
+                # 1. Let result be the auto directionality of element.
+                let result = dom_element_auto_directionality(this)
+
+                # 2. If result is null, then return 'ltr'.
+                # 3. Return result.
+                return result else DomElementDirectionality.ltr
+            _: trap("VERIFY_NOT_REACHED")
+    # -> undefined
+    assert(maybe_dir == none)
+
+    # If element is a bdi element:
+    let local_name = dom_element_local_name(this)
+    if ak.fly_string_eq_fly_string(&local_name, &html_tag_names_bdi):
+        # 1. Let result be the auto directionality of element.
+        let result = dom_element_auto_directionality(this)
+
+        # 2. If result is null, then return 'ltr'.
+        # 3. Return result.
+        return result else DomElementDirectionality.ltr
+
+    # If element is an input element whose type attribute is in the Telephone state:
+    if let input_element = as_if_html_input_element(this):
+        if html_input_element_type_state(input_element) == HtmlInputElementTypeAttributeState.telephone:
+            # Return 'ltr'.
+            return DomElementDirectionality.ltr
+
+    # Otherwise:
+    # Return the parent directionality of element.
+    return dom_element_parent_directionality(this)
+
+## Ported from Element.cpp:4076 Web::DOM::Element::is_auto_directionality_form_associated_element.
+# https://html.spec.whatwg.org/multipage/dom.html#auto-directionality-form-associated-elements
+pub func dom_element_is_auto_directionality_form_associated_element(this: DomElement*) -> bool:
+    # The auto-directionality form-associated elements are:
+    # input elements whose type attribute is in the Hidden, Text, Search, Telephone, URL, Email, Password, Submit Button, Reset Button, or Button state,
+    # and textarea elements.
+    if is_html_text_area_element(this):
+        return true
+    let input_element = as_if_html_input_element(this) else return false
+    return match html_input_element_type_state(input_element):
+        .hidden, .text, .search, .telephone, .url, .email, .password, .submit_button, .reset_button, .button => true
+        _ => false
+
+## Ported from Element.cpp:4086 Web::DOM::Element::auto_directionality.
+# https://html.spec.whatwg.org/multipage/dom.html#auto-directionality
+func dom_element_auto_directionality(this: DomElement*) -> DomElementDirectionality?:
+    # 1. If element is an auto-directionality form-associated element:
+    if dom_element_is_auto_directionality_form_associated_element(this):
+        let form_associated_element = as_if_form_associated_element(this) else trap("as<HTML::FormAssociatedElement> failed")
+        let value = html_form_associated_element_form_value(form_associated_element)
+
+        # 1. If element's value contains a character of bidirectional character type AL or R,
+        #    and there is no character of bidirectional character type L anywhere before it in the element's value, then return 'rtl'.
+        let view = ak.utf16_string_base_utf16_view(&value.utf16_string_base)
+        var iterator = ak.utf16_view_begin(&view)
+        while not ak.utf16_code_point_iterator_done(&iterator):
+            let code_point = ak.utf16_code_point_iterator_deref(&iterator)
+            discard(ak.utf16_code_point_iterator_inc(&iterator))
+            let bidi_class = web_unicode.bidirectional_class(code_point)
+            if bidi_class == web_unicode.BidiClass.left_to_right:
+                break
+            if bidi_class == web_unicode.BidiClass.right_to_left_arabic or bidi_class == web_unicode.BidiClass.right_to_left:
+                return DomElementDirectionality.rtl
+
+        # 2. If element's value is not the empty string, then return 'ltr'.
+        if ak.utf16_string_base_is_empty(&value.utf16_string_base):
+            return DomElementDirectionality.ltr
+
+        # 3. Return null.
+        return none
+
+    # 2. If element is a slot element whose root is a shadow root and element's assigned nodes are not empty:
+    if let slot = as_if_html_slot_element(this):
+        var assigned_nodes = html_slot_element_assigned_nodes(slot, HtmlAssignedNodesOptions(flatten = false))
+        if dom_node_is_shadow_root(tree_node_root(slot.dom_node())) and not ak.vector_is_empty(&assigned_nodes):
+            # 1 . For each node child of element's assigned nodes:
+            for maybe_child in ak.vector_span(&assigned_nodes):
+                let child = maybe_child else trap("null GC::Root<Node>")
+                # 1. Let childDirection be null.
+                var child_direction: DomElementDirectionality? = none
+
+                # 2. If child is a Text node, then set childDirection to the text node directionality of child.
+                if let text = as_if_dom_text(child):
+                    child_direction = dom_text_directionality(text)
+
+                # 3. Otherwise:
+                else:
+                    # 1. Assert: child is an Element node.
+                    assert(dom_node_is_element(child))
+
+                    # 2. Set childDirection to the contained text auto directionality of child with canExcludeRoot set to true.
+                    child_direction = dom_element_contained_text_auto_directionality(as_dom_element(child), true)
+
+                # 4. If childDirection is not null, then return childDirection.
+                if child_direction != none:
+                    return child_direction
+
+            # 2. Return null.
+            return none
+
+    # 3. Return the contained text auto directionality of element with canExcludeRoot set to false.
+    return dom_element_contained_text_auto_directionality(this, false)
+
+## Element::contained_text_auto_directionality's `is_one_of_the_filtered_elements` lambda.
+func dom_element_is_one_of_the_filtered_elements(descendant: DomNode*) -> bool:
+    if is_html_script_element(descendant) or is_html_style_element(descendant) or is_html_text_area_element(descendant):
+        return true
+    let element = as_if_dom_element(descendant) else return false
+    return dom_element_dir(element) != none
+
+## Ported from Element.cpp:4148 Web::DOM::Element::contained_text_auto_directionality.
+# https://html.spec.whatwg.org/multipage/dom.html#contained-text-auto-directionality
+func dom_element_contained_text_auto_directionality(this: DomElement*, can_exclude_root: bool) -> DomElementDirectionality?:
+    # To compute the contained text auto directionality of an element element with a boolean canExcludeRoot:
+
+    # 1. For each node descendant of element's descendants, in tree order:
+    var result: DomElementDirectionality? = none
+    var descendants = dom_node_subtree(this.dom_node()).iterator()
+    while let descendant = descendants.next():
+        # 1. If any of
+        #    - descendant
+        #    - any ancestor element of descendant that is a descendant of element
+        #    - if canExcludeRoot is true, element
+        #    is one of
+        #    - FIXME: a bdi element
+        #    - a script element
+        #    - a style element
+        #    - a textarea element
+        #    - an element whose dir attribute is not in the undefined state
+        #    then continue.
+        # NOTE: "any ancestor element of descendant that is a descendant of element" will be iterated already.
+        if dom_element_is_one_of_the_filtered_elements(descendant) or (can_exclude_root and dom_element_is_one_of_the_filtered_elements(this.dom_node())):
+            descendants.skip_children()
+            continue
+
+        # 2. If descendant is a slot element whose root is a shadow root, then return the directionality of that shadow root's host.
+        if let slot = as_if_html_slot_element(descendant):
+            let root = tree_node_root(slot.dom_node())
+            if let shadow_root = as_if_dom_shadow_root(root):
+                let host = dom_document_fragment_host(shadow_root.dom_document_fragment()) else trap("VERIFY: host")
+                result = dom_element_directionality(host)
+                break
+
+        # 3. If descendant is not a Text node, then continue.
+        let text = as_if_dom_text(descendant) else continue
+
+        # 4. Let result be the text node directionality of descendant.
+        result = dom_text_directionality(text)
+
+        # 5. If result is not null, then return result.
+        if result != none:
+            break
+
+    if result != none:
+        return result
+
+    # 2. Return null.
+    return none
+
+## Ported from Element.cpp:4211 Web::DOM::Element::parent_directionality.
+# https://html.spec.whatwg.org/multipage/dom.html#parent-directionality
+func dom_element_parent_directionality(this: DomElement*) -> DomElementDirectionality:
+    # 1. Let parentNode be element's parent node.
+    let parent_node = tree_node_parent(this.dom_node()) else return DomElementDirectionality.ltr
+
+    # 2. If parentNode is a shadow root, then return the directionality of parentNode's host.
+    if let shadow_root = as_if_dom_shadow_root(parent_node):
+        let host = dom_document_fragment_host(shadow_root.dom_document_fragment()) else trap("VERIFY: host")
+        return dom_element_directionality(host)
+
+    # 3. If parentNode is an element, then return the directionality of parentNode.
+    if let parent_element = as_if_dom_element(parent_node):
+        return dom_element_directionality(parent_element)
+
+    # 4. Return 'ltr'.
+    return DomElementDirectionality.ltr
+
+# mark: Inline style images =====================================================================
+
+## Ported from Element.cpp:4231 Web::DOM::prefetch_inline_style_image_resources.
+func dom_prefetch_inline_style_image_resources(inline_style: CssStyleProperties*, document: DomDocument*):
+    var properties = css_style_properties_properties(inline_style)
+    for property in ak.vector_span(&properties):
+        if css_style_value_is_value_list(property.value):
+            var values = css_style_value_list_values(css_style_value_as_value_list(property.value))
+            for item in ak.vector_span(&values):
+                dom_prefetch_inline_style_image_resources_load_image_if_needed(item, document)
+        else:
+            dom_prefetch_inline_style_image_resources_load_image_if_needed(property.value, document)
+
+## prefetch_inline_style_image_resources's `load_image_if_needed` lambda.
+func dom_prefetch_inline_style_image_resources_load_image_if_needed(value: CssStyleValue*, document: DomDocument*):
+    if css_style_value_is_abstract_image(value):
+        css_abstract_image_style_value_load_any_resources_dom_document(css_style_value_as_abstract_image(value), document)
+
+# mark: Numbered list items =====================================================================
+
+## Ported from Element.h:657 Web::DOM::Element::for_each_numbered_item_owned_by_list_owner (const).
+## The template callback is `Function<IterationDecision(Element*)>` (DESIGN.md §2.7).
+func dom_element_for_each_numbered_item_owned_by_list_owner_const(this: DomElement*, callback: ak.Function1[DomElement*, ak.IterationDecision]):
+    dom_element_for_each_numbered_item_owned_by_list_owner(this, callback)
+
+## Ported from Element.cpp:4535 Web::DOM::Element::for_each_numbered_item_owned_by_list_owner.
+func dom_element_for_each_numbered_item_owned_by_list_owner(this: DomElement*, callback: ak.Function1[DomElement*, ak.IterationDecision]):
+    var node = tree_node_first_child(this.dom_node())
+    while let current = node:
+        var at = current
+        # The C++ loop's increment, `node = node->next_in_pre_order(this)`, runs after every `continue`.
+        defer node = tree_node_next_in_pre_order_t(at, this.dom_node())
+
+        let element = as_if_dom_element(at) else continue
+
+        element.m_is_contained_in_list_subtree = true
+
+        if dom_node_is_html_ol_ul_menu_element(at):
+            # Skip list nodes and their descendents. They have their own, unrelated ordinals.
+            while let last_child = tree_node_last_child(at):  # Find the last node (preorder) in the subtree headed by node. O(1).
+                at = last_child
+
+            continue
+
+        # NB: unsafe_layout_node() because list ordinal computation happens during style
+        #     recalculation when layout is inherently stale.
+        if dom_node_unsafe_layout_node(at) == none:
+            continue  # Skip nodes that do not participate in the layout.
+
+        let computed_properties = dom_element_computed_properties(element) else trap("a laid-out element has computed properties")
+        let display = css_computed_properties_display(computed_properties)
+        if not css_display_is_list_item(&display):
+            continue  # Skip nodes that are not list items.
+
+        if ak.function1_call(&callback, element) == ak.IterationDecision.break_:
+            return
