@@ -4,6 +4,13 @@
 set -e
 cd "$(dirname "$0")"
 
+# Every hand-written fragment is laid out as the pinned compiler's formatter lays it out (the
+# skeleton generator's types_* and stubs/ fragments are not).
+echo "== luce-base fmt --check"
+for file in $(git ls-files '*.lucb' | grep -v -e '/types_' -e '/stubs/' -e '/generated'); do
+    luce-base fmt "$file" --check > /dev/null || { echo "$file is not formatted (luce-base fmt $file --write)"; exit 1; }
+done
+
 for module in web; do
     echo "== luce-base check src/luce_browser_engine/$module -W"
     # -W reports warnings without failing, so any output at all fails the run.
