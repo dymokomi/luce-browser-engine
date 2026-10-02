@@ -1,0 +1,398 @@
+#==============================================================================================
+#
+#   tests_event_loop - tests of the HTML event loop, tasks and task queues (region r29)
+#
+#   DESCRIPTION:
+#       Ladybird has no unit tests for HTML/EventLoop (it is exercised by every
+#       Tests/LibWeb test), so these pin the C++ behaviour: task ids and runnability, the task
+#       queue's order and filters, the processing model (one runnable task per round, then a
+#       microtask checkpoint, rescheduled on the Platform::Timer the embedder's loop fires),
+#       microtasks queued by microtasks, the steps run on reaching step 1, global tasks,
+#       pausing, the documents of the event loop, the backup incumbent realm stack, updating
+#       the rendering with no renderable document, unique task sources, parallel queues and
+#       the animation frame callback driver. The event loop runs over r13's scripted
+#       TestEventLoop (tests_platform), whose timers the tests fire.
+#
+#==============================================================================================
+
+# mark: Helpers =================================================================================
+
+## A log of numbered steps.
+struct TestHtmlLog:
+    var entries: i32[16]
+    var count: usize
+
+## The captures of a logged step: the log, the number, and an optional microtask to queue.
+struct TestHtmlLogStep:
+    var log: TestHtmlLog*
+    var number: i32
+    var queue_microtask_number: i32
+    var vm: Vm*
+
+## A logged step: appends its number; queues a logged microtask when asked to.
+func test_html_log_step(context: void*?):
+    let step = (TestHtmlLogStep*)(context else trap("no captures"))
+    step.log.entries[step.log.count] = step.number
+    step.log.count += 1
+    if step.queue_microtask_number != 0:
+        html_queue_a_microtask(none, test_html_log_steps(step.vm, step.log, step.queue_microtask_number))
+
+## The GC::Function of a logged step.
+func test_html_log_steps(vm: Vm*, log: TestHtmlLog*, number: i32, queue_microtask_number: i32 = 0) -> gc.Function0[unit]*:
+    let step = new TestHtmlLogStep(log = log, number = number, queue_microtask_number = queue_microtask_number, vm = vm) else trap("out of memory")
+    return gc.create_function0(vm_heap(vm), ak.Function0[unit](call = test_html_log_step, context = step))
+
+## Whether the log holds exactly `expected`.
+func test_html_log_is(log: const TestHtmlLog*, expected: const i32[]) -> bool:
+    if log.count != expected.length:
+        return false
+    for i in 0..<expected.length:
+        if log.entries[i] != expected[i]:
+            return false
+    return true
+
+## A Document made in `realm`'s heap by Node's constructor and the phase-1 steps of Document's
+## (r17's test_document_in_realm, in the heap, so that listeners can be added to it), registered with the main thread event loop as
+## Document::Document's last step does; its finalize unregisters it.
+func test_html_heap_document(realm: Realm*) -> DomDocument*:
+    let document = (DomDocument*)web_allocate_cell(realm, &dom_document_class)
+    dom_node_construct_realm(document.dom_node(), realm, document, DomNodeType.document_node)
+    document.global_event_handlers.vtable = &dom_document_global_event_handlers_vtable
+    document.global_event_handlers.class_id = document.cell().class_id
+    dom_document_init_fields(document)
+    document.m_content_type = ak.string_from_str("application/xml")
+    document.m_origin = web_url.origin_create_opaque()
+    document.m_default_single_line_container_name = html_tag_names_div
+    document.m_page = test_document_page()
+    document.m_url = web_url.about_blank()
+    document.bind_platform_object().m_legacy_platform_object_flags = BindPlatformObjectLegacyPlatformObjectFlags(supports_named_properties = 1, has_legacy_override_built_ins_interface_extended_attribute = 1)
+    dom_document_set_document_type(document, DocumentDomDocumentType.html)
+    gc.heap_undefer_gc(realm_heap(realm))
+    dom_event_target_initialize_impl(document.js_cell(), realm)
+    html_event_loop_register_document(html_main_thread_event_loop(), document)
+    return document
+
+## The filter that accepts every document.
+func test_html_any_document(context: void*?, document: DomDocument*) -> bool:
+    return true
+
+## A filter for take_first_runnable_matching / remove_tasks_matching: the task `context`.
+func test_html_is_task(context: void*?, task: HtmlTask*) -> bool:
+    return (void*?)task == context
+
+# mark: Tasks ===================================================================================
+
+test "Task: increasing ids, its source and document, runnable without a document":
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    var log = TestHtmlLog()
+    let first = html_task_create(vm, HtmlTaskSource.dom_manipulation, none, test_html_log_steps(vm, &log, 1))
+    let second = html_task_create(vm, HtmlTaskSource.networking, none, test_html_log_steps(vm, &log, 2))
+    assert(html_task_id(second) == html_task_id(first) + 1)
+    assert(html_task_source(first) == HtmlTaskSource.dom_manipulation)
+    assert(html_task_document(first) == none)
+    assert(html_task_is_runnable(first) and not html_task_is_permanently_unrunnable(first))
+    html_task_execute(second)
+    html_task_execute(first)
+    assert(test_html_log_is(&log, [2, 1]))
+
+    # A document that is not fully active (it has no navigable) makes its task unrunnable; a
+    # destroyed one makes it permanently unrunnable.
+    let document = test_document_in_realm(realm)
+    let task = html_task_create(vm, HtmlTaskSource.dom_manipulation, document, test_html_log_steps(vm, &log, 3))
+    assert(html_task_document(task) == document)
+    assert(not html_task_is_runnable(task) and not html_task_is_permanently_unrunnable(task))
+    document.m_has_been_destroyed = true
+    assert(html_task_is_permanently_unrunnable(task))
+
+test "TaskQueue: order, rendering tasks, unrunnable tasks and the filters":
+    let test_loop = install_test_event_loop()
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    let event_loop = html_main_thread_event_loop()
+    let queue = html_event_loop_task_queue(event_loop)
+    var log = TestHtmlLog()
+    let document = test_document_in_realm(realm)
+
+    let waiting = html_task_create(vm, HtmlTaskSource.dom_manipulation, document, test_html_log_steps(vm, &log, 1))
+    let rendering = html_task_create(vm, HtmlTaskSource.rendering, none, test_html_log_steps(vm, &log, 2))
+    let plain = html_task_create(vm, HtmlTaskSource.networking, none, test_html_log_steps(vm, &log, 3))
+    html_task_queue_add(queue, waiting)
+    # Adding a task schedules the event loop: its single-shot timer is registered.
+    assert(test_loop.registrations == 1 and event_loop.m_system_event_loop_timer != none)
+    html_task_queue_enqueue(queue, rendering)
+    html_task_queue_add(queue, plain)
+    assert(test_loop.registrations == 1)
+    assert(not html_task_queue_is_empty(queue))
+    assert(html_task_queue_last_added_task(queue) == plain)
+    assert(html_task_queue_has_rendering_tasks(queue))
+    assert(html_task_queue_has_runnable_tasks(queue))
+
+    # While the rendering task runs, rendering tasks are skipped.
+    event_loop.m_running_rendering_task = true
+    assert(html_task_queue_take_first_runnable(queue) == plain)
+    assert(html_task_queue_has_runnable_tasks(queue) == false)
+    event_loop.m_running_rendering_task = false
+    assert(html_task_queue_has_runnable_tasks(queue))
+
+    # The waiting task's document is not fully active: it stays; once destroyed it is dropped.
+    document.m_has_been_destroyed = true
+    assert(html_task_queue_take_first_runnable_matching(queue, ak.Function1[HtmlTask*, bool](call = test_html_is_task, context = waiting)) == none)
+    assert(ak.vector_size(&queue.m_tasks) == 1)
+    assert(html_task_queue_take_first_runnable(queue) == rendering)
+    assert(html_task_queue_is_empty(queue))
+    assert(html_task_queue_dequeue(queue) == none and html_task_queue_last_added_task(queue) == none)
+
+    # remove_tasks_matching removes without running; dequeue takes the first.
+    let a = html_task_create(vm, HtmlTaskSource.timer_task, none, test_html_log_steps(vm, &log, 4))
+    let b = html_task_create(vm, HtmlTaskSource.timer_task, none, test_html_log_steps(vm, &log, 5))
+    html_task_queue_add(queue, a)
+    html_task_queue_add(queue, b)
+    html_task_queue_remove_tasks_matching(queue, ak.Function1[HtmlTask*, bool](call = test_html_is_task, context = a))
+    assert(html_task_queue_dequeue(queue) == b)
+    assert(log.count == 0)
+
+    # Tasks of a temporary document for fragment parsing are not queued.
+    let fragment_document = test_document_in_realm(realm)
+    fragment_document.m_temporary_document_for_fragment_parsing = DomDocumentTemporaryDocumentForFragmentParsing.yes
+    html_task_queue_add(queue, html_task_create(vm, HtmlTaskSource.dom_manipulation, fragment_document, test_html_log_steps(vm, &log, 6)))
+    assert(html_task_queue_is_empty(queue))
+
+# mark: The processing model ====================================================================
+
+test "processing: one task per round, then its microtasks; the timer is re-armed while tasks remain":
+    let test_loop = install_test_event_loop()
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    let event_loop = html_main_thread_event_loop()
+    var log = TestHtmlLog()
+
+    discard(html_queue_a_task(HtmlTaskSource.dom_manipulation, none, none, test_html_log_steps(vm, &log, 1, queue_microtask_number = 10)))
+    discard(html_queue_a_task(HtmlTaskSource.networking, event_loop, none, test_html_log_steps(vm, &log, 2, queue_microtask_number = 20)))
+    discard(html_queue_a_task(HtmlTaskSource.dom_manipulation, none, none, test_html_log_steps(vm, &log, 3)))
+    # A task on the microtask source goes to the microtask queue.
+    discard(html_queue_a_task(HtmlTaskSource.microtask, none, none, test_html_log_steps(vm, &log, 4)))
+    html_run_when_event_loop_reaches_step_1(test_html_log_steps(vm, &log, 5))
+    assert(log.count == 0 and test_loop.registrations == 1)
+    assert(not html_event_loop_microtask_queue_empty(event_loop))
+
+    fire_test_timer(test_loop, 1)
+    assert(test_html_log_is(&log, [5, 1, 4, 10]))
+    assert(platform_timer_is_active(event_loop.m_system_event_loop_timer else trap("no timer")))
+    assert(html_event_loop_currently_running_task(event_loop) == none)
+    fire_test_timer(test_loop, 1)
+    assert(test_html_log_is(&log, [5, 1, 4, 10, 2, 20]))
+    fire_test_timer(test_loop, 1)
+    assert(test_html_log_is(&log, [5, 1, 4, 10, 2, 20, 3]))
+    # Nothing is left to run: the timer stays stopped and the idle period start time is set.
+    assert(not platform_timer_is_active(event_loop.m_system_event_loop_timer else trap("no timer")))
+    assert(event_loop.m_last_idle_period_start_time > 0.0)
+    assert(test_loop.timers[0] == none)
+    discard(realm)
+
+test "microtasks: a checkpoint runs microtasks queued by microtasks, in order, and does not nest":
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    let event_loop = html_main_thread_event_loop()
+    var log = TestHtmlLog()
+    html_queue_a_microtask(none, test_html_log_steps(vm, &log, 1, queue_microtask_number = 3))
+    html_queue_a_microtask(none, test_html_log_steps(vm, &log, 2))
+    let task = html_event_loop_dequeue_microtask(event_loop)
+    assert(html_task_source(task) == HtmlTaskSource.microtask)
+    html_event_loop_enqueue_microtask(event_loop, task)
+
+    # Inside a checkpoint, another checkpoint returns at once.
+    event_loop.m_performing_a_microtask_checkpoint = true
+    html_perform_a_microtask_checkpoint()
+    assert(log.count == 0)
+    event_loop.m_performing_a_microtask_checkpoint = false
+
+    html_perform_a_microtask_checkpoint()
+    assert(test_html_log_is(&log, [2, 1, 3]))
+    assert(html_event_loop_microtask_queue_empty(event_loop))
+    assert(not event_loop.m_performing_a_microtask_checkpoint)
+    discard(realm)
+
+test "queue_global_task: the global's relevant agent's event loop, no document for a non-Window global":
+    discard(install_test_event_loop())
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    let queue = html_event_loop_task_queue(html_main_thread_event_loop())
+    var log = TestHtmlLog()
+    let id = html_queue_global_task(HtmlTaskSource.user_interaction, realm_global_object(realm), test_html_log_steps(vm, &log, 1))
+    let task = html_task_queue_last_added_task(queue) else trap("no task")
+    assert(html_task_id(task) == id)
+    assert(html_task_source(task) == HtmlTaskSource.user_interaction)
+    assert(html_task_document(task) == none)
+
+test "pause: no task runs and checkpoints wait until the pause handle is gone":
+    discard(install_test_event_loop())
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    let event_loop = html_main_thread_event_loop()
+    let queue = html_event_loop_task_queue(event_loop)
+    var log = TestHtmlLog()
+    discard(html_queue_a_task(HtmlTaskSource.dom_manipulation, none, none, test_html_log_steps(vm, &log, 1)))
+    html_queue_a_microtask(none, test_html_log_steps(vm, &log, 2))
+
+    var context: HtmlTemporaryExecutionContext = ---
+    html_temporary_execution_context_construct_realm(&context, realm)
+    var handle = html_event_loop_pause(event_loop)
+    assert(html_event_loop_execution_paused(event_loop))
+    assert(handle.event_loop == event_loop and handle.global == realm_global_object(realm))
+    assert(not event_loop.m_running_rendering_task)
+    assert(not html_task_queue_has_runnable_tasks(queue))
+    assert(html_task_queue_take_first_runnable(queue) == none)
+    html_temporary_execution_context_destruct(&context)
+    assert(log.count == 0)
+
+    html_event_loop_pause_handle_destruct(&handle)
+    assert(not html_event_loop_execution_paused(event_loop))
+    assert(html_task_queue_has_runnable_tasks(queue))
+    html_perform_a_microtask_checkpoint()
+    assert(test_html_log_is(&log, [2]))
+
+# mark: Documents, settings objects and the rendering ===========================================
+
+test "the documents of the event loop: registered by the document, unregistered when collected":
+    web_test_clobber_stack()
+    run_event_loop_documents()
+
+## Two registered documents known only through weak pointers.
+noinline func make_test_event_loop_documents(realm: Realm*) -> (gc.Weak[DomDocument], gc.Weak[DomDocument]):
+    let first = test_html_heap_document(realm)
+    let second = test_html_heap_document(realm)
+    second.m_is_decoded_svg = true
+    return (gc.make_weak(first), gc.make_weak(second))
+
+noinline func run_event_loop_documents():
+    let vm = web_test_create_vm()
+    discard(web_test_install_agent(vm))
+    let realm = web_test_create_settings_realm(vm)
+    let event_loop = html_main_thread_event_loop()
+    let (first, second) = make_test_event_loop_documents(realm)
+    assert(ak.vector_size(&event_loop.m_documents) == 2)
+    assert(event_loop.m_documents_sort_dirty)
+
+    # Decoded SVG documents are never listed; the order is the registration order.
+    var documents = html_event_loop_documents_in_this_event_loop_matching(event_loop, ak.Function1[DomDocument*, bool](call = test_html_any_document, context = none))
+    assert(ak.vector_size(&documents) == 1)
+    assert(*ak.vector_at(&documents, 0) == gc.weak_ptr(&first))
+    assert(not event_loop.m_documents_sort_dirty)
+    html_event_loop_document_navigable_did_change(event_loop)
+    assert(event_loop.m_documents_sort_dirty)
+    documents = ak.Vector[DomDocument*?]()
+
+    # No document is fully active (none has a navigable): no same-loop windows, the idle
+    # deadline is 50ms after the idle period start.
+    var windows = html_event_loop_same_loop_windows(event_loop)
+    assert(ak.vector_is_empty(&windows))
+    event_loop.m_last_idle_period_start_time = 100.0
+    assert(html_event_loop_compute_deadline(event_loop) == 150.0)
+
+    # Updating the rendering finds no renderable document and only toggles its flag.
+    html_event_loop_update_the_rendering(event_loop)
+    assert(not event_loop.m_running_rendering_task)
+
+    web_test_clobber_stack()
+    gc.heap_collect_garbage(vm_heap(vm))
+    assert(not web_test_alive(&first) and not web_test_alive(&second))
+    assert(ak.vector_is_empty(&event_loop.m_documents))
+    web_test_destroy_vm(vm)
+
+test "the backup incumbent realm stack and the termination nesting level":
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    let event_loop = html_main_thread_event_loop()
+    let settings = web_test_settings_of(realm)
+    let other = web_test_settings_of(web_test_create_settings_realm(vm))
+    assert(html_event_loop_is_backup_incumbent_realm_stack_empty(event_loop))
+    html_event_loop_push_onto_backup_incumbent_realm_stack(event_loop, settings)
+    html_event_loop_push_onto_backup_incumbent_realm_stack(event_loop, other)
+    assert(html_event_loop_top_of_backup_incumbent_realm_stack(event_loop) == other)
+    html_event_loop_pop_backup_incumbent_realm_stack(event_loop)
+    assert(html_event_loop_top_of_backup_incumbent_realm_stack(event_loop) == settings)
+    html_event_loop_pop_backup_incumbent_realm_stack(event_loop)
+    assert(html_event_loop_is_backup_incumbent_realm_stack_empty(event_loop))
+
+    # Both settings objects registered with their responsible event loop, in creation order.
+    assert(ak.vector_size(&event_loop.m_related_environment_settings_objects) == 2)
+    assert(*ak.vector_at(&event_loop.m_related_environment_settings_objects, 1) == other)
+
+    html_event_loop_increment_termination_nesting_level(event_loop)
+    html_event_loop_increment_termination_nesting_level(event_loop)
+    html_event_loop_decrement_termination_nesting_level(event_loop)
+    assert(html_event_loop_termination_nesting_level(event_loop) == 1)
+
+# mark: Task sources and parallel queues ========================================================
+
+test "unique task sources start after the generic sources and are given back":
+    var first = HtmlUniqueTaskSource(source = HtmlTaskSource.unspecified)
+    var second = HtmlUniqueTaskSource(source = HtmlTaskSource.unspecified)
+    html_unique_task_source_construct(&first)
+    html_unique_task_source_construct(&second)
+    assert((i32)first.source >= (i32)HtmlTaskSource.unique_task_source_start)
+    assert((i32)second.source >= (i32)HtmlTaskSource.unique_task_source_start)
+    assert(first.source != second.source)
+    html_unique_task_source_destruct(&first)
+    html_unique_task_source_destruct(&second)
+
+test "ParallelQueue::enqueue queues a task on its unique source on the main thread event loop":
+    discard(install_test_event_loop())
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    var log = TestHtmlLog()
+    let parallel_queue = html_parallel_queue_create()
+    let id = html_parallel_queue_enqueue(parallel_queue, test_html_log_steps(vm, &log, 1))
+    let task = html_task_queue_last_added_task(html_event_loop_task_queue(html_main_thread_event_loop())) else trap("no task")
+    assert(html_task_id(task) == id)
+    assert(html_task_source(task) == parallel_queue.m_task_source.source)
+    assert(html_task_document(task) == none)
+    html_unique_task_source_destruct(&parallel_queue.m_task_source)
+    discard(realm)
+
+# mark: AnimationFrameCallbackDriver ============================================================
+
+## The captures of a logged animation frame callback.
+struct TestHtmlFrameCallback:
+    var log: TestHtmlLog*
+    var number: i32
+    var driver: HtmlAnimationFrameCallbackDriver*
+    var vm: Vm*
+
+## A logged animation frame callback; callback 2 adds callback 9 while the driver runs.
+func test_html_frame_callback(context: void*?, now: f64):
+    let captures = (TestHtmlFrameCallback*)(context else trap("no captures"))
+    assert(now == 16.5)
+    captures.log.entries[captures.log.count] = captures.number
+    captures.log.count += 1
+    if captures.number == 2:
+        discard(html_animation_frame_callback_driver_add(captures.driver, test_html_frame_function(captures.vm, captures.log, 9, captures.driver)))
+
+## The GC::Function of a logged animation frame callback.
+func test_html_frame_function(vm: Vm*, log: TestHtmlLog*, number: i32, driver: HtmlAnimationFrameCallbackDriver*) -> gc.Function1[f64, unit]*:
+    let captures = new TestHtmlFrameCallback(log = log, number = number, driver = driver, vm = vm) else trap("out of memory")
+    return gc.create_function1(vm_heap(vm), ak.Function1[f64, unit](call = test_html_frame_callback, context = captures))
+
+test "AnimationFrameCallbackDriver: ids from 1, removal, and callbacks added while running wait":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let heap = vm_heap(vm)
+    let driver = (HtmlAnimationFrameCallbackDriver*)web_heap_allocate_cell(heap, &html_animation_frame_callback_driver_class)
+    var log = TestHtmlLog()
+    assert(not html_animation_frame_callback_driver_has_callbacks(driver))
+    assert(html_animation_frame_callback_driver_add(driver, test_html_frame_function(vm, &log, 1, driver)) == 1)
+    assert(html_animation_frame_callback_driver_add(driver, test_html_frame_function(vm, &log, 2, driver)) == 2)
+    assert(html_animation_frame_callback_driver_add(driver, test_html_frame_function(vm, &log, 3, driver)) == 3)
+    assert(html_animation_frame_callback_driver_remove(driver, 1))
+    assert(not html_animation_frame_callback_driver_remove(driver, 1))
+    assert(html_animation_frame_callback_driver_has_callbacks(driver))
+
+    html_animation_frame_callback_driver_run(driver, 16.5)
+    assert(test_html_log_is(&log, [2, 3]))
+    assert(ak.ordered_hash_map_is_empty(&driver.m_executing_callbacks))
+    assert(html_animation_frame_callback_driver_has_callbacks(driver))
+    assert(ak.ordered_hash_map_contains_k(&driver.m_callbacks, 4))
+    html_animation_frame_callback_driver_run(driver, 16.5)
+    assert(test_html_log_is(&log, [2, 3, 9]))
+    assert(not html_animation_frame_callback_driver_has_callbacks(driver))
