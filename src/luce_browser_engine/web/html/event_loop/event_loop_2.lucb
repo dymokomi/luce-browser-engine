@@ -1,0 +1,598 @@
+#==============================================================================================
+#
+#   event_loop_2 - HTML::EventLoop: updating the rendering, queueing tasks and microtasks
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibWeb/HTML/EventLoop/EventLoop.cpp (lines 302-828) with the inline
+#       functions of EventLoop.h (lines 1-156): "update the rendering", queueing a task, a
+#       global task and a microtask, performing a microtask checkpoint, the documents of the
+#       event loop (kept in container-document order), the backup incumbent realm stack, the
+#       environment settings objects whose rejected promises a checkpoint reports, the
+#       same-loop windows, the idle deadline, and pausing.
+#
+#       Copyright (c) 2021, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2022, the SerenityOS developers.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Update the rendering ====================================================================
+
+## The filter of update_the_rendering's step 3: remove the documents that cannot render.
+func html_event_loop_is_renderable_document(context: void*?, document: DomDocument*) -> bool:
+    if not dom_document_is_fully_active(document):
+        return false
+
+    # doc is render-blocked;
+    if dom_document_is_render_blocked(document):
+        return false
+
+    # doc's visibility state is "hidden";
+    if dom_document_hidden(document):
+        return false
+
+    # doc's rendering is suppressed for view transitions; or
+    if dom_document_rendering_suppression_for_view_transitions(document):
+        return false
+
+    let navigable = dom_document_navigable(document) else return false
+
+    # doc's node navigable doesn't currently have a rendering opportunity.
+    if not html_navigable_has_a_rendering_opportunity(navigable):
+        return false
+
+    return true
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.cpp:303 Web::HTML::EventLoop::update_the_rendering.
+## https://html.spec.whatwg.org/multipage/webappapis.html#update-the-rendering
+func html_event_loop_update_the_rendering(this: HtmlEventLoop*):
+    assert(not this.m_running_rendering_task)
+    this.m_running_rendering_task = true
+    defer this.m_running_rendering_task = false
+
+    html_event_loop_process_input_events(this)
+
+    # 1. Let frameTimestamp be eventLoop's last render opportunity time.
+    let frame_timestamp = this.m_last_render_opportunity_time
+
+    # 2. Let docs be all fully active Document objects whose relevant agent's event loop is
+    #    eventLoop, sorted arbitrarily except that the following conditions must be met:
+    #    - Any Document B whose container document is A must be listed after A in the list.
+    #    - If there are two documents A and B that both have the same non-null container document
+    #      C, then the order of A and B in the list must match the shadow-including tree order
+    #      of their respective navigable containers in C's node tree.
+    # 3. Filter non-renderable documents: Remove from docs any Document object doc for which any of the following are true:
+    var docs_vector = html_event_loop_documents_in_this_event_loop_matching(this, ak.Function1[DomDocument*, bool](call = html_event_loop_is_renderable_document, context = none))
+    let docs = ak.vector_span(&docs_vector)
+
+    # AD-HOC: Update all the displayed video frames on HTMLMediaElements in documents' pages.
+    for document in docs:
+        page_update_all_media_element_video_sinks(dom_document_page(document else trap("a null document")))
+
+    # AD-HOC: Present all canvas element surfaces in documents' pages.
+    for document in docs:
+        page_present_all_canvas_element_surfaces(dom_document_page(document else trap("a null document")))
+
+    # FIXME: 4. Unnecessary rendering: Remove from docs any Document object doc for which all of the following are true:
+
+    # FIXME: 5. Remove from docs all Document objects for which the user agent believes that it's preferable to skip updating the rendering for other reasons.
+
+    # FIXME: 6. For each doc of docs, reveal doc.
+
+    # 7. For each doc of docs, flush autofocus candidates for doc if its node navigable is a top-level traversable.
+    for document in docs:
+        let doc = document else trap("a null document")
+        if let navigable = dom_document_navigable(doc):
+            if html_navigable_is_top_level_traversable(navigable):
+                dom_document_flush_autofocus_candidates(doc)
+
+    # 8. For each doc of docs, run the resize steps for doc. [CSSOMVIEW]
+    for document in docs:
+        dom_document_run_the_resize_steps(document else trap("a null document"))
+
+    # 9. For each doc of docs, run the scroll steps for doc. [CSSOMVIEW]
+    for document in docs:
+        dom_document_run_the_scroll_steps(document else trap("a null document"))
+
+    # 10. For each doc of docs, evaluate media queries and report changes for doc. [CSSOMVIEW]
+    for document in docs:
+        dom_document_evaluate_media_queries_and_report_changes(document else trap("a null document"))
+
+    # 11. For each doc of docs, update animations and send events for doc, passing in relative high resolution time given frameTimestamp and doc's relevant global object as the timestamp [WEBANIMATIONS]
+    for document in docs:
+        let doc = document else trap("a null document")
+        dom_document_update_animations_and_send_events(doc, high_resolution_time_relative_high_resolution_time(frame_timestamp, html_relevant_global_object((JsObject*)doc)))
+
+    # 12. For each doc of docs, run the fullscreen steps for doc. [FULLSCREEN]
+    for document in docs:
+        dom_document_run_fullscreen_steps(document else trap("a null document"))
+
+    # FIXME: 13. For each doc of docs, if the user agent detects that the backing storage associated with a CanvasRenderingContext2D or an OffscreenCanvasRenderingContext2D, context, has been lost, then it must run the context lost steps for each such context:
+
+    # 14. For each doc of docs, run the animation frame callbacks for doc, passing in the relative high resolution time given frameTimestamp and doc's relevant global object as the timestamp.
+    for document in docs:
+        let doc = document else trap("a null document")
+        let now = high_resolution_time_relative_high_resolution_time(frame_timestamp, html_relevant_global_object((JsObject*)doc))
+        html_run_animation_frame_callbacks(doc, now)
+
+    # FIXME: 15. Let unsafeStyleAndLayoutStartTime be the unsafe shared current time.
+
+    # 16. For each doc of docs:
+    for document in docs:
+        let doc = document else trap("a null document")
+        # 1. Let resizeObserverDepth be 0.
+        var resize_observer_depth: usize = 0
+
+        # 2. While true:
+        while true:
+            # 1. Recalculate styles and update layout for doc.
+            # NOTE: Recalculation of styles is handled by update_layout()
+            dom_document_update_layout(doc, DomUpdateLayoutReason.html_event_loop_rendering_update)
+
+            # Clamp viewport scroll offset to valid range after layout, in case the
+            # scrollable overflow area has shrunk (e.g. after a viewport size change).
+            if let navigable = dom_document_navigable(doc):
+                html_navigable_clamp_viewport_scroll_offset(navigable)
+
+            # 2. Let hadInitialVisibleContentVisibilityDetermination be false.
+            var had_initial_visible_content_visibility_determination = false
+
+            # 3. For each element element with 'auto' used value of 'content-visibility':
+            if dom_document_document_element(doc) != none:
+                let viewport_paintable = dom_document_paintable(doc) else trap("a document with a document element has no paintable")
+                for paintable_box in paint_viewport_paintable_paintable_boxes_with_auto_content_visibility(viewport_paintable):
+                    let element = as_dom_element(paint_paintable_dom_node((PaintPaintable*)paintable_box) else trap("a paintable box without a DOM node"))
+
+                    # 1. Let checkForInitialDetermination be true if element's proximity to the viewport is not determined and it is not relevant to the user. Otherwise, let checkForInitialDetermination be false.
+                    let check_for_initial_determination = dom_element_proximity_to_the_viewport(element) == DomProximityToTheViewport.not_determined and not dom_element_is_relevant_to_the_user(element)
+
+                    # 2. Determine proximity to the viewport for element.
+                    dom_element_determine_proximity_to_the_viewport(element)
+
+                    # 3. If checkForInitialDetermination is true and element is now relevant to the user, then set hadInitialVisibleContentVisibilityDetermination to true.
+                    if check_for_initial_determination and dom_element_is_relevant_to_the_user(element):
+                        had_initial_visible_content_visibility_determination = true
+
+            # 4. If hadInitialVisibleContentVisibilityDetermination is true, then continue.
+            if had_initial_visible_content_visibility_determination:
+                continue
+
+            # 5. Gather active resize observations at depth resizeObserverDepth for doc.
+            dom_document_gather_active_observations_at_depth(doc, resize_observer_depth)
+
+            # 6. If doc has active resize observations:
+            if dom_document_has_active_resize_observations(doc):
+                # 1. Set resizeObserverDepth to the result of broadcasting active resize observations given doc.
+                resize_observer_depth = dom_document_broadcast_active_resize_observations(doc)
+
+                # 2. Continue.
+                continue
+
+            # 7. Otherwise, break.
+            break
+
+        # 3. If doc has skipped resize observations, then deliver resize loop error given doc.
+        if dom_document_has_skipped_resize_observations(doc):
+            # FIXME: Deliver resize loop error.
+            discard(doc)
+
+    # FIXME: 17. For each doc of docs, if the focused area of doc is not a focusable area, then run the focusing steps for doc's viewport, and set doc's relevant global object's navigation API's focus changed during ongoing navigation to false.
+
+    # 18. For each doc of docs, perform pending transition operations for doc. [CSSVIEWTRANSITIONS]
+    for document in docs:
+        dom_document_perform_pending_transition_operations(document else trap("a null document"))
+
+    # 19. For each doc of docs, run the update intersection observations steps for doc, passing in the relative high resolution time given now and doc's relevant global object as the timestamp. [INTERSECTIONOBSERVER]
+    for document in docs:
+        let doc = document else trap("a null document")
+        # NB: Layout may have been invalidated by previous steps (e.g. view transitions at step 18).
+        #     Re-run layout here since intersection observations need up-to-date geometry.
+        dom_document_update_layout(doc, DomUpdateLayoutReason.html_event_loop_rendering_update)
+
+        let now = high_resolution_time_relative_high_resolution_time(frame_timestamp, html_relevant_global_object((JsObject*)doc))
+        dom_document_run_the_update_intersection_observations_steps(doc, now)
+
+    # FIXME: 20. For each doc of docs, record rendering time for doc given unsafeStyleAndLayoutStartTime.
+
+    # FIXME: 21. For each doc of docs, mark paint timing for doc.
+
+    # 22. For each doc of docs, update the rendering or user interface of doc and its node navigable to reflect the current state.
+    var index = docs.length
+    while index > 0:
+        index -= 1
+        let doc = docs[index] else trap("a null document")
+        let navigable = dom_document_navigable(doc) else trap("a rendered document has no navigable")
+        if not html_navigable_needs_repaint(navigable):
+            continue
+        if html_navigable_is_svg_page(navigable):
+            continue
+        if let active_document = html_navigable_active_document(navigable):
+            dom_document_update_layout(active_document, DomUpdateLayoutReason.html_event_loop_rendering_update)
+        html_navigable_paint_next_frame(navigable)
+        if html_navigable_is_traversable(navigable):
+            let traversable = html_navigable_traversable_navigable(navigable) else trap("a traversable navigable has no traversable")
+            html_traversable_navigable_process_screenshot_requests(traversable)
+
+    # 23. For each doc of docs, process top layer removals given doc.
+    for document in docs:
+        dom_document_process_top_layer_removals(document else trap("a null document"))
+
+    for document in docs:
+        let doc = document else trap("a null document")
+        # https://drafts.csswg.org/css-font-loading/#fontfaceset-pending-on-the-environment
+        # A FontFaceSet is pending on the environment if any of the following are true:
+        # - the document is still loading
+        # - the document has pending stylesheet requests
+        # FIXME: - the document has pending layout operations which might cause the user agent to request a font, or which depend on recently-loaded fonts
+        var context: HtmlTemporaryExecutionContext = ---
+        html_temporary_execution_context_construct_realm(&context, dom_document_realm(doc), HtmlTemporaryExecutionContextCallbacksEnabled.yes)
+        defer html_temporary_execution_context_destruct(&context)
+        css_font_face_set_set_is_pending_on_the_environment(dom_document_fonts(doc), dom_document_readiness(doc) == HtmlDocumentReadyState.loading)
+
+# mark: Queueing tasks and microtasks ===========================================================
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.cpp:523 Web::HTML::run_when_event_loop_reaches_step_1.
+pub func html_run_when_event_loop_reaches_step_1(steps: gc.Function0[unit]*):
+    let event_loop = html_main_thread_event_loop()
+    html_event_loop_run_upon_reaching_step_1(event_loop, steps)
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.cpp:530 Web::HTML::queue_a_task.
+## https://html.spec.whatwg.org/multipage/webappapis.html#queue-a-task
+pub func html_queue_a_task(source: HtmlTaskSource, event_loop: HtmlEventLoop*?, document: DomDocument*?, steps: gc.Function0[unit]*) -> u64:
+    # 1. If event loop was not given, set event loop to the implied event loop.
+    let loop = event_loop else html_main_thread_event_loop()
+
+    # FIXME: 2. If document was not given, set document to the implied document.
+
+    # 3. Let task be a new task.
+    # 4. Set task's steps to steps.
+    # 5. Set task's source to source.
+    # 6. Set task's document to the document.
+    # 7. Set task's script evaluation environment settings object set to an empty set.
+    let task = html_task_create(js_cell_vm(loop.js_cell()), source, document, steps)
+
+    # 8. Let queue be the task queue to which source is associated on event loop.
+    # 9. Append task to queue.
+    if source == HtmlTaskSource.microtask:
+        html_event_loop_enqueue_microtask(loop, task)
+    else:
+        html_task_queue_add(html_event_loop_task_queue(loop), task)
+
+    return html_task_id(task)
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.cpp:556 Web::HTML::queue_global_task.
+## https://html.spec.whatwg.org/multipage/webappapis.html#queue-a-global-task
+pub func html_queue_global_task(source: HtmlTaskSource, global_object: JsObject*, steps: gc.Function0[unit]*) -> u64:
+    # 1. Let event loop be global's relevant agent's event loop.
+    let event_loop = html_relevant_agent(global_object).event_loop else trap("the relevant agent has no event loop")
+
+    # 2. Let document be global's associated Document, if global is a Window object; otherwise null.
+    var document: DomDocument*? = none
+    if let window_object = as_if_html_window((gc.Cell*)global_object):
+        document = html_window_associated_document(window_object)
+
+    # 3. Queue a task given source, event loop, document, and steps.
+    return html_queue_a_task(source, event_loop, document, steps)
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.cpp:571 Web::HTML::queue_a_microtask.
+## https://html.spec.whatwg.org/multipage/webappapis.html#queue-a-microtask
+pub func html_queue_a_microtask(document: DomDocument*?, steps: gc.Function0[unit]*):
+    # 1. If event loop was not given, set event loop to the implied event loop.
+    let event_loop = html_main_thread_event_loop()
+
+    # FIXME: 2. If document was not given, set document to the implied document.
+
+    # 3. Let microtask be a new task.
+    # 4. Set microtask's steps to steps.
+    # 5. Set microtask's source to the microtask task source.
+    # 6. Set microtask's document to document.
+    let vm = js_cell_vm(event_loop.js_cell())
+    let microtask = html_task_create(vm, HtmlTaskSource.microtask, document, steps)
+
+    # FIXME: 7. Set microtask's script evaluation environment settings object set to an empty set.
+
+    # 8. Enqueue microtask on event loop's microtask queue.
+    html_event_loop_enqueue_microtask(event_loop, microtask)
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.cpp:591 Web::HTML::perform_a_microtask_checkpoint.
+pub func html_perform_a_microtask_checkpoint():
+    html_event_loop_perform_a_microtask_checkpoint(html_main_thread_event_loop())
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.cpp:597 Web::HTML::EventLoop::perform_a_microtask_checkpoint.
+## https://html.spec.whatwg.org/multipage/webappapis.html#perform-a-microtask-checkpoint
+pub func html_event_loop_perform_a_microtask_checkpoint(this: HtmlEventLoop*):
+    if html_event_loop_execution_paused(this):
+        return
+
+    # 1. If the event loop's performing a microtask checkpoint is true, then return.
+    if this.m_performing_a_microtask_checkpoint:
+        return
+
+    # NOTE: This assertion is per requirement 9.5 of the ECMA-262 spec, see: https://tc39.es/ecma262/#sec-jobs
+    # > At some future point in time, when there is no running context in the agent for which the job is scheduled and that agent's execution context stack is empty...
+    let vm = js_cell_vm(this.js_cell())
+    assert(vm_execution_context_stack(vm).length == 0)
+    assert(not vm_has_running_execution_context(vm))
+
+    # 2. Set the event loop's performing a microtask checkpoint to true.
+    this.m_performing_a_microtask_checkpoint = true
+
+    # 3. While the event loop's microtask queue is not empty:
+    while not ak.queue_is_empty(&this.m_microtask_queue):
+        # 1. Let oldestMicrotask be the result of dequeuing from the event loop's microtask queue.
+        let oldest_microtask = ak.queue_dequeue(&this.m_microtask_queue)
+
+        # 2. Set the event loop's currently running task to oldestMicrotask.
+        this.m_currently_running_task = oldest_microtask
+
+        # 3. Run oldestMicrotask.
+        html_task_execute(oldest_microtask)
+
+        # 4. Set the event loop's currently running task back to null.
+        this.m_currently_running_task = none
+
+    # 4. For each environment settings object settingsObject whose responsible event loop is this event loop, notify about rejected promises given settingsObject's global object.
+    var environments = ak.vector_clone(&this.m_related_environment_settings_objects)
+    for environment_settings_object in ak.vector_span(&environments):
+        html_universal_global_scope_mixin_notify_about_rejected_promises(html_environment_settings_object_universal_global_scope(environment_settings_object else trap("a null environment settings object")))
+
+    # 5. Cleanup Indexed Database transactions.
+    discard(indexed_db_cleanup_indexed_database_transactions(this))
+
+    # 6. Perform ClearKeptObjects().
+    vm_finish_execution_generation(vm)
+
+    # 7. Set the event loop's performing a microtask checkpoint to false.
+    this.m_performing_a_microtask_checkpoint = false
+
+    # FIXME: 8. Record timing info for microtask checkpoint.
+
+# mark: The documents of the event loop =========================================================
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.cpp:647 Web::HTML::EventLoop::documents_in_this_event_loop_matching.
+pub func html_event_loop_documents_in_this_event_loop_matching(this: HtmlEventLoop*, callback: ak.Function1[DomDocument*, bool]) -> ak.Vector[DomDocument*?]:
+    html_event_loop_ensure_documents_sorted(this)
+    var documents: ak.Vector[DomDocument*?]
+    for entry in ak.vector_span(&this.m_documents):
+        let document = gc.weak_ptr(&entry) else trap("VERIFY: a document of the event loop is alive")
+        if dom_document_is_decoded_svg(document):
+            continue
+        if not ak.function1_call(&callback, document):
+            continue
+        ak.vector_append_t(&documents, document)
+    return documents
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.cpp:662 Web::HTML::EventLoop::register_document.
+pub func html_event_loop_register_document(this: HtmlEventLoop*, document: DomDocument*):
+    ak.vector_append_t(&this.m_documents, gc.make_weak(document))
+    this.m_documents_sort_dirty = true
+
+## The predicate of unregister_document (`[&](auto& entry) { return entry.ptr() == &document; }`).
+func html_event_loop_is_weak_document(context: void*?, entry: const gc.Weak[DomDocument]*) -> bool:
+    return gc.weak_ptr(entry) == (DomDocument*?)context
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.cpp:668 Web::HTML::EventLoop::unregister_document.
+pub func html_event_loop_unregister_document(this: HtmlEventLoop*, document: DomDocument*):
+    let did_remove = ak.vector_remove_first_matching(&this.m_documents, ak.Function1[const gc.Weak[DomDocument]*, bool](call = html_event_loop_is_weak_document, context = document))
+    assert(did_remove)
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.cpp:674 Web::HTML::EventLoop::document_navigable_did_change.
+pub func html_event_loop_document_navigable_did_change(this: HtmlEventLoop*):
+    this.m_documents_sort_dirty = true
+
+## The state of ensure_documents_sorted's recursive `visit` lambda.
+struct HtmlEventLoopDocumentSort:
+    var this: HtmlEventLoop*
+    var doc_to_index: ak.HashMap[DomDocument*, usize, ak.PtrTraits[DomDocument]]
+    var visited: ak.Vector[bool]
+    var sorted: ak.Vector[gc.Weak[DomDocument]]
+
+## The recursive lambda `visit` of ensure_documents_sorted: a document after its container
+## document.
+func html_event_loop_document_sort_visit(sort: HtmlEventLoopDocumentSort*, idx: usize):
+    if *ak.vector_at(&sort.visited, idx):
+        return
+    *ak.vector_at(&sort.visited, idx) = true
+    let document = gc.weak_ptr(ak.vector_at(&sort.this.m_documents, idx)) else trap("VERIFY: a document of the event loop is alive")
+    if let navigable = dom_document_navigable(document):
+        if let container_doc = html_navigable_container_document(navigable):
+            if let container_idx = ak.hash_map_get_k(&sort.doc_to_index, container_doc):
+                html_event_loop_document_sort_visit(sort, *container_idx)
+    ak.vector_append_t(&sort.sorted, *ak.vector_at(&sort.this.m_documents, idx))
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.cpp:679 Web::HTML::EventLoop::ensure_documents_sorted.
+func html_event_loop_ensure_documents_sorted(this: HtmlEventLoop*):
+    # https://html.spec.whatwg.org/multipage/webappapis.html#update-the-rendering step 3.2:
+    # - Any Document B whose container document is A must be listed after A in the list.
+    # - If there are two documents A and B that both have the same non-null container document
+    #   C, then the order of A and B in the list must match the shadow-including tree order
+    #   of their respective navigable containers in C's node tree.
+
+    if not this.m_documents_sort_dirty:
+        return
+    this.m_documents_sort_dirty = false
+
+    var sort = HtmlEventLoopDocumentSort(this = this)
+    let count = ak.vector_size(&this.m_documents)
+    ak.hash_map_ensure_capacity(&sort.doc_to_index, count)
+    for i in 0..<count:
+        let document = gc.weak_ptr(ak.vector_at(&this.m_documents, i)) else trap("VERIFY: a document of the event loop is alive")
+        discard(ak.hash_map_set(&sort.doc_to_index, document, i))
+
+    ak.vector_resize(&sort.visited, count)
+    ak.vector_ensure_capacity(&sort.sorted, count)
+
+    for i in 0..<count:
+        html_event_loop_document_sort_visit(&sort, i)
+
+    this.m_documents = sort.sorted
+
+# mark: The backup incumbent realm stack and the settings objects ===============================
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.cpp:719 Web::HTML::EventLoop::push_onto_backup_incumbent_realm_stack.
+pub func html_event_loop_push_onto_backup_incumbent_realm_stack(this: HtmlEventLoop*, environment_settings_object: HtmlEnvironmentSettingsObject*):
+    ak.vector_append_t(&this.m_backup_incumbent_realm_stack, environment_settings_object)
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.cpp:724 Web::HTML::EventLoop::pop_backup_incumbent_realm_stack.
+pub func html_event_loop_pop_backup_incumbent_realm_stack(this: HtmlEventLoop*):
+    discard(ak.vector_take_last(&this.m_backup_incumbent_realm_stack))
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.cpp:729 Web::HTML::EventLoop::top_of_backup_incumbent_realm_stack.
+pub func html_event_loop_top_of_backup_incumbent_realm_stack(this: HtmlEventLoop*) -> HtmlEnvironmentSettingsObject*:
+    return *ak.vector_last(&this.m_backup_incumbent_realm_stack)
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.cpp:734 Web::HTML::EventLoop::register_environment_settings_object.
+pub func html_event_loop_register_environment_settings_object(this: HtmlEventLoop*, environment_settings_object: HtmlEnvironmentSettingsObject*):
+    ak.vector_append_t(&this.m_related_environment_settings_objects, environment_settings_object)
+
+## The predicate of unregister_environment_settings_object (`entry == &environment_settings_object`).
+func html_event_loop_is_environment_settings_object(context: void*?, entry: const (HtmlEnvironmentSettingsObject*?)*) -> bool:
+    return *entry == (HtmlEnvironmentSettingsObject*?)context
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.cpp:739 Web::HTML::EventLoop::unregister_environment_settings_object.
+pub func html_event_loop_unregister_environment_settings_object(this: HtmlEventLoop*, environment_settings_object: HtmlEnvironmentSettingsObject*):
+    let did_remove = ak.vector_remove_first_matching(&this.m_related_environment_settings_objects, ak.Function1[const (HtmlEnvironmentSettingsObject*?)*, bool](call = html_event_loop_is_environment_settings_object, context = environment_settings_object))
+    assert(did_remove)
+
+## The filter of same_loop_windows (`document.is_fully_active()`).
+func html_event_loop_is_fully_active_document(context: void*?, document: DomDocument*) -> bool:
+    return dom_document_is_fully_active(document)
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.cpp:746 Web::HTML::EventLoop::same_loop_windows.
+## https://html.spec.whatwg.org/multipage/webappapis.html#same-loop-windows
+pub func html_event_loop_same_loop_windows(this: HtmlEventLoop*) -> ak.Vector[HtmlWindow*?]:
+    var windows: ak.Vector[HtmlWindow*?]
+    var documents = html_event_loop_documents_in_this_event_loop_matching(this, ak.Function1[DomDocument*, bool](call = html_event_loop_is_fully_active_document, context = none))
+    for document in ak.vector_span(&documents):
+        ak.vector_append_t(&windows, dom_document_window(document else trap("a null document")) else trap("a fully active document has a window"))
+    return windows
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.cpp:756 Web::HTML::EventLoop::compute_deadline.
+## https://html.spec.whatwg.org/multipage/webappapis.html#event-loop-processing-model:last-idle-period-start-time
+pub func html_event_loop_compute_deadline(this: HtmlEventLoop*) -> f64:
+    # 1. Let deadline be this event loop's last idle period start time plus 50.
+    let deadline = this.m_last_idle_period_start_time + 50.0
+    # 2. Let hasPendingRenders be false.
+    var has_pending_renders = false
+    # 3. For each windowInSameLoop of the same-loop windows for this event loop:
+    var windows = html_event_loop_same_loop_windows(this)
+    for window in ak.vector_span(&windows):
+        # 1. If windowInSameLoop's map of animation frame callbacks is not empty,
+        #    or if the user agent believes that the windowInSameLoop might have pending rendering updates,
+        #    set hasPendingRenders to true.
+        if html_window_has_animation_frame_callbacks(window else trap("a null window")):
+            has_pending_renders = true
+        # FIXME: 2. Let timerCallbackEstimates be the result of getting the values of windowInSameLoop's map of active timers.
+        # FIXME: 3. For each timeoutDeadline of timerCallbackEstimates, if timeoutDeadline is less than deadline, set deadline to timeoutDeadline.
+    # 4. If hasPendingRenders is true, then:
+    if has_pending_renders:
+        # 1. Let nextRenderDeadline be this event loop's last render opportunity time plus (1000 divided by the current refresh rate).
+        # FIXME: Hardcoded to 60Hz
+        let next_render_deadline = this.m_last_render_opportunity_time + (1000.0 / 60.0)
+        # 2. If nextRenderDeadline is less than deadline, then return nextRenderDeadline.
+        if next_render_deadline < deadline:
+            return next_render_deadline
+    # 5. Return deadline.
+    return deadline
+
+# mark: Pausing =================================================================================
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.cpp:785 Web::HTML::EventLoop::PauseHandle::PauseHandle.
+pub func html_event_loop_pause_handle_construct(this: HtmlEventLoopPauseHandle*, event_loop: HtmlEventLoop*, global: JsObject*, time_before_pause: f64):
+    this.event_loop = event_loop
+    this.global = global
+    this.time_before_pause = time_before_pause
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.cpp:792 Web::HTML::EventLoop::PauseHandle::~PauseHandle:
+## the holder of a pause handle runs it (with `defer`) where the C++ handle goes out of scope.
+pub func html_event_loop_pause_handle_destruct(this: HtmlEventLoopPauseHandle*):
+    html_event_loop_unpause(this.event_loop, this.global, this.time_before_pause)
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.cpp:798 Web::HTML::EventLoop::pause.
+## https://html.spec.whatwg.org/multipage/webappapis.html#pause
+pub func html_event_loop_pause(this: HtmlEventLoop*) -> HtmlEventLoopPauseHandle:
+    this.m_execution_paused = true
+
+    # 1. Let global be the current global object.
+    let global = html_current_global_object()
+
+    # 2. Let timeBeforePause be the current high resolution time given global.
+    let time_before_pause = high_resolution_time_current_high_resolution_time(global)
+
+    # 3. If necessary, update the rendering or user interface of any Document or navigable to reflect the current state.
+    if not this.m_running_rendering_task:
+        html_event_loop_update_the_rendering(this)
+
+    # 4. Wait until the condition goal is met. While a user agent has a paused task, the corresponding event loop must
+    #    not run further tasks, and any script in the currently running task must block. User agents should remain
+    #    responsive to user input while paused, however, albeit in a reduced capacity since the event loop will not be
+    #    doing anything.
+
+    var handle: HtmlEventLoopPauseHandle = ---
+    html_event_loop_pause_handle_construct(&handle, this, global, time_before_pause)
+    return handle
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.cpp:820 Web::HTML::EventLoop::unpause.
+pub func html_event_loop_unpause(this: HtmlEventLoop*, global: JsObject*, time_before_pause: f64):
+    this.m_execution_paused = false
+
+    # FIXME: 5. Record pause duration given the duration from timeBeforePause to the current high resolution time given global.
+    discard(high_resolution_time_current_high_resolution_time(global) - time_before_pause)
+
+# mark: EventLoop.h =============================================================================
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.h:50 Web::HTML::EventLoop::type.
+pub func html_event_loop_type(this: HtmlEventLoop*) -> HtmlEventLoopType:
+    return this.m_type
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.h:52 Web::HTML::EventLoop::run_upon_reaching_step_1.
+pub func html_event_loop_run_upon_reaching_step_1(this: HtmlEventLoop*, task: gc.Function0[unit]*):
+    ak.vector_append_t(&this.m_reached_step_1_tasks, task)
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.h:54 Web::HTML::EventLoop::task_queue.
+pub func html_event_loop_task_queue(this: HtmlEventLoop*) -> HtmlTaskQueue*:
+    return this.m_task_queue else trap("the event loop has no task queue")
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.h:55 Web::HTML::EventLoop::task_queue (const).
+pub func html_event_loop_task_queue_const(this: HtmlEventLoop*) -> HtmlTaskQueue*:
+    return this.m_task_queue else trap("the event loop has no task queue")
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.h:57 Web::HTML::EventLoop::microtask_queue_empty.
+pub func html_event_loop_microtask_queue_empty(this: HtmlEventLoop*) -> bool:
+    return ak.queue_is_empty(&this.m_microtask_queue)
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.h:58 Web::HTML::EventLoop::enqueue_microtask.
+pub func html_event_loop_enqueue_microtask(this: HtmlEventLoop*, task: HtmlTask*):
+    ak.queue_enqueue(&this.m_microtask_queue, task)
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.h:59 Web::HTML::EventLoop::dequeue_microtask.
+pub func html_event_loop_dequeue_microtask(this: HtmlEventLoop*) -> HtmlTask*:
+    return ak.queue_dequeue(&this.m_microtask_queue)
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.h:66 Web::HTML::EventLoop::termination_nesting_level.
+pub func html_event_loop_termination_nesting_level(this: HtmlEventLoop*) -> usize:
+    return this.m_termination_nesting_level
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.h:67 Web::HTML::EventLoop::increment_termination_nesting_level.
+pub func html_event_loop_increment_termination_nesting_level(this: HtmlEventLoop*):
+    this.m_termination_nesting_level += 1
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.h:68 Web::HTML::EventLoop::decrement_termination_nesting_level.
+pub func html_event_loop_decrement_termination_nesting_level(this: HtmlEventLoop*):
+    this.m_termination_nesting_level -= 1
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.h:70 Web::HTML::EventLoop::currently_running_task.
+pub func html_event_loop_currently_running_task(this: HtmlEventLoop*) -> HtmlTask*?:
+    return this.m_currently_running_task
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.h:87 Web::HTML::EventLoop::is_backup_incumbent_realm_stack_empty.
+pub func html_event_loop_is_backup_incumbent_realm_stack_empty(this: HtmlEventLoop*) -> bool:
+    return ak.vector_is_empty(&this.m_backup_incumbent_realm_stack)
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.h:96 Web::HTML::EventLoop::execution_paused.
+pub func html_event_loop_execution_paused(this: HtmlEventLoop*) -> bool:
+    return this.m_execution_paused
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.h:98 Web::HTML::EventLoop::running_rendering_task.
+pub func html_event_loop_running_rendering_task(this: HtmlEventLoop*) -> bool:
+    return this.m_running_rendering_task

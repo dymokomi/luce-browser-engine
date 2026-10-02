@@ -1,0 +1,152 @@
+#==============================================================================================
+#
+#   tests_scenarios - end-to-end paths the scripting environments unblock (region r29)
+#
+#   DESCRIPTION:
+#       The paths regions r17 and r19 left for this region: an Event made by its real
+#       constructor (its time stamp reads the relevant global object's settings), dispatched
+#       through a node tree to native listeners (each call prepares to run script and a callback
+#       in the listener's realm and cleans up after, ending in a microtask checkpoint), and a
+#       document's readiness change firing readystatechange at the document. They run in a
+#       principal realm of tests_environments (a test global and settings object); the
+#       documents and elements are r17's and r18's test nodes.
+#
+#==============================================================================================
+
+# mark: Helpers =================================================================================
+
+## What a native test listener records.
+struct TestHtmlListener:
+    var log: TestHtmlLog*
+    var number: i32
+    var realm: Realm*
+    var stop_propagation: bool
+    var saw_wrong_realm: bool
+    var last_event_type: ak.FlyString
+
+## The behaviour of a native test listener: logs its number, checks that the listener's realm is
+## the current realm (prepare to run script pushed it), and optionally stops propagation.
+func test_html_listener_call(context: void*?, vm: Vm*) -> JsValue!:
+    let listener = (TestHtmlListener*)(context else trap("no captures"))
+    let event = as_dom_event((gc.Cell*)js_value_as_object(vm_argument(vm, 0)))
+    listener.log.entries[listener.log.count] = listener.number
+    listener.log.count += 1
+    if vm_current_realm(vm) != listener.realm:
+        listener.saw_wrong_realm = true
+    listener.last_event_type = dom_event_type(event)
+    if listener.stop_propagation:
+        dom_event_stop_propagation(event)
+    return js_undefined()
+
+## An IDLEventListener over a native function, made as C++'s native listeners are made:
+## NativeFunction::create, CallbackType (whose callback context is the realm's principal settings
+## object) and IDLEventListener::create.
+func test_html_native_listener(realm: Realm*, listener: TestHtmlListener*) -> DomIdlEventListener*:
+    let function = js_native_function_create(realm, JsNativeFunctionBehaviour(call = test_html_listener_call, context = listener), 1, ak.utf16_fly_string_new(), realm)
+    let callback = realm_create_idl_callback_type_realm(realm, (JsObject*)function, realm, IdlOperationReturnsPromise.no)
+    return dom_idl_event_listener_create(realm, callback)
+
+## A recording listener `number` of `realm` (the captures live in the test's memory).
+func test_html_listener(realm: Realm*, log: TestHtmlLog*, number: i32, stop_propagation: bool = false) -> TestHtmlListener*:
+    return new TestHtmlListener(log = log, number = number, realm = realm, stop_propagation = stop_propagation, saw_wrong_realm = false, last_event_type = ak.FlyString()) else trap("out of memory")
+
+# mark: Dispatch ================================================================================
+
+test "an event made by its constructor dispatches through a node tree to native listeners":
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    let event_loop = html_main_thread_event_loop()
+    let document = test_html_heap_document(realm)
+    let parent = test_realm_element(realm, document, "div")
+    let child = test_realm_element(realm, document, "span")
+    tree_node_append_child(document.dom_node(), parent.dom_node())
+    tree_node_append_child(parent.dom_node(), child.dom_node())
+
+    var log = TestHtmlLog()
+    let type_ = ak.fly_string_from_str("custom")
+    let capturing = test_html_listener(realm, &log, 1)
+    let at_target = test_html_listener(realm, &log, 2)
+    let once = test_html_listener(realm, &log, 5)
+    let bubbling = test_html_listener(realm, &log, 3)
+    let on_document = test_html_listener(realm, &log, 4)
+    dom_event_target_add_event_listener(parent.dom_event_target(), type_, test_html_native_listener(realm, capturing), test_add_options(capture = true))
+    dom_event_target_add_event_listener(child.dom_event_target(), type_, test_html_native_listener(realm, at_target), test_add_options())
+    dom_event_target_add_event_listener(child.dom_event_target(), type_, test_html_native_listener(realm, once), test_add_options(once = true))
+    dom_event_target_add_event_listener(parent.dom_event_target(), type_, test_html_native_listener(realm, bubbling), test_add_options())
+    dom_event_target_add_event_listener(document.dom_event_target(), type_, test_html_native_listener(realm, on_document), test_add_options())
+
+    # The constructor's time stamp is the current high resolution time relative to the time
+    # origin (1000ms after the monotonic clock's zero in the test settings object).
+    let before = high_resolution_time_unsafe_shared_current_time()
+    let event = dom_event_create(realm, type_, DomEventInit(bubbles = true))
+    let after = high_resolution_time_unsafe_shared_current_time()
+    assert(dom_event_time_stamp(event) >= high_resolution_time_coarsen_time(before) - 1000.0)
+    assert(dom_event_time_stamp(event) <= after - 1000.0)
+    assert(event.m_is_trusted)
+
+    # Capture at the parent, the target's listeners in order, then bubbling up to the document.
+    assert(dom_event_target_dispatch_event(child.dom_event_target(), event))
+    assert(test_html_log_is(&log, [1, 2, 5, 3, 4]))
+    assert(dom_event_event_phase(event) == 0 and dom_event_current_target(event) == none)
+    assert(test_fly_is(on_document.last_event_type, "custom"))
+
+    # Every call ran in the listener's realm and cleaned up after itself.
+    assert(not capturing.saw_wrong_realm and not at_target.saw_wrong_realm and not on_document.saw_wrong_realm)
+    assert(vm_execution_context_stack(vm).length == 0)
+    assert(html_event_loop_is_backup_incumbent_realm_stack_empty(event_loop))
+
+    # The once listener is gone; a non-bubbling event stops at the target.
+    log = TestHtmlLog()
+    assert(dom_event_target_dispatch_event(child.dom_event_target(), dom_event_create(realm, type_)))
+    assert(test_html_log_is(&log, [1, 2]))
+
+    # stopPropagation() in the capturing listener stops the dispatch after the parent.
+    log = TestHtmlLog()
+    capturing.stop_propagation = true
+    assert(dom_event_target_dispatch_event(child.dom_event_target(), dom_event_create(realm, type_, DomEventInit(bubbles = true))))
+    assert(test_html_log_is(&log, [1]))
+
+test "a listener's microtask runs at the checkpoint after the listener returns":
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    let document = test_html_heap_document(realm)
+    let element = test_realm_element(realm, document, "div")
+    tree_node_append_child(document.dom_node(), element.dom_node())
+
+    var log = TestHtmlLog()
+    let type_ = ak.fly_string_from_str("ping")
+    dom_event_target_add_event_listener(element.dom_event_target(), type_, test_html_native_listener(realm, test_html_listener(realm, &log, 1)), test_add_options())
+    # The microtask is queued before the dispatch; it waits for the first checkpoint, which the
+    # clean-up after the listener performs once the execution context stack is empty.
+    html_queue_a_microtask(none, test_html_log_steps(vm, &log, 2))
+    assert(dom_event_target_dispatch_event(element.dom_event_target(), dom_event_create(realm, type_)))
+    assert(test_html_log_is(&log, [1, 2]))
+
+# mark: Readiness ===============================================================================
+
+test "Document::update_readiness fires readystatechange at the document":
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    html_event_names_readystatechange = ak.fly_string_from_str("readystatechange")
+    let document = test_html_heap_document(realm)
+    document.m_readiness = HtmlDocumentReadyState.loading
+
+    var log = TestHtmlLog()
+    let listener = test_html_listener(realm, &log, 1)
+    dom_event_target_add_event_listener(document.dom_event_target(), html_event_names_readystatechange, test_html_native_listener(realm, listener), test_add_options())
+
+    dom_document_update_readiness(document, HtmlDocumentReadyState.interactive)
+    assert(test_sv_is(dom_document_ready_state(document), "interactive"))
+    assert(test_html_log_is(&log, [1]))
+    assert(test_fly_is(listener.last_event_type, "readystatechange"))
+    assert(test_document_client_log.frames_requested == 1)
+
+    # The same readiness again fires nothing.
+    dom_document_update_readiness(document, HtmlDocumentReadyState.interactive)
+    assert(log.count == 1)
+
+    # Complete: without a traversable navigable, page_did_load waits for one.
+    dom_document_update_readiness(document, HtmlDocumentReadyState.complete)
+    assert(test_html_log_is(&log, [1, 1]))
+    assert(document.m_needs_to_call_page_did_load)
+    assert(vm_execution_context_stack(vm).length == 0)

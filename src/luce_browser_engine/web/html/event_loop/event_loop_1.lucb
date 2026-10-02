@@ -1,0 +1,319 @@
+#==============================================================================================
+#
+#   event_loop_1 - HTML::EventLoop: construction, scheduling, spinning, the processing model
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibWeb/HTML/EventLoop/EventLoop.cpp (lines 37-300): the constructor
+#       and visit_edges, scheduling a round of processing on a Platform::Timer (the embedder's
+#       loop runs it through the Core event loop seam), the main thread's event loop, spinning
+#       the event loop, the event loop processing model (one task, then a microtask
+#       checkpoint), queueing the rendering update task, and handing the pages' queued input
+#       events to the pages.
+#
+#       Copyright (c) 2021, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2022, the SerenityOS developers.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Construction ============================================================================
+
+## heap.allocate<HTML::EventLoop>(type): an EventLoop cell constructed under DeferGC.
+pub func heap_allocate_html_event_loop(heap: gc.Heap*, type_: HtmlEventLoopType) -> HtmlEventLoop*:
+    let this = (HtmlEventLoop*)web_heap_allocate_cell(heap, &html_event_loop_class)
+    gc.heap_defer_gc(heap)
+    html_event_loop_construct(this, type_)
+    gc.heap_undefer_gc(heap)
+    return this
+
+## The captures of the rendering task function (`[this] { update_the_rendering(); }`).
+struct HtmlEventLoopRenderingTask:
+    var this: HtmlEventLoop*
+
+    static func call(context: void*?):
+        let captures = (HtmlEventLoopRenderingTask*)(context else trap("no captures"))
+        html_event_loop_update_the_rendering(captures.this)
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.cpp:37 Web::HTML::EventLoop::EventLoop.
+pub func html_event_loop_construct(this: HtmlEventLoop*, type_: HtmlEventLoopType):
+    this.m_type = type_
+    let heap = gc.cell_heap(this.cell())
+    this.m_task_queue = heap_allocate_html_task_queue(heap, this)
+
+    let captures = new HtmlEventLoopRenderingTask(this = this) else trap("out of memory")
+    this.m_rendering_task_function = gc.create_function0(heap, ak.Function0[unit](call = HtmlEventLoopRenderingTask.call, context = captures))
+
+## The visitor of the microtask queue's for_each (`[&](auto& task) { visitor.visit(task); }`).
+func html_event_loop_visit_microtask(context: void*?, task: const (HtmlTask*)*):
+    let visitor = (gc.CellVisitor*)(context else trap("no visitor"))
+    gc.cell_visitor_visit_t_2(visitor, *task)
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.cpp:49 Web::HTML::EventLoop::visit_edges (override).
+pub func html_event_loop_visit_edges_impl(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (HtmlEventLoop*)base
+    gc.cell_visit_edges_impl(base, visitor)
+    gc.cell_visitor_visit_vector(visitor, &this.m_reached_step_1_tasks)
+    gc.cell_visitor_visit_t(visitor, this.m_task_queue)
+    ak.queue_for_each(&this.m_microtask_queue, ak.Function1[const (HtmlTask*)*, unit](call = html_event_loop_visit_microtask, context = visitor))
+    gc.cell_visitor_visit_t(visitor, this.m_currently_running_task)
+    gc.cell_visitor_visit_vector(visitor, &this.m_backup_incumbent_realm_stack)
+    gc.cell_visitor_visit_t(visitor, this.m_rendering_task_function)
+    gc.cell_visitor_visit_t(visitor, this.m_system_event_loop_timer)
+
+# mark: Scheduling ==============================================================================
+
+## The captures of the system event loop timer's handler (`[this] { process(); }`).
+struct HtmlEventLoopScheduleProcess:
+    var this: HtmlEventLoop*
+
+    static func call(context: void*?):
+        let captures = (HtmlEventLoopScheduleProcess*)(context else trap("no captures"))
+        html_event_loop_process(captures.this)
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.cpp:61 Web::HTML::EventLoop::schedule.
+pub func html_event_loop_schedule(this: HtmlEventLoop*):
+    if this.m_system_event_loop_timer == none:
+        let heap = gc.cell_heap(this.cell())
+        let captures = new HtmlEventLoopScheduleProcess(this = this) else trap("out of memory")
+        this.m_system_event_loop_timer = platform_timer_create_single_shot(heap, 0, gc.create_function0(heap, ak.Function0[unit](call = HtmlEventLoopScheduleProcess.call, context = captures)))
+
+    let timer = this.m_system_event_loop_timer else trap("no system event loop timer")
+    if not platform_timer_is_active(timer):
+        platform_timer_restart(timer)
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.cpp:73 Web::HTML::main_thread_event_loop.
+pub func html_main_thread_event_loop() -> HtmlEventLoop*:
+    let agent = vm_agent(bind_main_thread_vm()) else trap("VERIFY: the main thread VM has no agent")
+    return agent.event_loop else trap("VERIFY: the main thread agent has no event loop")
+
+# mark: Spinning the event loop =================================================================
+
+## The captures of spin_until's goal (`[this, goal_condition] { ... }`).
+struct HtmlEventLoopSpinUntilGoal:
+    var this: HtmlEventLoop*
+    var goal_condition: gc.Function0[bool]*
+
+    static func call(context: void*?) -> bool:
+        let captures = (HtmlEventLoopSpinUntilGoal*)(context else trap("no captures"))
+        let this = captures.this
+        if ak.function0_call(&captures.goal_condition.function):
+            return true
+        if html_task_queue_has_runnable_tasks(this.m_task_queue else trap("no task queue")):
+            html_event_loop_schedule(this)
+            # FIXME: Remove the platform event loop plugin so that this doesn't look out of place
+            core_event_loop_wake()
+        return ak.function0_call(&captures.goal_condition.function)
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.cpp:79 Web::HTML::EventLoop::spin_until.
+## https://html.spec.whatwg.org/multipage/webappapis.html#spin-the-event-loop
+pub func html_event_loop_spin_until(this: HtmlEventLoop*, goal_condition: gc.Function0[bool]*):
+    # FIXME: The spec wants us to do the rest of the enclosing algorithm (i.e. the caller)
+    #    in the context of the currently running task on entry. That's not possible with this implementation.
+    # 1. Let task be the event loop's currently running task.
+    # 2. Let task source be task's source.
+
+    # 3. Let old stack be a copy of the JavaScript execution context stack.
+    # 4. Empty the JavaScript execution context stack.
+    let vm = js_cell_vm(this.js_cell())
+    vm_save_execution_context_stack(vm)
+    vm_clear_execution_context_stack(vm)
+
+    # 5. Perform a microtask checkpoint.
+    html_event_loop_perform_a_microtask_checkpoint(this)
+
+    # 6. In parallel:
+    #    1. Wait until the condition goal is met.
+    #    2. Queue a task on task source to:
+    #       1. Replace the JavaScript execution context stack with old stack.
+    #       2. Perform any steps that appear after this spin the event loop instance in the original algorithm.
+    #       NOTE: This is achieved by returning from the function.
+
+    let heap = gc.cell_heap(this.cell())
+    let captures = new HtmlEventLoopSpinUntilGoal(this = this, goal_condition = goal_condition) else trap("out of memory")
+    platform_event_loop_plugin_spin_until(platform_event_loop_plugin_the(), gc.create_function0(heap, ak.Function0[bool](call = HtmlEventLoopSpinUntilGoal.call, context = captures)))
+
+    vm_restore_execution_context_stack(vm)
+
+    # 7. Stop task, allowing whatever algorithm that invoked it to resume.
+    # NOTE: This is achieved by returning from the function.
+
+# mark: The event loop processing model =========================================================
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.cpp:120 Web::HTML::EventLoop::process.
+## https://html.spec.whatwg.org/multipage/webappapis.html#event-loop-processing-model
+pub func html_event_loop_process(this: HtmlEventLoop*):
+    let task_queue_of_this = this.m_task_queue else trap("no task queue")
+
+    # 1. Let oldestTask and taskStartTime be null.
+    var oldest_task: HtmlTask*? = none
+    # [[maybe_unused]] double task_start_time: the FIXME steps below would read it.
+
+    # Some algorithms request that steps or states only occur once the event loop has reached step 1.
+    # Invoke a set of tasks that these algorithms request us to in order to achieve this.
+    let reached_step_1_tasks = this.m_reached_step_1_tasks
+    this.m_reached_step_1_tasks = ak.Vector[gc.Function0[unit]*]()
+    for reached_step_1_task in ak.vector_span_const(&reached_step_1_tasks):
+        ak.function0_call(&reached_step_1_task.function)
+
+    # 2. If the event loop has a task queue with at least one runnable task, then:
+    if html_task_queue_has_runnable_tasks(task_queue_of_this):
+        # 1. Let taskQueue be one such task queue, chosen in an implementation-defined manner.
+        let task_queue = task_queue_of_this
+
+        # 2. Set taskStartTime to the unsafe shared current time.
+        discard(high_resolution_time_unsafe_shared_current_time())
+
+        # 3. Set oldestTask to the first runnable task in taskQueue, and remove it from taskQueue.
+        oldest_task = html_task_queue_take_first_runnable(task_queue)
+        let task = oldest_task else trap("VERIFY: a runnable task")
+
+        # FIXME: 4. If oldestTask's document is not null, then record task start time given taskStartTime and oldestTask's document.
+
+        # 5. Set the event loop's currently running task to oldestTask.
+        this.m_currently_running_task = task
+
+        # 6. Perform oldestTask's steps.
+        html_task_execute(task)
+
+        # 7. Set the event loop's currently running task back to null.
+        this.m_currently_running_task = none
+
+        # 8. Perform a microtask checkpoint.
+        html_event_loop_perform_a_microtask_checkpoint(this)
+
+    # 3. Let taskEndTime be the unsafe shared current time. [HRT]
+    discard(high_resolution_time_unsafe_shared_current_time())
+
+    # 4. If oldestTask is not null, then:
+    if oldest_task != none:
+        # FIXME: 1. Let top-level browsing contexts be an empty set.
+        # FIXME: 2. For each environment settings object settings of oldestTask's script evaluation environment settings object set:
+        # FIXME: 2.1. Let global be settings's global object.
+        # FIXME: 2.2. If global is not a Window object, then continue.
+        # FIXME: 2.3. If global's browsing context is null, then continue.
+        # FIXME: 2.4. Let tlbc be global's browsing context's top-level browsing context.
+        # FIXME: 2.5. If tlbc is not null, then append it to top-level browsing contexts.
+        # FIXME: 3. Report long tasks, passing in taskStartTime, taskEndTime, top-level browsing contexts, and oldestTask.
+        # FIXME: 4. If oldestTask's document is not null, then record task end time given taskEndTime and oldestTask's document.
+        discard(oldest_task)
+
+    # 5. If this is a window event loop that has no runnable task in this event loop's task queues, then:
+    if this.m_type == HtmlEventLoopType.window and not html_task_queue_has_runnable_tasks(task_queue_of_this):
+        # 1. Set this event loop's last idle period start time to the unsafe shared current time.
+        this.m_last_idle_period_start_time = high_resolution_time_unsafe_shared_current_time()
+
+        # 2. Let computeDeadline be the following steps:
+        # Implemented in EventLoop::compute_deadline()
+
+        # 3. For each win of the same-loop windows for this event loop, perform the start an idle period algorithm for win with the following step: return the result of calling computeDeadline, coarsened given win's relevant settings object's cross-origin isolated capability. [REQUESTIDLECALLBACK]
+        var windows = html_event_loop_same_loop_windows(this)
+        for win in ak.vector_span(&windows):
+            html_window_start_an_idle_period(win else trap("a null window"))
+
+    # If there are eligible tasks in the queue, schedule a new round of processing. :^)
+    if html_task_queue_has_runnable_tasks(task_queue_of_this) or (not ak.queue_is_empty(&this.m_microtask_queue) and not this.m_performing_a_microtask_checkpoint):
+        html_event_loop_schedule(this)
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.cpp:195 Web::HTML::EventLoop::queue_task_to_update_the_rendering.
+## https://html.spec.whatwg.org/multipage/webappapis.html#event-loop-processing-model
+pub func html_event_loop_queue_task_to_update_the_rendering(this: HtmlEventLoop*):
+    # FIXME: 1. Wait until at least one navigable whose active document's relevant agent's event loop is eventLoop might have a rendering opportunity.
+
+    # 2. Set eventLoop's last render opportunity time to the unsafe shared current time.
+    this.m_last_render_opportunity_time = high_resolution_time_unsafe_shared_current_time()
+
+    # OPTIMIZATION: If there are already rendering tasks in the queue, we don't need to queue another one.
+    if html_task_queue_has_rendering_tasks(this.m_task_queue else trap("no task queue")):
+        return
+
+    # 3. For each navigable that has a rendering opportunity, queue a global task on the rendering task source given navigable's active window to update the rendering:
+    for entry in ak.hash_table_begin(html_all_navigables()):
+        let navigable = *entry
+        if not html_navigable_is_traversable(navigable):
+            continue
+        if not html_navigable_has_a_rendering_opportunity(navigable):
+            continue
+
+        let document = html_navigable_active_document(navigable) else continue
+        if dom_document_is_decoded_svg(document):
+            continue
+
+        let active_window = html_navigable_active_window(navigable) else trap("VERIFY: a navigable with an active document has an active window")
+        discard(html_queue_global_task(HtmlTaskSource.rendering, (JsObject*)active_window, this.m_rendering_task_function else trap("no rendering task function")))
+
+# mark: Input events ============================================================================
+
+## The filter of process_input_events: the documents of traversable navigables.
+func html_event_loop_is_document_of_traversable_navigable(context: void*?, document: DomDocument*) -> bool:
+    if dom_document_is_decoded_svg(document):
+        return false
+    let navigable = dom_document_navigable(document) else return false
+    if not html_navigable_is_traversable(navigable):
+        return false
+    return true
+
+## The lambda process_input_events_queue of process_input_events: run the queued input events of
+## `page`, re-enqueueing the events of other pages.
+func html_event_loop_process_input_events_queue(page: Page*):
+    let page_client_of_page = page_client(page)
+    let input_events_queue = page_client_input_event_queue(page_client_of_page)
+
+    # Process events only for this page, collecting others to re-enqueue
+    var events_for_other_pages: ak.Queue[QueuedInputEvent]
+
+    while not ak.queue_is_empty(input_events_queue):
+        let event = ak.queue_dequeue(input_events_queue)
+
+        # Skip events that are not intended for this page
+        if event.page_id != page_client_id(page_client_of_page):
+            ak.queue_enqueue(&events_for_other_pages, event)
+            continue
+
+        let result = match event.event:
+            .key_event(key_event) => html_event_loop_process_key_event(page, key_event)
+            .mouse_event(mouse_event) => html_event_loop_process_mouse_event(page, mouse_event)
+            .drag_event(drag_event) => page_handle_drag_and_drop_event(page, drag_event.type_, drag_event.position, drag_event.screen_position, (u32)drag_event.button, (u32)drag_event.buttons, (u32)drag_event.modifiers, drag_event.files)
+            .pinch_event(pinch_event) => page_handle_pinch_event(page, pinch_event.position, pinch_event.scale_delta)
+
+        for i in 0..<event.coalesced_event_count:
+            page_client_report_finished_handling_input_event(page_client_of_page, event.page_id, EventResult.dropped)
+        page_client_report_finished_handling_input_event(page_client_of_page, event.page_id, result)
+
+    # Re-enqueue events for other pages
+    while not ak.queue_is_empty(&events_for_other_pages):
+        ak.queue_enqueue(input_events_queue, ak.queue_dequeue(&events_for_other_pages))
+
+    page_handle_sdl_input_events(page)
+
+## The KeyEvent arm of process_input_events' event.visit(...).
+func html_event_loop_process_key_event(page: Page*, key_event: KeyEvent) -> EventResult:
+    match key_event.type_:
+        .key_down:
+            return page_handle_keydown(page, key_event.key, (u32)key_event.modifiers, key_event.code_point, key_event.repeat)
+        .key_up:
+            return page_handle_keyup(page, key_event.key, (u32)key_event.modifiers, key_event.code_point, key_event.repeat)
+        _:
+            trap("VERIFY_NOT_REACHED")
+
+## The MouseEvent arm of process_input_events' event.visit(...).
+func html_event_loop_process_mouse_event(page: Page*, mouse_event: MouseEvent) -> EventResult:
+    match mouse_event.type_:
+        .mouse_down:
+            return page_handle_mousedown(page, mouse_event.position, mouse_event.screen_position, (u32)mouse_event.button, (u32)mouse_event.buttons, (u32)mouse_event.modifiers, mouse_event.click_count)
+        .mouse_up:
+            return page_handle_mouseup(page, mouse_event.position, mouse_event.screen_position, (u32)mouse_event.button, (u32)mouse_event.buttons, (u32)mouse_event.modifiers)
+        .mouse_move:
+            return page_handle_mousemove(page, mouse_event.position, mouse_event.screen_position, (u32)mouse_event.buttons, (u32)mouse_event.modifiers)
+        .mouse_leave:
+            return page_handle_mouseleave(page)
+        .mouse_wheel:
+            return page_handle_mousewheel(page, mouse_event.position, mouse_event.screen_position, (u32)mouse_event.button, (u32)mouse_event.buttons, (u32)mouse_event.modifiers, mouse_event.wheel_delta_x, mouse_event.wheel_delta_y)
+        _:
+            trap("VERIFY_NOT_REACHED")
+
+## Ported from Libraries/LibWeb/HTML/EventLoop/EventLoop.cpp:224 Web::HTML::EventLoop::process_input_events.
+func html_event_loop_process_input_events(this: HtmlEventLoop*):
+    var documents_of_traversable_navigables = html_event_loop_documents_in_this_event_loop_matching(this, ak.Function1[DomDocument*, bool](call = html_event_loop_is_document_of_traversable_navigable, context = none))
+
+    for document in ak.vector_span(&documents_of_traversable_navigables):
+        html_event_loop_process_input_events_queue(dom_document_page(document else trap("a null document")))
