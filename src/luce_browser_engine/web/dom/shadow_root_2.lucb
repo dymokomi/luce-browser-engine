@@ -1,0 +1,269 @@
+#==============================================================================================
+#
+#   shadow_root_2 - DOM::ShadowRoot: the part element map, ShadowRoot.h and shadow-including walks
+#
+#   DESCRIPTION:
+#       Port of LibWeb/DOM/ShadowRoot.cpp (lines 284-378: the part element map with the
+#       exportparts parser, and the custom element registry) and the inline functions of
+#       ShadowRoot.h, including Node's shadow-including descendant traversals, which are
+#       defined there.
+#
+#==============================================================================================
+
+# mark: The part element map ====================================================================
+
+## Ported from ShadowRoot.cpp:286 Web::DOM::ShadowRoot::part_element_map.
+# C++ answers `PartElementMap const&`.
+pub func dom_shadow_root_part_element_map(this: DomShadowRoot*) -> const ak.HashMap[ak.FlyString, ak.OrderedHashTable[DomAbstractElement, DomAbstractElementTraits], ak.FlyStringTraits]*:
+    # FIXME: dom_tree_version() is crude and invalidates more than necessary.
+    #        Come up with a smarter way of invalidating this if it turns out to be slow.
+    let document = dom_node_document(this.dom_node())
+    if this.m_dom_tree_version_when_calculated_part_element_map < dom_document_dom_tree_version(document):
+        dom_shadow_root_calculate_part_element_map(this)
+        this.m_dom_tree_version_when_calculated_part_element_map = dom_document_dom_tree_version(document)
+    return &this.m_part_element_map
+
+## `[](u32 c) { return c == ','; }`: the splitter of parse_exportparts_attribute.
+struct DomParseExportpartsAttributeIsComma: ak.CodePointPredicate:
+    var unused: u8
+
+    func matches(code_point: u32) -> bool:
+        return code_point == (u32)','
+
+## parse_exportparts_attribute's per-mapping lambda, with its captures (the result vector).
+struct DomParseExportpartsAttributeMapping: ak.Utf8ViewCallback:
+    var result: ak.Vector[DomExportedPart]*
+
+    mutating func call(mapping: ak.Utf8View):
+        let mapping_string = ak.utf8_view_as_string(&mapping)
+        let trimmed = ak.string_view_trim_whitespace(&mapping_string)
+        if ak.string_view_is_empty(&trimmed):
+            return
+
+        let parts = ak.string_view_split_view_u8(&trimmed, ':', ak.SplitBehavior.keep_empty)
+        if ak.vector_size(&parts) == 1:
+            let name = ak.fly_string_from_utf8(ak.string_view_trim_whitespace(ak.vector_at_const(&parts, 0))) else trap("MUST: FlyString::from_utf8")
+            ak.vector_append_t(self.result, DomExportedPart(inner_name = name, outer_name = name))
+        elif ak.vector_size(&parts) == 2:
+            let inner_name = ak.fly_string_from_utf8(ak.string_view_trim_whitespace(ak.vector_at_const(&parts, 0))) else trap("MUST: FlyString::from_utf8")
+            let outer_name = ak.fly_string_from_utf8(ak.string_view_trim_whitespace(ak.vector_at_const(&parts, 1))) else trap("MUST: FlyString::from_utf8")
+            ak.vector_append_t(self.result, DomExportedPart(inner_name = inner_name, outer_name = outer_name))
+
+## Ported from ShadowRoot.cpp:304 Web::DOM::parse_exportparts_attribute.
+# https://drafts.csswg.org/css-shadow-1/#exportparts
+# Parse the exportparts attribute into a list of (inner_name, outer_name) pairs.
+func dom_parse_exportparts_attribute(element: DomElement*) -> ak.Vector[DomExportedPart]:
+    var result: ak.Vector[DomExportedPart]
+    let exportparts = dom_element_get_attribute(element, html_attribute_names_exportparts) else return result
+
+    let code_points = ak.string_code_points(&exportparts)
+    let splitter = DomParseExportpartsAttributeIsComma(unused = 0)
+    var mapping = DomParseExportpartsAttributeMapping(result = &result)
+    ak.utf8_view_for_each_split_view(&code_points, &splitter, ak.SplitBehavior.nothing, &mapping)
+
+    return result
+
+## Ported from ShadowRoot.cpp:330 Web::DOM::ShadowRoot::calculate_part_element_map.
+# https://drafts.csswg.org/css-shadow-1/#calculate-the-part-element-map
+func dom_shadow_root_calculate_part_element_map(this: DomShadowRoot*):
+    # To calculate the part element map of a shadow root, outerRoot:
+
+    ak.hash_map_clear(&this.m_part_element_map)
+
+    # 1. For each descendant el within outerRoot:
+    for node in dom_node_subtree(this.dom_node()):
+        let element = as_if_dom_element(node) else continue
+
+        # 1. For each name in el’s part name list, append el to outerRoot’s part element map[name].
+        for name in dom_element_part_names(element):
+            let elements = ak.hash_map_ensure(&this.m_part_element_map, name)
+            discard(ak.ordered_hash_table_set(elements, dom_abstract_element_make(element)))
+
+        # 2. If el is a shadow host itself then let innerRoot be its shadow root.
+        if dom_element_is_shadow_host(element):
+            let inner_root = dom_element_shadow_root(element) else trap("VERIFY: shadow host's shadow root")
+
+            # 3. Calculate innerRoot’s part element map.
+            let inner_map = dom_shadow_root_part_element_map(inner_root)
+
+            # 4. For each innerName/outerName in el’s forwarded part name list:
+            let forwarded_parts = dom_parse_exportparts_attribute(element)
+            for part in ak.vector_span_const(&forwarded_parts):
+                # 1. If innerName is an ident:
+                if let inner_parts = ak.hash_map_get_k_const(inner_map, part.inner_name):
+                    # 1. Let innerParts be innerRoot’s part element map[innerName]
+                    # 2. Append the elements in innerParts to outerRoot’s part element map[outerName]
+                    for abstract_el in ak.ordered_hash_table_begin((ak.OrderedHashTable[DomAbstractElement, DomAbstractElementTraits]*)inner_parts):
+                        let outer_elements = ak.hash_map_ensure(&this.m_part_element_map, part.outer_name)
+                        discard(ak.ordered_hash_table_set(outer_elements, *abstract_el))
+                # FIXME: 2. If innerName is a pseudo-element name, append innerRoot’s
+                #        pseudo-element(s) with that name to outerRoot’s part element map[outerName].
+
+## Ported from ShadowRoot.cpp:368 Web::DOM::ShadowRoot::custom_element_registry.
+# https://dom.spec.whatwg.org/#dom-documentorshadowroot-customelementregistry
+pub func dom_shadow_root_custom_element_registry(this: DomShadowRoot*) -> HtmlCustomElementRegistry*?:
+    # 1. If this is a document, then return this’s custom element registry.
+    # NB: Impossible.
+
+    # 2. Assert: this is a ShadowRoot node.
+    # 3. Return this’s custom element registry.
+    return this.m_custom_element_registry
+
+# mark: ShadowRoot.h ============================================================================
+
+## Ported from ShadowRoot.h:27 Web::DOM::ShadowRoot::mode.
+pub func dom_shadow_root_mode(this: DomShadowRoot*) -> BindShadowRootMode:
+    return this.m_mode
+
+## Ported from ShadowRoot.h:29 Web::DOM::ShadowRoot::slot_assignment.
+pub func dom_shadow_root_slot_assignment(this: DomShadowRoot*) -> BindSlotAssignmentMode:
+    return this.m_slot_assignment
+
+## Ported from ShadowRoot.h:30 Web::DOM::ShadowRoot::set_slot_assignment.
+pub func dom_shadow_root_set_slot_assignment(this: DomShadowRoot*, slot_assignment: BindSlotAssignmentMode):
+    this.m_slot_assignment = slot_assignment
+
+## Ported from ShadowRoot.h:32 Web::DOM::ShadowRoot::delegates_focus.
+pub func dom_shadow_root_delegates_focus(this: DomShadowRoot*) -> bool:
+    return this.m_delegates_focus
+
+## Ported from ShadowRoot.h:33 Web::DOM::ShadowRoot::set_delegates_focus.
+pub func dom_shadow_root_set_delegates_focus(this: DomShadowRoot*, delegates_focus: bool):
+    this.m_delegates_focus = delegates_focus
+
+## Ported from ShadowRoot.h:35 Web::DOM::ShadowRoot::declarative.
+pub func dom_shadow_root_declarative(this: DomShadowRoot*) -> bool:
+    return this.m_declarative
+
+## Ported from ShadowRoot.h:36 Web::DOM::ShadowRoot::set_declarative.
+pub func dom_shadow_root_set_declarative(this: DomShadowRoot*, declarative: bool):
+    this.m_declarative = declarative
+
+## Ported from ShadowRoot.h:38 Web::DOM::ShadowRoot::clonable.
+pub func dom_shadow_root_clonable(this: DomShadowRoot*) -> bool:
+    return this.m_clonable
+
+## Ported from ShadowRoot.h:39 Web::DOM::ShadowRoot::set_clonable.
+pub func dom_shadow_root_set_clonable(this: DomShadowRoot*, clonable: bool):
+    this.m_clonable = clonable
+
+## Ported from ShadowRoot.h:41 Web::DOM::ShadowRoot::serializable.
+pub func dom_shadow_root_serializable(this: DomShadowRoot*) -> bool:
+    return this.m_serializable
+
+## Ported from ShadowRoot.h:42 Web::DOM::ShadowRoot::set_serializable.
+pub func dom_shadow_root_set_serializable(this: DomShadowRoot*, serializable: bool):
+    this.m_serializable = serializable
+
+## Ported from ShadowRoot.h:47 Web::DOM::ShadowRoot::available_to_element_internals.
+pub func dom_shadow_root_available_to_element_internals(this: DomShadowRoot*) -> bool:
+    return this.m_available_to_element_internals
+
+## Ported from ShadowRoot.h:48 Web::DOM::ShadowRoot::set_available_to_element_internals.
+pub func dom_shadow_root_set_available_to_element_internals(this: DomShadowRoot*, available_to_element_internals: bool):
+    this.m_available_to_element_internals = available_to_element_internals
+
+## Ported from ShadowRoot.h:50 Web::DOM::ShadowRoot::is_user_agent_internal.
+pub func dom_shadow_root_is_user_agent_internal(this: DomShadowRoot*) -> bool:
+    return this.m_user_agent_internal
+
+## Ported from ShadowRoot.h:51 Web::DOM::ShadowRoot::set_user_agent_internal.
+pub func dom_shadow_root_set_user_agent_internal(this: DomShadowRoot*, user_agent_internal: bool):
+    this.m_user_agent_internal = user_agent_internal
+
+## Ported from ShadowRoot.h:53 Web::DOM::ShadowRoot::uses_document_style_sheets.
+pub func dom_shadow_root_uses_document_style_sheets(this: DomShadowRoot*) -> bool:
+    return this.m_uses_document_style_sheets
+
+## Ported from ShadowRoot.h:54 Web::DOM::ShadowRoot::set_uses_document_style_sheets.
+pub func dom_shadow_root_set_uses_document_style_sheets(this: DomShadowRoot*, value: bool):
+    this.m_uses_document_style_sheets = value
+
+## Ported from ShadowRoot.h:71 Web::DOM::ShadowRoot::style_sheets_for_bindings.
+pub func dom_shadow_root_style_sheets_for_bindings(this: DomShadowRoot*) -> CssStyleSheetList*?:
+    return dom_shadow_root_style_sheets(this)
+
+## Ported from ShadowRoot.h:83 Web::DOM::ShadowRoot::anchor_name_map.
+pub func dom_shadow_root_anchor_name_map(this: DomShadowRoot*) -> DomAnchorNameMap*:
+    return &this.m_anchor_name_map
+
+## Ported from ShadowRoot.h:84 Web::DOM::ShadowRoot::anchor_name_map.
+pub func dom_shadow_root_anchor_name_map_const(this: DomShadowRoot*) -> DomAnchorNameMap:
+    return this.m_anchor_name_map
+
+## Ported from ShadowRoot.h:90 Web::DOM::ShadowRoot::for_each_registered_slot.
+pub func dom_shadow_root_for_each_registered_slot(this: DomShadowRoot*, callback: ak.Function1[HtmlSlotElement*, unit]):
+    if let slot_registry = this.m_slot_registry:
+        dom_slot_registry_for_each_slot(slot_registry, callback)
+
+## Ported from ShadowRoot.h:98 Web::DOM::ShadowRoot::style_scope.
+pub func dom_shadow_root_style_scope_const(this: DomShadowRoot*) -> CssStyleScope:
+    return this.m_style_scope
+
+## Ported from ShadowRoot.h:99 Web::DOM::ShadowRoot::style_scope.
+pub func dom_shadow_root_style_scope(this: DomShadowRoot*) -> CssStyleScope*:
+    return &this.m_style_scope
+
+## Ported from ShadowRoot.h:105 Web::DOM::ShadowRoot::set_custom_element_registry.
+pub func dom_shadow_root_set_custom_element_registry(this: DomShadowRoot*, registry: HtmlCustomElementRegistry*?):
+    this.m_custom_element_registry = registry
+
+## Ported from ShadowRoot.h:107 Web::DOM::ShadowRoot::keep_custom_element_registry_null.
+pub func dom_shadow_root_keep_custom_element_registry_null(this: DomShadowRoot*) -> bool:
+    return this.m_keep_custom_element_registry_null
+
+## Ported from ShadowRoot.h:108 Web::DOM::ShadowRoot::set_keep_custom_element_registry_null.
+pub func dom_shadow_root_set_keep_custom_element_registry_null(this: DomShadowRoot*, value: bool):
+    this.m_keep_custom_element_registry_null = value
+
+## Ported from ShadowRoot.h:122 Web::DOM::ShadowRoot::node_name (override).
+pub func dom_shadow_root_node_name_impl(base: DomNode*) -> ak.FlyString:
+    return ak.fly_string_from_str("#shadow-root")
+
+## Ported from ShadowRoot.h:123 Web::DOM::ShadowRoot::is_shadow_root (override).
+pub func dom_shadow_root_is_shadow_root_impl(base: DomNode*) -> bool:
+    return true
+
+# mark: Shadow-including traversal ==============================================================
+
+# https://dom.spec.whatwg.org/#concept-shadow-including-tree-order
+# In shadow-including tree order is shadow-including preorder, depth-first traversal of a node tree.
+# Shadow-including preorder, depth-first traversal of a node tree tree is preorder, depth-first traversal
+# of tree, with for each shadow host encountered in tree, shadow-including preorder, depth-first traversal
+# of that element’s shadow root’s node tree just after it is encountered.
+
+# https://dom.spec.whatwg.org/#concept-shadow-including-descendant
+# An object A is a shadow-including descendant of an object B, if A is a descendant of B, or A’s root is a
+# shadow root and A’s root’s host is a shadow-including inclusive descendant of B.
+
+# https://dom.spec.whatwg.org/#concept-shadow-including-inclusive-descendant
+# A shadow-including inclusive descendant is an object or one of its shadow-including descendants.
+
+## Ported from ShadowRoot.h:187 Web::DOM::Node::for_each_shadow_including_inclusive_descendant.
+pub func dom_node_for_each_shadow_including_inclusive_descendant(this: DomNode*, callback: ak.Function1[DomNode*, TraversalDecision]) -> TraversalDecision:
+    let call = callback.call else trap("VERIFY: callback")
+    let decision = call(callback.context, this)
+    if decision == TraversalDecision.break_:
+        return TraversalDecision.break_
+    if decision == TraversalDecision.skip_children_and_continue:
+        return TraversalDecision.continue_
+
+    if dom_node_for_each_shadow_including_descendant(this, callback) == TraversalDecision.break_:
+        return TraversalDecision.break_
+
+    return TraversalDecision.continue_
+
+## Ported from ShadowRoot.h:202 Web::DOM::Node::for_each_shadow_including_descendant.
+pub func dom_node_for_each_shadow_including_descendant(this: DomNode*, callback: ak.Function1[DomNode*, TraversalDecision]) -> TraversalDecision:
+    if dom_node_is_element(this):
+        if let shadow_root = dom_element_shadow_root((DomElement*)this):
+            if dom_node_for_each_shadow_including_inclusive_descendant(shadow_root.dom_node(), callback) == TraversalDecision.break_:
+                return TraversalDecision.break_
+
+    var child_node = tree_node_first_child(this)
+    while let child = child_node:
+        if dom_node_for_each_shadow_including_inclusive_descendant(child, callback) == TraversalDecision.break_:
+            return TraversalDecision.break_
+        child_node = tree_node_next_sibling(child)
+
+    return TraversalDecision.continue_
