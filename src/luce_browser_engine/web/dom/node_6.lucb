@@ -1,0 +1,499 @@
+#==============================================================================================
+#
+#   node_6 - DOM::Node: namespaces, root node, length, layout links, mutation records
+#
+#   DESCRIPTION:
+#       Port of LibWeb/DOM/Node.cpp (lines 2350-2833): the in-scope namespace prefixes, locate
+#       a namespace, lookupNamespaceURI()/lookupPrefix()/isDefaultNamespace(), inertness,
+#       getRootNode(), the debug description, a node's length, the layout-node and paintable
+#       accessors, queueing (tree) mutation records and the TreeNode child-list primitives
+#       Node wraps.
+#
+#==============================================================================================
+
+# mark: Helpers =================================================================================
+
+## `Optional<String> == "literal"`: present and equal to the text.
+func dom_node_optional_string_is(a: ak.String?, text: str) -> bool:
+    let a_value = a else return false
+    return ak.string_eq_string_view(&a_value, ak.sv(text))
+
+## `Optional<String> == Optional<String>`: both empty, or both present and equal.
+func dom_node_optional_strings_equal(a: ak.String?, b: ak.String?) -> bool:
+    let a_value = a else return b == none
+    let b_value = b else return false
+    return ak.string_equals(&a_value, &b_value)
+
+## `Optional<FlyString> == Optional<String>`: both empty, or both present and equal.
+func dom_node_optional_fly_string_equals_optional_string(a: ak.FlyString?, b: ak.String?) -> bool:
+    let a_value = a else return b == none
+    let b_value = b else return false
+    return ak.fly_string_eq_string(&a_value, &b_value)
+
+## `Optional<FlyString> == FlyString`: present and equal.
+func dom_node_optional_fly_string_is(a: ak.FlyString?, b: ak.FlyString) -> bool:
+    let a_value = a else return false
+    return ak.fly_string_eq_fly_string(&a_value, &b)
+
+## The captures of Node::get_in_scope_prefixes's add_prefix lambda.
+struct DomNodeGetInScopePrefixesAddPrefix:
+    var this: DomNode*
+    var prefixes: ak.Vector[ak.FlyString]
+    var seen_prefixes: ak.HashTable[ak.FlyString, ak.FlyStringTraits]
+
+## Node::get_in_scope_prefixes's add_prefix lambda.
+func dom_node_get_in_scope_prefixes_add_prefix(captures: DomNodeGetInScopePrefixesAddPrefix*, prefix: ak.FlyString):
+    if not ak.hash_table_contains_t(&captures.seen_prefixes, prefix):
+        ak.vector_append_t(&captures.prefixes, prefix)
+        discard(ak.hash_table_set(&captures.seen_prefixes, prefix))
+        assert(dom_node_lookup_namespace_uri(captures.this, ak.fly_string_to_string_const(&prefix)) != none)
+
+# mark: Namespaces ==============================================================================
+
+## Ported from Node.cpp:2351 Web::DOM::Node::get_in_scope_prefixes.
+pub func dom_node_get_in_scope_prefixes(this: DomNode*) -> ak.Vector[ak.FlyString]:
+    # https://html.spec.whatwg.org/multipage/xhtml.html#parsing-xhtml-fragments
+    # "A namespace prefix is in scope if the DOM lookupNamespaceURI() method on the element would return a non-null value for that prefix."
+
+    var add_prefix = DomNodeGetInScopePrefixesAddPrefix(this = this)
+
+    dom_node_get_in_scope_prefixes_add_prefix(&add_prefix, ak.fly_string_from_str("xml"))
+    dom_node_get_in_scope_prefixes_add_prefix(&add_prefix, ak.fly_string_from_str("xmlns"))
+
+    var current: DomElement*? = none
+
+    if is_dom_element(this):
+        current = (DomElement*)this
+    elif is_dom_document(this):
+        current = dom_document_document_element((DomDocument*)this)
+    elif is_dom_attr(this):
+        current = dom_attr_owner_element((DomAttr*)this)
+    else:
+        current = dom_node_parent_element(this)
+
+    while let current_element = current:
+        if dom_element_namespace_uri(current_element) != none:
+            let prefix = dom_element_prefix(current_element) else ak.fly_string_from_str("")
+            dom_node_get_in_scope_prefixes_add_prefix(&add_prefix, prefix)
+
+        if let attributes = dom_element_attributes(current_element):
+            for i in 0..<dom_named_node_map_length(attributes):
+                let attr = dom_named_node_map_item(attributes, (u32)i) else trap("NamedNodeMap::item out of range")
+                if not dom_node_optional_fly_string_is(dom_attr_namespace_uri(attr), namespace_xmlns):
+                    continue
+
+                var declared_prefix: ak.FlyString? = none
+
+                let attr_local_name = dom_attr_local_name(attr)
+                if dom_attr_prefix(attr) == none and ak.fly_string_eq_string_view(&attr_local_name, ak.sv("xmlns")):
+                    declared_prefix = ak.fly_string_from_str("")
+                elif dom_node_optional_fly_string_is(dom_attr_prefix(attr), ak.fly_string_from_str("xmlns")):
+                    declared_prefix = attr_local_name
+                else:
+                    continue
+
+                let prefix = declared_prefix else trap("unreachable")
+                let value = dom_attr_value(attr)
+                if not ak.string_is_empty(&value):
+                    dom_node_get_in_scope_prefixes_add_prefix(&add_prefix, prefix)
+                discard(ak.hash_table_set(&add_prefix.seen_prefixes, prefix))  # Mark as seen even if the value is empty
+
+        current = dom_node_parent_element(current_element.dom_node())
+
+    return add_prefix.prefixes
+
+## Ported from Node.cpp:2417 Web::DOM::Node::locate_a_namespace.
+# https://dom.spec.whatwg.org/#locate-a-namespace
+pub func dom_node_locate_a_namespace(this: DomNode*, prefix: ak.String?) -> ak.String?:
+    # To locate a namespace for a node using prefix, switch on the interface node implements:
+
+    # Element
+    if is_dom_element(this):
+        # 1. If prefix is "xml", then return the XML namespace.
+        if dom_node_optional_string_is(prefix, "xml"):
+            return ak.fly_string_to_string_const(&namespace_xml)
+
+        # 2. If prefix is "xmlns", then return the XMLNS namespace.
+        if dom_node_optional_string_is(prefix, "xmlns"):
+            return ak.fly_string_to_string_const(&namespace_xmlns)
+
+        # 3. If its namespace is non-null and its namespace prefix is prefix, then return namespace.
+        let element = as_dom_element(this)
+        if let namespace_uri = dom_element_namespace_uri(element):
+            if dom_node_optional_fly_string_equals_optional_string(dom_element_prefix(element), prefix):
+                return ak.fly_string_to_string_const(&namespace_uri)
+
+        # 4. If it has an attribute whose namespace is the XMLNS namespace, namespace prefix is "xmlns", and local name is prefix,
+        #    or if prefix is null and it has an attribute whose namespace is the XMLNS namespace, namespace prefix is null,
+        #    and local name is "xmlns", then return its value if it is not the empty string, and null otherwise.
+        if let attributes = dom_element_attributes(element):
+            for i in 0..<dom_named_node_map_length(attributes):
+                let attr = dom_named_node_map_item(attributes, (u32)i) else trap("NamedNodeMap::item out of range")
+                if dom_node_optional_fly_string_is(dom_attr_namespace_uri(attr), namespace_xmlns):
+                    let attr_local_name = dom_attr_local_name(attr)
+                    if (dom_node_optional_fly_string_is(dom_attr_prefix(attr), ak.fly_string_from_str("xmlns")) and dom_node_optional_fly_string_equals_optional_string(attr_local_name, prefix)) or (prefix == none and dom_attr_prefix(attr) == none and ak.fly_string_eq_string_view(&attr_local_name, ak.sv("xmlns"))):
+                        let value = dom_attr_value(attr)
+                        if not ak.string_is_empty(&value):
+                            return value
+
+                        return none
+
+        # 5. If its parent element is null, then return null.
+        # 6. Return the result of running locate a namespace on its parent element using prefix.
+        let parent_element = dom_node_parent_element(element.dom_node()) else return none
+        return dom_node_locate_a_namespace(parent_element.dom_node(), prefix)
+
+    # Document
+    if is_dom_document(this):
+        # 1. If its document element is null, then return null.
+        let document_element = dom_document_document_element(as_dom_document(this)) else return none
+
+        # 2. Return the result of running locate a namespace on its document element using prefix.
+        return dom_node_locate_a_namespace(document_element.dom_node(), prefix)
+
+    # DocumentType
+    # DocumentFragment
+    if is_dom_document_type(this) or is_dom_document_fragment(this):
+        # Return null.
+        return none
+
+    # Attr
+    if is_dom_attr(this):
+        # 1. If its element is null, then return null.
+        let element = dom_attr_owner_element(as_dom_attr(this)) else return none
+
+        # 2. Return the result of running locate a namespace on its element using prefix.
+        return dom_node_locate_a_namespace(element.dom_node(), prefix)
+
+    # Otherwise
+    # 1. If its parent element is null, then return null.
+    let parent_element = dom_node_parent_element(this) else return none
+
+    # 2. Return the result of running locate a namespace on its parent element using prefix.
+    return dom_node_locate_a_namespace(parent_element.dom_node(), prefix)
+
+## Ported from Node.cpp:2503 Web::DOM::Node::lookup_namespace_uri.
+# https://dom.spec.whatwg.org/#dom-node-lookupnamespaceuri
+pub func dom_node_lookup_namespace_uri(this: DomNode*, prefix: ak.String?) -> ak.String?:
+    # 1. If prefix is the empty string, then set it to null.
+    var maybe_prefix = prefix
+    if let value = maybe_prefix:
+        if ak.string_is_empty(&value):
+            maybe_prefix = none
+
+    # 2. Return the result of running locate a namespace for this using prefix.
+    return dom_node_locate_a_namespace(this, maybe_prefix)
+
+## Ported from Node.cpp:2514 Web::DOM::Node::lookup_prefix.
+# https://dom.spec.whatwg.org/#dom-node-lookupprefix
+pub func dom_node_lookup_prefix(this: DomNode*, namespace_: ak.String?) -> ak.String?:
+    # 1. If namespace is null or the empty string, then return null.
+    let namespace_value = namespace_ else return none
+    if ak.string_is_empty(&namespace_value):
+        return none
+
+    # 2. Switch on the interface this implements:
+
+    # Element
+    if is_dom_element(this):
+        # Return the result of locating a namespace prefix for it using namespace.
+        let element = as_dom_element(this)
+        return dom_element_locate_a_namespace_prefix(element, namespace_)
+
+    # Document
+    if is_dom_document(this):
+        # Return the result of locating a namespace prefix for its document element, if its document element is non-null; otherwise null.
+        let document_element = dom_document_document_element(as_dom_document(this)) else return none
+
+        return dom_element_locate_a_namespace_prefix(document_element, namespace_)
+
+    # DocumentType
+    # DocumentFragment
+    if is_dom_document_type(this) or is_dom_document_fragment(this):
+        # Return null
+        return none
+
+    # Attr
+    if is_dom_attr(this):
+        # Return the result of locating a namespace prefix for its element, if its element is non-null; otherwise null.
+        let element = dom_attr_owner_element(as_dom_attr(this)) else return none
+
+        return dom_element_locate_a_namespace_prefix(element, namespace_)
+
+    # Otherwise
+    # Return the result of locating a namespace prefix for its parent element, if its parent element is non-null; otherwise null.
+    let parent_element = dom_node_parent_element(this) else return none
+
+    return dom_element_locate_a_namespace_prefix(parent_element, namespace_)
+
+## Ported from Node.cpp:2565 Web::DOM::Node::is_default_namespace.
+# https://dom.spec.whatwg.org/#dom-node-isdefaultnamespace
+pub func dom_node_is_default_namespace(this: DomNode*, namespace_: ak.String?) -> bool:
+    # 1. If namespace is the empty string, then set it to null.
+    var maybe_namespace = namespace_
+    if let value = maybe_namespace:
+        if ak.string_is_empty(&value):
+            maybe_namespace = none
+
+    # 2. Let defaultNamespace be the result of running locate a namespace for this using null.
+    let default_namespace = dom_node_locate_a_namespace(this, none)
+
+    # 3. Return true if defaultNamespace is the same as namespace; otherwise false.
+    return dom_node_optional_strings_equal(default_namespace, maybe_namespace)
+
+# mark: Inertness, root node, description and length ============================================
+
+## Ported from Node.cpp:2578 Web::DOM::Node::is_inert.
+pub func dom_node_is_inert(this: DomNode*) -> bool:
+    if let html_element = as_if_html_element(this):
+        return html_element_is_inert(html_element)
+
+    if let enclosing_html_element = dom_node_enclosing_html_element(this):
+        return html_element_is_inert(enclosing_html_element)
+
+    return false
+
+## Ported from Node.cpp:2590 Web::DOM::Node::in_a_document_tree.
+# https://dom.spec.whatwg.org/#in-a-document-tree
+pub func dom_node_in_a_document_tree(this: DomNode*) -> bool:
+    # An element is in a document tree if its root is a document.
+    return dom_node_is_document(tree_node_root(this))
+
+## Ported from Node.cpp:2597 Web::DOM::Node::get_root_node.
+# https://dom.spec.whatwg.org/#dom-node-getrootnode
+pub func dom_node_get_root_node(this: DomNode*, options: DomGetRootNodeOptions) -> DomNode*:
+    # The getRootNode(options) method steps are to return this’s shadow-including root if options["composed"] is true;
+    if options.composed:
+        return dom_node_shadow_including_root(this)
+
+    # otherwise this’s root.
+    return tree_node_root(this)
+
+## Ported from Node.cpp:2607 Web::DOM::Node::debug_description.
+pub func dom_node_debug_description(this: DomNode*) -> ak.String:
+    var builder = ak.string_builder_new()
+    let name = dom_node_node_name(this)
+    let lowercase_name = ak.fly_string_to_ascii_lowercase(&name)
+    ak.string_builder_append_string_view(&builder, ak.fly_string_bytes_as_string_view(&lowercase_name))
+    if dom_node_is_element(this):
+        let element = (DomElement*)this
+        if let id = dom_element_id(element):
+            ak.string_builder_append(&builder, "#")
+            ak.string_builder_append_string_view(&builder, ak.fly_string_bytes_as_string_view(&id))
+        var class_names = dom_element_class_names(element)
+        for class_name in ak.vector_span(&class_names):
+            ak.string_builder_append(&builder, ".")
+            ak.string_builder_append_string_view(&builder, ak.fly_string_bytes_as_string_view(&class_name))
+    return ak.string_builder_to_string(&builder) else trap("MUST: StringBuilder::to_string")
+
+## Ported from Node.cpp:2622 Web::DOM::Node::length.
+# https://dom.spec.whatwg.org/#concept-node-length
+pub func dom_node_length(this: DomNode*) -> usize:
+    # 1. If node is a DocumentType or Attr node, then return 0.
+    if dom_node_is_document_type(this) or dom_node_is_attribute(this):
+        return 0
+
+    # 2. If node is a CharacterData node, then return node’s data’s length.
+    if dom_node_is_character_data(this):
+        return dom_character_data_length_in_utf16_code_units(as_dom_character_data(this))
+
+    # 3. Return the number of node’s children.
+    return tree_node_child_count(this)
+
+# mark: Layout node and paintable accessors =====================================================
+
+## Ported from Node.cpp:2636 Web::DOM::Node::layout_node const.
+pub func dom_node_layout_node_const(this: DomNode*) -> LayoutNode*?:
+    if this.m_layout_node != none:
+        assert(dom_document_layout_is_up_to_date(dom_node_document(this)))
+    return this.m_layout_node
+
+## Ported from Node.cpp:2643 Web::DOM::Node::layout_node.
+pub func dom_node_layout_node(this: DomNode*) -> LayoutNode*?:
+    if this.m_layout_node != none:
+        assert(dom_document_layout_is_up_to_date(dom_node_document(this)))
+    return this.m_layout_node
+
+## Ported from Node.cpp:2650 Web::DOM::Node::set_paintable.
+pub func dom_node_set_paintable(this: DomNode*, paintable: PaintPaintable*?):
+    this.m_paintable = paintable
+
+## Ported from Node.cpp:2655 Web::DOM::Node::clear_paintable.
+pub func dom_node_clear_paintable(this: DomNode*):
+    this.m_paintable = none
+
+## Ported from Node.cpp:2660 Web::DOM::Node::set_needs_repaint.
+pub func dom_node_set_needs_repaint(this: DomNode*, should_invalidate_display_list: InvalidateDisplayList = InvalidateDisplayList.yes):
+    if let layout_node = dom_node_unsafe_layout_node(this):
+        for paintable in ak.intrusive_list_begin(layout_node_paintables(layout_node)):
+            paint_paintable_set_needs_repaint(paintable, should_invalidate_display_list)
+
+## Ported from Node.cpp:2668 Web::DOM::Node::set_needs_layout_update.
+pub func dom_node_set_needs_layout_update(this: DomNode*, reason: DomSetNeedsLayoutReason):
+    if let node = dom_node_unsafe_layout_node(this):
+        layout_node_set_needs_layout_update(node, reason)
+        dom_document_set_needs_repaint_t[DomNode](dom_node_document(this), InvalidateDisplayList.no)
+
+## Ported from Node.cpp:2676 Web::DOM::Node::paintable const.
+pub func dom_node_paintable_const(this: DomNode*) -> PaintPaintable*?:
+    if this.m_paintable != none:
+        assert(dom_document_layout_is_up_to_date(dom_node_document(this)))
+    return this.m_paintable
+
+## Ported from Node.cpp:2683 Web::DOM::Node::paintable.
+pub func dom_node_paintable(this: DomNode*) -> PaintPaintable*?:
+    if this.m_paintable != none:
+        assert(dom_document_layout_is_up_to_date(dom_node_document(this)))
+    return this.m_paintable
+
+## Ported from Node.cpp:2690 Web::DOM::Node::paintable_box const.
+pub func dom_node_paintable_box_const(this: DomNode*) -> PaintPaintableBox*?:
+    let p = dom_node_paintable_const(this) else return none
+    if paint_paintable_is_paintable_box(p):
+        return (PaintPaintableBox*)p
+    return none
+
+## Ported from Node.cpp:2697 Web::DOM::Node::paintable_box.
+pub func dom_node_paintable_box(this: DomNode*) -> PaintPaintableBox*?:
+    let p = dom_node_paintable(this) else return none
+    if paint_paintable_is_paintable_box(p):
+        return (PaintPaintableBox*)p
+    return none
+
+## Ported from Node.cpp:2704 Web::DOM::Node::unsafe_paintable_box const.
+pub func dom_node_unsafe_paintable_box_const(this: DomNode*) -> PaintPaintableBox*?:
+    let paintable = this.m_paintable else return none
+    if paint_paintable_is_paintable_box(paintable):
+        return (PaintPaintableBox*)paintable
+    return none
+
+## Ported from Node.cpp:2711 Web::DOM::Node::unsafe_paintable_box.
+pub func dom_node_unsafe_paintable_box(this: DomNode*) -> PaintPaintableBox*?:
+    let paintable = this.m_paintable else return none
+    if paint_paintable_is_paintable_box(paintable):
+        return (PaintPaintableBox*)paintable
+    return none
+
+# mark: Mutation records ========================================================================
+
+## Ported from Node.cpp:2719 Web::DOM::Node::queue_mutation_record.
+# https://dom.spec.whatwg.org/#queue-a-mutation-record
+pub func dom_node_queue_mutation_record(this: DomNode*, type_: ak.FlyString, attribute_name: ak.FlyString?, attribute_namespace: ak.FlyString?, old_value: ak.String?, added_nodes: ak.Vector[DomNode*?], removed_nodes: ak.Vector[DomNode*?], previous_sibling: DomNode*?, next_sibling: DomNode*?):
+    let document = dom_node_document(this)
+    let page = dom_document_page(document)
+
+    # NOTE: We defer garbage collection until the end of the scope, since we can't safely use MutationObserver* as a hashmap key otherwise.
+    # FIXME: This is a total hack.
+    let heap = gc.cell_heap(this.cell())
+    gc.heap_defer_gc(heap)
+    defer gc.heap_undefer_gc(heap)
+
+    # 1. Let interestedObservers be an empty map.
+    # mutationObserver -> mappedOldValue
+    var interested_observers: ak.OrderedHashMap[DomMutationObserver*, ak.String?, ak.PtrTraits[DomMutationObserver]]
+
+    # 2. Let nodes be the inclusive ancestors of target.
+    # 3. For each node of nodes, and then for each registered of node’s registered observer list:
+    var inclusive_ancestor: DomNode*? = this
+    while let node = inclusive_ancestor:
+        inclusive_ancestor = tree_node_parent(node)
+        let registered_observer_list = node.m_registered_observer_list else continue
+        for registered_observer in ak.vector_span(registered_observer_list):
+            # 1. Let options be registered’s options.
+            let options = dom_registered_observer_options(registered_observer)
+
+            # 2. If none of the following are true
+            #      - node is not target and options["subtree"] is false
+            #      - type is "attributes" and options["attributes"] either does not exist or is false
+            #      - type is "attributes", options["attributeFilter"] exists, and options["attributeFilter"] does not contain name or namespace is non-null
+            #      - type is "characterData" and options["characterData"] either does not exist or is false
+            #      - type is "childList" and options["childList"] is false
+            #    then:
+            let type_is_attributes = ak.fly_string_eq_fly_string(&type_, &dom_mutation_type_attributes)
+            let type_is_character_data = ak.fly_string_eq_fly_string(&type_, &dom_mutation_type_character_data)
+            let type_is_child_list = ak.fly_string_eq_fly_string(&type_, &dom_mutation_type_child_list)
+            var attribute_filter_excludes = false
+            if type_is_attributes:
+                if let attribute_filter = options.attribute_filter:
+                    let name = attribute_name else ak.fly_string_from_string(ak.string_new())
+                    attribute_filter_excludes = attribute_namespace != none or not ak.vector_contains_slow[ak.String, ak.StringTraits](&attribute_filter, ak.fly_string_to_string_const(&name))
+            if not (node != this and not options.subtree) and not (type_is_attributes and not (options.attributes else false)) and not attribute_filter_excludes and not (type_is_character_data and not (options.character_data else false)) and not (type_is_child_list and not options.child_list):
+                # 1. Let mo be registered’s observer.
+                let mutation_observer = dom_registered_observer_observer(registered_observer)
+
+                # 2. If interestedObservers[mo] does not exist, then set interestedObservers[mo] to null.
+                if not ak.ordered_hash_map_contains_k(&interested_observers, mutation_observer):
+                    discard(ak.ordered_hash_map_set(&interested_observers, mutation_observer, none))
+
+                # 3. If either type is "attributes" and options["attributeOldValue"] is true, or type is "characterData" and options["characterDataOldValue"] is true, then set interestedObservers[mo] to oldValue.
+                if (type_is_attributes and (options.attribute_old_value else false)) or (type_is_character_data and (options.character_data_old_value else false)):
+                    discard(ak.ordered_hash_map_set(&interested_observers, mutation_observer, old_value))
+
+    # OPTIMIZATION: If there are no interested observers, bail without doing any more work.
+    if ak.ordered_hash_map_is_empty(&interested_observers) and not page_listen_for_dom_mutations(page):
+        return
+
+    # FIXME: The MutationRecord constructor should take an Optional<FlyString> attribute name and namespace
+    var string_attribute_name: ak.String? = none
+    if let name = attribute_name:
+        string_attribute_name = ak.fly_string_to_string_const(&name)
+    var string_attribute_namespace: ak.String? = none
+    if let namespace_ = attribute_namespace:
+        string_attribute_namespace = ak.fly_string_to_string_const(&namespace_)
+
+    let realm = bind_platform_object_realm(this.bind_platform_object())
+    let added_nodes_list = dom_static_node_list_create(realm, added_nodes)
+    let removed_nodes_list = dom_static_node_list_create(realm, removed_nodes)
+
+    # 4. For each observer → mappedOldValue of interestedObservers:
+    for entry in ak.ordered_hash_map_begin(&interested_observers):
+        let observer = entry.key
+        let mapped_old_value = entry.value
+        # 1. Let record be a new MutationRecord object with its type set to type, target set to target, attributeName set to name, attributeNamespace set to namespace, oldValue set to mappedOldValue,
+        #    addedNodes set to addedNodes, removedNodes set to removedNodes, previousSibling set to previousSibling, and nextSibling set to nextSibling.
+        let record = dom_mutation_record_create(realm, type_, this, added_nodes_list, removed_nodes_list, previous_sibling, next_sibling, string_attribute_name, string_attribute_namespace, mapped_old_value)
+
+        # 2. Enqueue record to observer’s record queue.
+        dom_mutation_observer_enqueue_record(observer, record)
+
+        # 3. Append observer to the surrounding agent’s pending mutation observers.
+        # (JS::Object& from a platform object: JS::Object is opaque until phase 3, DESIGN.md §3.6.)
+        let agent = html_relevant_similar_origin_window_agent((JsObject*)this)
+        ak.vector_append_t(&agent.pending_mutation_observers, observer)
+
+    # 5. Queue a mutation observer microtask.
+    bind_queue_mutation_observer_microtask()
+
+    # AD-HOC: Notify the UI if it is interested in DOM mutations (i.e. for DevTools).
+    if page_listen_for_dom_mutations(page):
+        page_client_page_did_mutate_dom(page_client(page), type_, this, added_nodes_list, removed_nodes_list, previous_sibling, next_sibling, string_attribute_name)
+
+## Ported from Node.cpp:2804 Web::DOM::Node::queue_tree_mutation_record.
+# https://dom.spec.whatwg.org/#queue-a-tree-mutation-record
+pub func dom_node_queue_tree_mutation_record(this: DomNode*, added_nodes: ak.Vector[DomNode*?], removed_nodes: ak.Vector[DomNode*?], previous_sibling: DomNode*?, next_sibling: DomNode*?):
+    # 1. Assert: either addedNodes or removedNodes is not empty.
+    assert(ak.vector_size(&added_nodes) > 0 or ak.vector_size(&removed_nodes) > 0)
+
+    # 2. Queue a mutation record of "childList" for target with null, null, null, addedNodes, removedNodes, previousSibling, and nextSibling.
+    dom_node_queue_mutation_record(this, dom_mutation_type_child_list, none, none, none, added_nodes, removed_nodes, previous_sibling, next_sibling)
+
+# mark: Child-list primitives ===================================================================
+
+## Ported from Node.cpp:2813 Web::DOM::Node::append_child_impl.
+pub func dom_node_append_child_impl(this: DomNode*, node: DomNode*):
+    assert(tree_node_parent(node) == none)
+
+    if not dom_node_is_child_allowed(this, node):
+        return
+
+    tree_node_append_child(this, node)
+
+## Ported from Node.cpp:2823 Web::DOM::Node::insert_before_impl.
+pub func dom_node_insert_before_impl(this: DomNode*, node: DomNode*, child: DomNode*?):
+    if child == none:
+        return dom_node_append_child_impl(this, node)
+    tree_node_insert_before(this, node, child)
+
+## Ported from Node.cpp:2830 Web::DOM::Node::remove_child_impl.
+pub func dom_node_remove_child_impl(this: DomNode*, node: DomNode*):
+    tree_node_remove_child(this, node)

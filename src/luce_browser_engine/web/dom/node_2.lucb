@@ -1,0 +1,450 @@
+#==============================================================================================
+#
+#   node_2 - DOM::Node: insert, pre-insert, append, pre-remove and remove
+#
+#   DESCRIPTION:
+#       Port of LibWeb/DOM/Node.cpp (lines 568-986): the DOM's insert algorithm with its
+#       live-range, slot, custom-element and mutation-record steps, pre-insert, append,
+#       pre-remove, the live range pre-remove steps and the remove algorithm.
+#
+#==============================================================================================
+
+# mark: Helpers =================================================================================
+
+## The empty `Vector<GC::Root<Node>>` (`{}`) the mutation-record calls pass.
+func dom_node_no_nodes() -> ak.Vector[DomNode*?]:
+    var nodes: ak.Vector[DomNode*?]
+    return nodes
+
+## `{ node }`: a `Vector<GC::Root<Node>>` holding one node.
+func dom_node_one_node(node: DomNode*) -> ak.Vector[DomNode*?]:
+    var nodes: ak.Vector[DomNode*?]
+    ak.vector_append_t(&nodes, node)
+    return nodes
+
+## `element->is_shadow_host() && element->shadow_root()->slot_assignment() == Bindings::SlotAssignmentMode::Named`.
+func dom_node_is_named_shadow_host(element: DomElement*) -> bool:
+    if not dom_element_is_shadow_host(element):
+        return false
+    let shadow_root = dom_element_shadow_root(element) else trap("shadow host without a shadow root")
+    return dom_shadow_root_slot_assignment(shadow_root) == BindSlotAssignmentMode.named
+
+# mark: Insert ==================================================================================
+
+## Node::insert_before's step 7 lambda, run for each shadow-including inclusive descendant of an
+## inserted node, in shadow-including tree order. It captures nothing it still needs: the C++
+## captures `this` only for `vm().heap()`, which the empty argument list does not need here.
+func dom_node_insert_before_inclusive_descendant_steps(context: void*?, inclusive_descendant: DomNode*) -> TraversalDecision:
+    # 1. Run the insertion steps with inclusiveDescendant.
+    dom_node_inserted(inclusive_descendant)
+
+    # 2. If inclusiveDescendant is not connected, then continue.
+    if not dom_node_is_connected(inclusive_descendant):
+        return TraversalDecision.continue_
+
+    # 3. If inclusiveDescendant is an element and inclusiveDescendant’s custom element registry is non-null:
+    #    (An element with a null registry is not a shadow root either, so the `elif` below is the C++'s `else if`.)
+    if let custom_element = as_if_dom_element(inclusive_descendant):
+        let registry = dom_element_custom_element_registry(custom_element) else return TraversalDecision.continue_
+        # 1. If inclusiveDescendant’s custom element registry’s is scoped is true, then append
+        #    inclusiveDescendant’s node document to inclusiveDescendant’s custom element registry’s scoped
+        #    document set.
+        if html_custom_element_registry_is_scoped(registry):
+            html_custom_element_registry_append_scoped_document(registry, dom_node_document(custom_element.dom_node()))
+
+        # 2. If inclusiveDescendant is custom, then enqueue a custom element callback reaction with
+        #    inclusiveDescendant, callback name "connectedCallback", and « ».
+        if dom_element_is_custom(custom_element):
+            var empty_arguments: ak.Vector[JsValue]
+            dom_element_enqueue_a_custom_element_callback_reaction(custom_element, html_custom_element_reaction_names_connected_callback, empty_arguments)
+
+        # 3. Otherwise, try to upgrade inclusiveDescendant.
+        else:
+            dom_element_try_to_upgrade(custom_element)
+    # 4. Otherwise, if inclusiveDescendant is a shadow root, inclusiveDescendant’s custom element registry is
+    #    non-null, and inclusiveDescendant’s custom element registry’s is scoped is true, then append
+    #    inclusiveDescendant’s node document to inclusiveDescendant’s custom element registry’s scoped
+    #    document set.
+    elif let shadow_root = as_if_dom_shadow_root(inclusive_descendant):
+        if let registry = dom_shadow_root_custom_element_registry(shadow_root):
+            if html_custom_element_registry_is_scoped(registry):
+                html_custom_element_registry_append_scoped_document(registry, dom_node_document(shadow_root.dom_node()))
+
+    return TraversalDecision.continue_
+
+## Node::insert_before's step 11 lambda: append each shadow-including inclusive descendant to
+## staticNodeList (the context).
+func dom_node_insert_before_collect_static_node_list(context: void*?, inclusive_descendant: DomNode*) -> TraversalDecision:
+    let static_node_list = (ak.Vector[DomNode*]*)(context else trap("no static node list"))
+    ak.vector_append_t(static_node_list, inclusive_descendant)
+    return TraversalDecision.continue_
+
+## Ported from Node.cpp:569 Web::DOM::Node::insert_before.
+# https://dom.spec.whatwg.org/#concept-node-insert
+pub func dom_node_insert_before(this: DomNode*, node: DomNode*, child: DomNode*?, suppress_observers: bool = false):
+    # 1. Let nodes be node’s children, if node is a DocumentFragment node; otherwise « node ».
+    var nodes: ak.Vector[DomNode*?]
+    if is_dom_document_fragment(node):
+        nodes = dom_node_children_as_vector(node)
+    else:
+        ak.vector_append_t(&nodes, node)
+
+    # 2. Let count be nodes’s size.
+    let count = ak.vector_size(&nodes)
+
+    # 3. If count is 0, then return.
+    if count == 0:
+        return
+
+    # 4. If node is a DocumentFragment node:
+    if is_dom_document_fragment(node):
+        # 1. Remove its children with suppressObservers set to true.
+        dom_node_remove_all_children(node, true)
+
+        # 2. Queue a tree mutation record for node with « », nodes, null, and null.
+        # NOTE: This step intentionally does not pay attention to suppressObservers.
+        dom_node_queue_tree_mutation_record(node, dom_node_no_nodes(), nodes, none, none)
+
+    # 5. If child is non-null:
+    if let child_node = child:
+        # 1. For each live range whose start node is parent and start offset is greater than child’s index:
+        #    increase its start offset by count.
+        for entry in ak.hash_table_begin(dom_range_live_ranges()):
+            let range = *entry else continue
+            if dom_abstract_range_start_container(range.dom_abstract_range()) == this and (usize)dom_abstract_range_start_offset(range.dom_abstract_range()) > tree_node_index(child_node):
+                dom_range_increase_start_offset(range, (u32)count)
+
+        # 2. For each live range whose end node is parent and end offset is greater than child’s index:
+        #    increase its end offset by count.
+        for entry in ak.hash_table_begin(dom_range_live_ranges()):
+            let range = *entry else continue
+            if dom_abstract_range_end_container(range.dom_abstract_range()) == this and (usize)dom_abstract_range_end_offset(range.dom_abstract_range()) > tree_node_index(child_node):
+                dom_range_increase_end_offset(range, (u32)count)
+
+    # 6. Let previousSibling be child’s previous sibling or parent’s last child if child is null.
+    var previous_sibling: DomNode*? = none
+    if let child_node = child:
+        previous_sibling = tree_node_previous_sibling(child_node)
+    else:
+        previous_sibling = tree_node_last_child(this)
+
+    # 7. For each node in nodes, in tree order:
+    # FIXME: In tree order
+    for maybe_node_to_insert in ak.vector_span(&nodes):
+        let node_to_insert = maybe_node_to_insert else trap("null GC::Root<Node>")
+
+        # 1. Adopt node into parent’s node document.
+        dom_document_adopt_node(dom_node_document(this), node_to_insert)
+
+        # 2. If child is null, then append node to parent’s children.
+        if child == none:
+            dom_node_append_child_impl(this, node_to_insert)
+        # 3. Otherwise, insert node into parent’s children before child’s index.
+        else:
+            dom_node_insert_before_impl(this, node_to_insert, child)
+
+        # 4. If parent is a shadow host whose shadow root’s slot assignment is "named" and node is a slottable, then
+        #    assign a slot for node.
+        if let element = as_if_dom_element(this):
+            let is_named_shadow_host = dom_node_is_named_shadow_host(element)
+
+            if is_named_shadow_host and dom_node_is_slottable(node_to_insert):
+                dom_assign_a_slot(dom_node_as_slottable(node_to_insert))
+
+        # 5. If parent’s root is a shadow root, and parent is a slot whose assigned nodes is the empty list, then run
+        #    signal a slot change for parent.
+        if let this_slot_element = as_if_html_slot_element(this):
+            if dom_node_is_shadow_root(tree_node_root(this)):
+                if dom_slot_assigned_nodes_internal(&this_slot_element.slot).length == 0:
+                    dom_signal_a_slot_change(this_slot_element)
+
+        # AD-HOC: Register any slot elements in the inserted subtree with the shadow root’s slot registry
+        #         before running assign_slottables_for_a_tree, so the registry is up-to-date.
+        if let shadow_root = as_if_dom_shadow_root(tree_node_root(node_to_insert)):
+            # for_each_in_inclusive_subtree_of_type<HTML::HTMLSlotElement>
+            for inclusive_descendant in dom_node_inclusive_subtree(node_to_insert):
+                if let slot = as_if_html_slot_element(inclusive_descendant):
+                    dom_shadow_root_register_slot(shadow_root, slot)
+
+        # 6. Run assign slottables for a tree with node’s root.
+        dom_assign_slottables_for_a_tree(tree_node_root(node_to_insert))
+
+        dom_node_invalidate_style(node_to_insert, DomStyleInvalidationReason.node_insert_before)
+
+        # 7. For each shadow-including inclusive descendant inclusiveDescendant of node, in shadow-including tree order:
+        discard(dom_node_for_each_shadow_including_inclusive_descendant(node_to_insert, ak.Function1[DomNode*, TraversalDecision](call = dom_node_insert_before_inclusive_descendant_steps, context = none)))
+
+    # 8. If suppressObservers is false, then queue a tree mutation record for parent with nodes, « », previousSibling,
+    #    and child.
+    if not suppress_observers:
+        dom_node_queue_tree_mutation_record(this, nodes, dom_node_no_nodes(), previous_sibling, child)
+
+    # 9. Run the children changed steps for parent.
+    let metadata = DomNodeChildrenChangedMetadata(type_ = DomNodeChildrenChangedMetadataType.inserted, node = node)
+    dom_node_children_changed(this, metadata)
+
+    # 10. Let staticNodeList be a list of nodes, initially « ».
+    # NOTE: We collect all nodes before calling the post-connection steps on any one of them, instead of calling the
+    #       post-connection steps while we’re traversing the node tree. This is because the post-connection steps can
+    #       modify the tree’s structure, making live traversal unsafe, possibly leading to the post-connection steps
+    #       being called multiple times on the same node.
+    var static_node_list: ak.Vector[DomNode*]
+
+    # 11. For each node of nodes, in tree order:
+    for maybe_inserted_node in ak.vector_span(&nodes):
+        let inserted_node = maybe_inserted_node else trap("null GC::Root<Node>")
+        # 1. For each shadow-including inclusive descendant inclusiveDescendant of node, in shadow-including tree
+        #    order: append inclusiveDescendant to staticNodeList.
+        discard(dom_node_for_each_shadow_including_inclusive_descendant(inserted_node, ak.Function1[DomNode*, TraversalDecision](call = dom_node_insert_before_collect_static_node_list, context = &static_node_list)))
+
+    # 12. For each node of staticNodeList: if node is connected, then run the post-connection steps with node.
+    for static_node in ak.vector_span(&static_node_list):
+        if dom_node_is_connected(static_node):
+            dom_node_post_connection(static_node)
+
+    if dom_node_is_connected(this):
+        # NB: Called during DOM insertion, layout is not up to date.
+        if let layout_node = dom_node_unsafe_layout_node(this):
+            let display = layout_node_display(layout_node)
+            if css_display_is_contents(&display):
+                if let parent_element = dom_node_parent_element(this):
+                    dom_node_set_needs_layout_tree_update(parent_element.dom_node(), true, DomSetNeedsLayoutTreeUpdateReason.node_insert_before_with_display_contents)
+        dom_node_set_needs_layout_tree_update(this, true, DomSetNeedsLayoutTreeUpdateReason.node_insert_before)
+
+    # AD-HOC: invalidate the ordinal of the first list_item of the list_owner of the child node, if any.
+    var child_is_element = false
+    if let child_node = child:
+        child_is_element = dom_node_is_element(child_node)
+    if child_is_element:
+        dom_element_maybe_invalidate_ordinals_for_list_owner((DomElement*)(child else trap("unreachable")))
+    elif dom_node_is_element(this) and not dom_node_is_html_ol_ul_menu_element(this):
+        dom_element_maybe_invalidate_ordinals_for_list_owner((DomElement*)this)
+    # NOTE: If the child node is null and the parent node is an ol, ul or menu element then:
+    #       the new node will be the first in the list of a potential list owner and it will not have
+    #       an ordinal value (default from constructor).
+    # FIXME: This will not work if the child or the parent is not an element. Is insert_before even possible in this situation?
+
+    dom_document_bump_dom_tree_version(dom_node_document(this))
+
+## Ported from Node.cpp:761 Web::DOM::Node::pre_insert.
+# https://dom.spec.whatwg.org/#concept-node-pre-insert
+pub func dom_node_pre_insert(this: DomNode*, node: DomNode*, child: DomNode*?) -> DomNode*!:
+    # 1. Ensure pre-insertion validity of node into parent before child.
+    try dom_node_ensure_pre_insertion_validity(this, bind_platform_object_realm(this.bind_platform_object()), node, child)
+
+    # 2. Let referenceChild be child.
+    var reference_child = child
+
+    # 3. If referenceChild is node, then set referenceChild to node’s next sibling.
+    if reference_child == node:
+        reference_child = tree_node_next_sibling(node)
+
+    # 4. Insert node into parent before referenceChild.
+    dom_node_insert_before(this, node, reference_child)
+
+    # 5. Return node.
+    return node
+
+## Ported from Node.cpp:781 Web::DOM::Node::remove_child.
+# https://dom.spec.whatwg.org/#dom-node-removechild
+pub func dom_node_remove_child(this: DomNode*, child: DomNode*) -> DomNode*!:
+    # The removeChild(child) method steps are to return the result of pre-removing child from this.
+    return try dom_node_pre_remove(this, child)
+
+## Ported from Node.cpp:788 Web::DOM::Node::pre_remove.
+# https://dom.spec.whatwg.org/#concept-node-pre-remove
+pub func dom_node_pre_remove(this: DomNode*, child: DomNode*) -> DomNode*!:
+    # 1. If child’s parent is not parent, then throw a "NotFoundError" DOMException.
+    if tree_node_parent(child) != this:
+        return try idl_throw(.idl_dom_exception(idl_not_found_error_create(bind_platform_object_realm(this.bind_platform_object()), ak.utf16_string_from_str("Child does not belong to this node"))))
+
+    # 2. Remove child.
+    dom_node_remove(child)
+
+    # 3. Return child.
+    return child
+
+## Ported from Node.cpp:802 Web::DOM::Node::append_child.
+# https://dom.spec.whatwg.org/#concept-node-append
+pub func dom_node_append_child(this: DomNode*, node: DomNode*) -> DomNode*!:
+    # To append a node node to a node parent: pre-insert node into parent before null.
+    return try dom_node_pre_insert(this, node, none)
+
+# mark: Remove ==================================================================================
+
+## Ported from Node.cpp:809 Web::DOM::Node::live_range_pre_remove.
+# https://dom.spec.whatwg.org/#live-range-pre-remove-steps
+pub func dom_node_live_range_pre_remove(this: DomNode*):
+    # 1. Let parent be node’s parent.
+    # 2. Assert: parent is not null.
+    let parent = tree_node_parent(this) else trap("VERIFY: parent")
+
+    # 3. Let index be node’s index.
+    let index = tree_node_index(this)
+
+    # 4. For each live range whose start node is an inclusive descendant of node, set its start to (parent, index).
+    for entry in ak.hash_table_begin(dom_range_live_ranges()):
+        let range = *entry else continue
+        if tree_node_is_inclusive_descendant_of(dom_abstract_range_start_container(range.dom_abstract_range()), this):
+            dom_range_set_start(range, parent, (u32)index) else trap("MUST: Range::set_start")
+
+    # 5. For each live range whose end node is an inclusive descendant of node, set its end to (parent, index).
+    for entry in ak.hash_table_begin(dom_range_live_ranges()):
+        let range = *entry else continue
+        if tree_node_is_inclusive_descendant_of(dom_abstract_range_end_container(range.dom_abstract_range()), this):
+            dom_range_set_end(range, parent, (u32)index) else trap("MUST: Range::set_end")
+
+    # 6. For each live range whose start node is parent and start offset is greater than index, decrease its start
+    #    offset by 1.
+    for entry in ak.hash_table_begin(dom_range_live_ranges()):
+        let range = *entry else continue
+        if dom_abstract_range_start_container(range.dom_abstract_range()) == parent and (usize)dom_abstract_range_start_offset(range.dom_abstract_range()) > index:
+            dom_range_decrease_start_offset(range, 1)
+
+    # 7. For each live range whose end node is parent and end offset is greater than index, decrease its end offset by 1.
+    for entry in ak.hash_table_begin(dom_range_live_ranges()):
+        let range = *entry else continue
+        if dom_abstract_range_end_container(range.dom_abstract_range()) == parent and (usize)dom_abstract_range_end_offset(range.dom_abstract_range()) > index:
+            dom_range_decrease_end_offset(range, 1)
+
+## The lambda of Node::remove's step 4 and Node::move_node's step 10: run the NodeIterator
+## pre-removing steps given node (the context) and the iterator.
+func dom_node_run_node_iterator_pre_removing_steps(context: void*?, node_iterator: DomNodeIterator*):
+    let node = (DomNode*)(context else trap("no node"))
+    dom_node_iterator_run_pre_removing_steps(node_iterator, node)
+
+## The captures of Node::remove's step 14 lambda.
+struct DomNodeRemoveDescendantSteps:
+    var parent: DomNode*
+    var parent_root: DomNode*
+    var is_parent_connected: bool
+
+## Node::remove's step 14 lambda, run for each shadow-including descendant of the removed node.
+func dom_node_remove_descendant_steps(context: void*?, descendant: DomNode*) -> TraversalDecision:
+    let captures = (DomNodeRemoveDescendantSteps*)(context else trap("no captures"))
+
+    # 1. Run the removing steps with descendant, false, and parent.
+    dom_node_removed_from(descendant, DomNodeIsSubtreeRoot.no, captures.parent, captures.parent_root)
+
+    # 2. If descendant is custom and isParentConnected is true, then enqueue a custom element callback reaction
+    #    with descendant, callback name "disconnectedCallback", and « ».
+    if let element = as_if_dom_element(descendant):
+        if dom_element_is_custom(element) and captures.is_parent_connected:
+            var empty_arguments: ak.Vector[JsValue]
+            dom_element_enqueue_a_custom_element_callback_reaction(element, html_custom_element_reaction_names_disconnected_callback, empty_arguments)
+
+    return TraversalDecision.continue_
+
+## Ported from Node.cpp:847 Web::DOM::Node::remove.
+# https://dom.spec.whatwg.org/#concept-node-remove
+pub func dom_node_remove(this: DomNode*, suppress_observers: bool = false):
+    # 1. Let parent be node’s parent
+    # 2. Assert: parent is non-null.
+    let parent = tree_node_parent(this) else trap("VERIFY: parent")
+
+    # 3. Run the live range pre-remove steps, given node.
+    dom_node_live_range_pre_remove(this)
+
+    # 4. For each NodeIterator object iterator whose root’s node document is node’s node document:
+    #    run the NodeIterator pre-removing steps given node and iterator.
+    dom_document_for_each_node_iterator(dom_node_document(this), ak.Function1[DomNodeIterator*, unit](call = dom_node_run_node_iterator_pre_removing_steps, context = this))
+
+    # 5. Let oldPreviousSibling be node’s previous sibling.
+    let old_previous_sibling = tree_node_previous_sibling(this)
+
+    # 6. Let oldNextSibling be node’s next sibling.
+    let old_next_sibling = tree_node_next_sibling(this)
+
+    # AD-HOC: invalidate the ordinal of the first list_item of the list_owner of the removed node, if any.
+    if dom_node_is_element(this):
+        let this_element = (DomElement*)this
+        dom_element_maybe_invalidate_ordinals_for_list_owner(this_element, this_element)
+
+    if dom_node_is_connected(this):
+        # Since the tree structure is about to change, we need to invalidate both style and layout.
+        # In the future, we should find a way to only invalidate the parts that actually need it.
+        dom_node_invalidate_style(this, DomStyleInvalidationReason.node_remove)
+
+        # NOTE: If we didn’t have a layout node before, rebuilding the layout tree isn’t gonna give us one
+        #       after we’ve been removed from the DOM.
+        # NB: Called during DOM removal, layout is not up to date.
+        if dom_node_unsafe_layout_node(this) != none:
+            dom_node_set_needs_layout_tree_update(parent, true, DomSetNeedsLayoutTreeUpdateReason.node_remove)
+
+    # 7. Remove node from its parent’s children.
+    dom_node_remove_child_impl(parent, this)
+
+    # 8. If node is assigned, then run assign slottables for node’s assigned slot.
+    if let assigned_slot = dom_assigned_slot_for_node(this):
+        dom_assign_slottables(assigned_slot)
+
+    let parent_root = tree_node_root(parent)
+
+    # 9. If parent’s root is a shadow root, and parent is a slot whose assigned nodes is the empty list, then run
+    #    signal a slot change for parent.
+    if let parent_slot_element = as_if_html_slot_element(parent):
+        if dom_node_is_shadow_root(parent_root):
+            if dom_slot_assigned_nodes_internal(&parent_slot_element.slot).length == 0:
+                dom_signal_a_slot_change(parent_slot_element)
+
+    # 10. If node has an inclusive descendant that is a slot, then:
+    var has_descendent_slot = false
+    let shadow_root = as_if_dom_shadow_root(parent_root)
+
+    # for_each_in_inclusive_subtree_of_type<HTML::HTMLSlotElement>
+    for inclusive_descendant in dom_node_inclusive_subtree(this):
+        let slot = as_if_html_slot_element(inclusive_descendant) else continue
+        has_descendent_slot = true
+        let root = shadow_root else break
+        # AD-HOC: Unregister slot from the shadow root's registry before assign_slottables_for_a_tree.
+        dom_shadow_root_unregister_slot(root, slot)
+
+    if has_descendent_slot:
+        # 1. Run assign slottables for a tree with parent’s root.
+        dom_assign_slottables_for_a_tree(parent_root)
+
+        # 2. Run assign slottables for a tree with node.
+        dom_assign_slottables_for_a_tree(this)
+
+    # 11. Run the removing steps with node, true, and parent.
+    dom_node_removed_from(this, DomNodeIsSubtreeRoot.yes, parent, parent_root)
+
+    # 12. Let isParentConnected be parent’s connected.
+    let is_parent_connected = dom_node_is_connected(parent)
+
+    # 13. If node is custom and isParentConnected is true, then enqueue a custom element callback reaction with node,
+    #     callback name "disconnectedCallback", and an empty argument list.
+    # Spec Note: It is intentional for now that custom elements do not get parent passed.
+    #            This might change in the future if there is a need.
+    if let element = as_if_dom_element(this):
+        if dom_element_is_custom(element) and is_parent_connected:
+            var empty_arguments: ak.Vector[JsValue]
+            dom_element_enqueue_a_custom_element_callback_reaction(element, html_custom_element_reaction_names_disconnected_callback, empty_arguments)
+
+    # 14. For each shadow-including descendant descendant of node, in shadow-including tree order:
+    var descendant_steps = DomNodeRemoveDescendantSteps(parent = parent, parent_root = parent_root, is_parent_connected = is_parent_connected)
+    discard(dom_node_for_each_shadow_including_descendant(this, ak.Function1[DomNode*, TraversalDecision](call = dom_node_remove_descendant_steps, context = &descendant_steps)))
+
+    # 15. For each inclusive ancestor inclusiveAncestor of parent, and then for each registered of inclusiveAncestor’s
+    #     registered observer list, if registered’s options["subtree"] is true, then append a new transient registered
+    #     observer whose observer is registered’s observer, options is registered’s options, and source is registered
+    #     to node’s registered observer list.
+    var inclusive_ancestor: DomNode*? = parent
+    while let ancestor = inclusive_ancestor:
+        inclusive_ancestor = tree_node_parent(ancestor)
+        let registered_observer_list = ancestor.m_registered_observer_list else continue
+        for registered in ak.vector_span(registered_observer_list):
+            if dom_registered_observer_options(registered).subtree:
+                let transient_observer = dom_transient_registered_observer_create(dom_registered_observer_observer(registered), dom_registered_observer_options(registered), registered)
+                dom_node_add_registered_observer(this, transient_observer.dom_registered_observer())
+
+    # 16. If suppressObservers is false, then queue a tree mutation record for parent with « », « node »,
+    #     oldPreviousSibling, and oldNextSibling.
+    if not suppress_observers:
+        dom_node_queue_tree_mutation_record(parent, dom_node_no_nodes(), dom_node_one_node(this), old_previous_sibling, old_next_sibling)
+
+    # 17. Run the children changed steps for parent.
+    let metadata = DomNodeChildrenChangedMetadata(type_ = DomNodeChildrenChangedMetadataType.removal, node = this)
+    dom_node_children_changed(parent, metadata)
+
+    dom_document_bump_dom_tree_version(dom_node_document(this))
