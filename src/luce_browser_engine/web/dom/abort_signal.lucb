@@ -1,0 +1,285 @@
+#==============================================================================================
+#
+#   abort_signal - DOM::AbortSignal: abort reasons, abort algorithms and dependent signals
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibWeb/DOM/AbortSignal.cpp (lines 1-232) and AbortSignal.h (lines
+#       1-90): adding and removing abort algorithms, signalling abort (running the abort steps
+#       and firing `abort`), the static abort()/timeout()/any() and creating a dependent abort
+#       signal. An abort reason is a JS value; a DOMException reason is the exception as a JS
+#       object value (DESIGN.md §3.6).
+#
+#       Copyright (c) 2021, Luke Wilde <lukew@serenityos.org>
+#       Copyright (c) 2024, Tim Ledbetter <timledbetter@gmail.com>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Construction ============================================================================
+
+## Ported from Libraries/LibWeb/DOM/AbortSignal.cpp:21 Web::DOM::AbortSignal::construct_impl.
+pub func dom_abort_signal_construct_impl(realm: Realm*) -> DomAbortSignal*!:
+    return realm_create_dom_abort_signal(realm, realm)
+
+## Ported from Libraries/LibWeb/DOM/AbortSignal.cpp:26 Web::DOM::AbortSignal::AbortSignal.
+pub func dom_abort_signal_construct(this: DomAbortSignal*, realm: Realm*):
+    dom_event_target_construct(this.dom_event_target(), realm)
+    dom_abort_signal_init_fields(this)
+
+## Ported from Libraries/LibWeb/DOM/AbortSignal.cpp:31 Web::DOM::AbortSignal::initialize (override).
+pub func dom_abort_signal_initialize_impl(base: JsCell*, realm: Realm*):
+    web_set_prototype_for_interface(base, realm, BindInterfaceName.abort_signal)
+    dom_event_target_initialize_impl(base, realm)
+
+# mark: Abort algorithms ========================================================================
+
+## Ported from Libraries/LibWeb/DOM/AbortSignal.cpp:38 Web::DOM::AbortSignal::add_abort_algorithm.
+## https://dom.spec.whatwg.org/#abortsignal-add
+pub func dom_abort_signal_add_abort_algorithm(this: DomAbortSignal*, abort_algorithm: ak.Function0[unit]) -> u64?:
+    # 1. If signal is aborted, then return.
+    if dom_abort_signal_aborted(this):
+        return none
+
+    # 2. Append algorithm to signal’s abort algorithms.
+    this.m_next_abort_algorithm_id += 1
+    let function = gc.create_function0(vm_heap(js_cell_vm(this.js_cell())), abort_algorithm)
+    discard(ak.ordered_hash_map_set(&this.m_abort_algorithms, this.m_next_abort_algorithm_id, function))
+    return this.m_next_abort_algorithm_id
+
+## Ported from Libraries/LibWeb/DOM/AbortSignal.cpp:50 Web::DOM::AbortSignal::remove_abort_algorithm.
+## https://dom.spec.whatwg.org/#abortsignal-remove
+pub func dom_abort_signal_remove_abort_algorithm(this: DomAbortSignal*, id: u64):
+    # To remove an algorithm algorithm from an AbortSignal signal, remove algorithm from signal’s abort algorithms.
+    discard(ak.ordered_hash_map_remove_k(&this.m_abort_algorithms, id))
+
+## Ported from Libraries/LibWeb/DOM/AbortSignal.h:36 Web::DOM::AbortSignal::aborted.
+## https://dom.spec.whatwg.org/#dom-abortsignal-aborted
+## An AbortSignal object is aborted when its abort reason is not undefined.
+pub func dom_abort_signal_aborted(this: DomAbortSignal*) -> bool:
+    return not js_value_is_undefined(this.m_abort_reason)
+
+## Ported from Libraries/LibWeb/DOM/AbortSignal.cpp:57 Web::DOM::AbortSignal::signal_abort.
+## https://dom.spec.whatwg.org/#abortsignal-signal-abort
+pub func dom_abort_signal_signal_abort(this: DomAbortSignal*, reason: JsValue):
+    # 1. If signal is aborted, then return.
+    if dom_abort_signal_aborted(this):
+        return
+
+    # 2. Set signal’s abort reason to reason if it is given; otherwise to a new "AbortError" DOMException.
+    if not js_value_is_undefined(reason):
+        this.m_abort_reason = reason
+    else:
+        let realm = bind_platform_object_realm(this.bind_platform_object())
+        this.m_abort_reason = js_value_from_object((JsObject*)idl_abort_error_create(realm, ak.utf16_string_from_str("Aborted without reason")))
+
+    # 3. Let dependentSignalsToAbort be a new list.
+    var dependent_signals_to_abort: ak.Vector[DomAbortSignal*?]
+
+    # 4. For each dependentSignal of signal’s dependent signals:
+    for entry in ak.vector_span(&this.m_dependent_signals):
+        let dependent_signal = entry else trap("AbortSignal: a null dependent signal")
+        # 1. If dependentSignal is not aborted, then:
+        if not dom_abort_signal_aborted(dependent_signal):
+            # 1. Set dependentSignal’s abort reason to signal’s abort reason.
+            dom_abort_signal_set_reason(dependent_signal, this.m_abort_reason)
+
+            # 2. Append dependentSignal to dependentSignalsToAbort.
+            ak.vector_append_t(&dependent_signals_to_abort, dependent_signal)
+
+    # 5. Run the abort steps for signal.
+    dom_abort_signal_run_the_abort_steps(this)
+
+    # 6. For each dependentSignal of dependentSignalsToAbort, run the abort steps for dependentSignal.
+    for entry in ak.vector_span(&dependent_signals_to_abort):
+        dom_abort_signal_run_the_abort_steps(entry else trap("AbortSignal: a null dependent signal"))
+
+## The `run_the_abort_steps` lambda of AbortSignal::signal_abort (AbortSignal.cpp:85).
+## https://dom.spec.whatwg.org/#run-the-abort-steps
+func dom_abort_signal_run_the_abort_steps(signal: DomAbortSignal*):
+    # 1. For each algorithm in signal’s abort algorithms: run algorithm.
+    for algorithm in ak.ordered_hash_map_begin(&signal.m_abort_algorithms):
+        ak.function0_call(&algorithm.value.function)
+
+    # 2. Empty signal’s abort algorithms.
+    ak.ordered_hash_map_clear(&signal.m_abort_algorithms)
+
+    # 3. Fire an event named abort at signal.
+    let abort_event = dom_event_create(bind_platform_object_realm(signal.bind_platform_object()), html_event_names_abort)
+    dom_event_set_is_trusted(abort_event, true)
+    discard(dom_event_target_dispatch_event(signal.dom_event_target(), abort_event))
+
+# mark: Attributes ==============================================================================
+
+## Ported from Libraries/LibWeb/DOM/AbortSignal.cpp:107 Web::DOM::AbortSignal::set_onabort.
+pub func dom_abort_signal_set_onabort(this: DomAbortSignal*, event_handler: IdlCallbackType*?):
+    dom_event_target_set_event_handler_attribute(this.dom_event_target(), html_event_names_abort, event_handler)
+
+## Ported from Libraries/LibWeb/DOM/AbortSignal.cpp:112 Web::DOM::AbortSignal::onabort.
+pub func dom_abort_signal_onabort(this: DomAbortSignal*) -> IdlCallbackType*?:
+    return dom_event_target_event_handler_attribute(this.dom_event_target(), html_event_names_abort)
+
+## Ported from Libraries/LibWeb/DOM/AbortSignal.h:44 Web::DOM::AbortSignal::reason.
+## https://dom.spec.whatwg.org/#dom-abortsignal-reason
+pub func dom_abort_signal_reason(this: DomAbortSignal*) -> JsValue:
+    return this.m_abort_reason
+
+## Ported from Libraries/LibWeb/DOM/AbortSignal.h:45 Web::DOM::AbortSignal::set_reason.
+pub func dom_abort_signal_set_reason(this: DomAbortSignal*, reason: JsValue):
+    this.m_abort_reason = reason
+
+## Ported from Libraries/LibWeb/DOM/AbortSignal.cpp:118 Web::DOM::AbortSignal::throw_if_aborted.
+## https://dom.spec.whatwg.org/#dom-abortsignal-throwifaborted
+pub func dom_abort_signal_throw_if_aborted(this: DomAbortSignal*) -> !:
+    # The throwIfAborted() method steps are to throw this’s abort reason, if this is aborted.
+    if not dom_abort_signal_aborted(this):
+        return
+
+    # return JS::throw_completion(m_abort_reason); (DESIGN.md §2.10: the completion is the VM's.)
+    vm_set_pending_exception(js_cell_vm(this.js_cell()), .js_completion(js_throw_completion(this.m_abort_reason)))
+    error(js_exception, "")
+
+## Ported from Libraries/LibWeb/DOM/AbortSignal.cpp:127 Web::DOM::AbortSignal::visit_edges (override).
+pub func dom_abort_signal_visit_edges_impl(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (DomAbortSignal*)base
+    dom_event_target_visit_edges_impl(base, visitor)
+    js_visit_value(visitor, this.m_abort_reason)
+    gc.cell_visitor_visit_opaque_3(visitor, &this.m_abort_algorithms)
+    gc.cell_visitor_visit_vector_nullable(visitor, &this.m_source_signals)
+    gc.cell_visitor_visit_vector_nullable(visitor, &this.m_dependent_signals)
+
+# mark: Static methods ==========================================================================
+
+## Ported from Libraries/LibWeb/DOM/AbortSignal.cpp:137 Web::DOM::AbortSignal::abort.
+## https://dom.spec.whatwg.org/#dom-abortsignal-abort
+pub func dom_abort_signal_abort(vm: Vm*, reason: JsValue) -> DomAbortSignal*!:
+    let realm = vm_current_realm(vm) else trap("AbortSignal::abort: no current realm")
+
+    # 1. Let signal be a new AbortSignal object.
+    let signal = try dom_abort_signal_construct_impl(realm)
+
+    # 2. Set signal’s abort reason to reason if it is given; otherwise to a new "AbortError" DOMException.
+    var abort_reason = reason
+    if js_value_is_undefined(abort_reason):
+        abort_reason = js_value_from_object((JsObject*)idl_abort_error_create(realm, ak.utf16_string_from_str("Aborted without reason")))
+
+    dom_abort_signal_set_reason(signal, abort_reason)
+
+    # 3. Return signal.
+    return signal
+
+## The captures of AbortSignal::timeout's queued task (AbortSignal.cpp:166).
+struct DomAbortSignalTimeoutTask:
+    var realm: Realm*
+    var signal: DomAbortSignal*
+
+    ## 1. Queue a global task on the timer task source given global to signal abort given signal and a new "TimeoutError" DOMException.
+    static func call(context: void*?):
+        let captures = (DomAbortSignalTimeoutTask*)(context else trap("AbortSignal::timeout: no captures"))
+        let reason = idl_timeout_error_create(captures.realm, ak.utf16_string_from_str("Signal timed out"))
+        dom_abort_signal_signal_abort(captures.signal, js_value_from_object((JsObject*)reason))
+
+## The captures of AbortSignal::timeout's completion step (AbortSignal.cpp:164).
+struct DomAbortSignalTimeoutStep:
+    var realm: Realm*
+    var global: JsObject*
+    var signal: DomAbortSignal*
+
+    static func call(context: void*?):
+        let captures = (DomAbortSignalTimeoutStep*)(context else trap("AbortSignal::timeout: no captures"))
+        # 1. Queue a global task on the timer task source given global to signal abort given signal and a new "TimeoutError" DOMException.
+        let task = new DomAbortSignalTimeoutTask(realm = captures.realm, signal = captures.signal) else trap("out of memory")
+        let steps = gc.create_function0(realm_heap(captures.realm), ak.Function0[unit](call = DomAbortSignalTimeoutTask.call, context = task))
+        discard(html_queue_global_task(HtmlTaskSource.timer_task, captures.global, steps))
+
+## Ported from Libraries/LibWeb/DOM/AbortSignal.cpp:153 Web::DOM::AbortSignal::timeout.
+## https://dom.spec.whatwg.org/#dom-abortsignal-timeout
+pub func dom_abort_signal_timeout(vm: Vm*, milliseconds: u64) -> DomAbortSignal*!:
+    let realm = vm_current_realm(vm) else trap("AbortSignal::timeout: no current realm")
+
+    # 1. Let signal be a new AbortSignal object.
+    let signal = try dom_abort_signal_construct_impl(realm)
+
+    # 2. Let global be signal’s relevant global object.
+    let global = html_relevant_global_object((JsObject*)signal)
+    let window_or_worker = as_if_window_or_worker_global_scope_mixin((gc.Cell*)global) else trap("as<HTML::WindowOrWorkerGlobalScopeMixin> failed")
+
+    # 3. Run steps after a timeout given global, "AbortSignal-timeout", milliseconds, and the following step:
+    # (C++ passes the u64 to an i32 parameter, which truncates.)
+    let step = new DomAbortSignalTimeoutStep(realm = realm, global = global, signal = signal) else trap("out of memory")
+    html_window_or_worker_global_scope_mixin_run_steps_after_a_timeout(window_or_worker, (i32)milliseconds, ak.Function0[unit](call = DomAbortSignalTimeoutStep.call, context = step))
+
+    # 4. Return signal.
+    return signal
+
+## Ported from Libraries/LibWeb/DOM/AbortSignal.cpp:178 Web::DOM::AbortSignal::any.
+## https://dom.spec.whatwg.org/#dom-abortsignal-any
+pub func dom_abort_signal_any(vm: Vm*, signals: ak.Vector[DomAbortSignal*?]) -> DomAbortSignal*!:
+    # The static any(signals) method steps are to return the result of creating a dependent abort signal from signals using AbortSignal and the current realm.
+    let realm = vm_current_realm(vm) else trap("AbortSignal::any: no current realm")
+    return try dom_abort_signal_create_dependent_abort_signal(realm, signals)
+
+## Ported from Libraries/LibWeb/DOM/AbortSignal.cpp:185 Web::DOM::AbortSignal::create_dependent_abort_signal.
+## https://dom.spec.whatwg.org/#create-a-dependent-abort-signal
+pub func dom_abort_signal_create_dependent_abort_signal(realm: Realm*, signals: ak.Vector[DomAbortSignal*?]) -> DomAbortSignal*!:
+    # 1. Let resultSignal be a new object implementing signalInterface using realm.
+    let result_signal = try dom_abort_signal_construct_impl(realm)
+
+    # 2. For each signal of signals: if signal is aborted, then set resultSignal’s abort reason to signal’s abort reason and return resultSignal.
+    for entry in ak.vector_span_const(&signals):
+        let signal = entry else trap("AbortSignal: a null signal")
+        if dom_abort_signal_aborted(signal):
+            dom_abort_signal_set_reason(result_signal, dom_abort_signal_reason(signal))
+            return result_signal
+
+    # 3. Set resultSignal’s dependent to true.
+    dom_abort_signal_set_dependent(result_signal, true)
+
+    # 4. For each signal of signals:
+    for entry in ak.vector_span_const(&signals):
+        let signal = entry else trap("AbortSignal: a null signal")
+        # 1. If signal’s dependent is false, then:
+        if not dom_abort_signal_dependent(signal):
+            # 1. Append signal to resultSignal’s source signals.
+            dom_abort_signal_append_source_signal(result_signal, signal)
+
+            # 2. Append resultSignal to signal’s dependent signals.
+            dom_abort_signal_append_dependent_signal(signal, result_signal)
+        # 2. Otherwise, for each sourceSignal of signal’s source signals:
+        else:
+            var source_signals = dom_abort_signal_source_signals(signal)
+            for source_entry in ak.vector_span(&source_signals):
+                # 1. Assert: sourceSignal is not aborted and not dependent.
+                let source_signal = source_entry else trap("VERIFY: source_signal")
+                assert(not dom_abort_signal_aborted(source_signal))
+                assert(not dom_abort_signal_dependent(source_signal))
+
+                # 2. Append sourceSignal to resultSignal’s source signals.
+                dom_abort_signal_append_source_signal(result_signal, source_signal)
+
+                # 3. Append resultSignal to sourceSignal’s dependent signals.
+                dom_abort_signal_append_dependent_signal(source_signal, result_signal)
+
+    # 5. Return resultSignal
+    return result_signal
+
+# mark: Dependent signals (AbortSignal.h) =======================================================
+
+## Ported from Libraries/LibWeb/DOM/AbortSignal.h:61 Web::DOM::AbortSignal::dependent.
+pub func dom_abort_signal_dependent(this: DomAbortSignal*) -> bool:
+    return this.m_dependent
+
+## Ported from Libraries/LibWeb/DOM/AbortSignal.h:62 Web::DOM::AbortSignal::set_dependent.
+pub func dom_abort_signal_set_dependent(this: DomAbortSignal*, dependent: bool):
+    this.m_dependent = dependent
+
+## Ported from Libraries/LibWeb/DOM/AbortSignal.h:64 Web::DOM::AbortSignal::source_signals: a copy.
+pub func dom_abort_signal_source_signals(this: DomAbortSignal*) -> ak.Vector[DomAbortSignal*?]:
+    return ak.vector_clone(&this.m_source_signals)
+
+## Ported from Libraries/LibWeb/DOM/AbortSignal.h:66 Web::DOM::AbortSignal::append_source_signal.
+pub func dom_abort_signal_append_source_signal(this: DomAbortSignal*, source_signal: DomAbortSignal*?):
+    ak.vector_append_t(&this.m_source_signals, source_signal)
+
+## Ported from Libraries/LibWeb/DOM/AbortSignal.h:67 Web::DOM::AbortSignal::append_dependent_signal.
+pub func dom_abort_signal_append_dependent_signal(this: DomAbortSignal*, dependent_signal: DomAbortSignal*?):
+    ak.vector_append_t(&this.m_dependent_signals, dependent_signal)
