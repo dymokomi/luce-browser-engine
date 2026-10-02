@@ -1,0 +1,236 @@
+#==============================================================================================
+#
+#   mutation_observer - DOM::MutationObserver, RegisteredObserver, TransientRegisteredObserver
+#
+#   DESCRIPTION:
+#       Port of LibWeb/DOM/MutationObserver.cpp (lines 1-193) and the inline functions of
+#       MutationObserver.h: observe() with its option checks, disconnect(), takeRecords(), and
+#       the registered observers nodes keep in their registered observer lists.
+#
+#==============================================================================================
+
+# mark: MutationObserver ========================================================================
+
+## Ported from MutationObserver.cpp:20 Web::DOM::MutationObserver::construct_impl.
+pub func dom_mutation_observer_construct_impl(realm: Realm*, callback: IdlCallbackType*?) -> DomMutationObserver*!:
+    return realm_create_dom_mutation_observer(realm, realm, callback)
+
+## Ported from MutationObserver.cpp:26 Web::DOM::MutationObserver::MutationObserver.
+# https://dom.spec.whatwg.org/#dom-mutationobserver-mutationobserver
+pub func dom_mutation_observer_construct(this: DomMutationObserver*, realm: Realm*, callback: IdlCallbackType*?):
+    bind_platform_object_construct_realm(this.bind_platform_object(), realm)
+    # The new MutationObserver(callback) constructor steps are to set this’s callback to callback.
+    this.m_callback = callback
+
+## Ported from MutationObserver.cpp:35 Web::DOM::MutationObserver::initialize (override).
+pub func dom_mutation_observer_initialize_impl(base: JsCell*, realm: Realm*):
+    web_set_prototype_for_interface(base, realm, BindInterfaceName.mutation_observer)
+    # Base::initialize(realm): PlatformObject inherits JS::Object's.
+    js_cell_initialize_impl(base, realm)
+
+## Ported from MutationObserver.cpp:41 Web::DOM::MutationObserver::visit_edges (override).
+pub func dom_mutation_observer_visit_edges_impl(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (DomMutationObserver*)base
+    bind_platform_object_visit_edges_impl(base, visitor)
+    gc.cell_visitor_visit_t(visitor, this.m_callback)
+    gc.cell_visitor_visit_vector(visitor, &this.m_record_queue)
+
+## The captures of observe's remove_all_matching predicate.
+struct DomMutationObserverObserveIsTransientOf:
+    var registered_observer: DomRegisteredObserver*
+
+## observe's predicate: the transient registered observers whose source is `registered_observer`.
+func dom_mutation_observer_observe_is_transient_of(context: void*?, observer: const (DomRegisteredObserver*)*) -> bool:
+    let captures = (DomMutationObserverObserveIsTransientOf*)(context else trap("no captures"))
+    let transient = as_if_dom_transient_registered_observer(*observer) else return false
+    return dom_transient_registered_observer_source(transient) == captures.registered_observer
+
+## Ported from MutationObserver.cpp:49 Web::DOM::MutationObserver::observe.
+# https://dom.spec.whatwg.org/#dom-mutationobserver-observe
+pub func dom_mutation_observer_observe(this: DomMutationObserver*, target: DomNode*, options_argument: DomMutationObserverInit) -> !:
+    var options = options_argument
+
+    # 1. If either options["attributeOldValue"] or options["attributeFilter"] exists, and options["attributes"] does not exist, then set options["attributes"] to true.
+    if (options.attribute_old_value != none or options.attribute_filter != none) and options.attributes == none:
+        options.attributes = true
+
+    # 2. If options["characterDataOldValue"] exists and options["characterData"] does not exist, then set options["characterData"] to true.
+    if options.character_data_old_value != none and options.character_data == none:
+        options.character_data = true
+
+    # 3. If none of options["childList"], options["attributes"], and options["characterData"] is true, then throw a TypeError.
+    if not options.child_list and (options.attributes == none or options.attributes == false) and (options.character_data == none or options.character_data == false):
+        try idl_throw_simple(IdlSimpleExceptionType.type_error, .string_view(ak.sv("Options must have one of childList, attributes or characterData set to true.")))
+
+    # 4. If options["attributeOldValue"] is true and options["attributes"] is false, then throw a TypeError.
+    # NOTE: If attributeOldValue is present, attributes will be present because of step 1.
+    if options.attribute_old_value == true and not (options.attributes else trap("VERIFY: attributes")):
+        try idl_throw_simple(IdlSimpleExceptionType.type_error, .string_view(ak.sv("attributes must be true if attributeOldValue is true.")))
+
+    # 5. If options["attributeFilter"] is present and options["attributes"] is false, then throw a TypeError.
+    # NOTE: If attributeFilter is present, attributes will be present because of step 1.
+    if options.attribute_filter != none and not (options.attributes else trap("VERIFY: attributes")):
+        try idl_throw_simple(IdlSimpleExceptionType.type_error, .string_view(ak.sv("attributes must be true if attributeFilter is present.")))
+
+    # 6. If options["characterDataOldValue"] is true and options["characterData"] is false, then throw a TypeError.
+    # NOTE: If characterDataOldValue is present, characterData will be present because of step 2.
+    if options.character_data_old_value == true and not (options.character_data else trap("VERIFY: characterData")):
+        try idl_throw_simple(IdlSimpleExceptionType.type_error, .string_view(ak.sv("characterData must be true if characterDataOldValue is true.")))
+
+    # 7. For each registered of target’s registered observer list, if registered’s observer is this:
+    var updated_existing_observer = false
+    if let target_observers = dom_node_registered_observer_list_const(target):
+        for registered_observer in ak.vector_span(target_observers):
+            if dom_registered_observer_observer(registered_observer) != this:
+                continue
+
+            updated_existing_observer = true
+
+            # 1. For each node of this’s node list, remove all transient registered observers whose source is registered from node’s registered observer list.
+            for weak_node in ak.vector_span(&this.m_node_list):
+                # FIXME: Is this correct?
+                let node = gc.weak_ptr(&weak_node) else continue
+
+                if let node_observers = dom_node_registered_observer_list_const(node):
+                    var captures = DomMutationObserverObserveIsTransientOf(registered_observer = registered_observer)
+                    let predicate = ak.Function1[const (DomRegisteredObserver*)*, bool](call = dom_mutation_observer_observe_is_transient_of, context = &captures)
+                    discard(ak.vector_remove_all_matching(node_observers, predicate))
+
+            # 2. Set registered’s options to options.
+            dom_registered_observer_set_options(registered_observer, options)
+            break
+
+    # 8. Otherwise:
+    if not updated_existing_observer:
+        # 1. Append a new registered observer whose observer is this and options is options to target’s registered observer list.
+        let new_registered_observer = dom_registered_observer_create(this, options)
+        dom_node_add_registered_observer(target, new_registered_observer)
+
+        # 2. Append a weak reference to target to this’s node list.
+        ak.vector_append_t(&this.m_node_list, gc.make_weak[DomNode](target))
+
+## disconnect's predicate: the registered observers whose observer is this.
+func dom_mutation_observer_disconnect_is_observer(context: void*?, registered_observer: const (DomRegisteredObserver*)*) -> bool:
+    let this = (DomMutationObserver*)(context else trap("no observer"))
+    return dom_registered_observer_observer(*registered_observer) == this
+
+## Ported from MutationObserver.cpp:121 Web::DOM::MutationObserver::disconnect.
+# https://dom.spec.whatwg.org/#dom-mutationobserver-disconnect
+pub func dom_mutation_observer_disconnect(this: DomMutationObserver*):
+    # 1. For each node of this’s node list, remove any registered observer from node’s registered observer list for which this is the observer.
+    for weak_node in ak.vector_span(&this.m_node_list):
+        # FIXME: Is this correct?
+        let node = gc.weak_ptr(&weak_node) else continue
+
+        if let node_observers = dom_node_registered_observer_list_const(node):
+            let predicate = ak.Function1[const (DomRegisteredObserver*)*, bool](call = dom_mutation_observer_disconnect_is_observer, context = this)
+            discard(ak.vector_remove_all_matching(node_observers, predicate))
+
+    # 2. Empty this’s record queue.
+    ak.vector_clear(&this.m_record_queue)
+
+## Ported from MutationObserver.cpp:141 Web::DOM::MutationObserver::take_records.
+# https://dom.spec.whatwg.org/#dom-mutationobserver-takerecords
+pub func dom_mutation_observer_take_records(this: DomMutationObserver*) -> ak.Vector[DomMutationRecord*?]:
+    # 1. Let records be a clone of this’s record queue.
+    var records: ak.Vector[DomMutationRecord*?]
+    for record in ak.vector_span(&this.m_record_queue):
+        ak.vector_append_t(&records, record)
+
+    # 2. Empty this’s record queue.
+    ak.vector_clear(&this.m_record_queue)
+
+    # 3. Return records.
+    return records
+
+# mark: RegisteredObserver ======================================================================
+
+## `heap.allocate<RegisteredObserver>(observer, options)`.
+func heap_allocate_dom_registered_observer(heap: gc.Heap*, observer: DomMutationObserver*, options: DomMutationObserverInit) -> DomRegisteredObserver*:
+    let this = (DomRegisteredObserver*)web_heap_allocate_cell(heap, &dom_registered_observer_class)
+    gc.heap_defer_gc(heap)
+    dom_registered_observer_construct(this, observer, options)
+    gc.heap_undefer_gc(heap)
+    return this
+
+## Ported from MutationObserver.cpp:155 Web::DOM::RegisteredObserver::create.
+pub func dom_registered_observer_create(observer: DomMutationObserver*, options: DomMutationObserverInit) -> DomRegisteredObserver*:
+    return heap_allocate_dom_registered_observer(gc.cell_heap(observer.cell()), observer, options)
+
+## Ported from MutationObserver.cpp:160 Web::DOM::RegisteredObserver::RegisteredObserver.
+pub func dom_registered_observer_construct(this: DomRegisteredObserver*, observer: DomMutationObserver*, options: DomMutationObserverInit):
+    this.m_observer = observer
+    this.m_options = options
+
+## Ported from MutationObserver.cpp:168 Web::DOM::RegisteredObserver::visit_edges (override).
+pub func dom_registered_observer_visit_edges_impl(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (DomRegisteredObserver*)base
+    # Base::visit_edges(visitor): JS::Cell's visits nothing.
+    gc.cell_visitor_visit_t_2(visitor, this.m_observer)
+
+# mark: TransientRegisteredObserver =============================================================
+
+## `heap.allocate<TransientRegisteredObserver>(observer, options, source)`.
+func heap_allocate_dom_transient_registered_observer(heap: gc.Heap*, observer: DomMutationObserver*, options: DomMutationObserverInit, source: DomRegisteredObserver*) -> DomTransientRegisteredObserver*:
+    let this = (DomTransientRegisteredObserver*)web_heap_allocate_cell(heap, &dom_transient_registered_observer_class)
+    gc.heap_defer_gc(heap)
+    dom_transient_registered_observer_construct(this, observer, options, source)
+    gc.heap_undefer_gc(heap)
+    return this
+
+## Ported from MutationObserver.cpp:174 Web::DOM::TransientRegisteredObserver::create.
+pub func dom_transient_registered_observer_create(observer: DomMutationObserver*, options: DomMutationObserverInit, source: DomRegisteredObserver*) -> DomTransientRegisteredObserver*:
+    return heap_allocate_dom_transient_registered_observer(gc.cell_heap(observer.cell()), observer, options, source)
+
+## Ported from MutationObserver.cpp:179 Web::DOM::TransientRegisteredObserver::TransientRegisteredObserver.
+pub func dom_transient_registered_observer_construct(this: DomTransientRegisteredObserver*, observer: DomMutationObserver*, options: DomMutationObserverInit, source: DomRegisteredObserver*):
+    dom_registered_observer_construct(this.dom_registered_observer(), observer, options)
+    this.m_source = source
+
+## Ported from MutationObserver.cpp:187 Web::DOM::TransientRegisteredObserver::visit_edges (override).
+pub func dom_transient_registered_observer_visit_edges_impl(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (DomTransientRegisteredObserver*)base
+    dom_registered_observer_visit_edges_impl(base, visitor)
+    gc.cell_visitor_visit_t_2(visitor, this.m_source)
+
+# mark: MutationObserver.h ======================================================================
+
+## Ported from MutationObserver.h:41 Web::DOM::MutationObserver::node_list.
+pub func dom_mutation_observer_node_list(this: DomMutationObserver*) -> ak.Vector[gc.Weak[DomNode]]*:
+    return &this.m_node_list
+
+## Ported from MutationObserver.h:42 Web::DOM::MutationObserver::node_list.
+pub func dom_mutation_observer_node_list_const(this: DomMutationObserver*) -> ak.Vector[gc.Weak[DomNode]]:
+    return this.m_node_list
+
+## Ported from MutationObserver.h:44 Web::DOM::MutationObserver::callback.
+pub func dom_mutation_observer_callback(this: DomMutationObserver*) -> IdlCallbackType*:
+    return this.m_callback else trap("VERIFY: MutationObserver callback")
+
+## Ported from MutationObserver.h:46 Web::DOM::MutationObserver::enqueue_record.
+pub func dom_mutation_observer_enqueue_record(this: DomMutationObserver*, mutation_record: DomMutationRecord*):
+    ak.vector_append_t(&this.m_record_queue, mutation_record)
+
+## Ported from MutationObserver.h:77 Web::DOM::RegisteredObserver::is_transient (virtual).
+pub func dom_registered_observer_is_transient_impl(this: DomRegisteredObserver*) -> bool:
+    return false
+
+## Ported from MutationObserver.h:79 Web::DOM::RegisteredObserver::observer.
+pub func dom_registered_observer_observer(this: DomRegisteredObserver*) -> DomMutationObserver*:
+    return this.m_observer
+
+## Ported from MutationObserver.h:81 Web::DOM::RegisteredObserver::options.
+pub func dom_registered_observer_options(this: DomRegisteredObserver*) -> DomMutationObserverInit:
+    return this.m_options
+
+## Ported from MutationObserver.h:82 Web::DOM::RegisteredObserver::set_options.
+pub func dom_registered_observer_set_options(this: DomRegisteredObserver*, options: DomMutationObserverInit):
+    this.m_options = options
+
+## Ported from MutationObserver.h:106 Web::DOM::TransientRegisteredObserver::source.
+pub func dom_transient_registered_observer_source(this: DomTransientRegisteredObserver*) -> DomRegisteredObserver*:
+    return this.m_source
+
+## Ported from MutationObserver.h:108 Web::DOM::TransientRegisteredObserver::is_transient (override).
+pub func dom_transient_registered_observer_is_transient_impl(base: DomRegisteredObserver*) -> bool:
+    return true
