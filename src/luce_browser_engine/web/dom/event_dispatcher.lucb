@@ -1,0 +1,416 @@
+#==============================================================================================
+#
+#   event_dispatcher - DOM::EventDispatcher: the event dispatch algorithm
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibWeb/DOM/EventDispatcher.cpp (lines 1-443) and EventDispatcher.h
+#       (lines 1-25): dispatching an event (building the event path through the targets' "get
+#       the parent", retargeting, the capturing and bubbling passes, activation behavior) and
+#       invoking the listeners of one path entry. A listener's callback is called through
+#       WebIDL::call_user_object_operation; native listeners (JS::NativeFunction) run before
+#       phase 3.
+#
+#       Copyright (c) 2020-2022, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2024, Glenn Skrzypczak <glenn.skrzypczak@gmail.com>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Invoking listeners ======================================================================
+
+## Ported from Libraries/LibWeb/DOM/EventDispatcher.cpp:35 Web::DOM::EventDispatcher::inner_invoke.
+## https://dom.spec.whatwg.org/#concept-event-listener-inner-invoke
+func dom_event_dispatcher_inner_invoke(event: DomEvent*, listeners: ak.Vector[DomEventListener*?]*, phase: DomEventPhase, invocation_target_in_shadow_tree: bool, legacy_output_did_listeners_throw: bool*) -> bool:
+    # 1. Let found be false.
+    var found = false
+
+    # 2. For each listener of listeners, whose removed is false:
+    for entry in ak.vector_span(listeners):
+        let listener = entry else trap("inner_invoke: a null listener")
+        if listener.removed:
+            continue
+
+        # 1. If event’s type attribute value is not listener’s type, then continue.
+        if not ak.fly_string_eq_fly_string(&event.m_type, &listener.type_):
+            continue
+
+        # 2. Set found to true.
+        found = true
+
+        # 3. If phase is "capturing" and listener’s capture is false, then continue.
+        if phase == DomEventPhase.capturing_phase and not listener.capture:
+            continue
+
+        # 4. If phase is "bubbling" and listener’s capture is true, then continue.
+        if phase == DomEventPhase.bubbling_phase and listener.capture:
+            continue
+
+        # 5. If listener’s once is true, then remove an event listener given event’s currentTarget attribute value and listener.
+        if listener.once:
+            let current_target = dom_event_current_target(event) else trap("inner_invoke: no current target")
+            dom_event_target_remove_an_event_listener(current_target, listener)
+
+        # 6. Let global be listener callback’s associated Realm’s global object.
+        let callback = dom_idl_event_listener_callback(listener.callback else trap("inner_invoke: a listener without a callback"))
+        let realm = js_object_shape_realm(callback.callback)
+        let global = realm_global_object(realm)
+
+        # 7. Let currentEvent be undefined.
+        var current_event: DomEvent*? = none
+
+        # 8. If global is a Window object, then:
+        if let window = as_if_html_window((gc.Cell*)global):
+            # 1. Set currentEvent to global’s current event.
+            current_event = html_window_current_event(window)
+
+            # 2. If invocationTargetInShadowTree is false, then set global’s current event to event.
+            if not invocation_target_in_shadow_tree:
+                html_window_set_current_event(window, event)
+
+        # 9. If listener’s passive is true, then set event’s in passive listener flag.
+        if listener.passive == true:
+            dom_event_set_in_passive_listener(event, true)
+
+        # FIXME: 10. If global is a Window object, then record timing info for event listener given event and listener.
+
+        # 11. Call a user object’s operation with listener’s callback, "handleEvent", « event », and event’s currentTarget attribute value.
+        # FIXME: These should be wrapped for us in call_user_object_operation, but it currently doesn't do that.
+        let this_value = js_value_from_object((JsObject*?)dom_event_current_target_for_bindings(event))
+        let wrapped_event = js_value_from_object((JsObject*)event)
+        let arguments: JsValue[1] = [wrapped_event]
+        let result = idl_call_user_object_operation(callback, ak.utf16_fly_string_from_str("handleEvent"), this_value, arguments)
+
+        # If this throws an exception, then:
+        if js_completion_is_error(&result):
+            # 1. Report exception for listener’s callback’s corresponding JavaScript object’s associated realm’s global object.
+            let window_or_worker = as_if_window_or_worker_global_scope_mixin((gc.Cell*)global) else trap("as<HTML::WindowOrWorkerGlobalScopeMixin> failed")
+            let error_completion = js_completion_release_error(&result)
+            html_window_or_worker_global_scope_mixin_report_an_exception(window_or_worker, js_completion_value(&error_completion))
+
+            # 2. Set legacyOutputDidListenersThrowFlag if given. (Only used by IndexedDB currently)
+            *legacy_output_did_listeners_throw = true
+
+        # 12. Unset event’s in passive listener flag.
+        dom_event_set_in_passive_listener(event, false)
+
+        # 13. If global is a Window object, then set global’s current event to currentEvent.
+        if let window = as_if_html_window((gc.Cell*)global):
+            html_window_set_current_event(window, current_event)
+
+        # 14. If event’s stop immediate propagation flag is set, then break.
+        if dom_event_should_stop_immediate_propagation(event):
+            break
+
+    # 3. Return found.
+    return found
+
+## Ported from Libraries/LibWeb/DOM/EventDispatcher.cpp:125 Web::DOM::EventDispatcher::invoke.
+## https://dom.spec.whatwg.org/#concept-event-listener-invoke
+func dom_event_dispatcher_invoke(struct_: DomEventPathEntry*, event: DomEvent*, phase: DomEventPhase, legacy_output_did_listeners_throw: bool*):
+    let path = dom_event_path(event)
+    var last_valid_shadow_adjusted_target: DomEventPathEntry*? = none
+    for index in 0..<ak.vector_size(path):
+        let entry = ak.vector_at(path, index)
+        if entry.index <= struct_.index and entry.shadow_adjusted_target != none:
+            last_valid_shadow_adjusted_target = entry
+
+    let last_valid_entry = last_valid_shadow_adjusted_target else trap("VERIFY: last_valid_shadow_adjusted_target.has_value()")
+
+    # 1. Set event’s target to the shadow-adjusted target of the last struct in event’s path,
+    # that is either struct or preceding struct, whose shadow-adjusted target is non-null.
+    dom_event_set_target(event, last_valid_entry.shadow_adjusted_target)
+
+    # 2. Set event’s relatedTarget to struct’s relatedTarget.
+    dom_event_set_related_target(event, struct_.related_target)
+
+    # 3. Set event’s touch target list to struct’s touch target list.
+    dom_event_set_touch_target_list(event, &struct_.touch_target_list)
+
+    # 4. If event’s stop propagation flag is set, then return.
+    if dom_event_should_stop_propagation(event):
+        return
+
+    # 5. Initialize event’s currentTarget attribute to struct’s invocation target.
+    dom_event_set_current_target(event, struct_.invocation_target)
+
+    # 6. Let listeners be a clone of event’s currentTarget attribute value’s event listener list.
+    # NOTE: This avoids event listeners added after this point from being run. Note that removal still has an effect due to the removed field.
+    let current_target = dom_event_current_target(event) else trap("invoke: no current target")
+    var listeners = dom_event_target_event_listener_list(current_target)
+
+    # 7. Let invocationTargetInShadowTree be struct’s invocation-target-in-shadow-tree.
+    let invocation_target_in_shadow_tree = struct_.invocation_target_in_shadow_tree
+
+    # 8. Let found be the result of running inner invoke with event, listeners, phase, invocationTargetInShadowTree, and legacyOutputDidListenersThrowFlag if given.
+    let found = dom_event_dispatcher_inner_invoke(event, &listeners, phase, invocation_target_in_shadow_tree, legacy_output_did_listeners_throw)
+
+    # 9. If found is false and event’s isTrusted attribute is true, then:
+    if not found and dom_event_is_trusted(event):
+        # 1. Let originalEventType be event’s type attribute value.
+        let original_event_type = dom_event_type(event)
+
+        # 2. If event’s type attribute value is a match for any of the strings in the first column in the following table,
+        #    set event’s type attribute value to the string in the second column on the same row as the matching string, and return otherwise.
+        if ak.fly_string_eq_fly_string(&event.m_type, &html_event_names_animationend):
+            dom_event_set_type(event, html_event_names_webkit_animation_end)
+        elif ak.fly_string_eq_fly_string(&event.m_type, &html_event_names_animationiteration):
+            dom_event_set_type(event, html_event_names_webkit_animation_iteration)
+        elif ak.fly_string_eq_fly_string(&event.m_type, &html_event_names_animationstart):
+            dom_event_set_type(event, html_event_names_webkit_animation_start)
+        elif ak.fly_string_eq_fly_string(&event.m_type, &html_event_names_transitionend):
+            dom_event_set_type(event, html_event_names_webkit_transition_end)
+        else:
+            return
+
+        # 3. Inner invoke with event, listeners, phase, invocationTargetInShadowTree, and legacyOutputDidListenersThrowFlag if given.
+        discard(dom_event_dispatcher_inner_invoke(event, &listeners, phase, invocation_target_in_shadow_tree, legacy_output_did_listeners_throw))
+
+        # 4. Set event’s type attribute value to originalEventType.
+        dom_event_set_type(event, original_event_type)
+
+# mark: Dispatching =============================================================================
+
+## Ported from Libraries/LibWeb/DOM/EventDispatcher.cpp:187 Web::DOM::EventDispatcher::dispatch.
+## https://dom.spec.whatwg.org/#concept-event-dispatch
+pub func dom_event_dispatcher_dispatch(target: DomEventTarget*, event: DomEvent*, legacy_target_override: bool = false) -> bool:
+    var legacy_output_did_listeners_throw = false
+    return dom_event_dispatcher_dispatch_bool(target, event, legacy_target_override, &legacy_output_did_listeners_throw)
+
+## Whether `target` is a node whose root is a shadow root (the tests of step 11).
+func dom_event_dispatcher_is_node_in_shadow_tree(target: DomEventTarget*?) -> bool:
+    let node = as_if_dom_node(target else return false) else return false
+    return is_dom_shadow_root(tree_node_root(node))
+
+## Ported from Libraries/LibWeb/DOM/EventDispatcher.cpp:194 Web::DOM::EventDispatcher::dispatch.
+## https://dom.spec.whatwg.org/#concept-event-dispatch
+pub func dom_event_dispatcher_dispatch_bool(target: DomEventTarget*, event: DomEvent*, legacy_target_override: bool, legacy_output_did_listeners_throw: bool*) -> bool:
+    # `target` is reassigned in step 6.9.8.
+    var current_target = target
+
+    # 1. Set event’s dispatch flag.
+    dom_event_set_dispatched(event, true)
+
+    # 2. Let targetOverride be target, if legacy target override flag is not given, and target’s associated Document otherwise. [HTML]
+    # NOTE: legacy target override flag is only used by HTML and only when target is a Window object.
+    var target_override: DomEventTarget*? = none
+    if not legacy_target_override:
+        target_override = current_target
+    else:
+        target_override = html_window_associated_document(as_html_window(current_target)).dom_event_target()
+
+    # 3. Let activationTarget be null.
+    var activation_target: DomEventTarget*? = none
+
+    # 4. Let relatedTarget be the result of retargeting event’s relatedTarget against target.
+    var related_target = dom_retarget(dom_event_related_target(event), current_target)
+
+    # 5. Let clearTargets be false.
+    var clear_targets = false
+
+    # OPTIMIZATION: Only dispatch events if there is at least one listener on the node or its ancestors. Activation
+    #               events are always dispatched. This saves us from going through the path building and dispatch
+    #               phases for events that will be dropped on the floor anyway.
+    # (is<UIEvents::MouseEvent>(event) is Event::fast_is<MouseEvent>, is_mouse_event().)
+    let is_activation_event = dom_event_is_mouse_event(event) and ak.fly_string_eq_fly_string(&event.m_type, &html_event_names_click)
+    var should_dispatch = is_activation_event
+    if not should_dispatch:
+        if let node = as_if_dom_node(current_target):
+            should_dispatch = dom_node_has_inclusive_ancestor_with_event_listener(node, dom_event_type(event))
+        else:
+            should_dispatch = true
+
+    # 6. If target is not relatedTarget or target is event’s relatedTarget, then:
+    if should_dispatch and (related_target != current_target or dom_event_related_target(event) == current_target):
+        # 1. Let touchTargets be a new list.
+        var touch_targets: ak.Vector[DomEventTarget*?]
+
+        # 2. For each touchTarget of event’s touch target list, append the result of retargeting touchTarget against target to touchTargets.
+        for touch_target in ak.vector_span(dom_event_touch_target_list(event)):
+            ak.vector_append_t(&touch_targets, dom_retarget(touch_target, current_target))
+
+        # 3. Append to an event path with event, target, targetOverride, relatedTarget, touchTargets, and false.
+        dom_event_append_to_path(event, current_target, target_override, related_target, &touch_targets, false)
+
+        # 4. Let isActivationEvent be true, if event is a MouseEvent object and event’s type attribute is "click";
+        #    otherwise false.
+        # NB: Step 4 is executed above as part of an optimization.
+
+        # 5. If isActivationEvent is true and target has activation behavior, then set activationTarget to target.
+        if is_activation_event and dom_event_target_has_activation_behavior(current_target):
+            activation_target = current_target
+
+        # 6. Let slottable be target, if target is a slottable and is assigned, and null otherwise.
+        var slottable: DomEventTarget*? = none
+
+        if let target_node = as_if_dom_node(current_target):
+            if dom_is_an_assigned_slottable(target_node):
+                slottable = current_target
+
+        # 7. Let slot-in-closed-tree be false
+        var slot_in_closed_tree = false
+
+        # 8. Let parent be the result of invoking target’s get the parent with event.
+        var parent = dom_event_target_get_parent(current_target, event)
+
+        # 9. While parent is non-null:
+        while let parent_target = parent:
+            # 1. If slottable is non-null:
+            if slottable != none:
+                # 1. Assert: parent is a slot.
+                assert(is_html_slot_element(parent_target))
+
+                # 2. Set slottable to null.
+                slottable = none
+
+                # 3. If parent’s root is a shadow root whose mode is "closed", then set slot-in-closed-tree to true.
+                let parent_root = tree_node_root((DomNode*)parent_target)
+
+                if dom_node_is_shadow_root(parent_root) and dom_shadow_root_mode((DomShadowRoot*)parent_root) == BindShadowRootMode.closed:
+                    slot_in_closed_tree = true
+
+            # 2. If parent is a slottable and is assigned, then set slottable to parent.
+            if let parent_node = as_if_dom_node(parent_target):
+                if dom_is_an_assigned_slottable(parent_node):
+                    slottable = parent_target
+
+            # 3. Let relatedTarget be the result of retargeting event’s relatedTarget against parent.
+            related_target = dom_retarget(dom_event_related_target(event), parent_target)
+
+            # 4. Let touchTargets be a new list.
+            ak.vector_clear(&touch_targets)
+
+            # 5. For each touchTarget of event’s touch target list, append the result of retargeting touchTarget against parent to touchTargets.
+            for touch_target in ak.vector_span(dom_event_touch_target_list(event)):
+                ak.vector_append_t(&touch_targets, dom_retarget(touch_target, parent_target))
+
+            # 6. If parent is a Window object, or parent is a node and target’s root is a shadow-including inclusive ancestor of parent, then:
+            if is_html_window(parent_target) or (is_dom_node(parent_target) and dom_node_is_shadow_including_inclusive_ancestor_of(tree_node_root(as_dom_node(current_target)), as_dom_node(parent_target))):
+                # 1. If isActivationEvent is true, event’s bubbles attribute is true, activationTarget is null, and parent has activation behavior, then set activationTarget to parent.
+                if is_activation_event and dom_event_bubbles(event) and activation_target == none and dom_event_target_has_activation_behavior(parent_target):
+                    activation_target = parent_target
+
+                # 2. Append to an event path with event, parent, null, relatedTarget, touchTargets, and slot-in-closed-tree.
+                dom_event_append_to_path(event, parent_target, none, related_target, &touch_targets, slot_in_closed_tree)
+
+            # 7. Otherwise, if parent is relatedTarget, then set parent to null.
+            elif related_target == parent_target:
+                parent = none
+            # 8. Otherwise, set target to parent and then:
+            else:
+                current_target = parent_target
+
+                # 1. If isActivationEvent is true, activationTarget is null, and target has activation behavior, then set activationTarget to target.
+                if is_activation_event and activation_target == none and dom_event_target_has_activation_behavior(current_target):
+                    activation_target = current_target
+
+                # 2. Append to an event path with event, parent, target, relatedTarget, touchTargets, and slot-in-closed-tree.
+                dom_event_append_to_path(event, parent_target, current_target, related_target, &touch_targets, slot_in_closed_tree)
+
+            # 9. If parent is non-null, then set parent to the result of invoking parent’s get the parent with event.
+            if let next = parent:
+                parent = dom_event_target_get_parent(next, event)
+
+            # 10. Set slot-in-closed-tree to false.
+            slot_in_closed_tree = false
+
+        # 10. Let clearTargetsStruct be the last struct in event’s path whose shadow-adjusted target is non-null.
+        let path = dom_event_path(event)
+        var last_struct: DomEventPathEntry*? = none
+        for index in 0..<ak.vector_size(path):
+            let entry = ak.vector_at(path, index)
+            if entry.shadow_adjusted_target != none:
+                last_struct = entry
+
+        let clear_targets_struct = last_struct else trap("VERIFY: clear_targets_struct.has_value()")
+
+        # 11. If clearTargetsStruct’s shadow-adjusted target, clearTargetsStruct’s relatedTarget, or an EventTarget
+        #     object in clearTargetsStruct’s touch target list is a node whose root is a shadow root:
+        #     set clearTargets to true.
+        if dom_event_dispatcher_is_node_in_shadow_tree(clear_targets_struct.shadow_adjusted_target):
+            clear_targets = true
+
+        if not clear_targets and dom_event_dispatcher_is_node_in_shadow_tree(clear_targets_struct.related_target):
+            clear_targets = true
+
+        if not clear_targets:
+            for touch_target in ak.vector_span(&clear_targets_struct.touch_target_list):
+                if dom_event_dispatcher_is_node_in_shadow_tree(touch_target):
+                    clear_targets = true
+                    break
+
+        # 12. If activationTarget is non-null and activationTarget has legacy-pre-activation behavior, then run activationTarget’s legacy-pre-activation behavior.
+        if let target_with_activation = activation_target:
+            dom_event_target_legacy_pre_activation_behavior(target_with_activation)
+
+        # 13. For each struct of event’s path, in reverse order:
+        var reverse_index = ak.vector_size(path)
+        while reverse_index > 0:
+            reverse_index -= 1
+            let entry = ak.vector_at(path, reverse_index)
+
+            # 1. If struct’s shadow-adjusted target is non-null, then set event’s eventPhase attribute to AT_TARGET.
+            if entry.shadow_adjusted_target != none:
+                dom_event_set_phase(event, DomEventPhase.at_target)
+            # 2. Otherwise, set event’s eventPhase attribute to CAPTURING_PHASE.
+            else:
+                dom_event_set_phase(event, DomEventPhase.capturing_phase)
+
+            # 3. Invoke with struct, event, "capturing", and legacyOutputDidListenersThrowFlag if given.
+            dom_event_dispatcher_invoke(entry, event, DomEventPhase.capturing_phase, legacy_output_did_listeners_throw)
+
+        # 14. For each struct of event’s path:
+        for index in 0..<ak.vector_size(path):
+            let entry = ak.vector_at(path, index)
+
+            # 1. If struct’s shadow-adjusted target is non-null, then set event’s eventPhase attribute to AT_TARGET.
+            if entry.shadow_adjusted_target != none:
+                dom_event_set_phase(event, DomEventPhase.at_target)
+            # 2. Otherwise:
+            else:
+                # 1. If event’s bubbles attribute is false, then continue.
+                if not dom_event_bubbles(event):
+                    continue
+
+                # 2. Set event’s eventPhase attribute to BUBBLING_PHASE.
+                dom_event_set_phase(event, DomEventPhase.bubbling_phase)
+
+            # 3. Invoke with struct, event, "bubbling", and legacyOutputDidListenersThrowFlag if given.
+            dom_event_dispatcher_invoke(entry, event, DomEventPhase.bubbling_phase, legacy_output_did_listeners_throw)
+
+    # 7. Set event’s eventPhase attribute to NONE.
+    dom_event_set_phase(event, DomEventPhase.none_)
+
+    # 8. Set event’s currentTarget attribute to null.
+    dom_event_set_current_target(event, none)
+
+    # 9. Set event’s path to the empty list.
+    dom_event_clear_path(event)
+
+    # 10. Unset event’s dispatch flag, stop propagation flag, and stop immediate propagation flag.
+    dom_event_set_dispatched(event, false)
+    dom_event_set_stop_propagation(event, false)
+    dom_event_set_stop_immediate_propagation(event, false)
+
+    # 11. If clearTargets, then:
+    if clear_targets:
+        # 1. Set event’s target to null.
+        dom_event_set_target(event, none)
+
+        # 2. Set event’s relatedTarget to null.
+        dom_event_set_related_target(event, none)
+
+        # 3. Set event’s touch target list to the empty list.
+        dom_event_clear_touch_target_list(event)
+
+    # 12. If activationTarget is non-null, then:
+    if let target_with_activation = activation_target:
+        # 1. If event’s canceled flag is unset, then run activationTarget’s activation behavior with event.
+        if not dom_event_cancelled(event):
+            dom_event_target_activation_behavior(target_with_activation, event)
+            dom_event_target_legacy_cancelled_activation_behavior_was_not_called(target_with_activation)
+        # 2. Otherwise, if activationTarget has legacy-canceled-activation behavior, then run activationTarget’s legacy-canceled-activation behavior.
+        else:
+            dom_event_target_legacy_cancelled_activation_behavior(target_with_activation)
+
+    # 13. Return false if event’s canceled flag is set; otherwise true.
+    return not dom_event_cancelled(event)

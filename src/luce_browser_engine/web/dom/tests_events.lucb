@@ -1,0 +1,700 @@
+#==============================================================================================
+#
+#   tests_events - tests of DOM events, EventTarget, AbortSignal and the native-call seam (r19)
+#
+#   DESCRIPTION:
+#       Ladybird has no unit tests for these files (its DOM events are tested through
+#       Tests/LibWeb/Text, which needs scripting), so these pin the C++ behaviour of what runs
+#       before the regions the event code calls into are ported: EventTarget's construction
+#       (alone and as the base of a node, made in a realm), adding and removing event listeners
+#       (options, de-duplication, abort signals), the event handler map, dispatchEvent()'s
+#       errors, the event flags, the event path and composedPath(), CustomEvent, the
+#       invoke/inner-invoke filtering, AbortSignal's algorithms, reasons and dependent signals,
+#       AbortController, JS::NativeFunction called through JS::call, completions, object
+#       values, the GC edges, HighResolutionTime's coarsening and the UI event names.
+#
+#       Not reachable yet (they trap in other regions' stubs, so they cannot run here): creating
+#       an Event through realm.create (HTML::relevant_global_object, r29), dispatching
+#       (DOM::retarget, r18), calling a listener (principal_realm_settings_object and
+#       prepare_to_run_script, r29) and therefore signal_abort, which fires `abort`. Events are
+#       built here as the Event constructor builds them, without the time stamp.
+#
+#==============================================================================================
+
+# mark: Helpers =================================================================================
+
+## An Event built as Event::Event(realm, type, init) builds it, without the time stamp (which
+## needs the relevant global object's settings, region r29).
+func test_event(realm: Realm*, type_: str, bubbles: bool = false, cancelable: bool = false) -> DomEvent*:
+    let event = (DomEvent*)web_allocate_cell(realm, &dom_event_class)
+    bind_platform_object_construct_realm(event.bind_platform_object(), realm)
+    event.m_type = ak.fly_string_from_str(type_)
+    event.m_bubbles = bubbles
+    event.m_cancelable = cancelable
+    event.m_initialized = true
+    web_initialize_cell(event.cell(), realm)
+    return event
+
+## What a test native function saw when it was called.
+struct TestNativeCall:
+    var calls: i32
+    var argument_count: usize
+    var argument: JsValue
+    var this_value: JsValue
+    var realm: Realm*?
+    var fail: bool
+
+## A native function behaviour recording its call into a TestNativeCall.
+func test_native_behaviour(context: void*?, vm: Vm*) -> JsValue!:
+    let seen = (TestNativeCall*)(context else trap("no captures"))
+    seen.calls += 1
+    seen.argument_count = vm_argument_count(vm)
+    seen.argument = vm_argument(vm, 0)
+    seen.this_value = vm_this_value(vm)
+    seen.realm = vm_current_realm(vm)
+    if seen.fail:
+        try vm_throw_completion(vm, IdlSimpleExceptionType.type_error, .string_view(ak.sv("listener failed")))
+    return js_value_from_bool(true)
+
+## A WebIDL callback whose object is a native function recording into `seen`. Its callback context
+## would be the realm's principal settings object (region r29); the realm cell stands in for it,
+## which only the callback's edges read.
+func test_callback(realm: Realm*, seen: TestNativeCall*) -> IdlCallbackType*:
+    let function = js_native_function_create(realm, JsNativeFunctionBehaviour(call = test_native_behaviour, context = seen), 1, ak.utf16_fly_string_new(), realm)
+    let callback = (IdlCallbackType*)web_allocate_cell(realm, &idl_callback_type_class)
+    idl_callback_type_construct_html_environment_settings_obje(callback, (JsObject*)function, (HtmlEnvironmentSettingsObject*)realm)
+    web_initialize_cell(callback.cell(), realm)
+    return callback
+
+## An IDLEventListener over a recording native function.
+func test_listener(realm: Realm*, seen: TestNativeCall*) -> DomIdlEventListener*:
+    return dom_idl_event_listener_create(realm, test_callback(realm, seen))
+
+## A DOM node of class `info` made in `realm` through Node's constructor (Node::Node, which runs
+## EventTarget::EventTarget) and EventTarget's initialize. The concrete classes' constructors
+## are other regions' (Document r17, DocumentFragment r18; Element's traps in r13b's ARIAMixin);
+## the node document is a hand-built one (r15's test_document), outside the heap.
+func test_realm_node(realm: Realm*, info: const ak.ClassInfo*, type_: DomNodeType, document: DomDocument*) -> DomNode*:
+    let node = (DomNode*)web_allocate_cell(realm, info)
+    dom_node_construct_realm(node, realm, document, type_)
+    gc.heap_undefer_gc(gc.cell_heap(node.cell()))
+    dom_event_target_initialize_impl(node.js_cell(), realm)
+    return node
+
+## The options of add_event_listener: capture, passive, once and signal.
+func test_add_options(capture: bool = false, passive: bool? = none, once: bool = false, signal: DomAbortSignal*? = none) -> DomAddEventListenerOptionsOrBool:
+    return .dom_add_event_listener_options(DomAddEventListenerOptions(event_listener_options = DomEventListenerOptions(capture = capture), passive = passive, once = once, signal = signal))
+
+## The raw encoding of a JS value (JsValue holds a union, so it has no ==).
+func test_bits(value: JsValue) -> u64:
+    return value.nan_boxed_value.m_value.encoded
+
+# mark: EventTarget =============================================================================
+
+test "new EventTarget(): realm.create runs EventTarget's constructor and initialize":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let realm = web_test_create_realm(vm)
+    let target = dom_event_target_construct_impl(realm) else trap("construct_impl failed")
+    assert(target.cell().vtable == (const gc.CellVTable*)&dom_event_target_vtable)
+    assert(target.cell().class_id == dom_event_target_class.first_id)
+    assert(bind_platform_object_realm(target.bind_platform_object()) == realm)
+    assert(target.m_data == none)
+    assert(not dom_event_target_has_event_listeners(target))
+    var list = dom_event_target_event_listener_list(target)
+    assert(ak.vector_is_empty(&list))
+    assert(dom_event_target_is_dom_event_target(target))
+    assert(not dom_event_target_is_focusable(target))
+    assert(not dom_event_target_has_activation_behavior(target))
+    assert(dom_event_target_get_parent(target, test_event(realm, "x")) == none)
+
+test "addEventListener: a listener per (type, callback, capture), in order, with its options":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let realm = web_test_create_realm(vm)
+    let target = dom_event_target_construct_impl(realm) else trap("construct_impl failed")
+    var seen_a = TestNativeCall()
+    var seen_b = TestNativeCall()
+    let a = test_listener(realm, &seen_a)
+    let b = test_listener(realm, &seen_b)
+    let click = ak.fly_string_from_str("click")
+    let wheel = ak.fly_string_from_str("wheel")
+
+    dom_event_target_add_event_listener(target, click, a, .bool_(false))
+    dom_event_target_add_event_listener(target, click, a, .bool_(false))
+    dom_event_target_add_event_listener(target, click, a, .bool_(true))
+    dom_event_target_add_event_listener(target, click, b, test_add_options(once = true, passive = true))
+    dom_event_target_add_event_listener(target, wheel, a, test_add_options())
+    # A null callback adds nothing.
+    dom_event_target_add_event_listener(target, click, none, .bool_(false))
+
+    var list = dom_event_target_event_listener_list(target)
+    assert(ak.vector_size(&list) == 4)
+    let first = *ak.vector_at(&list, 0) else trap("no listener")
+    assert(ak.fly_string_eq_fly_string(&first.type_, &click) and first.callback == a and not first.capture and not first.once)
+    # The default passive value is false except for touch and wheel events on a window or the
+    # nodes of a document's top; this target is neither.
+    assert(first.passive == false)
+    let second = *ak.vector_at(&list, 1) else trap("no listener")
+    assert(second.callback == a and second.capture)
+    let third = *ak.vector_at(&list, 2) else trap("no listener")
+    assert(third.callback == b and third.once and third.passive == true)
+    let fourth = *ak.vector_at(&list, 3) else trap("no listener")
+    assert(ak.fly_string_eq_fly_string(&fourth.type_, &wheel) and fourth.passive == false)
+    assert(dom_event_target_has_event_listener(target, click))
+    assert(not dom_event_target_has_event_listener(target, ak.fly_string_from_str("keyup")))
+
+    # removeEventListener matches type, callback and the flattened capture.
+    dom_event_target_remove_event_listener(target, click, a, .dom_event_listener_options(DomEventListenerOptions(capture = true)))
+    list = dom_event_target_event_listener_list(target)
+    assert(ak.vector_size(&list) == 3)
+    assert(second.removed)
+    dom_event_target_remove_event_listener(target, click, b, .bool_(true))
+    list = dom_event_target_event_listener_list(target)
+    assert(ak.vector_size(&list) == 3)
+    dom_event_target_remove_event_listener_without_options(target, click, b)
+    dom_event_target_remove_event_listener_without_options(target, click, a)
+    dom_event_target_remove_event_listener_without_options(target, wheel, a)
+    assert(not dom_event_target_has_event_listeners(target))
+    assert(seen_a.calls == 0 and seen_b.calls == 0)
+
+test "add_event_listener_without_options adds a bubbling listener; the list is a copy":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let realm = web_test_create_realm(vm)
+    let target = dom_event_target_construct_impl(realm) else trap("construct_impl failed")
+    var seen = TestNativeCall()
+    let listener = test_listener(realm, &seen)
+    dom_event_target_add_event_listener_without_options(target, ak.fly_string_from_str("load"), listener)
+    var copy = dom_event_target_event_listener_list(target)
+    ak.vector_clear(&copy)
+    assert(dom_event_target_has_event_listeners(target))
+    var list = dom_event_target_event_listener_list(target)
+    let entry = *ak.vector_at(&list, 0) else trap("no listener")
+    assert(not entry.capture and not entry.once and entry.signal == none)
+
+test "a listener with an aborted signal is not added; a signal's abort algorithm removes it":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let realm = web_test_create_realm(vm)
+    let target = dom_event_target_construct_impl(realm) else trap("construct_impl failed")
+    var seen = TestNativeCall()
+    let listener = test_listener(realm, &seen)
+    let type_ = ak.fly_string_from_str("message")
+
+    let aborted = dom_abort_signal_construct_impl(realm) else trap("construct_impl failed")
+    dom_abort_signal_set_reason(aborted, js_value_from_bool(true))
+    dom_event_target_add_event_listener(target, type_, listener, test_add_options(signal = aborted))
+    assert(not dom_event_target_has_event_listeners(target))
+
+    let signal = dom_abort_signal_construct_impl(realm) else trap("construct_impl failed")
+    dom_event_target_add_event_listener(target, type_, listener, test_add_options(signal = signal))
+    assert(dom_event_target_has_event_listener(target, type_))
+    assert(ak.ordered_hash_map_size(&signal.m_abort_algorithms) == 1)
+
+    # Step 1 of the abort steps: run every abort algorithm (signal_abort would then fire `abort`).
+    for algorithm in ak.ordered_hash_map_begin(&signal.m_abort_algorithms):
+        ak.function0_call(&algorithm.value.function)
+    assert(not dom_event_target_has_event_listeners(target))
+
+test "dispatchEvent() throws InvalidStateError for an event being dispatched or not initialized":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let realm = web_test_create_realm(vm)
+    let target = dom_event_target_construct_impl(realm) else trap("construct_impl failed")
+    let event = test_event(realm, "x")
+    event.m_dispatch = true
+    var result = dom_event_target_dispatch_event_binding(target, event) catch failure:
+        assert(failure.code == webidl_exception)
+        recover false
+    assert(not result)
+    var message = idl_exception_to_string(vm_take_pending_exception(vm))
+    assert(ak.string_eq_string_view(&message, ak.sv("[InvalidStateError]: The event is already being dispatched.")))
+
+    event.m_dispatch = false
+    event.m_initialized = false
+    result = dom_event_target_dispatch_event_binding(target, event) catch failure:
+        assert(failure.code == webidl_exception)
+        recover false
+    assert(not result)
+    message = idl_exception_to_string(vm_take_pending_exception(vm))
+    assert(ak.string_eq_string_view(&message, ak.sv("[InvalidStateError]: Cannot dispatch an uninitialized event.")))
+
+test "the event handler map: no handler reads null; deactivating or clearing an absent one does nothing":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let realm = web_test_create_realm(vm)
+    let target = dom_event_target_construct_impl(realm) else trap("construct_impl failed")
+    let name = ak.fly_string_from_str("abort")
+    assert(dom_event_target_event_handler_attribute(target, name) == none)
+    dom_event_target_set_event_handler_attribute(target, name, none)
+    dom_event_target_deactivate_event_handler(target, name)
+    let data = target.m_data else trap("no data")
+    assert(ak.hash_map_is_empty(&data.event_handler_map))
+
+    # A handler whose value is a callback reads back as that callback.
+    var seen = TestNativeCall()
+    let callback = test_callback(realm, &seen)
+    let handler = heap_allocate_html_event_handler_callback_type(vm_heap(vm), callback)
+    discard(ak.hash_map_set(&data.event_handler_map, name, handler))
+    assert(dom_event_target_get_current_value_of_event_handler(target, name) == callback)
+    dom_event_target_deactivate_event_handler(target, name)
+    assert(dom_event_target_event_handler_attribute(target, name) == none)
+
+test "the Window event handler sets":
+    ui_events_event_names_initialize_strings()
+    assert(dom_is_window_reflecting_body_element_event_handler(ak.fly_string_from_str("scroll")))
+    assert(dom_is_window_reflecting_body_element_event_handler(ak.fly_string_from_str("resize")))
+    assert(not dom_is_window_reflecting_body_element_event_handler(ak.fly_string_from_str("click")))
+    assert(not dom_is_window_event_handler(ak.fly_string_from_str("click")))
+
+test "an EventTarget's listeners and their callbacks survive collections":
+    web_test_clobber_stack()
+    run_listeners_survive_collections()
+
+noinline func run_listeners_survive_collections():
+    let vm = web_test_create_vm()
+    let context = make_test_realm_context(vm)
+    let weaks = make_test_target_with_listener(vm, context)
+    web_test_clobber_stack()
+    gc.heap_collect_garbage(vm_heap(vm))
+    assert(web_test_alive(&weaks.0))
+    assert(web_test_alive(&weaks.1))
+    discard(vm_pop_execution_context(vm))
+    web_test_destroy_vm(vm)
+
+## A target kept alive from the C heap, with one listener over a native function; Weaks of the
+## listener and of its callback's native function.
+noinline func make_test_target_with_listener(vm: Vm*, context: JsExecutionContext*) -> (gc.Weak[DomEventListener], gc.Weak[JsNativeFunction]):
+    let realm = context.realm else trap("no realm")
+    let target = dom_event_target_construct_impl(realm) else trap("construct_impl failed")
+    vm_keep_alive(vm, target)
+    let seen = new TestNativeCall() else trap("out of memory")
+    let listener = test_listener(realm, seen)
+    dom_event_target_add_event_listener_without_options(target, ak.fly_string_from_str("x"), listener)
+    var list = dom_event_target_event_listener_list(target)
+    let entry = *ak.vector_at(&list, 0) else trap("no listener")
+    let function = (JsNativeFunction*)dom_idl_event_listener_callback(listener).callback
+    return (gc.make_weak[DomEventListener](entry), gc.make_weak[JsNativeFunction](function))
+
+# mark: Nodes ===================================================================================
+
+test "a node made in a realm is an EventTarget; listeners on an ancestor are found":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let realm = web_test_create_realm(vm)
+    let document = test_document()
+    let fragment = test_realm_node(realm, &dom_document_fragment_class, DomNodeType.document_fragment_node, document)
+    let element = test_realm_node(realm, &dom_element_class, DomNodeType.element_node, document)
+    assert(bind_platform_object_realm(element.bind_platform_object()) == realm)
+    assert(element.cell().vtable == (const gc.CellVTable*)&dom_element_vtable)
+    assert(dom_node_document(element) == document)
+    tree_node_append_child(fragment, element)
+    assert(tree_node_parent(element) == fragment)
+
+    var seen = TestNativeCall()
+    let type_ = ak.fly_string_from_str("custom")
+    dom_event_target_add_event_listener(fragment.dom_event_target(), type_, test_listener(realm, &seen), .bool_(true))
+    assert(dom_node_has_inclusive_ancestor_with_event_listener(element, type_))
+    assert(dom_event_target_has_event_listener(fragment.dom_event_target(), type_))
+    assert(not dom_event_target_has_event_listeners(element.dom_event_target()))
+
+    # The event path of the element: the element itself, then its parent (dispatch builds it
+    # through Node's get the parent; the path is appended here as dispatch appends it).
+    let event = test_event(realm, "custom", bubbles = true)
+    var no_touch_targets: ak.Vector[DomEventTarget*?]
+    dom_event_append_to_path(event, element.dom_event_target(), element.dom_event_target(), none, &no_touch_targets, false)
+    dom_event_append_to_path(event, fragment.dom_event_target(), none, none, &no_touch_targets, false)
+    let path = dom_event_path(event)
+    assert(ak.vector_size(path) == 2)
+    assert(not ak.vector_at(path, 0).invocation_target_in_shadow_tree and not ak.vector_at(path, 1).root_of_closed_tree)
+    assert(ak.vector_at(path, 1).index == 1)
+
+    # In the capturing pass the parent's capturing listener is found (calling it is region r29's
+    # principal_realm_settings_object away); the element has none.
+    var threw = false
+    dom_event_set_current_target(event, element.dom_event_target())
+    var element_listeners = dom_event_target_event_listener_list(element.dom_event_target())
+    assert(not dom_event_dispatcher_inner_invoke(event, &element_listeners, DomEventPhase.capturing_phase, false, &threw))
+
+# mark: Event ===================================================================================
+
+test "Event: cancellation, propagation flags and initEvent":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let realm = web_test_create_realm(vm)
+    let event = test_event(realm, "x", bubbles = true)
+    assert(dom_event_is_dom_event(event) and not dom_event_is_mouse_event(event) and not dom_event_is_pointer_event(event))
+    assert(dom_event_event_phase(event) == 0)
+
+    # preventDefault() only cancels a cancelable event outside a passive listener.
+    dom_event_prevent_default(event)
+    assert(not dom_event_default_prevented(event) and dom_event_return_value(event))
+    event.m_cancelable = true
+    dom_event_set_in_passive_listener(event, true)
+    dom_event_prevent_default(event)
+    assert(not dom_event_cancelled(event))
+    dom_event_set_in_passive_listener(event, false)
+    dom_event_set_return_value(event, true)
+    assert(not dom_event_cancelled(event))
+    dom_event_set_return_value(event, false)
+    assert(dom_event_default_prevented(event) and not dom_event_return_value(event))
+
+    # cancelBubble can only be set; stopImmediatePropagation() sets both flags.
+    dom_event_set_cancel_bubble(event, false)
+    assert(not dom_event_cancel_bubble(event))
+    dom_event_set_cancel_bubble(event, true)
+    assert(dom_event_should_stop_propagation(event) and not dom_event_should_stop_immediate_propagation(event))
+    dom_event_stop_immediate_propagation(event)
+    assert(dom_event_should_stop_immediate_propagation(event))
+
+    # initEvent() does nothing while dispatching, and otherwise reinitializes the event.
+    event.m_is_trusted = true
+    event.m_dispatch = true
+    dom_event_init_event(event, ak.string_from_str("y"), false, false)
+    assert(ak.fly_string_eq_string_view(&event.m_type, ak.sv("x")))
+    event.m_dispatch = false
+    dom_event_set_target(event, dom_event_target_construct_impl(realm) else trap("construct_impl failed"))
+    dom_event_init_event(event, ak.string_from_str("y"), false, true)
+    assert(ak.fly_string_eq_string_view(&event.m_type, ak.sv("y")))
+    assert(not dom_event_bubbles(event) and dom_event_cancelable(event))
+    assert(not dom_event_cancelled(event) and not dom_event_should_stop_propagation(event) and not dom_event_should_stop_immediate_propagation(event))
+    assert(not dom_event_is_trusted(event) and dom_event_target(event) == none and dom_event_initialized(event))
+
+test "composedPath() hides the closed shadow trees the current target is not in":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let realm = web_test_create_realm(vm)
+    let event = test_event(realm, "x")
+    var targets: ak.Vector[DomEventTarget*]
+    for _ in 0..<4:
+        ak.vector_append_t(&targets, dom_event_target_construct_impl(realm) else trap("construct_impl failed"))
+    let t = ak.vector_span(&targets)
+
+    var empty = dom_event_composed_path(event)
+    assert(ak.vector_is_empty(&empty))
+
+    # The path of an event from inside a closed shadow tree, as dispatch appends it (innermost
+    # first): t[0] in the tree, t[1] its closed shadow root, t[2] the host, t[3] the document.
+    var no_touch_targets: ak.Vector[DomEventTarget*?]
+    for target in t:
+        dom_event_append_to_path(event, target, none, none, &no_touch_targets, false)
+    ak.vector_at(&event.m_path, 1).root_of_closed_tree = true
+
+    # From outside the closed tree, the tree and its root are hidden.
+    dom_event_set_current_target(event, t[3])
+    var path = dom_event_composed_path(event)
+    assert(ak.vector_size(&path) == 2)
+    assert(*ak.vector_at(&path, 0) == t[2] and *ak.vector_at(&path, 1) == t[3])
+
+    # From inside it, or at its root, everything is visible.
+    dom_event_set_current_target(event, t[0])
+    path = dom_event_composed_path(event)
+    assert(ak.vector_size(&path) == 4)
+    for i in 0..<4:
+        assert(*ak.vector_at(&path, (usize)i) == t[(usize)i])
+    dom_event_set_current_target(event, t[1])
+    path = dom_event_composed_path(event)
+    assert(ak.vector_size(&path) == 4)
+    assert(*ak.vector_at(&path, 0) == t[0] and *ak.vector_at(&path, 3) == t[3])
+
+test "append_to_path copies the touch targets and numbers the entries":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let realm = web_test_create_realm(vm)
+    let event = test_event(realm, "x")
+    let a = dom_event_target_construct_impl(realm) else trap("construct_impl failed")
+    let b = dom_event_target_construct_impl(realm) else trap("construct_impl failed")
+    var touch_targets: ak.Vector[DomEventTarget*?]
+    ak.vector_append_t(&touch_targets, b)
+    dom_event_append_to_path(event, a, a, b, &touch_targets, true)
+    ak.vector_clear(&touch_targets)
+    dom_event_append_to_path(event, b, none, none, &touch_targets, false)
+    let first = ak.vector_at(&event.m_path, 0)
+    assert(first.invocation_target == a and first.shadow_adjusted_target == a and first.related_target == b)
+    assert(ak.vector_size(&first.touch_target_list) == 1 and first.slot_in_closed_tree and not first.root_of_closed_tree)
+    assert(first.index == 0 and ak.vector_at(&event.m_path, 1).index == 1)
+    dom_event_set_touch_target_list(event, &first.touch_target_list)
+    ak.vector_clear(&first.touch_target_list)
+    assert(ak.vector_size(dom_event_touch_target_list(event)) == 1)
+    dom_event_clear_path(event)
+    dom_event_clear_touch_target_list(event)
+    assert(ak.vector_is_empty(dom_event_path(event)) and ak.vector_is_empty(dom_event_touch_target_list(event)))
+
+test "CustomEvent: detail defaults to null; initCustomEvent sets it unless dispatching":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let realm = web_test_create_realm(vm)
+    let init = dom_custom_event_init_default()
+    assert(js_value_is_null(init.detail))
+    let event = (DomCustomEvent*)web_allocate_cell(realm, &dom_custom_event_class)
+    bind_platform_object_construct_realm(event.bind_platform_object(), realm)
+    dom_custom_event_init_fields(event)
+    web_initialize_cell(event.cell(), realm)
+    assert(is_dom_event(event) and is_dom_custom_event(event))
+    assert(js_value_is_null(dom_custom_event_detail(event)))
+    dom_custom_event_init_custom_event(event, ak.string_from_str("ping"), true, true, js_value_from_f64(42.0))
+    assert(js_value_as_double(dom_custom_event_detail(event)) == 42.0)
+    assert(dom_event_bubbles(event.dom_event()) and dom_event_cancelable(event.dom_event()))
+    event.dom_event().m_dispatch = true
+    dom_custom_event_init_custom_event(event, ak.string_from_str("pong"), false, false, js_null())
+    assert(js_value_as_double(dom_custom_event_detail(event)) == 42.0)
+
+# mark: Dispatch ================================================================================
+
+test "inner invoke: removed listeners, other types and the other phase are skipped":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let realm = web_test_create_realm(vm)
+    let target = dom_event_target_construct_impl(realm) else trap("construct_impl failed")
+    var seen = TestNativeCall()
+    let listener = test_listener(realm, &seen)
+    let event = test_event(realm, "x")
+    dom_event_set_current_target(event, target)
+    dom_event_target_add_event_listener(target, ak.fly_string_from_str("x"), listener, .bool_(true))
+    dom_event_target_add_event_listener(target, ak.fly_string_from_str("y"), listener, .bool_(false))
+    var listeners = dom_event_target_event_listener_list(target)
+    var threw = false
+
+    # The capturing listener of type x is found in the bubbling phase but not called.
+    assert(dom_event_dispatcher_inner_invoke(event, &listeners, DomEventPhase.bubbling_phase, false, &threw))
+    # A removed listener is not even found.
+    let capturing = *ak.vector_at(&listeners, 0) else trap("no listener")
+    capturing.removed = true
+    assert(not dom_event_dispatcher_inner_invoke(event, &listeners, DomEventPhase.capturing_phase, false, &threw))
+    assert(seen.calls == 0 and not threw)
+
+test "invoke: the target is the last shadow-adjusted target up to the struct; stop propagation returns":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let realm = web_test_create_realm(vm)
+    let a = dom_event_target_construct_impl(realm) else trap("construct_impl failed")
+    let b = dom_event_target_construct_impl(realm) else trap("construct_impl failed")
+    let event = test_event(realm, "x")
+    var touch_targets: ak.Vector[DomEventTarget*?]
+    ak.vector_append_t(&touch_targets, a)
+    dom_event_append_to_path(event, a, a, none, &touch_targets, false)
+    dom_event_append_to_path(event, b, none, a, &touch_targets, false)
+    var threw = false
+    dom_event_dispatcher_invoke(ak.vector_at(&event.m_path, 1), event, DomEventPhase.bubbling_phase, &threw)
+    assert(dom_event_target(event) == a and dom_event_related_target(event) == a)
+    assert(dom_event_current_target(event) == b)
+    assert(ak.vector_size(dom_event_touch_target_list(event)) == 1)
+
+    dom_event_set_current_target(event, none)
+    dom_event_stop_propagation(event)
+    dom_event_dispatcher_invoke(ak.vector_at(&event.m_path, 0), event, DomEventPhase.capturing_phase, &threw)
+    assert(dom_event_current_target(event) == none)
+
+# mark: AbortSignal and AbortController =========================================================
+
+test "AbortSignal: abort algorithms are numbered from 1 and removed by id; none once aborted":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let realm = web_test_create_realm(vm)
+    let signal = dom_abort_signal_construct_impl(realm) else trap("construct_impl failed")
+    assert(not dom_abort_signal_aborted(signal))
+    assert(js_value_is_undefined(dom_abort_signal_reason(signal)))
+    assert(dom_abort_signal_add_abort_algorithm(signal, ak.Function0[unit]()) == 1)
+    assert(dom_abort_signal_add_abort_algorithm(signal, ak.Function0[unit]()) == 2)
+    dom_abort_signal_remove_abort_algorithm(signal, 1)
+    assert(ak.ordered_hash_map_size(&signal.m_abort_algorithms) == 1)
+    assert(ak.ordered_hash_map_contains_k(&signal.m_abort_algorithms, 2))
+    dom_abort_signal_set_reason(signal, js_null())
+    assert(dom_abort_signal_aborted(signal))
+    assert(dom_abort_signal_add_abort_algorithm(signal, ak.Function0[unit]()) == none)
+    # signal_abort of an aborted signal does nothing.
+    dom_abort_signal_signal_abort(signal, js_value_from_bool(true))
+    assert(js_value_is_null(dom_abort_signal_reason(signal)))
+
+## throw_if_aborted, answering false when nothing was thrown.
+func test_throw_if_aborted(signal: DomAbortSignal*) -> bool!:
+    try dom_abort_signal_throw_if_aborted(signal)
+    return false
+
+test "AbortSignal::throw_if_aborted throws the reason as a JS completion":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let realm = web_test_create_realm(vm)
+    let signal = dom_abort_signal_construct_impl(realm) else trap("construct_impl failed")
+    assert(not (test_throw_if_aborted(signal) else trap("not aborted, so nothing is thrown")))
+    dom_abort_signal_set_reason(signal, js_value_from_f64(7.0))
+    let thrown = test_throw_if_aborted(signal) catch failure:
+        assert(failure.code == js_exception)
+        recover true
+    assert(thrown)
+    let completion = vm_take_throw_completion(vm)
+    assert(js_completion_is_error(&completion))
+    assert(js_value_as_double(js_completion_value(&completion)) == 7.0)
+
+test "AbortSignal.abort(): an AbortError DOMException reason by default":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let context = js_execution_context_create()
+    context.realm = web_test_create_realm(vm)
+    vm_push_execution_context(vm, context)
+    defer discard(vm_pop_execution_context(vm))
+
+    let with_reason = dom_abort_signal_abort(vm, js_value_from_f64(3.0)) else trap("abort failed")
+    assert(js_value_as_double(dom_abort_signal_reason(with_reason)) == 3.0)
+
+    let signal = dom_abort_signal_abort(vm, js_undefined()) else trap("abort failed")
+    assert(dom_abort_signal_aborted(signal))
+    let reason = dom_abort_signal_reason(signal)
+    assert(js_value_is_object(reason))
+    let exception = as_idl_dom_exception((gc.Cell*)js_value_as_object(reason))
+    let text = idl_dom_exception_to_string(exception)
+    assert(ak.string_eq_string_view(&text, ak.sv("[AbortError]: Aborted without reason")))
+
+test "AbortSignal.any(): dependent signals follow their source signals":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let context = js_execution_context_create()
+    let realm = web_test_create_realm(vm)
+    context.realm = realm
+    vm_push_execution_context(vm, context)
+    defer discard(vm_pop_execution_context(vm))
+
+    let a = dom_abort_signal_construct_impl(realm) else trap("construct_impl failed")
+    let b = dom_abort_signal_construct_impl(realm) else trap("construct_impl failed")
+    var signals: ak.Vector[DomAbortSignal*?]
+    ak.vector_append_t(&signals, a)
+    ak.vector_append_t(&signals, b)
+    let dependent = dom_abort_signal_any(vm, signals) else trap("any failed")
+    assert(dom_abort_signal_dependent(dependent) and not dom_abort_signal_aborted(dependent))
+    assert(ak.vector_size(&dependent.m_source_signals) == 2)
+    assert(ak.vector_size(&a.m_dependent_signals) == 1 and *ak.vector_at(&a.m_dependent_signals, 0) == dependent)
+
+    # A dependent of a dependent depends on the sources directly.
+    var of_dependent: ak.Vector[DomAbortSignal*?]
+    ak.vector_append_t(&of_dependent, dependent)
+    let second = dom_abort_signal_create_dependent_abort_signal(realm, of_dependent) else trap("create failed")
+    var sources = dom_abort_signal_source_signals(second)
+    assert(ak.vector_size(&sources) == 2 and *ak.vector_at(&sources, 0) == a and *ak.vector_at(&sources, 1) == b)
+    assert(ak.vector_size(&b.m_dependent_signals) == 2)
+    assert(ak.vector_is_empty(&dependent.m_dependent_signals))
+
+    # An aborted signal in the list makes an aborted, independent signal with its reason.
+    dom_abort_signal_set_reason(b, js_value_from_f64(9.0))
+    let aborted = dom_abort_signal_create_dependent_abort_signal(realm, signals) else trap("create failed")
+    assert(js_value_as_double(dom_abort_signal_reason(aborted)) == 9.0)
+    assert(not dom_abort_signal_dependent(aborted) and ak.vector_is_empty(&aborted.m_source_signals))
+
+test "new AbortController(): a controller with a new signal":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let realm = web_test_create_realm(vm)
+    let controller = dom_abort_controller_construct_impl(realm) else trap("construct_impl failed")
+    let signal = dom_abort_controller_signal(controller)
+    assert(is_dom_abort_signal(signal) and not dom_abort_signal_aborted(signal))
+    assert(bind_platform_object_realm(signal.bind_platform_object()) == realm)
+
+test "an abort reason held only as a JS value survives collections":
+    web_test_clobber_stack()
+    run_abort_reason_survives()
+
+noinline func run_abort_reason_survives():
+    let vm = web_test_create_vm()
+    let context = make_test_realm_context(vm)
+    let weak = make_test_signal_with_reason(vm, context)
+    web_test_clobber_stack()
+    gc.heap_collect_garbage(vm_heap(vm))
+    assert(web_test_alive(&weak))
+    discard(vm_pop_execution_context(vm))
+    web_test_destroy_vm(vm)
+
+## A signal kept alive from the C heap whose reason is a new DOMException; a Weak of the exception.
+noinline func make_test_signal_with_reason(vm: Vm*, context: JsExecutionContext*) -> gc.Weak[IdlDomException]:
+    let realm = context.realm else trap("no realm")
+    let signal = dom_abort_signal_construct_impl(realm) else trap("construct_impl failed")
+    vm_keep_alive(vm, signal)
+    let exception = idl_abort_error_create(realm, ak.utf16_string_from_str("reason"))
+    dom_abort_signal_set_reason(signal, js_value_from_object((JsObject*)exception))
+    return gc.make_weak[IdlDomException](exception)
+
+# mark: Native functions, completions and values ================================================
+
+test "JS::call of a native function: arguments, this value, realm and the context stack":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let realm = web_test_create_realm(vm)
+    var seen = TestNativeCall()
+    let function = js_native_function_create(realm, JsNativeFunctionBehaviour(call = test_native_behaviour, context = &seen), 1, ak.utf16_fly_string_new(), realm)
+    assert(js_object_is_function((JsObject*)function))
+    assert(js_object_shape_realm((JsObject*)function) == realm)
+    assert(not js_object_is_function(realm_global_object(realm)))
+    assert(js_object_shape_realm(realm_global_object(realm)) == realm)
+
+    # [[Call]] needs a running execution context (the caller's).
+    let caller = js_execution_context_create()
+    vm_push_execution_context(vm, caller)
+    defer discard(vm_pop_execution_context(vm))
+    let arguments: JsValue[2] = [js_value_from_f64(1.5), js_null()]
+    let result = js_call(vm, (JsFunctionObject*)function, js_value_from_bool(false), arguments) else trap("call failed")
+    assert(js_value_is_boolean(result) and js_value_as_bool(result))
+    assert(seen.calls == 1 and seen.argument_count == 2 and js_value_as_double(seen.argument) == 1.5)
+    assert(js_value_is_boolean(seen.this_value) and not js_value_as_bool(seen.this_value))
+    assert(seen.realm == realm)
+    assert(vm_running_execution_context(vm) == caller)
+
+    # Past the arguments a native function reads undefined; a failure pops its context too.
+    seen.fail = true
+    let no_arguments: JsValue[1] = [js_undefined()]
+    let failed = js_call(vm, (JsFunctionObject*)function, js_undefined(), no_arguments[0..<0]) catch failure:
+        assert(failure.code == js_exception)
+        recover js_null()
+    assert(js_value_is_null(failed))
+    assert(seen.argument_count == 0 and js_value_is_undefined(seen.argument))
+    assert(vm_running_execution_context(vm) == caller)
+    discard(vm_take_pending_exception(vm))
+
+test "completions and the throw completion of a DOMException":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let realm = web_test_create_realm(vm)
+    let normal = js_completion_from_value(js_value_from_f64(2.0))
+    assert(js_completion_type(&normal) == JsCompletionType.normal and not js_completion_is_abrupt(&normal) and not js_completion_is_error(&normal))
+    let thrown = js_throw_completion(js_null())
+    assert(js_completion_is_abrupt(&thrown) and js_completion_is_error(&thrown))
+    let exception = idl_not_found_error_create(realm, ak.utf16_string_from_str("gone"))
+    let completion = throw_completion(exception)
+    assert(js_completion_is_error(&completion))
+    assert(js_value_as_object(js_completion_value(&completion)) == (JsObject*)exception)
+
+    # A WebIDL exception left pending becomes the throw completion of its DOMException.
+    let threw = web_test_throw(.idl_dom_exception(exception)) catch: recover false
+    assert(not threw)
+    let taken = vm_take_throw_completion(vm)
+    assert(js_value_as_object(js_completion_value(&taken)) == (JsObject*)exception)
+
+test "JS values of objects: tagged cells, null for none; nullish and booleans":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let realm = web_test_create_realm(vm)
+    let global = realm_global_object(realm)
+    let value = js_value_from_object(global)
+    assert(js_value_is_object(value) and not js_value_is_nullish(value))
+    assert(js_value_as_object(value) == global)
+    assert(test_bits(value) == (0xfff9 << 48) | ((u64)(usize)global & 0x0000ffffffffffff))
+    assert(js_value_is_null(js_value_from_object(none)))
+    assert(js_value_is_nullish(js_null()) and js_value_is_nullish(js_undefined()))
+    assert(not js_value_is_nullish(js_value_from_bool(false)) and not js_value_is_nullish(js_value_from_f64(0.0)))
+    assert(js_value_as_bool(js_value_from_bool(true)) and not js_value_as_bool(js_value_from_bool(false)))
+
+# mark: HighResolutionTime and UI event names ===================================================
+
+test "coarsen time: 100 microseconds, or 5 for cross-origin isolated":
+    assert(high_resolution_time_coarsen_time(1234.56789) == math.floor(1234.56789 / 0.1) * 0.1)
+    assert(high_resolution_time_coarsen_time(0.09) == 0.0)
+    assert(high_resolution_time_coarsen_time(1234.56789, HtmlCanUseCrossOriginIsolatedApIs.yes) == math.floor(1234.56789 / 0.005) * 0.005)
+    let before = high_resolution_time_unsafe_shared_current_time()
+    let after = high_resolution_time_unsafe_shared_current_time()
+    assert(after >= before and before > 0.0)
+    assert(high_resolution_time_wall_clock_unsafe_current_time() > 1.6e12)
+
+test "the UI event names are interned":
+    ui_events_event_names_initialize_strings()
+    assert(ak.fly_string_eq_string_view(&ui_events_event_names_keydown, ak.sv("keydown")))
+    assert(ak.fly_string_eq_string_view(&ui_events_event_names_pointerrawupdate, ak.sv("pointerrawupdate")))
+    let resize = ak.fly_string_from_str("resize")
+    assert(ak.fly_string_eq_fly_string(&ui_events_event_names_resize, &resize))

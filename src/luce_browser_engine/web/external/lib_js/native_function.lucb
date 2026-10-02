@@ -1,0 +1,229 @@
+#==============================================================================================
+#
+#   native_function - JS::NativeFunction, JS::call and JS::Completion before scripting
+#
+#   DESCRIPTION:
+#       Port of the parts of Libraries/LibJS that let LibWeb call its own native event
+#       listeners before luce-js arrives (DESIGN.md §3.6): NativeFunction::create, its [[Call]]
+#       and CapturingNativeFunction::call (NativeFunction.cpp), JS::call (call_impl,
+#       AbstractOperations.cpp), the arguments a native behaviour reads from the running
+#       execution context (VM::argument, VM::argument_count, VM::this_value), the completion
+#       record (Completion.h, Completion.cpp: throw_completion) and the two JS::Object queries
+#       LibWeb asks of a callback's object (is_function, shape().realm()). Before phase 3 the
+#       JS objects LibWeb meets are cells: platform objects and native functions. ECMAScript
+#       function objects, callable proxies and the bytecode interpreter's stack are phase 3.
+#       Added in region r19.
+#
+#       Copyright (c) 2020-2025, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2021-2023, Linus Groh <linusg@serenityos.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: NativeFunction ==========================================================================
+
+## Ported from Libraries/LibJS/Runtime/NativeFunction.cpp:63 JS::NativeFunction::create
+## (Realm&, Function<ThrowCompletionOr<Value>(VM&)>, i32 length, PropertyKey const& name,
+## Optional<Realm*>): 10.3.3 CreateBuiltinFunction ( behaviour, length, name,
+## additionalInternalSlotsList [ , realm [ , prototype [ , prefix ] ] ] ),
+## https://tc39.es/ecma262/#sec-createbuiltinfunction. `realm` none is "not present". The
+## prototype, length and name are JS properties of the function (phase 3).
+pub func js_native_function_create(allocating_realm: Realm*, behaviour: JsNativeFunctionBehaviour, length: i32, name: ak.Utf16FlyString, realm: Realm*? = none) -> JsNativeFunction*:
+    let vm = realm_vm(allocating_realm)
+
+    # 1. If realm is not present, set realm to the current Realm Record.
+    var function_realm = realm
+    if function_realm == none:
+        function_realm = vm_current_realm(vm)
+    let callee_realm = function_realm else trap("NativeFunction::create: no realm")
+
+    # 2. If prototype is not present, set prototype to realm.[[Intrinsics]].[[%Function.prototype%]].
+    # (The prototype is a JS object: phase 3.)
+
+    # 3. Let internalSlotsList be a List containing the names of all the internal slots that 10.3 requires for the built-in function object that is about to be created.
+    # 4. Append to internalSlotsList the elements of additionalInternalSlotsList.
+
+    # 5. Let func be a new built-in function object that, when called, performs the action described by behaviour using the provided arguments as the values of the corresponding parameters specified by behaviour. The new function object has internal slots whose names are the elements of internalSlotsList, and an [[InitialName]] internal slot.
+    # 6. Set func.[[Prototype]] to prototype.
+    # 7. Set func.[[Extensible]] to true.
+    # 8. Set func.[[Realm]] to realm.
+    # 9. Set func.[[InitialName]] to null.
+    let function = (JsNativeFunction*)web_allocate_cell(allocating_realm, &js_native_function_class)
+    js_native_function_construct(function, behaviour, callee_realm)
+    web_initialize_cell(function.cell(), allocating_realm)
+
+    # 10. Perform SetFunctionLength(func, length).
+    # 11. If prefix is not present, then
+    #     a. Perform SetFunctionName(func, name).
+    # (Both are JS properties of the function: phase 3.)
+
+    # 13. Return func.
+    return function
+
+## Ported from Libraries/LibJS/Runtime/NativeFunction.cpp:21 CapturingNativeFunction::CapturingNativeFunction
+## over NativeFunction.cpp:117 JS::NativeFunction::NativeFunction(Object* prototype, Realm&).
+pub func js_native_function_construct(this: JsNativeFunction*, native_function: JsNativeFunctionBehaviour, realm: Realm*):
+    this.m_realm = realm
+    this.m_native_function = native_function
+
+## Ported from Libraries/LibJS/Runtime/NativeFunction.cpp:55 JS::NativeFunction::visit_edges and
+## NativeFunction.cpp:41 CapturingNativeFunction::visit_edges (override): the realm and,
+## conservatively, the behaviour's captures.
+pub func js_native_function_visit_edges_impl(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (JsNativeFunction*)base
+    gc.cell_visit_edges_impl(base, visitor)
+    gc.cell_visitor_visit_t_2(visitor, this.m_realm)
+    let captures = (u8*)this + offsetof(JsNativeFunction, m_native_function)
+    gc.cell_visitor_visit_possible_values(visitor, u8[](captures, sizeof(JsNativeFunctionBehaviour)))
+
+## JS_OBJECT(NativeFunction, FunctionObject)'s class_name.
+func js_native_function_class_name_impl(this: gc.Cell*) -> ak.StringView:
+    return ak.sv("NativeFunction")
+
+## Ported from Libraries/LibJS/Runtime/NativeFunction.cpp:34 CapturingNativeFunction::call (override).
+pub func js_native_function_call(this: JsNativeFunction*) -> JsValue!:
+    let call = this.m_native_function.call else trap("VERIFY: NativeFunction without a behaviour")
+    return try call(this.m_native_function.context, js_cell_vm(this.js_cell()))
+
+## Ported from Libraries/LibJS/Runtime/NativeFunction.cpp:184 JS::NativeFunction::internal_call:
+## 10.3.1 [[Call]] ( thisArgument, argumentsList ),
+## https://tc39.es/ecma262/#sec-built-in-function-objects-call-thisargument-argumentslist
+pub func js_native_function_internal_call(this: JsNativeFunction*, callee_context: JsExecutionContext*, this_argument: JsValue) -> JsValue!:
+    let vm = js_cell_vm(this.js_cell())
+
+    # 1. Let callerContext be the running execution context.
+    # (Its environments, which the callee context inherits, are phase 3.)
+    discard(vm_running_execution_context(vm))
+
+    # 2. If callerContext is not already suspended, suspend callerContext.
+    # 3. Let calleeContext be a new execution context.
+
+    # 4. Set the Function of calleeContext to F.
+    callee_context.function = (JsFunctionObject*)this
+
+    # 5. Let calleeRealm be F.[[Realm]].
+    # 6. Set the Realm of calleeContext to calleeRealm.
+    callee_context.realm = this.m_realm
+
+    # 7. Set the ScriptOrModule of calleeContext to null.
+    # Note: This is already the default value.
+
+    # 8. Perform any necessary implementation-defined initialization of calleeContext.
+    callee_context.this_value = this_argument
+
+    # 9. Push calleeContext onto the execution context stack; calleeContext is now the running execution context.
+    vm_push_execution_context(vm, callee_context)
+
+    # 10. Let result be the Completion Record that is the result of evaluating F in a manner that conforms to the specification of F. thisArgument is the this value, argumentsList provides the named parameters, and the NewTarget value is undefined.
+    let result = js_native_function_call(this) catch failure:
+        # 11. Remove calleeContext from the execution context stack and restore callerContext as the running execution context.
+        discard(vm_pop_execution_context(vm))
+        error(failure.code, failure.message)
+
+    # 11. Remove calleeContext from the execution context stack and restore callerContext as the running execution context.
+    discard(vm_pop_execution_context(vm))
+
+    # 12. Return ? result.
+    return result
+
+# mark: Call ====================================================================================
+
+## Ported from Libraries/LibJS/Runtime/AbstractOperations.cpp:88 JS::call_impl (JS::call):
+## 7.3.14 Call ( F, V [ , argumentsList ] ), https://tc39.es/ecma262/#sec-call. The callee
+## context's arguments are the list itself (the interpreter stack's copy is phase 3).
+pub func js_call(vm: Vm*, function: JsFunctionObject*, this_value: JsValue, arguments_list: const JsValue[]) -> JsValue!:
+    # 1. If argumentsList is not present, set argumentsList to a new empty List.
+
+    # 2. If IsCallable(F) is false, throw a TypeError exception.
+    # Note: Called with a FunctionObject ref
+
+    # 3. Return ? F.[[Call]](V, argumentsList).
+    var callee_context = JsExecutionContext(function = none, realm = none, arguments = arguments_list)
+    return try js_function_object_internal_call(function, &callee_context, this_value)
+
+## JS::FunctionObject::internal_call (virtual, FunctionObject.h): [[Call]]. The only function
+## objects before phase 3 are native functions; ECMAScript function objects run in luce-js.
+pub func js_function_object_internal_call(this: JsFunctionObject*, callee_context: JsExecutionContext*, this_argument: JsValue) -> JsValue!:
+    if let native_function = as_if_js_native_function((gc.Cell*)this):
+        return try js_native_function_internal_call(native_function, callee_context, this_argument)
+    trap("unported (P3): [[Call]] of an ECMAScript function object")
+
+## Ported from Libraries/LibJS/Runtime/VM.h:322 JS::VM::argument_count.
+pub func vm_argument_count(this: Vm*) -> usize:
+    return vm_running_execution_context(this).arguments.length
+
+## Ported from Libraries/LibJS/Runtime/VM.h:327 JS::VM::argument (ExecutionContext::argument,
+## ExecutionContext.h:90): undefined past the passed arguments.
+pub func vm_argument(this: Vm*, index: usize) -> JsValue:
+    let arguments = vm_running_execution_context(this).arguments
+    if index >= arguments.length:
+        return js_undefined()
+    return arguments[index]
+
+## Ported from Libraries/LibJS/Runtime/VM.h:332 JS::VM::this_value.
+pub func vm_this_value(this: Vm*) -> JsValue:
+    return vm_running_execution_context(this).this_value else trap("VERIFY: no this value")
+
+# mark: Object ==================================================================================
+
+## JS::Object::is_function (virtual, Object.h): whether the object is callable. Before phase 3 the
+## callable objects are native functions.
+pub func js_object_is_function(this: JsObject*) -> bool:
+    return is_js_native_function((gc.Cell*)this)
+
+## `object.shape().realm()`: the realm an object was created in. Before phase 3 the JS objects
+## are cells: a platform object knows its realm (Bindings::PlatformObject::realm), a native
+## function its [[Realm]], which is also its shape's.
+pub func js_object_shape_realm(this: JsObject*) -> Realm*:
+    let cell = (gc.Cell*)this
+    if let platform_object = as_if_bind_platform_object(cell):
+        return bind_platform_object_realm(platform_object)
+    if let native_function = as_if_js_native_function(cell):
+        return native_function.m_realm
+    trap("unported (P3): JS::Object::shape().realm() of a JS object")
+
+# mark: Completion ==============================================================================
+
+## Ported from Libraries/LibJS/Runtime/Completion.h:60 JS::Completion::Completion(Type, Value).
+pub func js_completion_create(type_: JsCompletionType, value: JsValue) -> JsCompletion:
+    assert(type_ != JsCompletionType.empty)
+    return JsCompletion(m_type = type_, m_value = value)
+
+## Ported from Libraries/LibJS/Runtime/Completion.h:72 JS::Completion::Completion(Value):
+## 5.2.3.1 Implicit Completion Values, a normal completion.
+pub func js_completion_from_value(value: JsValue) -> JsCompletion:
+    return js_completion_create(JsCompletionType.normal, value)
+
+## Ported from Libraries/LibJS/Runtime/Completion.h:87 JS::Completion::type.
+pub func js_completion_type(this: const JsCompletion*) -> JsCompletionType:
+    assert(this.m_type != JsCompletionType.empty)
+    return this.m_type
+
+## Ported from Libraries/LibJS/Runtime/Completion.h:92 JS::Completion::value.
+pub func js_completion_value(this: const JsCompletion*) -> JsValue:
+    return this.m_value
+
+## Ported from Libraries/LibJS/Runtime/Completion.h:96 JS::Completion::is_abrupt: "abrupt
+## completion refers to any completion with a [[Type]] value other than normal".
+pub func js_completion_is_abrupt(this: const JsCompletion*) -> bool:
+    return this.m_type != JsCompletionType.normal
+
+## Ported from Libraries/LibJS/Runtime/Completion.h:99 JS::Completion::is_error.
+pub func js_completion_is_error(this: const JsCompletion*) -> bool:
+    return this.m_type == JsCompletionType.throw_
+
+## Ported from Libraries/LibJS/Runtime/Completion.h:101 JS::Completion::release_error.
+pub func js_completion_release_error(this: const JsCompletion*) -> JsCompletion:
+    assert(js_completion_is_error(this))
+    return js_completion_create(this.m_type, this.m_value)
+
+## Ported from Libraries/LibJS/Runtime/Completion.cpp:142 JS::throw_completion.
+pub func js_throw_completion(value: JsValue) -> JsCompletion:
+    # 1. Return Completion Record { [[Type]]: throw, [[Value]]: value, [[Target]]: empty }.
+    return js_completion_create(JsCompletionType.throw_, value)
+
+## `ThrowCompletionOr<T>::throw_completion()` / `release_error()` of a call that failed: a `T!`
+## that failed stored its exception in the VM (DESIGN.md §2.10); it is taken and, if it is still
+## a WebIDL exception, converted as Bindings::exception_to_throw_completion does.
+pub func vm_take_throw_completion(vm: Vm*) -> JsCompletion:
+    return bind_exception_to_throw_completion(vm, vm_take_pending_exception(vm))
