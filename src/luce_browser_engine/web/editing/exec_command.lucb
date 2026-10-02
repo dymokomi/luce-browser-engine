@@ -1,0 +1,470 @@
+#==============================================================================================
+#
+#   exec_command - Document.execCommand() and the queryCommand*() methods
+#
+#   DESCRIPTION:
+#       Port of LibWeb/Editing/ExecCommand.cpp (all of it): the DOM::Document methods of the
+#       execCommand spec (exec_command, query_command_enabled/indeterm/state/supported/value)
+#       and the value-override bookkeeping. The command table, the active range and the
+#       editing algorithms they call are Editing/ (phase 4) and live in the closure stubs.
+#
+#       Copyright (c) 2024-2025, Jelle Raaijmakers <jelle@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Helpers =================================================================================
+
+## exec_command step 4: the commands it fires no input events for (the Miscellaneous commands, plus the clipboard ones).
+let exec_command_miscellaneous_commands: str[9] = ["copy", "cut", "defaultParagraphSeparator", "paste", "redo", "selectAll", "styleWithCSS", "undo", "useCSS"]
+
+## query_command_enabled: the Miscellaneous commands that are always enabled.
+let exec_command_always_enabled_commands: str[5] = ["defaultParagraphSeparator", "redo", "styleWithCSS", "undo", "useCSS"]
+
+## query_command_enabled: the commands not enabled when the editing host is plaintext-only.
+let exec_command_plaintext_only_disabled_commands: str[25] = [
+    "backColor",
+    "bold",
+    "createLink",
+    "fontName",
+    "fontSize",
+    "foreColor",
+    "formatBlock",  # AD-HOC: https://github.com/w3c/editing/issues/478
+    "hiliteColor",
+    "indent",
+    "insertHorizontalRule",
+    "insertImage",
+    "insertOrderedList",
+    "insertUnorderedList",
+    "italic",
+    "justifyCenter",
+    "justifyFull",
+    "justifyLeft",
+    "justifyRight",
+    "outdent",
+    "removeFormat",
+    "strikethrough",
+    "subscript",
+    "superscript",
+    "underline",
+    "unlink"]
+
+## query_command_indeterm: the standard inline value commands.
+let exec_command_standard_inline_value_commands: str[4] = ["backColor", "fontName", "foreColor", "hiliteColor"]
+
+## `command.is_one_of(names...)` for FlyStrings compared by content.
+func exec_command_is_one_of(command: const ak.FlyString*, names: const str[]) -> bool:
+    for name in names:
+        if ak.fly_string_eq_string_view(command, ak.sv(name)):
+            return true
+    return false
+
+## `command.is_one_of_ignoring_ascii_case(names...)`.
+func exec_command_is_one_of_ignoring_ascii_case(command: const ak.FlyString*, names: const str[]) -> bool:
+    for name in names:
+        if ak.fly_string_equals_ignoring_ascii_case_string_view(command, ak.sv(name)):
+            return true
+    return false
+
+## `return WebIDL::InvalidStateError::create(realm(), message)` from an ExceptionOr function.
+func exec_command_throw_invalid_state(document: DomDocument*, message: str) -> never!:
+    return try dom_document_throw(idl_invalid_state_error_create(dom_document_realm(document), ak.utf16_string_from_str(message)))
+
+## `inline_activated_values.contains_slow(value)` over Utf16Views.
+func exec_command_inline_values_contain(values: const ak.Vector[ak.Utf16View]*, value: const ak.Utf16String*) -> bool:
+    for candidate in ak.vector_span_const(values):
+        if ak.utf16_string_base_eq_utf16_view(&value.utf16_string_base, &candidate):
+            return true
+    return false
+
+## `Editing::effective_command_value(node, command).value_or({})`.
+func exec_command_effective_value_or_empty(node: DomNode*?, command: ak.FlyString) -> ak.Utf16String:
+    if let value = editing_effective_command_value(node, command):
+        return value
+    return ak.Utf16String()
+
+# mark: execCommand =============================================================================
+
+## Ported from ExecCommand.cpp:20 Web::DOM::Document::exec_command.
+# https://w3c.github.io/editing/docs/execCommand/#execcommand()
+pub func dom_document_exec_command(this: DomDocument*, command: ak.FlyString, show_ui: bool, value: ak.Utf16String) -> bool!:
+    # AD-HOC: This is not directly mentioned in the spec, but all major browsers limit editing API calls to HTML documents
+    if not dom_document_is_html_document(this):
+        try exec_command_throw_invalid_state(this, "execCommand is only supported on HTML documents")
+
+    # AD-HOC: All major browsers refuse to recursively execute execCommand() (e.g. inside input event handlers).
+    if this.m_inside_exec_command:
+        return false
+    # TemporaryChange guard_recursion { m_inside_exec_command, true };
+    let previous_inside_exec_command = this.m_inside_exec_command
+    this.m_inside_exec_command = true
+    defer this.m_inside_exec_command = previous_inside_exec_command
+
+    # 1. If only one argument was provided, let show UI be false.
+    # 2. If only one or two arguments were provided, let value be the empty string.
+    # NOTE: these steps are dealt by the default values for both show_ui and value
+
+    # 3. If command is not supported or not enabled, return false.
+    # NOTE: query_command_enabled() also checks if command is supported
+    let enabled = dom_document_query_command_enabled(this, command) else trap("MUST: query_command_enabled")
+    if not enabled:
+        return false
+
+    # 4. If command is not in the Miscellaneous commands section:
+    #
+    #    We don't fire events for copy/cut/paste/undo/redo/selectAll because they should all have their own events. We
+    #    don't fire events for styleWithCSS/useCSS because it's not obvious where to fire them, or why anyone would
+    #    want them. We don't fire events for unsupported commands, because then if they became supported and were
+    #    classified with the exec_command_miscellaneous_commands events, we'd have to stop firing events for consistency's sake.
+    #
+    # AD-HOC: The defaultParagraphSeparator command is also in the Miscellaneous commands section
+    let command_definition = editing_find_command_definition(command) else trap("VERIFY: optional_command.has_value()")
+    var affected_editing_host: DomNode*? = none
+    if not exec_command_is_one_of(&command_definition.command, exec_command_miscellaneous_commands):
+        # 1. Let affected editing host be the editing host that is an inclusive ancestor of the active range's start
+        #    node and end node, and is not the ancestor of any editing host that is an inclusive ancestor of the active
+        #    range's start node and end node.
+        #
+        # NOTE: Because either the start or end node of the range could be inside an editing host that is part of the
+        #       other node's editing host, we can probe both and see if either one is the other's ancestor.
+        # NOTE: We can reuse ->editing_host() here since query_command_enabled() above already checked that both the
+        #       start and end nodes are either editable or an editing host.
+        let range = editing_active_range(this) else trap("VERIFY: an active range")
+        let start_node_editing_host = dom_node_editing_host(dom_abstract_range_start_container(range.dom_abstract_range())) else trap("VERIFY: the start node has an editing host")
+        let end_node_editing_host = dom_node_editing_host(dom_abstract_range_end_container(range.dom_abstract_range())) else trap("VERIFY: the end node has an editing host")
+        affected_editing_host = end_node_editing_host if tree_node_is_ancestor_of(start_node_editing_host, end_node_editing_host) else start_node_editing_host
+
+        # 2. Fire an event named "beforeinput" at affected editing host using InputEvent, with its
+        #    bubbles and cancelable attributes initialized to true, and its data attribute
+        #    initialized to null.
+        # 3. If the value returned by the previous step is false, return false.
+        # 4. If command is not enabled, return false.
+        #
+        #    We have to check again whether the command is enabled, because the beforeinput handler might have done
+        #    something annoying like getSelection().removeAllRanges().
+        # 5. Let affected editing host be the editing host that is an inclusive ancestor of the active range's start
+        #    node and end node, and is not the ancestor of any editing host that is an inclusive ancestor of the active
+        #    range's start node and end node.
+        #
+        #    This new affected editing host is what we'll fire the input event at in a couple of lines. We want to
+        #    compute it beforehand just to be safe: bugs in the command action might remove the selection or something
+        #    bad like that, and we don't want to have to handle it later. We recompute it after the beforeinput event
+        #    is handled so that if the handler moves the selection to some other editing host, the input event will be
+        #    fired at the editing host that was actually affected.
+
+        # AD-HOC: No, we don't. Neither Chrome nor Firefox fire the "beforeinput" event for execCommand(). This is an
+        #         open discussion for the spec: https://github.com/w3c/editing/issues/200
+
+    # https://w3c.github.io/editing/docs/execCommand/#preserves-overrides
+    # If a command preserves overrides, then before taking its action, the user agent must record current overrides.
+    var overrides: ak.Vector[EditingRecordedOverride]
+    if command_definition.preserves_overrides:
+        overrides = editing_record_current_overrides(this)
+
+    # NOTE: Step 7 below asks us whether the DOM tree was modified, so keep track of the document versions.
+    let old_dom_tree_version = dom_document_dom_tree_version(this)
+    let old_character_data_version = dom_document_character_data_version(this)
+
+    # 5. Take the action for command, passing value to the instructions as an argument.
+    let action = command_definition.action else trap("VERIFY: the command has an action")
+    let command_result = action(this, value)
+
+    # https://w3c.github.io/editing/docs/execCommand/#preserves-overrides
+    # After taking the action, if the active range is collapsed, it must restore states and values from the recorded
+    # list.
+    if not ak.vector_is_empty(&overrides):
+        if let selection = this.m_selection:
+            if selection_selection_is_collapsed(selection):
+                editing_restore_states_and_values(this, &overrides)
+
+    # 6. If the previous step returned false, return false.
+    if not command_result:
+        return false
+
+    # 7. If the action modified DOM tree, then fire an event named "input" at affected editing host using InputEvent,
+    #    with its isTrusted and bubbles attributes initialized to true, inputType attribute initialized to the mapped
+    #    value of command, and its data attribute initialized to null.
+    let tree_was_modified = dom_document_dom_tree_version(this) != old_dom_tree_version or dom_document_character_data_version(this) != old_character_data_version
+    if tree_was_modified:
+        if let editing_host = affected_editing_host:
+            var event_init: UiEventsInputEventInit = ---
+            ui_events_input_event_init_init_fields(&event_init)
+            event_init.ui_event_init.event_init.bubbles = true
+            event_init.input_type = command_definition.mapped_value
+
+            # AD-HOC: For insertText, we do what other browsers do and set data to value.
+            if ak.fly_string_eq_string_view(&command, ak.sv("insertText")):
+                event_init.data = value
+
+            let event = (DomEvent*)ui_events_input_event_create_from_platform_event(dom_document_realm(this), html_event_names_input, event_init)
+            dom_event_set_is_trusted(event, true)
+            discard(dom_event_target_dispatch_event(editing_host.dom_event_target(), event))
+
+    # AD-HOC: Scroll the cursor into view after executing a command.
+    if let selection = dom_document_get_selection(this):
+        selection_selection_scroll_focus_into_view(selection)
+
+    # 8. Return true.
+    return true
+
+# mark: queryCommand* ===========================================================================
+
+## Ported from ExecCommand.cpp:144 Web::DOM::Document::query_command_enabled.
+# https://w3c.github.io/editing/docs/execCommand/#querycommandenabled()
+pub func dom_document_query_command_enabled(this: DomDocument*, command: ak.FlyString) -> bool!:
+    # AD-HOC: This is not directly mentioned in the spec, but all major browsers limit editing API calls to HTML documents
+    if not dom_document_is_html_document(this):
+        try exec_command_throw_invalid_state(this, "queryCommandEnabled is only supported on HTML documents")
+
+    # 2. Return true if command is both supported and enabled, false otherwise.
+    let supported = dom_document_query_command_supported(this, command) else trap("MUST: query_command_supported")
+    if not supported:
+        return false
+
+    # https://w3c.github.io/editing/docs/execCommand/#enabled
+    # Among commands defined in this specification, those listed in Miscellaneous commands are always enabled, except
+    # for the cut command and the paste command.
+    # NOTE: cut and paste are actually in the Clipboard commands section
+    if exec_command_is_one_of_ignoring_ascii_case(&command, exec_command_always_enabled_commands):
+        return true
+
+    # AD-HOC: selectAll requires a selection object to exist.
+    if ak.fly_string_equals_ignoring_ascii_case_string_view(&command, ak.sv("selectAll")):
+        return dom_document_get_selection(this) != none
+
+    # The other commands defined here are enabled if the active range is not null,
+    let active_range = editing_active_range(this) else return false
+
+    # its start node is either editable or an editing host,
+    let start_node = dom_abstract_range_start_container(active_range.dom_abstract_range())
+    if not dom_node_is_editable_or_editing_host(start_node):
+        return false
+
+    # FIXME: the editing host of its start node is not an EditContext editing host,
+    discard(dom_node_editing_host(start_node))
+
+    # its end node is either editable or an editing host,
+    let end_node = dom_abstract_range_end_container(active_range.dom_abstract_range())
+    if not dom_node_is_editable_or_editing_host(end_node):
+        return false
+
+    # FIXME: the editing host of its end node is not an EditContext editing host,
+    discard(dom_node_editing_host(end_node))
+
+    # and there is some editing host that is an inclusive ancestor of both its start node and its end node.
+    var inclusive_ancestor_editing_host: DomNode*? = none
+    var ancestor: DomNode*? = start_node
+    while let candidate = ancestor:
+        if dom_node_is_editing_host(candidate) and tree_node_is_inclusive_ancestor_of(candidate, end_node):
+            inclusive_ancestor_editing_host = candidate
+            break
+        ancestor = tree_node_parent(candidate)
+    let editing_host = inclusive_ancestor_editing_host else return false
+
+    # NOTE: Commands can define additional conditions for being enabled, and currently the only condition mentioned in
+    #       the spec is that certain commands must not be enabled if the editing host is in the plaintext-only state.
+    if let html_element = as_if_html_element(editing_host.cell()):
+        if html_element_content_editable_state(html_element) == HtmlContentEditableState.plaintext_only and exec_command_is_one_of_ignoring_ascii_case(&command, exec_command_plaintext_only_disabled_commands):
+            return false
+
+    return true
+
+## query_command_indeterm's callback for standard inline value commands: two formattable nodes with distinct
+## effective command values.
+struct ExecCommandDistinctValues:
+    var command: ak.FlyString
+    var first_node_value: ak.Utf16String?
+    var has_distinct_values: bool
+
+    static func call(context: void*?, descendant: DomNode*) -> TraversalDecision:
+        let state = (ExecCommandDistinctValues*)(context else trap("indeterm: no state"))
+        if not editing_is_formattable_node(descendant):
+            return TraversalDecision.continue_
+
+        let node_value = editing_effective_command_value(descendant, state.command) else return TraversalDecision.continue_
+
+        if let first = state.first_node_value:
+            if not ak.utf16_string_base_eq_utf16_string_base(&first.utf16_string_base, &node_value.utf16_string_base):
+                state.has_distinct_values = true
+                return TraversalDecision.break_
+        else:
+            state.first_node_value = node_value
+
+        return TraversalDecision.continue_
+
+## query_command_indeterm's callback for inline command activated values: at least one match and one mismatch.
+struct ExecCommandMatchAndMismatch:
+    var command: ak.FlyString
+    var inline_activated_values: const ak.Vector[ak.Utf16View]*
+    var has_at_least_one_match: bool
+    var has_at_least_one_mismatch: bool
+
+    static func call(context: void*?, descendant: DomNode*) -> TraversalDecision:
+        let state = (ExecCommandMatchAndMismatch*)(context else trap("indeterm: no state"))
+        if not editing_is_formattable_node(descendant):
+            return TraversalDecision.continue_
+
+        let node_value = editing_effective_command_value(descendant, state.command) else return TraversalDecision.continue_
+
+        if exec_command_inline_values_contain(state.inline_activated_values, &node_value):
+            state.has_at_least_one_match = true
+        else:
+            state.has_at_least_one_mismatch = true
+
+        if state.has_at_least_one_match and state.has_at_least_one_mismatch:
+            return TraversalDecision.break_
+        return TraversalDecision.continue_
+
+## Ported from ExecCommand.cpp:239 Web::DOM::Document::query_command_indeterm.
+# https://w3c.github.io/editing/docs/execCommand/#querycommandindeterm()
+pub func dom_document_query_command_indeterm(this: DomDocument*, command: ak.FlyString) -> bool!:
+    # AD-HOC: This is not directly mentioned in the spec, but all major browsers limit editing API calls to HTML documents
+    if not dom_document_is_html_document(this):
+        try exec_command_throw_invalid_state(this, "queryCommandIndeterm is only supported on HTML documents")
+
+    # 1. If command is not supported or has no indeterminacy, return false.
+    let command_definition = editing_find_command_definition(command) else return false
+    if command_definition.indeterminate == none:
+        # https://w3c.github.io/editing/docs/execCommand/#inline-command-activated-values
+        # If a command is a standard inline value command, it is indeterminate if among formattable nodes that are
+        # effectively contained in the active range, there are two that have distinct effective command values.
+        if exec_command_is_one_of(&command_definition.command, exec_command_standard_inline_value_commands):
+            var state = ExecCommandDistinctValues(command = command_definition.command, first_node_value = none, has_distinct_values = false)
+            let range = editing_active_range(this)
+            editing_for_each_node_effectively_contained_in_range(range, ak.Function1[DomNode*, TraversalDecision](call = ExecCommandDistinctValues.call, context = &state))
+            return state.has_distinct_values
+
+        # If a command has inline command activated values defined but nothing else defines when it is indeterminate,
+        # it is indeterminate if among formattable nodes effectively contained in the active range, there is at least
+        # one whose effective command value is one of the given values and at least one whose effective command value
+        # is not one of the given values.
+        if not ak.vector_is_empty(&command_definition.inline_activated_values):
+            let range = editing_active_range(this)
+            var state = ExecCommandMatchAndMismatch(command = command_definition.command, inline_activated_values = &command_definition.inline_activated_values, has_at_least_one_match = false, has_at_least_one_mismatch = false)
+            editing_for_each_node_effectively_contained_in_range(range, ak.Function1[DomNode*, TraversalDecision](call = ExecCommandMatchAndMismatch.call, context = &state))
+            return state.has_at_least_one_match and state.has_at_least_one_mismatch
+
+        return false
+
+    # 2. Return true if command is indeterminate, otherwise false.
+    let indeterminate = command_definition.indeterminate else trap("unreachable: checked above")
+    return indeterminate(this)
+
+## query_command_state's callback collecting the formattable nodes effectively contained in the active range.
+func exec_command_collect_formattable_node(context: void*?, descendant: DomNode*) -> TraversalDecision:
+    let formattable_nodes = (ak.Vector[DomNode*]*)(context else trap("state: no list"))
+    if editing_is_formattable_node(descendant):
+        ak.vector_append_t(formattable_nodes, descendant)
+    return TraversalDecision.continue_
+
+## Ported from ExecCommand.cpp:315 Web::DOM::Document::query_command_state.
+# https://w3c.github.io/editing/docs/execCommand/#querycommandstate()
+pub func dom_document_query_command_state(this: DomDocument*, command: ak.FlyString) -> bool!:
+    # AD-HOC: This is not directly mentioned in the spec, but all major browsers limit editing API calls to HTML documents
+    if not dom_document_is_html_document(this):
+        try exec_command_throw_invalid_state(this, "queryCommandState is only supported on HTML documents")
+
+    # 1. If command is not supported or has no state, return false.
+    let command_definition = editing_find_command_definition(command) else return false
+    let state_override = dom_document_command_state_override(this, command_definition.command)
+    if command_definition.state == none and state_override == none:
+        # https://w3c.github.io/editing/docs/execCommand/#inline-command-activated-values
+        # If a command has inline command activated values defined, its state is true if either no formattable node is
+        # effectively contained in the active range, and the active range's start node's effective command value is one
+        # of the given values;
+        let inline_values = &command_definition.inline_activated_values
+        if ak.vector_is_empty(inline_values):
+            return false
+        let range = editing_active_range(this) else return false
+
+        var formattable_nodes: ak.Vector[DomNode*]
+        editing_for_each_node_effectively_contained_in_range(range, ak.Function1[DomNode*, TraversalDecision](call = exec_command_collect_formattable_node, context = &formattable_nodes))
+        if ak.vector_is_empty(&formattable_nodes):
+            let start_value = exec_command_effective_value_or_empty(dom_abstract_range_start_container(range.dom_abstract_range()), command_definition.command)
+            return exec_command_inline_values_contain(inline_values, &start_value)
+
+        # or if there is at least one formattable node effectively contained in the active range, and all of them have
+        # an effective command value equal to one of the given values.
+        for node in ak.vector_span(&formattable_nodes):
+            let node_value = exec_command_effective_value_or_empty(node, command_definition.command)
+            if not exec_command_inline_values_contain(inline_values, &node_value):
+                return false
+        return true
+
+    # 2. If the state override for command is set, return it.
+    if let state_override_value = state_override:
+        return state_override_value
+
+    # 3. Return true if command's state is true, otherwise false.
+    let state = command_definition.state else trap("VERIFY: the command has a state")
+    return state(this)
+
+## Ported from ExecCommand.cpp:364 Web::DOM::Document::query_command_supported.
+# https://w3c.github.io/editing/docs/execCommand/#querycommandsupported()
+pub func dom_document_query_command_supported(this: DomDocument*, command: ak.FlyString) -> bool!:
+    # AD-HOC: This is not directly mentioned in the spec, but all major browsers limit editing API calls to HTML documents
+    if not dom_document_is_html_document(this):
+        try exec_command_throw_invalid_state(this, "queryCommandSupported is only supported on HTML documents")
+
+    # When the queryCommandSupported(command) method on the Document interface is invoked, the user agent must return
+    # true if command is supported and available within the current script on the current site, and false otherwise.
+    # AD-HOC: Supported commands should have an action defined. Currently, ::preserveWhitespace does not have one.
+    let command_definition = editing_find_command_definition(command) else return false
+    return command_definition.action != none
+
+## Ported from ExecCommand.cpp:378 Web::DOM::Document::query_command_value.
+# https://w3c.github.io/editing/docs/execCommand/#querycommandvalue()
+pub func dom_document_query_command_value(this: DomDocument*, command: ak.FlyString) -> ak.String!:
+    # AD-HOC: This is not directly mentioned in the spec, but all major browsers limit editing API calls to HTML documents
+    if not dom_document_is_html_document(this):
+        try exec_command_throw_invalid_state(this, "queryCommandValue is only supported on HTML documents")
+
+    # 1. If command is not supported or has no value, return the empty string.
+    let command_definition = editing_find_command_definition(command) else return ak.String()
+    let value_override = dom_document_command_value_override(this, command_definition.command)
+    if command_definition.value == none and value_override == none:
+        return ak.String()
+
+    # 2. If command is "fontSize" and its value override is set, convert the value override to an
+    #    integer number of pixels and return the legacy font size for the result.
+    if ak.fly_string_eq_string_view(&command_definition.command, ak.sv("fontSize")):
+        if let override_value = value_override:
+            let override_view = ak.utf16_string_base_utf16_view(&override_value.utf16_string_base)
+            let pixel_size = editing_font_size_to_pixel_size(&override_view)
+            let legacy_size = editing_legacy_font_size(gfx.css_pixels_to_int_const(&pixel_size))
+            return ak.utf16_string_base_to_utf8_but_should_be_ported_to_utf16(&legacy_size.utf16_string_base)
+
+    # 3. If the value override for command is set, return it.
+    if let override_value = value_override:
+        return ak.utf16_string_base_to_utf8_but_should_be_ported_to_utf16(&override_value.utf16_string_base)
+
+    # 4. Return command's value.
+    let value = command_definition.value else trap("VERIFY: the command has a value")
+    let command_value = value(this)
+    return ak.utf16_string_base_to_utf8_but_should_be_ported_to_utf16(&command_value.utf16_string_base)
+
+# mark: Value overrides =========================================================================
+
+## Ported from ExecCommand.cpp:409 Web::DOM::Document::set_command_value_override.
+# https://w3c.github.io/editing/docs/execCommand/#value-override
+pub func dom_document_set_command_value_override(this: DomDocument*, command: ak.FlyString, value: ak.Utf16String):
+    discard(ak.hash_map_set(&this.m_command_value_override, command, value))
+
+    # The value override for the backColor command must be the same as the value override for the hiliteColor command,
+    # such that setting one sets the other to the same thing and unsetting one unsets the other.
+    if ak.fly_string_eq_string_view(&command, ak.sv("backColor")):
+        discard(ak.hash_map_set(&this.m_command_value_override, ak.fly_string_from_str("hiliteColor"), value))
+    elif ak.fly_string_eq_string_view(&command, ak.sv("hiliteColor")):
+        discard(ak.hash_map_set(&this.m_command_value_override, ak.fly_string_from_str("backColor"), value))
+
+## Ported from ExecCommand.cpp:422 Web::DOM::Document::clear_command_value_override.
+# https://w3c.github.io/editing/docs/execCommand/#value-override
+pub func dom_document_clear_command_value_override(this: DomDocument*, command: ak.FlyString):
+    discard(ak.hash_map_remove_k(&this.m_command_value_override, command))
+
+    # The value override for the backColor command must be the same as the value override for the hiliteColor command,
+    # such that setting one sets the other to the same thing and unsetting one unsets the other.
+    if ak.fly_string_eq_string_view(&command, ak.sv("backColor")):
+        discard(ak.hash_map_remove_k(&this.m_command_value_override, ak.fly_string_from_str("hiliteColor")))
+    elif ak.fly_string_eq_string_view(&command, ak.sv("hiliteColor")):
+        discard(ak.hash_map_remove_k(&this.m_command_value_override, ak.fly_string_from_str("backColor")))
