@@ -1,0 +1,568 @@
+#==============================================================================================
+#
+#   document_8 - DOM::Document: favicons, document.domain, policy, navigables, destruction
+#
+#   DESCRIPTION:
+#       Port of LibWeb/DOM/Document.cpp (lines 4255-4791): page showing, the stacking context
+#       tree, favicons, the window, style sheets, history, registrable domain suffixes and the
+#       document.domain setter, the navigation ID, the active sandboxing flag set, the policy
+#       container, snapshotting source snapshot params, the descendant, ancestor and document-
+#       tree child navigables, the unloading cleanup steps, destroying a document, making it
+#       unsalvageable, and the DocumentLifecycleState that counts children during destruction
+#       and unloading.
+#
+#==============================================================================================
+
+# mark: Favicons, window, style sheets, history =================================================
+
+## AK/Debug.h SPAM_DEBUG (0 in the reference build).
+let spam_debug: bool = false
+
+## check_favicon_after_loading_link_resource's filter: link elements that loaded an icon.
+func dom_document_favicon_link_filter(context: void*?, element: DomElement*) -> bool:
+    let link = as_if_html_link_element(element) else return false
+
+    return html_link_element_has_loaded_icon(link)
+
+## Ported from Document.cpp:4255 Web::DOM::Document::check_favicon_after_loading_link_resource.
+pub func dom_document_check_favicon_after_loading_link_resource(this: DomDocument*):
+    # https://html.spec.whatwg.org/multipage/links.html#rel-icon
+    # NOTE: firefox also load favicons outside the head tag, which is against spec (see table 4.6.7)
+    let head_element = dom_document_head(this) else return
+
+    let favicon_link_elements = dom_html_collection_create(head_element.dom_parent_node(), DomHtmlCollectionScope.descendants, ak.Function1[DomElement*, bool](call = dom_document_favicon_link_filter, context = none), ak.Function2[DomElement*, DomElement*, bool]())
+
+    if dom_html_collection_length(favicon_link_elements) == 0:
+        if spam_debug:
+            ak.dbgln("No favicon found to be used")
+        return
+
+    # 4.6.7.8 Link type "icon"
+    #
+    # If there are multiple equally appropriate icons, user agents must use the last one declared
+    # in tree order at the time that the user agent collected the list of icons.
+    #
+    # If multiple icons are provided, the user agent must select the most appropriate icon
+    # according to the type, media, and sizes attributes.
+    #
+    # FIXME: There is no selective behavior yet for favicons.
+    var i = dom_html_collection_length(favicon_link_elements)
+    while i > 0:
+        i -= 1
+        let favicon_element = dom_html_collection_item(favicon_link_elements, i)
+
+        if favicon_element == this.m_active_element:
+            return
+
+        # If the user agent tries to use an icon but that icon is determined, upon closer examination,
+        # to in fact be inappropriate (...), then the user agent must try the next-most-appropriate icon
+        # as determined by the attributes.
+        let favicon = favicon_element else trap("the collection has an item at every index below its length")
+        if html_link_element_load_favicon_and_use_if_window_is_active((HtmlLinkElement*)favicon):
+            this.m_active_favicon = favicon.dom_node()
+            return
+
+    if spam_debug:
+        ak.dbgln("No favicon found to be used")
+
+## Ported from Document.cpp:4302 Web::DOM::Document::set_window.
+pub func dom_document_set_window(this: DomDocument*, window: HtmlWindow*):
+    this.m_window = window
+
+## Ported from Document.cpp:4307 Web::DOM::Document::style_sheets.
+pub func dom_document_style_sheets(this: DomDocument*) -> CssStyleSheetList*:
+    if this.m_style_sheets == none:
+        this.m_style_sheets = css_style_sheet_list_create(this.dom_node())
+    return this.m_style_sheets else trap("unreachable: set above")
+
+## Ported from Document.cpp:4314 Web::DOM::Document::style_sheets.
+pub func dom_document_style_sheets_const(this: DomDocument*) -> CssStyleSheetList*:
+    return dom_document_style_sheets(this)
+
+## Ported from Document.cpp:4319 Web::DOM::Document::history.
+pub func dom_document_history(this: DomDocument*) -> HtmlHistory*:
+    if this.m_history == none:
+        this.m_history = html_history_create(dom_document_realm(this))
+    return this.m_history else trap("unreachable: set above")
+
+## Ported from Document.cpp:4326 Web::DOM::Document::history.
+pub func dom_document_history_const(this: DomDocument*) -> HtmlHistory*:
+    return dom_document_history(this)
+
+## Ported from Document.cpp:4332 Web::DOM::Document::domain.
+# https://html.spec.whatwg.org/multipage/origin.html#dom-document-domain
+pub func dom_document_domain(this: DomDocument*) -> ak.String:
+    # 1. Let effectiveDomain be this's origin's effective domain.
+    let origin = dom_document_origin(this)
+    let effective_domain = web_url.origin_effective_domain(&origin)
+
+    # 2. If effectiveDomain is null, then return the empty string.
+    let domain = effective_domain else return ak.String()
+
+    # 3. Return effectiveDomain, serialized.
+    return web_url.host_serialize(&domain)
+
+# mark: document.domain =========================================================================
+
+## Ported from Document.cpp:4346 Web::DOM::is_a_registrable_domain_suffix_of_or_is_equal_to.
+# https://html.spec.whatwg.org/multipage/browsers.html#is-a-registrable-domain-suffix-of-or-is-equal-to
+pub func dom_is_a_registrable_domain_suffix_of_or_is_equal_to(host_suffix_string: ak.StringView, original_host: web_url.Host) -> bool:
+    # 1. If hostSuffixString is the empty string, then return false.
+    if ak.string_view_is_empty(&host_suffix_string):
+        return false
+
+    # 2. Let hostSuffix be the result of parsing hostSuffixString.
+    let host_suffix = web_url.parser_parse_host(host_suffix_string)
+
+    # 3. If hostSuffix is failure, then return false.
+    let host_suffix_value = host_suffix else return false
+
+    # 4. If hostSuffix does not equal originalHost, then:
+    if not web_url.host_eq(&host_suffix_value, original_host):
+        # 1. If hostSuffix or originalHost is not a domain, then return false.
+        # NOTE: This excludes hosts that are IP addresses.
+        if not web_url.host_has_string(&host_suffix_value) or not web_url.host_has_string(&original_host):
+            return false
+        let suffix_domain = web_url.host_get_string(&host_suffix_value)
+        let original_host_string = web_url.host_get_string(&original_host)
+
+        # 2. If hostSuffix, prefixed by U+002E (.), does not match the end of originalHost, then return false.
+        var prefixed = ak.string_builder_new()
+        ak.string_builder_append(&prefixed, ".")
+        ak.string_builder_append_string_view(&prefixed, ak.string_bytes_as_string_view(&suffix_domain))
+        let prefixed_host_suffix = ak.string_builder_to_string(&prefixed) else trap("MUST: String::formatted")
+        if not ak.string_ends_with_bytes(&original_host_string, ak.string_bytes_as_string_view(&prefixed_host_suffix)):
+            return false
+
+        # 3. If any of the following are true:
+        #     * hostSuffix equals hostSuffix's public suffix; or
+        #     * hostSuffix, prefixed by U+002E (.), matches the end of originalHost's public suffix,
+        #    then return false. [URL]
+        if let host_suffix_public_suffix = web_url.host_public_suffix(&host_suffix_value):
+            if ak.string_equals(&suffix_domain, &host_suffix_public_suffix):
+                return false
+
+        let original_host_public_suffix = web_url.host_public_suffix(&original_host) else trap("VERIFY: a domain has a public suffix")
+
+        if ak.string_ends_with_bytes(&original_host_public_suffix, ak.string_bytes_as_string_view(&prefixed_host_suffix)):
+            return false
+
+        # 4. Assert: originalHost's public suffix, prefixed by U+002E (.), matches the end of hostSuffix.
+        var prefixed_public_suffix = ak.string_builder_new()
+        ak.string_builder_append(&prefixed_public_suffix, ".")
+        ak.string_builder_append_string_view(&prefixed_public_suffix, ak.string_bytes_as_string_view(&original_host_public_suffix))
+        assert(ak.string_ends_with_bytes(&suffix_domain, ak.string_builder_string_view(&prefixed_public_suffix)))
+
+    # 5. Return true.
+    return true
+
+## Ported from Document.cpp:4395 Web::DOM::Document::set_domain.
+# https://html.spec.whatwg.org/multipage/browsers.html#dom-document-domain
+pub func dom_document_set_domain(this: DomDocument*, domain: ak.String) -> !:
+    let realm = dom_document_realm(this)
+
+    # 1. If this's browsing context is null, then throw a "SecurityError" DOMException.
+    if this.m_browsing_context == none:
+        return try dom_document_throw(idl_security_error_create(realm, ak.utf16_string_from_str("Document.domain setter requires a browsing context")))
+
+    # 2. If this's active sandboxing flag set has its sandboxed document.domain browsing context flag set, then throw a "SecurityError" DOMException.
+    if html_has_flag(dom_document_active_sandboxing_flag_set(this), HtmlSandboxingFlagSet.sandboxed_document_domain):
+        return try dom_document_throw(idl_security_error_create(realm, ak.utf16_string_from_str("Document.domain setter is sandboxed")))
+
+    # 3. Let effectiveDomain be this's origin's effective domain.
+    let origin = dom_document_origin(this)
+    let effective_domain = web_url.origin_effective_domain(&origin)
+
+    # 4. If effectiveDomain is null, then throw a "SecurityError" DOMException.
+    let effective_domain_value = effective_domain else return try dom_document_throw(idl_security_error_create(realm, ak.utf16_string_from_str("Document.domain setter called on a Document with a null effective domain")))
+
+    # 5. If the given value is not a registrable domain suffix of and is not equal to effectiveDomain, then throw a "SecurityError" DOMException.
+    if not dom_is_a_registrable_domain_suffix_of_or_is_equal_to(ak.string_bytes_as_string_view(&domain), effective_domain_value):
+        return try dom_document_throw(idl_security_error_create(realm, ak.utf16_string_from_str("Document.domain setter called for an invalid domain")))
+
+    # FIXME: 6. If the surrounding agent's agent cluster's is origin-keyed is true, then return.
+
+    # FIXME: 7. Set this's origin's domain to the result of parsing the given value.
+
+    ak.dbgln(f"(STUBBED) Document::set_domain(domain='{ak.string_view_text(ak.string_bytes_as_string_view(&domain))}')")
+
+# mark: Navigation ID, sandboxing, policy container =============================================
+
+## Ported from Document.cpp:4426 Web::DOM::Document::set_navigation_id.
+pub func dom_document_set_navigation_id(this: DomDocument*, navigation_id: ak.String?):
+    this.m_navigation_id = navigation_id
+
+## Ported from Document.cpp:4431 Web::DOM::Document::navigation_id.
+pub func dom_document_navigation_id(this: DomDocument*) -> ak.String?:
+    return this.m_navigation_id
+
+## Ported from Document.cpp:4436 Web::DOM::Document::active_sandboxing_flag_set.
+pub func dom_document_active_sandboxing_flag_set(this: DomDocument*) -> HtmlSandboxingFlagSet:
+    return this.m_active_sandboxing_flag_set
+
+## Ported from Document.cpp:4441 Web::DOM::Document::set_active_sandboxing_flag_set.
+pub func dom_document_set_active_sandboxing_flag_set(this: DomDocument*, sandboxing_flag_set: HtmlSandboxingFlagSet):
+    this.m_active_sandboxing_flag_set = sandboxing_flag_set
+
+## heap.allocate<HTML::PolicyContainer>(heap): a PolicyContainer cell constructed under DeferGC.
+pub func heap_allocate_html_policy_container(heap: gc.Heap*) -> HtmlPolicyContainer*:
+    let container = (HtmlPolicyContainer*)web_heap_allocate_cell(heap, &html_policy_container_class)
+    gc.heap_defer_gc(heap)
+    html_policy_container_construct(container, heap)
+    gc.heap_undefer_gc(heap)
+    return container
+
+## Ported from Document.cpp:4446 Web::DOM::Document::policy_container.
+pub func dom_document_policy_container(this: DomDocument*) -> HtmlPolicyContainer*:
+    let heap = gc.cell_heap(this.cell())
+    if this.m_policy_container == none:
+        this.m_policy_container = heap_allocate_html_policy_container(heap)
+    return this.m_policy_container else trap("unreachable: set above")
+
+## Ported from Document.cpp:4455 Web::DOM::Document::set_policy_container.
+pub func dom_document_set_policy_container(this: DomDocument*, policy_container: HtmlPolicyContainer*):
+    this.m_policy_container = policy_container
+
+## Ported from Document.cpp:4461 Web::DOM::Document::snapshot_source_snapshot_params.
+# https://html.spec.whatwg.org/multipage/browsing-the-web.html#snapshotting-source-snapshot-params
+pub func dom_document_snapshot_source_snapshot_params(this: DomDocument*) -> HtmlSourceSnapshotParams*:
+    let heap = gc.cell_heap(this.cell())
+    # To snapshot source snapshot params given a Document sourceDocument, return a new source snapshot params with
+    return heap_allocate_html_source_snapshot_params(
+        heap, html_window_has_transient_activation(as_html_window((gc.Cell*)html_relevant_global_object((JsObject*)this))), this.m_active_sandboxing_flag_set, not html_has_flag(this.m_active_sandboxing_flag_set, HtmlSandboxingFlagSet.sandboxed_downloads), dom_document_relevant_settings_object(this), html_policy_container_clone(dom_document_policy_container(this), heap),
+    )
+    # has transient activation
+    #    true if sourceDocument's relevant global object has transient activation; otherwise false
+
+    # sandboxing flags
+    #     sourceDocument's active sandboxing flag set
+
+    # allows downloading
+    #     false if sourceDocument's active sandboxing flag set has the sandboxed downloads browsing context flag set; otherwise true
+
+    # fetch client
+    #     sourceDocument's relevant settings object
+
+    # source policy container
+    #     a clone of sourceDocument's policy container
+
+# mark: Navigables ==============================================================================
+
+## The captures of descendant_navigables' walk: the list being extended.
+struct DomDocumentDescendantNavigablesWalk:
+    var navigables: ak.Vector[HtmlNavigable*?]*
+
+## descendant_navigables' walk over the shadow-including descendants.
+func dom_document_descendant_navigables_visit(context: void*?, node: DomNode*) -> TraversalDecision:
+    let captures = (DomDocumentDescendantNavigablesWalk*)(context else trap("no captures"))
+    if let navigable_container = as_if_html_navigable_container(node):
+        # 1. If navigableContainer's content navigable is null, then continue.
+        let content_navigable = html_navigable_container_content_navigable(navigable_container) else return TraversalDecision.continue_
+
+        # 2. Extend navigables with navigableContainer's content navigable's active document's inclusive descendant navigables.
+        # AD-HOC: If the descendant navigable doesn't have an active document, just skip over it.
+        let document = html_navigable_active_document(content_navigable) else return TraversalDecision.continue_
+        var inclusive_descendants = dom_document_inclusive_descendant_navigables(document)
+        ak.vector_extend(captures.navigables, &inclusive_descendants)
+    return TraversalDecision.continue_
+
+## Ported from Document.cpp:4487 Web::DOM::Document::descendant_navigables.
+# https://html.spec.whatwg.org/multipage/document-sequences.html#descendant-navigables
+pub func dom_document_descendant_navigables(this: DomDocument*) -> ak.Vector[HtmlNavigable*?]:
+    # 1. Let navigables be new list.
+    var navigables: ak.Vector[HtmlNavigable*?]
+
+    # 2. Let navigableContainers be a list of all shadow-including descendants of document that are navigable containers, in shadow-including tree order.
+    # 3. For each navigableContainer of navigableContainers:
+    var captures = DomDocumentDescendantNavigablesWalk(navigables = &navigables)
+    discard(dom_node_for_each_shadow_including_descendant(this.dom_node(), ak.Function1[DomNode*, TraversalDecision](call = dom_document_descendant_navigables_visit, context = &captures)))
+
+    # 4. Return navigables.
+    return navigables
+
+## Ported from Document.cpp:4515 Web::DOM::Document::descendant_navigables.
+pub func dom_document_descendant_navigables_const(this: DomDocument*) -> ak.Vector[HtmlNavigable*?]:
+    return dom_document_descendant_navigables(this)
+
+## Ported from Document.cpp:4521 Web::DOM::Document::inclusive_descendant_navigables.
+# https://html.spec.whatwg.org/multipage/document-sequences.html#inclusive-descendant-navigables
+pub func dom_document_inclusive_descendant_navigables(this: DomDocument*) -> ak.Vector[HtmlNavigable*?]:
+    # FIXME: The document's node navigable should not be null here. But we currently do not implement the "unload a
+    #        document and its descendants" steps correctly, and the navigable becomes null during unloading. We are
+    #        essentially destroying the document too early. See Document::unload_a_document_and_its_descendants. See:
+    #        https://github.com/LadybirdBrowser/ladybird/issues/7825
+    let document_node_navigable = dom_document_navigable(this) else return ak.Vector[HtmlNavigable*?]()
+
+    # 1. Let navigables be « document's node navigable ».
+    var navigables: ak.Vector[HtmlNavigable*?]
+    ak.vector_append_t(&navigables, document_node_navigable)
+
+    # 2. Extend navigables with document's descendant navigables.
+    var descendants = dom_document_descendant_navigables(this)
+    ak.vector_extend(&navigables, &descendants)
+
+    # 3. Return navigables.
+    return navigables
+
+## Ported from Document.cpp:4543 Web::DOM::Document::ancestor_navigables.
+# https://html.spec.whatwg.org/multipage/document-sequences.html#ancestor-navigables
+pub func dom_document_ancestor_navigables(this: DomDocument*) -> ak.Vector[HtmlNavigable*?]:
+    # FIXME: The document's node navigable should not be null here. But we currently do not implement the "unload a
+    #        document and its descendants" steps correctly, and the navigable becomes null during unloading. We are
+    #        essentially destroying the document too early. See Document::unload_a_document_and_its_descendants. See:
+    #        https://github.com/LadybirdBrowser/ladybird/issues/7825
+    let document_node_navigable = dom_document_navigable(this) else return ak.Vector[HtmlNavigable*?]()
+
+    # 1. Let navigable be document's node navigable's parent.
+    var navigable = html_navigable_parent(document_node_navigable)
+
+    # 2. Let ancestors be an empty list.
+    var ancestors: ak.Vector[HtmlNavigable*?]
+
+    # 3. While navigable is not null:
+    while let current = navigable:
+        # 1. Prepend navigable to ancestors.
+        ak.vector_prepend_u(&ancestors, current)
+
+        # 2. Set navigable to navigable's parent.
+        navigable = html_navigable_parent(current)
+
+    # 4. Return ancestors.
+    return ancestors
+
+## Ported from Document.cpp:4572 Web::DOM::Document::ancestor_navigables.
+pub func dom_document_ancestor_navigables_const(this: DomDocument*) -> ak.Vector[HtmlNavigable*?]:
+    return dom_document_ancestor_navigables(this)
+
+## Ported from Document.cpp:4578 Web::DOM::Document::inclusive_ancestor_navigables.
+# https://html.spec.whatwg.org/multipage/document-sequences.html#inclusive-ancestor-navigables
+pub func dom_document_inclusive_ancestor_navigables(this: DomDocument*) -> ak.Vector[HtmlNavigable*?]:
+    # FIXME: The document's node navigable should not be null here. But we currently do not implement the "unload a
+    #        document and its descendants" steps correctly, and the navigable becomes null during unloading. We are
+    #        essentially destroying the document too early. See Document::unload_a_document_and_its_descendants. See:
+    #        https://github.com/LadybirdBrowser/ladybird/issues/7825
+    let document_node_navigable = dom_document_navigable(this) else return ak.Vector[HtmlNavigable*?]()
+
+    # 1. Let navigables be document's ancestor navigables.
+    var navigables = dom_document_ancestor_navigables(this)
+
+    # 2. Append document's node navigable to navigables.
+    ak.vector_append_t(&navigables, document_node_navigable)
+
+    # 3. Return navigables.
+    return navigables
+
+## The captures of document_tree_child_navigables' insertion predicate: `[&]` (the container).
+struct DomDocumentTreeChildNavigablesOrder:
+    var container: HtmlNavigableContainer*
+
+## document_tree_child_navigables' insertion predicate: the container comes before the existing one's.
+func dom_document_tree_child_navigables_is_before(context: void*?, existing_navigable: const (HtmlNavigable*?)*) -> bool:
+    let captures = (DomDocumentTreeChildNavigablesOrder*)(context else trap("no captures"))
+    let existing = *existing_navigable else trap("a null navigable")
+    let existing_container = html_navigable_container(existing) else trap("a child navigable has a container")
+    return tree_node_is_before(captures.container.dom_node(), existing_container.dom_node())
+
+## Ported from Document.cpp:4599 Web::DOM::Document::document_tree_child_navigables.
+# https://html.spec.whatwg.org/multipage/document-sequences.html#document-tree-child-navigables
+pub func dom_document_document_tree_child_navigables(this: DomDocument*) -> ak.Vector[HtmlNavigable*?]:
+    # 1. If document's node navigable is null, then return the empty list.
+    if dom_document_navigable(this) == none:
+        return ak.Vector[HtmlNavigable*?]()
+
+    # 2. Let navigables be new list.
+    var navigables: ak.Vector[HtmlNavigable*?]
+
+    # 3. Let navigableContainers be a list of all descendants of document that are navigable containers, in tree order.
+    # 4. For each navigableContainer of navigableContainers:
+    #     1. If navigableContainer's content navigable is null, then continue.
+    #     2. Append navigableContainer's content navigable to navigables.
+    # OPTIMIZATION: Iterate all registered navigables to avoid a full tree traversal.
+    for navigable in ak.hash_table_begin(html_all_navigables()):
+        let container = html_navigable_container(*navigable) else continue
+        if not tree_node_is_ancestor_of(this.dom_node(), container.dom_node()):
+            continue
+        var captures = DomDocumentTreeChildNavigablesOrder(container = container)
+        ak.vector_insert_before_matching(&navigables, *navigable, ak.Function1[const (HtmlNavigable*?)*, bool](call = dom_document_tree_child_navigables_is_before, context = &captures))
+
+    # 5. Return navigables.
+    return navigables
+
+# mark: Unloading cleanup and destruction =======================================================
+
+## Ported from Document.cpp:4627 Web::DOM::Document::run_unloading_cleanup_steps.
+# https://html.spec.whatwg.org/multipage/document-lifecycle.html#unloading-document-cleanup-steps
+func dom_document_run_unloading_cleanup_steps(this: DomDocument*):
+    # 1. Let window be document's relevant global object.
+    # (as<HTML::WindowOrWorkerGlobalScopeMixin>: a document's relevant global object is its Window.)
+    let window = &as_html_window((gc.Cell*)html_relevant_global_object((JsObject*)this)).window_or_worker_global_scope_mixin
+
+    # 2. For each WebSocket object webSocket whose relevant global object is window, make disappear webSocket.
+    #    If this affected any WebSocket objects, then make document unsalvageable given document and "websocket".
+    let affected_any_web_sockets = html_window_or_worker_global_scope_mixin_make_disappear_all_web_sockets(window)
+    if affected_any_web_sockets == HtmlWindowOrWorkerGlobalScopeMixinAffectedAnyWebSockets.yes:
+        dom_document_make_unsalvageable(this, ak.string_from_str("websocket"))
+
+    # FIXME: 3. For each WebTransport object transport whose relevant global object is window, run the context cleanup steps given transport.
+
+    # 4. If document's salvageable state is false, then:
+    if not this.m_salvageable:
+        # 1. For each EventSource object eventSource whose relevant global object is equal to window, forcibly close eventSource.
+        html_window_or_worker_global_scope_mixin_forcibly_close_all_event_sources(window)
+
+        # 2. Clear window's map of active timers.
+        html_window_or_worker_global_scope_mixin_clear_map_of_active_timers(window)
+
+    # https://w3c.github.io/IndexedDB/#database-connection
+    # If the execution context where the connection was created is destroyed
+    # (for example due to the user navigating away from that page), the connection is closed.
+    # AD-HOC: We have no way to detect when the execution context that created the connection is destroyed, and
+    #         making LibJS notify us of that would undoubtedly be very costly to performance. All other browsers also
+    #         opt not to follow the spec exactly in regards to this, instead letting the connection stay open until
+    #         GC collects it. However, we need to be proactive about this when navigating for the sake of test-web.
+    html_window_or_worker_global_scope_mixin_close_all_idb_connections(window)
+
+    file_api_run_unloading_cleanup_steps(this)
+    dom_document_fully_exit_fullscreen(this)
+
+## The captures of destroy()'s message-port walk: `[&]` (the document).
+struct DomDocumentDestroyMessagePorts:
+    var this: DomDocument*
+
+## destroy()'s message-port walk: disentangle the ports whose window's document is this one.
+func dom_document_destroy_disentangle_port(context: void*?, port: HtmlMessagePort*):
+    let captures = (DomDocumentDestroyMessagePorts*)(context else trap("no captures"))
+    let global = html_relevant_global_object((JsObject*)port)
+    let window = as_if_html_window((gc.Cell*)global) else return
+
+    if html_window_associated_document(window) == captures.this:
+        html_message_port_disentangle(port)
+
+## The captures of destroy()'s task filter: `[this]`.
+struct DomDocumentDestroyTaskFilter:
+    var this: DomDocument*
+
+## destroy()'s task filter: the tasks of this document.
+func dom_document_destroy_task_is_ours(context: void*?, task: HtmlTask*) -> bool:
+    let captures = (DomDocumentDestroyTaskFilter*)(context else trap("no captures"))
+    return html_task_document(task) == captures.this
+
+## Ported from Document.cpp:4663 Web::DOM::Document::destroy.
+# https://html.spec.whatwg.org/multipage/document-lifecycle.html#destroy-a-document
+pub func dom_document_destroy(this: DomDocument*):
+    # FIXME: 1. Assert: this is running as part of a task queued on document's relevant agent's event loop.
+
+    # 2. Abort document.
+    dom_document_abort(this)
+
+    # AD-HOC: Notify document observers that this document became inactive.
+    #         This allows observers (e.g. HTMLImageElement) to clear resources like
+    #         DocumentLoadEventDelayers that would otherwise block the parent
+    #         document's load event forever.
+    #         Note: did_stop_being_active_document_in_navigable() handles the navigation case,
+    #         but document destruction (e.g. iframe removal) takes a different path.
+    #         The flag ensures we don't fire the callback twice for the same document
+    #         (once from navigation, then again from destruction).
+    if not this.m_has_fired_document_became_inactive:
+        this.m_has_fired_document_became_inactive = true
+        dom_document_notify_document_observers_became_inactive(this)
+
+    # 3. Set document's salvageable state to false.
+    this.m_salvageable = false
+
+    # 4. Let ports be the list of MessagePorts whose relevant global object's associated Document is document.
+    # 5. For each port in ports, disentangle port.
+    var port_captures = DomDocumentDestroyMessagePorts(this = this)
+    html_message_port_for_each_message_port(ak.Function1[HtmlMessagePort*, unit](call = dom_document_destroy_disentangle_port, context = &port_captures))
+
+    # 6. Run any unloading document cleanup steps for document that are defined by this specification and other applicable specifications.
+    dom_document_run_unloading_cleanup_steps(this)
+
+    # AD-HOC: Destruction does not go through did_stop_being_active_document_in_navigable(),
+    #         but stale per-node and root layout/paintable pointers can still keep the old
+    #         layout tree alive until GC runs.
+    dom_document_clear_layout_and_paintable_nodes_for_inactive_document(this)
+    dom_document_tear_down_layout_tree(this)
+
+    # 7. Remove any tasks whose document is document from any task queue (without running those tasks).
+    var task_captures = DomDocumentDestroyTaskFilter(this = this)
+    html_task_queue_remove_tasks_matching(html_event_loop_task_queue(html_main_thread_event_loop()), ak.Function1[HtmlTask*, bool](call = dom_document_destroy_task_is_ours, context = &task_captures))
+
+    # AD-HOC: Mark this document as destroyed so we can remove tasks from the queue that will never be able to run.
+    this.m_has_been_destroyed = true
+
+    # 8. Set document's browsing context to null.
+    this.m_browsing_context = none
+
+    # Not in the spec:
+    for navigable_container in ak.hash_table_begin(html_navigable_container_all_instances()):
+        let container = *navigable_container else continue
+        if dom_node_document(container.dom_node()) == this:
+            if let content_navigable = html_navigable_container_content_navigable(container):
+                html_navigable_remove_from_all_navigables(content_navigable)
+
+    # 9. Set document's node navigable's active session history entry's document state's document to null.
+    if let navigable = dom_document_navigable(this):
+        html_navigable_set_active_document(navigable, none)
+
+        # AD-HOC: We set the page's focused navigable during mouse-down events. If that navigable is this document's
+        #         navigable, we must be sure to reset the page's focused navigable.
+        page_navigable_document_destroyed(dom_document_page(this), navigable)
+
+    # FIXME: 10. Remove document from the owner set of each WorkerGlobalScope object whose set contains document.
+    # FIXME: 11. For each workletGlobalScope in document's worklet global scopes, terminate workletGlobalScope.
+
+## Ported from Document.cpp:4740 Web::DOM::Document::make_unsalvageable.
+# https://html.spec.whatwg.org/multipage/browsing-the-web.html#make-document-unsalvageable
+pub func dom_document_make_unsalvageable(this: DomDocument*, reason: ak.String):
+    # FIXME: 1. Let details be a new not restored reason details whose reason is reason.
+    # FIXME: 2. Append details to document's bfcache blocking details.
+
+    # 3. Set document's salvageable state to false.
+    dom_document_set_salvageable(this, false)
+
+# mark: DocumentLifecycleState ==================================================================
+
+## heap.allocate<DocumentLifecycleState>(document, remaining, finish_callback): constructed under DeferGC.
+func heap_allocate_dom_document_lifecycle_state(heap: gc.Heap*, document: DomDocument*, remaining: usize, finish_callback: gc.Function0[unit]*) -> DomDocumentLifecycleState*:
+    let state = (DomDocumentLifecycleState*)web_heap_allocate_cell(heap, &dom_document_lifecycle_state_class)
+    gc.heap_defer_gc(heap)
+    dom_document_lifecycle_state_construct(state, document, remaining, finish_callback)
+    gc.heap_undefer_gc(heap)
+    return state
+
+## The captures of the lifecycle state's timeout: `[this]`.
+struct DomDocumentLifecycleStateTimeout:
+    var this: DomDocumentLifecycleState*
+
+## The lifecycle state's timeout handler.
+func dom_document_lifecycle_state_timed_out(context: void*?):
+    let this = ((DomDocumentLifecycleStateTimeout*)(context else trap("no captures"))).this
+    if this.remaining_children > 0:
+        ak.dbgln(f"FIXME: Document unload/destruction timed out with {this.remaining_children} remaining children")
+
+## Ported from Document.cpp:4755 Web::DOM::DocumentLifecycleState::DocumentLifecycleState.
+func dom_document_lifecycle_state_construct(this: DomDocumentLifecycleState*, document: DomDocument*, remaining: usize, finish_callback: gc.Function0[unit]*):
+    let heap = gc.cell_heap(this.cell())
+    this.remaining_children = remaining
+    this.document = document
+    this.finish_callback = finish_callback
+    let captures = new DomDocumentLifecycleStateTimeout(this = this) else trap("out of memory")
+    this.timeout = platform_timer_create_single_shot(heap, dom_document_lifecycle_state_timeout_ms, gc.create_function0[unit](heap, ak.Function0[unit](call = dom_document_lifecycle_state_timed_out, context = captures)))
+    platform_timer_start(this.timeout)
+
+## Ported from Document.cpp:4766 Web::DOM::DocumentLifecycleState::visit_edges (override).
+pub func dom_document_lifecycle_state_visit_edges_impl(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (DomDocumentLifecycleState*)base
+    gc.cell_visit_edges_impl(base, visitor)
+    gc.cell_visitor_visit_t_2(visitor, this.document)
+    gc.cell_visitor_visit_t_2(visitor, this.finish_callback)
+    gc.cell_visitor_visit_t_2(visitor, this.timeout)
+
+## Ported from Document.cpp:4774 Web::DOM::DocumentLifecycleState::did_process_child.
+func dom_document_lifecycle_state_did_process_child(this: DomDocumentLifecycleState*):
+    this.remaining_children -= 1
+    if this.remaining_children > 0:
+        return
+    platform_timer_stop(this.timeout)
+    discard(html_queue_a_task(HtmlTaskSource.navigation_and_traversal, none, none, this.finish_callback))

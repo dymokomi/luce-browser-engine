@@ -1,0 +1,301 @@
+#==============================================================================================
+#
+#   document_15 - DOM::Document: custom properties, cookies, to_string, selectors
+#
+#   DESCRIPTION:
+#       Port of LibWeb/DOM/Document.cpp (lines 8067-8270): the registered custom properties
+#       and their cache, XPath entry points, the cookie version index, the to_string of the
+#       layout and invalidation reasons, the pending CSS imports, pointer lock and the
+#       selector query cache.
+#
+#==============================================================================================
+
+# mark: Registered custom properties ============================================================
+
+## Ported from Document.cpp:8067 Web::DOM::Document::registered_property_set.
+pub func dom_document_registered_property_set(this: DomDocument*) -> ak.HashMap[ak.FlyString, CssCustomPropertyRegistration, ak.FlyStringTraits]*:
+    return &this.m_registered_property_set
+
+## Ported from Document.cpp:8072 Web::DOM::Document::create_expression.
+pub func dom_document_create_expression(this: DomDocument*, expression: ak.String, resolver: XPathXPathNsResolver*? = none) -> XPathXPathExpression*!:
+    let realm = dom_document_realm(this)
+    return try xpath_create_expression(realm, expression, resolver)
+
+## Ported from Document.cpp:8078 Web::DOM::Document::evaluate.
+pub func dom_document_evaluate(this: DomDocument*, expression: ak.String, context_node: DomNode*, resolver: XPathXPathNsResolver*? = none, type_: u16 = 0, result: XPathXPathResult*? = none) -> XPathXPathResult*!:
+    let realm = dom_document_realm(this)
+    return try xpath_evaluate(realm, expression, context_node, resolver, type_, result)
+
+## Ported from Document.cpp:8084 Web::DOM::Document::create_ns_resolver.
+pub func dom_document_create_ns_resolver(this: DomDocument*, node_resolver: DomNode*) -> DomNode*:
+    return node_resolver
+
+## Ported from Document.cpp:8090 Web::DOM::Document::get_registered_custom_property.
+# https://drafts.css-houdini.org/css-properties-values-api/#determining-registration
+pub func dom_document_get_registered_custom_property(this: DomDocument*, name: ak.FlyString) -> const CssCustomPropertyRegistration*?:
+    # If the Document’s [[registeredPropertySet]] slot contains a record with the custom property’s name, the
+    # registration is that record.
+    if let registered_property = ak.hash_map_get_k(&this.m_registered_property_set, name):
+        return registered_property
+
+    # Otherwise, if the Document’s active stylesheets contain at least one valid @property rule representing a
+    # registration with the custom property’s name, the last such one in document order is the registration.
+    if let registered_property = ak.hash_map_get_k(&this.m_cached_registered_properties_from_css_property_rules, name):
+        return registered_property
+
+    # Otherwise there is no registration, and the custom property is not a registered custom property.
+    return none
+
+## Ported from Document.cpp:8106 Web::DOM::Document::custom_property_initial_value.
+pub func dom_document_custom_property_initial_value(this: DomDocument*, name: ak.FlyString) -> CssStyleValue*:
+    if let maybe_custom_property = dom_document_get_registered_custom_property(this, name):
+        if let initial_value = maybe_custom_property.initial_value:
+            return initial_value
+        return css_guaranteed_invalid_style_value_create().css_style_value()
+
+    # For non-registered properties, the initial value is the guaranteed-invalid value.
+    # See: https://drafts.csswg.org/css-variables/#propdef-
+    return css_guaranteed_invalid_style_value_create().css_style_value()
+
+## Ported from Document.cpp:8120 Web::DOM::Document::did_change_custom_property_registrations.
+pub func dom_document_did_change_custom_property_registrations(this: DomDocument*):
+    this.m_custom_property_registration_generation += 1
+
+    # Custom property registration changes can alter inheritance and initial values even when no selector matching
+    # changes. Registrations only move when a stylesheet containing an @property rule is added/removed or when
+    # CSS.registerProperty() is called, so a full document restyle is cheap enough in practice.
+    dom_node_invalidate_style(this.dom_node(), DomStyleInvalidationReason.other)
+
+## CSS/CustomPropertyRegistration.h:35 operator==(CustomPropertyRegistration const&, CustomPropertyRegistration const&).
+func dom_custom_property_registrations_equal(a: const CssCustomPropertyRegistration*, b: const CssCustomPropertyRegistration*) -> bool:
+    if not ak.fly_string_eq_fly_string(&a.property_name, &b.property_name):
+        return false
+    if not ak.string_equals(&a.syntax, &b.syntax):
+        return false
+    if a.inherit != b.inherit:
+        return false
+    if a.initial_value == b.initial_value:
+        return true
+    let a_value = a.initial_value else return false
+    let b_value = b.initial_value else return false
+    return css_style_value_equals(a_value, b_value)
+
+## AK's HashMap operator== over registrations (sizes equal, and every entry found with an equal value).
+func dom_registration_maps_equal(a: ak.HashMap[ak.FlyString, CssCustomPropertyRegistration, ak.FlyStringTraits]*, b: ak.HashMap[ak.FlyString, CssCustomPropertyRegistration, ak.FlyStringTraits]*) -> bool:
+    if ak.hash_map_size(a) != ak.hash_map_size(b):
+        return false
+    for entry in ak.hash_map_begin(a):
+        let other = ak.hash_map_get_k(b, entry.key) else return false
+        if not dom_custom_property_registrations_equal(&entry.value, other):
+            return false
+    return true
+
+## build_registered_properties_cache's inner lambda: collect each @property rule's registration.
+func dom_document_collect_property_rule(context: void*?, rule: CssRule*):
+    let cache = (ak.HashMap[ak.FlyString, CssCustomPropertyRegistration, ak.FlyStringTraits]*)(context else trap("no captures"))
+    if let property_rule = as_if_css_property_rule(rule):
+        discard(ak.hash_map_set(cache, css_property_rule_name(property_rule), css_property_rule_to_registration(property_rule)))
+
+## build_registered_properties_cache's outer lambda: walk each active style sheet's effective rules.
+func dom_document_collect_property_rules_of_sheet(context: void*?, style_sheet: CssCssStyleSheet*):
+    css_css_style_sheet_for_each_effective_rule(style_sheet, TraversalOrder.preorder, ak.Function1[CssRule*, unit](call = dom_document_collect_property_rule, context = context))
+
+## Ported from Document.cpp:8130 Web::DOM::Document::build_registered_properties_cache.
+pub func dom_document_build_registered_properties_cache(this: DomDocument*):
+    var cached_registered_properties_from_css_property_rules: ak.HashMap[ak.FlyString, CssCustomPropertyRegistration, ak.FlyStringTraits]
+    dom_document_for_each_active_css_style_sheet(this, ak.Function1[CssCssStyleSheet*, unit](call = dom_document_collect_property_rules_of_sheet, context = &cached_registered_properties_from_css_property_rules))
+
+    if not dom_registration_maps_equal(&cached_registered_properties_from_css_property_rules, &this.m_cached_registered_properties_from_css_property_rules):
+        dom_document_did_change_custom_property_registrations(this)
+
+    this.m_cached_registered_properties_from_css_property_rules = cached_registered_properties_from_css_property_rules
+
+# mark: Cookie version index ====================================================================
+
+## `HTTP::Cookie::canonicalize_domain(new_domain) == HTTP::Cookie::canonicalize_domain(old_url)` (Optional<String> ==).
+func dom_document_optional_string_equals(a: ak.String, b: ak.String?) -> bool:
+    let b_value = b else return false
+    return ak.string_equals(&a, &b_value)
+
+## Ported from Document.cpp:8146 Web::DOM::Document::ensure_cookie_version_index.
+pub func dom_document_ensure_cookie_version_index(this: DomDocument*, new_url: web_url.Url, old_url: web_url.Url):
+    let maybe_new_domain = http_cookie_canonicalize_domain(new_url)
+    if maybe_new_domain == none:
+        this.m_cookie_version_index = none
+        return
+    let new_domain = maybe_new_domain else trap("unreachable: checked above")
+
+    if this.m_cookie_version_index != none and dom_document_optional_string_equals(new_domain, http_cookie_canonicalize_domain(old_url)):
+        return
+
+    page_client_page_did_request_document_cookie_version_index(page_client(dom_document_page(this)), dom_node_unique_id(this.dom_node()), new_domain)
+    this.m_cookie_version_index = none
+
+# mark: to_string ===============================================================================
+
+## Ported from Document.cpp:8161 Web::DOM::to_string(SetNeedsLayoutReason).
+pub func dom_to_string_dom_set_needs_layout_reason(reason: DomSetNeedsLayoutReason) -> ak.StringView:
+    match reason:
+        .character_data_replace_data: return ak.sv("CharacterDataReplaceData")
+        .finalize_a_cross_document_navigation: return ak.sv("FinalizeACrossDocumentNavigation")
+        .generated_content_image_finished_loading: return ak.sv("GeneratedContentImageFinishedLoading")
+        .html_canvas_element_width_or_height_change: return ak.sv("HTMLCanvasElementWidthOrHeightChange")
+        .html_image_element_react_to_changes_in_the_environment: return ak.sv("HTMLImageElementReactToChangesInTheEnvironment")
+        .html_image_element_update_the_image_data: return ak.sv("HTMLImageElementUpdateTheImageData")
+        .html_video_element_natural_dimensions_changed: return ak.sv("HTMLVideoElementNaturalDimensionsChanged")
+        .html_video_element_set_video_track: return ak.sv("HTMLVideoElementSetVideoTrack")
+        .keyframe_effect: return ak.sv("KeyframeEffect")
+        .layout_tree_update: return ak.sv("LayoutTreeUpdate")
+        .navigable_set_viewport_size: return ak.sv("NavigableSetViewportSize")
+        .svg_graphics_element_transform_change: return ak.sv("SVGGraphicsElementTransformChange")
+        .svg_image_element_fetch_the_document: return ak.sv("SVGImageElementFetchTheDocument")
+        .svg_image_filter_fetch: return ak.sv("SVGImageFilterFetch")
+        .svg_view_box_change: return ak.sv("SVGViewBoxChange")
+        .style_change: return ak.sv("StyleChange")
+        _: trap("VERIFY_NOT_REACHED")
+
+## Ported from Document.cpp:8173 Web::DOM::to_string(SetNeedsLayoutTreeUpdateReason).
+pub func dom_to_string_dom_set_needs_layout_tree_upda(reason: DomSetNeedsLayoutTreeUpdateReason) -> ak.StringView:
+    match reason:
+        .element_set_inner_html: return ak.sv("ElementSetInnerHTML")
+        .element_set_shadow_root: return ak.sv("ElementSetShadowRoot")
+        .details_element_opened_or_closed: return ak.sv("DetailsElementOpenedOrClosed")
+        .html_input_element_src_attribute: return ak.sv("HTMLInputElementSrcAttribute")
+        .htmlo_list_element_ordinal_values: return ak.sv("HTMLOListElementOrdinalValues")
+        .html_object_element_update_layout_and_child_objects: return ak.sv("HTMLObjectElementUpdateLayoutAndChildObjects")
+        .keyframe_effect: return ak.sv("KeyframeEffect")
+        .node_insert_before: return ak.sv("NodeInsertBefore")
+        .node_insert_before_with_display_contents: return ak.sv("NodeInsertBeforeWithDisplayContents")
+        .node_remove: return ak.sv("NodeRemove")
+        .node_set_text_content: return ak.sv("NodeSetTextContent")
+        .none_: return ak.sv("None")
+        .shadow_root_set_inner_html: return ak.sv("ShadowRootSetInnerHTML")
+        .style_change: return ak.sv("StyleChange")
+        _: trap("VERIFY_NOT_REACHED")
+
+## Ported from Document.cpp:8185 Web::DOM::to_string(InvalidateLayoutTreeReason).
+pub func dom_to_string_dom_invalidate_layout_tree_rea(reason: DomInvalidateLayoutTreeReason) -> ak.StringView:
+    match reason:
+        .document_add_an_element_to_the_top_layer: return ak.sv("DocumentAddAnElementToTheTopLayer")
+        .document_request_an_element_to_be_removed_from_the_top_layer: return ak.sv("DocumentRequestAnElementToBeRemovedFromTheTopLayer")
+        .document_immediately_remove_element_from_the_top_layer: return ak.sv("DocumentImmediatelyRemoveElementFromTheTopLayer")
+        .document_pending_top_layer_removals_processed: return ak.sv("DocumentPendingTopLayerRemovalsProcessed")
+        _: trap("VERIFY_NOT_REACHED")
+
+## Ported from Document.cpp:8197 Web::DOM::to_string(UpdateLayoutReason).
+pub func dom_to_string_dom_update_layout_reason(reason: DomUpdateLayoutReason) -> ak.StringView:
+    match reason:
+        .auto_scroll_selection: return ak.sv("AutoScrollSelection")
+        .child_document_style_update: return ak.sv("ChildDocumentStyleUpdate")
+        .debugging: return ak.sv("Debugging")
+        .document_element_from_point: return ak.sv("DocumentElementFromPoint")
+        .document_elements_from_point: return ak.sv("DocumentElementsFromPoint")
+        .document_find_matching_text: return ak.sv("DocumentFindMatchingText")
+        .document_set_design_mode: return ak.sv("DocumentSetDesignMode")
+        .dump_display_list: return ak.sv("DumpDisplayList")
+        .element_check_visibility: return ak.sv("ElementCheckVisibility")
+        .element_client_height: return ak.sv("ElementClientHeight")
+        .element_client_width: return ak.sv("ElementClientWidth")
+        .element_get_client_rects: return ak.sv("ElementGetClientRects")
+        .element_is_potentially_scrollable: return ak.sv("ElementIsPotentiallyScrollable")
+        .element_scroll: return ak.sv("ElementScroll")
+        .element_scroll_height: return ak.sv("ElementScrollHeight")
+        .element_scroll_into_view: return ak.sv("ElementScrollIntoView")
+        .element_scroll_left: return ak.sv("ElementScrollLeft")
+        .element_scroll_top: return ak.sv("ElementScrollTop")
+        .element_scroll_width: return ak.sv("ElementScrollWidth")
+        .element_set_scroll_left: return ak.sv("ElementSetScrollLeft")
+        .element_set_scroll_top: return ak.sv("ElementSetScrollTop")
+        .event_handler_dispatch_chrome_widget_event: return ak.sv("EventHandlerDispatchChromeWidgetEvent")
+        .event_handler_handle_drag_and_drop: return ak.sv("EventHandlerHandleDragAndDrop")
+        .event_handler_handle_mouse_down: return ak.sv("EventHandlerHandleMouseDown")
+        .event_handler_handle_mouse_move: return ak.sv("EventHandlerHandleMouseMove")
+        .event_handler_handle_mouse_up: return ak.sv("EventHandlerHandleMouseUp")
+        .event_handler_handle_mouse_wheel: return ak.sv("EventHandlerHandleMouseWheel")
+        .event_handler_run_activation_behavior: return ak.sv("EventHandlerRunActivationBehavior")
+        .event_handler_show_context_menu: return ak.sv("EventHandlerShowContextMenu")
+        .html_element_get_the_text_steps: return ak.sv("HTMLElementGetTheTextSteps")
+        .html_element_offset_height: return ak.sv("HTMLElementOffsetHeight")
+        .html_element_offset_left: return ak.sv("HTMLElementOffsetLeft")
+        .html_element_offset_parent: return ak.sv("HTMLElementOffsetParent")
+        .html_element_offset_top: return ak.sv("HTMLElementOffsetTop")
+        .html_element_offset_width: return ak.sv("HTMLElementOffsetWidth")
+        .html_element_scroll_parent: return ak.sv("HTMLElementScrollParent")
+        .html_event_loop_rendering_update: return ak.sv("HTMLEventLoopRenderingUpdate")
+        .html_image_element_height: return ak.sv("HTMLImageElementHeight")
+        .html_image_element_width: return ak.sv("HTMLImageElementWidth")
+        .html_image_element_x: return ak.sv("HTMLImageElementX")
+        .html_image_element_y: return ak.sv("HTMLImageElementY")
+        .html_input_element_height: return ak.sv("HTMLInputElementHeight")
+        .html_input_element_width: return ak.sv("HTMLInputElementWidth")
+        .html_label_element_activation_behavior: return ak.sv("HTMLLabelElementActivationBehavior")
+        .hosted_document_before_paint: return ak.sv("HostedDocumentBeforePaint")
+        .inspect_dom_tree: return ak.sv("InspectDOMTree")
+        .internals_hit_test: return ak.sv("InternalsHitTest")
+        .media_query_list_matches: return ak.sv("MediaQueryListMatches")
+        .navigable_selected_text: return ak.sv("NavigableSelectedText")
+        .navigable_viewport_scroll: return ak.sv("NavigableViewportScroll")
+        .node_name_or_description: return ak.sv("NodeNameOrDescription")
+        .range_get_client_rects: return ak.sv("RangeGetClientRects")
+        .resolved_css_style_declaration_property: return ak.sv("ResolvedCSSStyleDeclarationProperty")
+        .svg_decoded_image_data_render: return ak.sv("SVGDecodedImageDataRender")
+        .scroll_cursor_into_view: return ak.sv("ScrollCursorIntoView")
+        .process_screenshot: return ak.sv("ProcessScreenshot")
+        .svg_graphics_element_get_b_box: return ak.sv("SVGGraphicsElementGetBBox")
+        .source_set_normalize_source_densities: return ak.sv("SourceSetNormalizeSourceDensities")
+        .view_transition_capture: return ak.sv("ViewTransitionCapture")
+        .window_scroll: return ak.sv("WindowScroll")
+        _: trap("VERIFY_NOT_REACHED")
+
+# mark: Pending CSS imports, pointer lock and the selector cache ================================
+
+## Ported from Document.cpp:8209 Web::DOM::Document::add_pending_css_import_rule.
+pub func dom_document_add_pending_css_import_rule(this: DomDocument*, rule: CssImportRule*):
+    discard(ak.hash_table_set(&this.m_pending_css_import_rules, rule))
+
+## Ported from Document.cpp:8214 Web::DOM::Document::remove_pending_css_import_rule.
+pub func dom_document_remove_pending_css_import_rule(this: DomDocument*, rule: CssImportRule*):
+    discard(ak.hash_table_remove_t(&this.m_pending_css_import_rules, rule))
+    if ak.hash_table_is_empty(&this.m_pending_css_import_rules):
+        page_client_request_frame(page_client(dom_document_page(this)))
+
+## Ported from Document.cpp:8221 Web::DOM::Document::exit_pointer_lock.
+pub func dom_document_exit_pointer_lock(this: DomDocument*):
+    ak.dbgln("FIXME: exit_pointer_lock()")
+
+## Ported from Document.cpp:8226 Web::DOM::contains_named_namespace.
+func dom_contains_named_namespace(selectors: ak.Vector[CssSelector*]) -> bool:
+    var list = selectors
+    for selector in ak.vector_span(&list):
+        # for (auto const& compound_selector : selector->compound_selectors()): each compound selector's simple
+        # selectors are checked for a named namespace (recursing into pseudo-class argument lists). The compound
+        # and simple selectors are opaque until region r38 fills CSS::Selector.
+        if not ak.vector_is_empty(&selector.m_compound_selectors):
+            trap("unported: Web::DOM::contains_named_namespace needs CSS::Selector::CompoundSelector (region r38)")
+    return false
+
+## The `static constexpr size_t MAX_SELECTOR_QUERY_CACHE_SIZE` of parse_or_cache_selector_list.
+let dom_document_max_selector_query_cache_size: usize = 512
+
+## Ported from Document.cpp:8246 Web::DOM::Document::parse_or_cache_selector_list.
+pub func dom_document_parse_or_cache_selector_list(this: DomDocument*, selector_text: ak.StringView) -> ak.Vector[CssSelector*]?:
+    let selector_text_string = ak.string_from_utf8(selector_text) else trap("MUST: String::from_utf8")
+
+    if let cached = ak.hash_map_get_k(&this.m_selector_query_cache, selector_text_string):
+        return *cached
+
+    var context: CssParsingParams = ---
+    css_parsing_params_construct_dom_document(&context, this)
+    var maybe_selectors = parse_selector(context, selector_text)
+
+    # "Note: Support for namespaces within selectors is not planned and will not be added."
+    if let selectors = maybe_selectors:
+        if dom_contains_named_namespace(selectors):
+            maybe_selectors = none
+
+    if ak.hash_map_size(&this.m_selector_query_cache) >= dom_document_max_selector_query_cache_size:
+        ak.hash_map_remove_opaque(&this.m_selector_query_cache, ak.hash_map_begin(&this.m_selector_query_cache))
+
+    discard(ak.hash_map_set(&this.m_selector_query_cache, selector_text_string, maybe_selectors))
+    let cached = ak.hash_map_get_k(&this.m_selector_query_cache, selector_text_string) else trap("VERIFY: the selector list was just cached")
+    return *cached

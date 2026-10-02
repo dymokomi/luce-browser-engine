@@ -1,0 +1,549 @@
+#==============================================================================================
+#
+#   document_4 - DOM::Document: updating style, link colors, color schemes, hovering
+#
+#   DESCRIPTION:
+#       Port of LibWeb/DOM/Document.cpp (lines 1752-2281): the recursive style update and
+#       update_style(), the per-element style-update checks, animated style, paint and hit-
+#       testing properties, the link colors, the supported color schemes and theme color from
+#       meta elements, the layout-node accessors, the inspected and highlighted nodes, and the
+#       hovered node with its pointer and mouse boundary events.
+#
+#==============================================================================================
+
+# mark: Updating style ==========================================================================
+
+## Ported from Document.cpp:1752 Web::DOM::update_style_recursively.
+func dom_update_style_recursively(node: DomNode*, style_computer: CssStyleComputer*, needs_inherited_style_update: bool, recompute_elements_depending_on_custom_properties_: bool, parent_display_changed: bool) -> CssRequiredInvalidationAfterStyleChange:
+    var recompute_elements_depending_on_custom_properties = recompute_elements_depending_on_custom_properties_
+    let needs_full_style_update = dom_document_needs_full_style_update(dom_node_document(node))
+    var invalidation = CssRequiredInvalidationAfterStyleChange()
+
+    if dom_node_is_element(node):
+        css_style_computer_push_ancestor(style_computer, (DomElement*)node)
+
+    # NOTE: If the current node has `display:none`, we can disregard all invalidation
+    #       caused by its children, as they will not be rendered anyway.
+    #       We will still recompute style for the children, though.
+    var is_display_none = false
+
+    var did_change_custom_properties = false
+    var node_invalidation = CssRequiredInvalidationAfterStyleChange()
+    if let element = as_if_dom_element(node):
+        # FIXME: We can avoid some unnecessary re-computations by, skipping if a) the contained if() functions don't
+        #        include media conditions, or b) the data used to resolve media queries hasn't changed.
+        let needs_style_update_due_to_if_media = dom_element_style_uses_if_css_function(element)
+
+        if needs_full_style_update or dom_node_needs_style_update(node) or parent_display_changed or (recompute_elements_depending_on_custom_properties and (dom_element_style_uses_var_css_function(element) or dom_element_style_uses_inherit_css_function(element))) or needs_style_update_due_to_if_media:
+            node_invalidation = dom_element_recompute_style(element, &did_change_custom_properties)
+        elif needs_inherited_style_update:
+            node_invalidation = dom_element_recompute_inherited_style(element)
+        let computed_properties = dom_element_computed_properties(element) else trap("the element has no computed properties")
+        let display = css_computed_properties_display(computed_properties)
+        is_display_none = css_display_is_none(&display)
+
+        if not css_required_invalidation_after_style_change_is_none(&node_invalidation):
+            css_invalidation_invalidate_assigned_slottables_after_slot_style_change(element)
+    if node_invalidation.relayout:
+        dom_node_set_needs_layout_update(node, DomSetNeedsLayoutReason.style_change)
+    if node_invalidation.rebuild_layout_tree:
+        # We mark layout tree for rebuild starting from parent element to correctly invalidate
+        # "display" property change to/from "contents" value.
+        if let parent_element = dom_node_parent_element(node):
+            dom_node_set_needs_layout_tree_update(parent_element.dom_node(), true, DomSetNeedsLayoutTreeUpdateReason.style_change)
+        else:
+            dom_node_set_needs_layout_tree_update(node, true, DomSetNeedsLayoutTreeUpdateReason.style_change)
+    dom_node_set_needs_style_update(node, false)
+    css_required_invalidation_after_style_change_or_assign(&invalidation, node_invalidation)
+
+    if did_change_custom_properties:
+        recompute_elements_depending_on_custom_properties = true
+
+    let children_need_inherited_style_update = not css_required_invalidation_after_style_change_is_none(&invalidation)
+    # NB: When display changes to/from flex/grid/contents, children may need to be blockified or un-blockified.
+    #     This requires a full style recompute, not just inherited style update.
+    let children_need_full_style_recompute = node_invalidation.rebuild_layout_tree
+    if needs_full_style_update or dom_node_child_needs_style_update(node) or children_need_inherited_style_update or recompute_elements_depending_on_custom_properties or children_need_full_style_recompute:
+        if dom_node_is_element(node):
+            if let shadow_root = dom_element_shadow_root((DomElement*)node):
+                if needs_full_style_update or dom_node_needs_style_update(shadow_root.dom_node()) or dom_node_child_needs_style_update(shadow_root.dom_node()):
+                    let subtree_invalidation = dom_update_style_recursively(shadow_root.dom_node(), style_computer, children_need_inherited_style_update, recompute_elements_depending_on_custom_properties, children_need_full_style_recompute)
+                    if not is_display_none:
+                        css_required_invalidation_after_style_change_or_assign(&invalidation, subtree_invalidation)
+
+        for child in dom_node_children(node):
+            if needs_full_style_update or dom_node_needs_style_update(child) or children_need_inherited_style_update or dom_node_child_needs_style_update(child) or recompute_elements_depending_on_custom_properties or children_need_full_style_recompute:
+                let subtree_invalidation = dom_update_style_recursively(child, style_computer, children_need_inherited_style_update, recompute_elements_depending_on_custom_properties, children_need_full_style_recompute)
+                if not is_display_none:
+                    css_required_invalidation_after_style_change_or_assign(&invalidation, subtree_invalidation)
+
+    dom_node_set_child_needs_style_update(node, false)
+
+    if dom_node_is_element(node):
+        css_style_computer_pop_ancestor(style_computer, (DomElement*)node)
+
+    return invalidation
+
+## Ported from Document.cpp:1835 Web::DOM::Document::update_style.
+pub func dom_document_update_style(this: DomDocument*):
+    # NOTE: If our parent document needs a relayout, we must do that *first*. This is required as it may cause the
+    # viewport to change which will can affect media query evaluation and the value of the `vw` unit.
+    if let navigable = dom_document_navigable(this):
+        if let container = html_navigable_container(navigable):
+            let container_document = dom_node_document(container.dom_node())
+            if container_document != this:
+                dom_document_update_layout(container_document, DomUpdateLayoutReason.child_document_style_update)
+
+    if dom_document_browsing_context(this) == none:
+        return
+
+    dom_document_update_animated_style_if_needed(this)
+
+    # Associated with each top-level browsing context is a current transition generation that is incremented on each
+    # style change event. [CSS-Transitions-2]
+    this.m_transition_generation += 1
+
+    if this.m_needs_invalidation_of_elements_affected_by_has:
+        this.m_needs_invalidation_of_elements_affected_by_has = false
+        css_invalidation_invalidate_style_for_pending_has_mutations(this)
+
+    if not css_style_invalidator_has_pending_invalidations(this.m_style_invalidator) and not dom_document_needs_full_style_update(this) and not dom_node_needs_style_update(this.dom_node()) and not dom_node_child_needs_style_update(this.dom_node()):
+        return
+
+    css_style_invalidator_invalidate(this.m_style_invalidator, this.dom_node())
+
+    # NOTE: If this is a document hosting <template> contents, style update is unnecessary.
+    if this.m_created_for_appropriate_template_contents:
+        return
+
+    # Fetch the viewport rect once, instead of repeatedly, during style computation.
+    css_style_computer_set_viewport_rect(dom_document_style_computer(this), dom_document_viewport_rect(this))
+
+    dom_document_evaluate_media_rules(this)
+
+    css_style_computer_reset_has_result_cache(dom_document_style_computer(this))
+    css_style_computer_reset_ancestor_filter(dom_document_style_computer(this))
+
+    dom_document_build_registered_properties_cache(this)
+
+    let invalidation = dom_update_style_recursively(this.dom_node(), dom_document_style_computer(this), false, false, false)
+    if not css_required_invalidation_after_style_change_is_none(&invalidation):
+        dom_document_invalidate_display_list(this)
+
+    if invalidation.rebuild_accumulated_visual_contexts:
+        dom_document_set_needs_accumulated_visual_contexts_update(this, true)
+
+    if invalidation.rebuild_stacking_context_tree:
+        dom_document_invalidate_stacking_context_tree(this)
+    this.m_needs_full_style_update = false
+
+## Ported from Document.cpp:1887 Web::DOM::Document::update_style_if_needed_for_element.
+pub func dom_document_update_style_if_needed_for_element(this: DomDocument*, abstract_element: DomAbstractElement):
+    if dom_document_element_needs_style_update(this, abstract_element):
+        dom_document_update_style(this)
+
+## Ported from Document.cpp:1893 Web::DOM::Document::element_needs_style_update.
+pub func dom_document_element_needs_style_update(this: DomDocument*, abstract_element: DomAbstractElement) -> bool:
+    var target = abstract_element
+
+    # If there are document-level reasons to update style, we can't skip.
+    if this.m_needs_full_style_update:
+        return true
+    if this.m_needs_animated_style_update:
+        return true
+    if this.m_needs_invalidation_of_elements_affected_by_has:
+        return true
+    if css_style_invalidator_has_pending_invalidations(this.m_style_invalidator):
+        return true
+
+    # Check the element itself.
+    let element = dom_abstract_element_element(&target)
+    if dom_node_needs_style_update(element.dom_node()):
+        return true
+    if dom_node_entire_subtree_needs_style_update(element.dom_node()):
+        return true
+
+    # Walk the inheritance ancestor chain. We use element_to_inherit_style_from()
+    # because style inheritance follows the flat tree (slotted elements inherit
+    # from their assigned slot, not their DOM parent). If any ancestor on the
+    # path has its style marked dirty, the target element's computed style could
+    # change via inherited properties, so we must update.
+    var ancestor = dom_abstract_element_element_to_inherit_style_from(&target)
+    while let current = ancestor:
+        var current_ancestor = current
+        let ancestor_element = dom_abstract_element_element(&current_ancestor)
+        if dom_node_needs_style_update(ancestor_element.dom_node()):
+            return true
+        if dom_node_entire_subtree_needs_style_update(ancestor_element.dom_node()):
+            return true
+        ancestor = dom_abstract_element_element_to_inherit_style_from(&current_ancestor)
+
+    # If the navigable has a container and that container needs a style update, then we need one as well, since the
+    # container's style can affect this element (e.g. via media queries or viewport units).
+    if let navigable = dom_document_navigable(this):
+        if let container = html_navigable_container(navigable):
+            var container_element: DomAbstractElement = ---
+            dom_abstract_element_construct(&container_element, container.dom_element())
+            if dom_document_element_needs_style_update(dom_node_document(container.dom_node()), container_element):
+                return true
+
+    return false
+
+## Ported from Document.cpp:1935 Web::DOM::Document::update_animated_style_if_needed.
+pub func dom_document_update_animated_style_if_needed(this: DomDocument*):
+    if not this.m_needs_animated_style_update:
+        return
+
+    var context = AnimationsAnimationUpdateContext()
+    # ~AnimationUpdateContext() applies the collected invalidations when the context goes out of scope.
+    defer animations_animation_update_context_destruct(&context)
+
+    for timeline in ak.hash_table_begin(&this.m_associated_animation_timelines):
+        var animations = animations_animation_timeline_associated_animations(*timeline)
+        for animation in ak.vector_span(&animations):
+            if animations_animation_is_idle(animation):
+                continue
+            if let effect = animations_animation_effect(animation):
+                animations_animation_effect_update_computed_properties(effect, &context)
+
+    this.m_needs_animated_style_update = false
+
+## Ported from Document.cpp:1954 Web::DOM::Document::set_needs_animated_style_update.
+pub func dom_document_set_needs_animated_style_update(this: DomDocument*):
+    if this.m_needs_animated_style_update:
+        return
+
+    this.m_needs_animated_style_update = true
+    dom_document_set_needs_repaint_invalidate_display_list(this, InvalidateDisplayList.no)
+
+## Ported from Document.cpp:1963 Web::DOM::Document::update_paint_and_hit_testing_properties_if_needed.
+pub func dom_document_update_paint_and_hit_testing_properties_if_needed(this: DomDocument*):
+    # NB: Called during paint property resolution.
+    if let paintable = dom_document_unsafe_paintable(this):
+        paint_viewport_paintable_refresh_scroll_state(paintable)
+
+    if this.m_needs_accumulated_visual_contexts_update:
+        this.m_needs_accumulated_visual_contexts_update = false
+        if let paintable = dom_document_unsafe_paintable(this):
+            paint_viewport_paintable_assign_accumulated_visual_contexts(paintable)
+
+# mark: Link colors and color schemes ===========================================================
+
+## Ported from Document.cpp:1978 Web::DOM::Document::set_normal_link_color.
+pub func dom_document_set_normal_link_color(this: DomDocument*, color: gfx.Color):
+    this.m_normal_link_color = color
+
+## Ported from Document.cpp:1983 Web::DOM::Document::set_active_link_color.
+pub func dom_document_set_active_link_color(this: DomDocument*, color: gfx.Color):
+    this.m_active_link_color = color
+
+## Ported from Document.cpp:1988 Web::DOM::Document::set_visited_link_color.
+pub func dom_document_set_visited_link_color(this: DomDocument*, color: gfx.Color):
+    this.m_visited_link_color = color
+
+## Ported from Document.cpp:1993 Web::DOM::Document::supported_color_schemes.
+## C++ answers `Optional<Vector<String> const&>`; the Vector shares its storage, so this answers it by value.
+pub func dom_document_supported_color_schemes(this: DomDocument*) -> ak.Vector[ak.String]?:
+    return this.m_supported_color_schemes
+
+## `element.name().has_value() && element.name()->equals_ignoring_ascii_case(name)`.
+func dom_element_name_equals_ignoring_ascii_case(element: DomElement*, name: str) -> bool:
+    let element_name = dom_element_name(element) else return false
+    return ak.fly_string_equals_ignoring_ascii_case_string_view(&element_name, ak.sv(name))
+
+## Ported from Document.cpp:1999 Web::DOM::Document::obtain_supported_color_schemes.
+# https://html.spec.whatwg.org/multipage/semantics.html#meta-color-scheme
+pub func dom_document_obtain_supported_color_schemes(this: DomDocument*):
+    this.m_supported_color_schemes = none
+
+    # 1. Let candidate elements be the list of all meta elements that meet the following criteria, in tree order:
+    for node in dom_node_subtree(this.dom_node()):
+        let element = as_if_html_meta_element(node) else continue
+        #     * the element is in a document tree;
+        #     * the element has a name attribute, whose value is an ASCII case-insensitive match for color-scheme; and
+        #     * the element has a content attribute.
+
+        # 2. For each element in candidate elements:
+        let content = dom_element_attribute(element.dom_element(), html_attribute_names_content)
+        if dom_element_name_equals_ignoring_ascii_case(element.dom_element(), "color-scheme"):
+            if let content_value = content:
+                # 1. Let parsed be the result of parsing a list of component values given the value of element's content attribute.
+                var context: CssParsingParams = ---
+                css_parsing_params_construct_dom_document(&context, dom_node_document(this.dom_node()))
+                let parsed = parse_css_value(context, ak.string_bytes_as_string_view(&content_value), css_data.PropertyId.color_scheme)
+
+                # 2. If parsed is a valid CSS 'color-scheme' property value, then return parsed.
+                if let parsed_value = parsed:
+                    if css_style_value_is_color_scheme(parsed_value):
+                        this.m_supported_color_schemes = css_color_scheme_style_value_schemes(css_style_value_as_color_scheme(parsed_value))
+                        break
+
+    # 3. Return null.
+
+## Ported from Document.cpp:2030 Web::DOM::Document::obtain_theme_color.
+# https://html.spec.whatwg.org/multipage/semantics.html#meta-theme-color
+pub func dom_document_obtain_theme_color(this: DomDocument*):
+    var theme_color = gfx.color_new_named_color(gfx.ColorNamedColor.transparent)
+
+    # 1. Let candidate elements be the list of all meta elements that meet the following criteria, in tree order:
+    for node in dom_node_subtree(this.dom_node()):
+        let element = as_if_html_meta_element(node) else continue
+        #     * the element is in a document tree;
+        #     * the element has a name attribute, whose value is an ASCII case-insensitive match for theme-color; and
+        #     * the element has a content attribute.
+
+        # 2. For each element in candidate elements:
+        let content = dom_element_attribute(element.dom_element(), html_attribute_names_content)
+        if not dom_element_name_equals_ignoring_ascii_case(element.dom_element(), "theme-color"):
+            continue
+        let content_value = content else continue
+
+        # 1. If element has a media attribute and the value of element's media attribute does not match the environment, then continue.
+        var context: CssParsingParams = ---
+        css_parsing_params_construct_dom_document(&context, dom_node_document(this.dom_node()))
+        let media = dom_element_attribute(element.dom_element(), html_attribute_names_media)
+        if let media_value = media:
+            let query = parse_media_query(context, ak.string_bytes_as_string_view(&media_value)) else continue
+            if not css_media_query_evaluate(query, this):
+                continue
+
+        # 2. Let value be the result of stripping leading and trailing ASCII whitespace from the value of element's content attribute.
+        let content_view = ak.string_bytes_as_string_view(&content_value)
+        let value = ak.string_view_trim(&content_view, web_infra.ascii_whitespace_view())
+
+        # 3. Let color be the result of parsing value.
+        let css_value = parse_css_value(context, value, css_data.PropertyId.color)
+
+        # 4. If color is not failure, then return color.
+        if let parsed_color = css_value:
+            if css_style_value_has_color(parsed_color):
+                var color_resolution_context = CssColorResolutionContext()
+                # NB: Called during theme color computation, layout may be stale.
+                if let html_element = dom_document_html_element(this):
+                    if let html_layout_node = dom_element_unsafe_layout_node(html_element.dom_element()):
+                        color_resolution_context = css_color_resolution_context_for_layout_node_with_style(html_layout_node)
+
+                theme_color = css_style_value_to_color(parsed_color, color_resolution_context) else trap("Optional::value() of an empty color")
+                break
+
+    # 3. Return nothing(the page has no theme color).
+    page_client_page_did_change_theme_color(page_client(dom_document_page(dom_node_document(this.dom_node()))), theme_color)
+
+# mark: Layout nodes, inspected and highlighted nodes ===========================================
+
+## Ported from Document.cpp:2078 Web::DOM::Document::layout_node.
+pub func dom_document_layout_node_const(this: DomDocument*) -> LayoutViewport*?:
+    return (LayoutViewport*?)dom_node_layout_node(this.dom_node())
+
+## Ported from Document.cpp:2083 Web::DOM::Document::layout_node.
+pub func dom_document_layout_node(this: DomDocument*) -> LayoutViewport*?:
+    return (LayoutViewport*?)dom_node_layout_node(this.dom_node())
+
+## Ported from Document.cpp:2088 Web::DOM::Document::unsafe_layout_node.
+pub func dom_document_unsafe_layout_node_const(this: DomDocument*) -> LayoutViewport*?:
+    return (LayoutViewport*?)dom_node_unsafe_layout_node(this.dom_node())
+
+## Ported from Document.cpp:2093 Web::DOM::Document::unsafe_layout_node.
+pub func dom_document_unsafe_layout_node(this: DomDocument*) -> LayoutViewport*?:
+    return (LayoutViewport*?)dom_node_unsafe_layout_node(this.dom_node())
+
+## Ported from Document.cpp:2098 Web::DOM::Document::set_inspected_node.
+pub func dom_document_set_inspected_node(this: DomDocument*, node: DomNode*?):
+    this.m_inspected_node = node
+
+## `layout_node && layout_node->first_paintable()`: the highlighted layout node's first paintable.
+func dom_document_highlighted_first_paintable(this: DomDocument*) -> PaintPaintable*?:
+    let layout_node = dom_document_highlighted_layout_node(this) else return none
+    return layout_node_first_paintable(layout_node)
+
+## Ported from Document.cpp:2103 Web::DOM::Document::set_highlighted_node.
+pub func dom_document_set_highlighted_node(this: DomDocument*, node: DomNode*?, pseudo_element: css_data.PseudoElement?):
+    if this.m_highlighted_node == node and this.m_highlighted_pseudo_element == pseudo_element:
+        return
+
+    if let first_paintable = dom_document_highlighted_first_paintable(this):
+        paint_paintable_set_needs_repaint(first_paintable, InvalidateDisplayList.yes)
+
+    this.m_highlighted_node = node
+    this.m_highlighted_pseudo_element = pseudo_element
+
+    if let first_paintable = dom_document_highlighted_first_paintable(this):
+        paint_paintable_set_needs_repaint(first_paintable, InvalidateDisplayList.yes)
+
+## Ported from Document.cpp:2118 Web::DOM::Document::highlighted_layout_node.
+pub func dom_document_highlighted_layout_node(this: DomDocument*) -> LayoutNode*?:
+    let highlighted_node = this.m_highlighted_node else return none
+
+    # NB: Called during painting inside update_layout().
+    let pseudo_element = this.m_highlighted_pseudo_element
+    if pseudo_element == none or not dom_node_is_element(highlighted_node):
+        return dom_node_unsafe_layout_node(highlighted_node)
+
+    let element = (DomElement*)highlighted_node
+    let pseudo = pseudo_element else trap("unreachable: checked above")
+    return (LayoutNode*?)dom_element_get_pseudo_element_node(element, pseudo)
+
+# mark: Hovering ================================================================================
+
+## Ported from Document.cpp:2131 Web::DOM::find_common_ancestor.
+func dom_find_common_ancestor(a: DomNode*?, b: DomNode*?) -> DomNode*?:
+    let node_a = a else return none
+    let node_b = b else return none
+
+    if node_a == node_b:
+        return node_a
+
+    var ancestors: ak.HashTable[DomNode*, ak.PtrTraits[DomNode]]
+    var node: DomNode*? = node_a
+    while let current = node:
+        discard(ak.hash_table_set(&ancestors, current))
+        node = (DomNode*?)dom_node_parent_or_shadow_host(current)
+
+    node = node_b
+    while let current = node:
+        if ak.hash_table_contains_t(&ancestors, current):
+            return current
+        node = (DomNode*?)dom_node_parent_or_shadow_host(current)
+
+    return none
+
+## A PointerEventInit for a mouse pointer, as set_hovered_node fills it.
+func dom_document_hover_pointer_event_init(this: DomDocument*, related_target: DomNode*?, bubbles_cancelable_composed: bool) -> UiEventsPointerEventInit:
+    var pointer_event_init = UiEventsPointerEventInit()
+    if bubbles_cancelable_composed:
+        pointer_event_init.mouse_event_init.event_modifier_init.ui_event_init.event_init.bubbles = true
+        pointer_event_init.mouse_event_init.event_modifier_init.ui_event_init.event_init.cancelable = true
+        pointer_event_init.mouse_event_init.event_modifier_init.ui_event_init.event_init.composed = true
+    pointer_event_init.mouse_event_init.related_target = (DomEventTarget*?)related_target
+    pointer_event_init.is_primary = true
+    # UIEvents::PointerTypes::Mouse
+    pointer_event_init.pointer_type = ak.string_from_str("mouse")
+    if let navigable = dom_document_navigable(this):
+        pointer_event_init.mouse_event_init.event_modifier_init.ui_event_init.view = html_navigable_active_window_proxy(navigable)
+    return pointer_event_init
+
+## Ported from Document.cpp:2151 Web::DOM::Document::set_hovered_node.
+pub func dom_document_set_hovered_node(this: DomDocument*, node: DomNode*?):
+    if this.m_hovered_node == node:
+        return
+
+    # move(m_hovered_node) leaves the member null until it is set below.
+    let old_hovered_node = this.m_hovered_node
+    this.m_hovered_node = none
+    let common_ancestor = dom_find_common_ancestor(old_hovered_node, node)
+
+    var old_hovered_node_root: DomNode*? = none
+    var new_hovered_node_root: DomNode*? = none
+    if let old = old_hovered_node:
+        old_hovered_node_root = tree_node_root(old)
+    if let new_node = node:
+        new_hovered_node_root = tree_node_root(new_node)
+    if old_hovered_node_root != new_hovered_node_root:
+        if let old_root = old_hovered_node_root:
+            css_invalidation_invalidate_style_after_pseudo_class_state_change_dom_node(css_data.PseudoClass.hover, this, &this.m_hovered_node, old_root, node)
+        if let new_root = new_hovered_node_root:
+            css_invalidation_invalidate_style_after_pseudo_class_state_change_dom_node(css_data.PseudoClass.hover, this, &this.m_hovered_node, new_root, node)
+    else:
+        let invalidation_root = common_ancestor else trap("hovered nodes in one tree have a common ancestor")
+        css_invalidation_invalidate_style_after_pseudo_class_state_change_dom_node(css_data.PseudoClass.hover, this, &this.m_hovered_node, invalidation_root, node)
+
+    this.m_hovered_node = node
+
+    # https://w3c.github.io/pointerevents/#the-pointerout-event
+    if let old = old_hovered_node:
+        if old != this.m_hovered_node:
+            let pointer_event_init = dom_document_hover_pointer_event_init(this, this.m_hovered_node, true)
+            let event = ui_events_pointer_event_create(dom_document_realm(this), ui_events_event_names_pointerout, pointer_event_init)
+            discard(dom_event_target_dispatch_event(old.dom_event_target(), (DomEvent*)event))
+
+    # https://w3c.github.io/uievents/#mouseout
+    if let old = old_hovered_node:
+        if old != this.m_hovered_node:
+            var mouse_event_init = UiEventsMouseEventInit()
+            mouse_event_init.event_modifier_init.ui_event_init.event_init.bubbles = true
+            mouse_event_init.event_modifier_init.ui_event_init.event_init.cancelable = true
+            mouse_event_init.event_modifier_init.ui_event_init.event_init.composed = true
+            mouse_event_init.related_target = (DomEventTarget*?)this.m_hovered_node
+            if let navigable = dom_document_navigable(this):
+                mouse_event_init.event_modifier_init.ui_event_init.view = html_navigable_active_window_proxy(navigable)
+            let event = ui_events_mouse_event_create(dom_document_realm(this), ui_events_event_names_mouseout, mouse_event_init)
+            discard(dom_event_target_dispatch_event(old.dom_event_target(), (DomEvent*)event))
+
+    # https://w3c.github.io/pointerevents/#the-pointerleave-event
+    if let old = old_hovered_node:
+        var hovered_is_descendant_of_old = false
+        if let hovered = this.m_hovered_node:
+            hovered_is_descendant_of_old = tree_node_is_descendant_of(hovered, old)
+        if not hovered_is_descendant_of_old:
+            var target: DomNode*? = old
+            while let current = target:
+                if current == common_ancestor:
+                    break
+                # FIXME: Populate the event with mouse coordinates, etc.
+                let pointer_event_init = dom_document_hover_pointer_event_init(this, this.m_hovered_node, false)
+                discard(dom_event_target_dispatch_event(current.dom_event_target(), (DomEvent*)ui_events_pointer_event_create(dom_document_realm(this), ui_events_event_names_pointerleave, pointer_event_init)))
+                target = tree_node_parent(current)
+
+    # https://w3c.github.io/uievents/#mouseleave
+    if let old = old_hovered_node:
+        var hovered_is_descendant_of_old = false
+        if let hovered = this.m_hovered_node:
+            hovered_is_descendant_of_old = tree_node_is_descendant_of(hovered, old)
+        if not hovered_is_descendant_of_old:
+            var target: DomNode*? = old
+            while let current = target:
+                if current == common_ancestor:
+                    break
+                # FIXME: Populate the event with mouse coordinates, etc.
+                var mouse_event_init = UiEventsMouseEventInit()
+                mouse_event_init.related_target = (DomEventTarget*?)this.m_hovered_node
+                discard(dom_event_target_dispatch_event(current.dom_event_target(), (DomEvent*)ui_events_mouse_event_create(dom_document_realm(this), ui_events_event_names_mouseleave, mouse_event_init)))
+                target = (DomNode*?)dom_node_parent_or_shadow_host(current)
+
+    # https://w3c.github.io/pointerevents/#the-pointerover-event
+    if let hovered = this.m_hovered_node:
+        if hovered != old_hovered_node:
+            let pointer_event_init = dom_document_hover_pointer_event_init(this, old_hovered_node, true)
+            let event = ui_events_pointer_event_create(dom_document_realm(this), ui_events_event_names_pointerover, pointer_event_init)
+            discard(dom_event_target_dispatch_event(hovered.dom_event_target(), (DomEvent*)event))
+
+    # https://w3c.github.io/uievents/#mouseover
+    if let hovered = this.m_hovered_node:
+        if hovered != old_hovered_node:
+            var mouse_event_init = UiEventsMouseEventInit()
+            mouse_event_init.event_modifier_init.ui_event_init.event_init.bubbles = true
+            mouse_event_init.event_modifier_init.ui_event_init.event_init.cancelable = true
+            mouse_event_init.event_modifier_init.ui_event_init.event_init.composed = true
+            mouse_event_init.related_target = (DomEventTarget*?)old_hovered_node
+            if let navigable = dom_document_navigable(this):
+                mouse_event_init.event_modifier_init.ui_event_init.view = html_navigable_active_window_proxy(navigable)
+            let event = ui_events_mouse_event_create(dom_document_realm(this), ui_events_event_names_mouseover, mouse_event_init)
+            discard(dom_event_target_dispatch_event(hovered.dom_event_target(), (DomEvent*)event))
+
+    # https://w3c.github.io/pointerevents/#the-pointerenter-event
+    # https://w3c.github.io/uievents/#mouseenter
+    # Enter events are dispatched from ancestor to descendant.
+    # Leave events are dispatched in the opposite order.
+    if let hovered = this.m_hovered_node:
+        var hovered_is_ancestor_of_old = false
+        if let old = old_hovered_node:
+            hovered_is_ancestor_of_old = tree_node_is_ancestor_of(hovered, old)
+        if not hovered_is_ancestor_of_old:
+            var entered_ancestors: ak.Vector[DomNode*]
+            var target: DomNode*? = hovered
+            while let current = target:
+                if current == common_ancestor:
+                    break
+                ak.vector_append_t(&entered_ancestors, current)
+                target = (DomNode*?)dom_node_parent_or_shadow_host(current)
+
+            var index = ak.vector_size(&entered_ancestors)
+            while index > 0:
+                index -= 1
+                let entered = *ak.vector_at(&entered_ancestors, index)
+                # FIXME: Populate the events with mouse coordinates, etc.
+                let pointer_event_init = dom_document_hover_pointer_event_init(this, old_hovered_node, false)
+                discard(dom_event_target_dispatch_event(entered.dom_event_target(), (DomEvent*)ui_events_pointer_event_create(dom_document_realm(this), ui_events_event_names_pointerenter, pointer_event_init)))
+                var mouse_event_init = UiEventsMouseEventInit()
+                mouse_event_init.related_target = (DomEventTarget*?)old_hovered_node
+                discard(dom_event_target_dispatch_event(entered.dom_event_target(), (DomEvent*)ui_events_mouse_event_create(dom_document_realm(this), ui_events_event_names_mouseenter, mouse_event_init)))

@@ -1,0 +1,338 @@
+#==============================================================================================
+#
+#   document_loading_1 - loading XML, HTML and text documents for a navigation
+#
+#   DESCRIPTION:
+#       Port of LibWeb/DOM/DocumentLoading.cpp (lines 40-302): converting a document into an
+#       XML error document, building XML documents, and the HTML, XML and text loaders. The
+#       C++ lambdas become capture structs with static `call` functions, wrapped in GC
+#       functions as in the donor.
+#
+#       Copyright (c) 2020, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2023, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
+#       Copyright (c) 2023, Sam Atkins <atkinssj@serenityos.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: XML documents ===========================================================================
+
+## Ported from DocumentLoading.cpp:41 Web::convert_to_xml_error_document.
+# Replaces a document's content with a simple error message.
+func convert_to_xml_error_document(document: DomDocument*, error_string: ak.Utf16String):
+    let html_element = dom_create_element(document, html_tag_names_html, namespace_html) else trap("MUST: create_element(html)")
+    let body_element = dom_create_element(document, html_tag_names_body, namespace_html) else trap("MUST: create_element(body)")
+    discard(dom_node_append_child(html_element.dom_node(), body_element.dom_node()) else trap("MUST: append_child"))
+    let text = realm_create_dom_text_utf16_string(dom_document_realm(document), document, error_string)
+    discard(dom_node_append_child(body_element.dom_node(), text.dom_node()) else trap("MUST: append_child"))
+    dom_node_remove_all_children(document.dom_node())
+    discard(dom_node_append_child(document.dom_node(), html_element.dom_node()) else trap("MUST: append_child"))
+
+## The `Optional<TextCodec::Decoder&> decoder` choice shared by build_xml_document and load_xml_document:
+## the Content-Type charset when it names a decoder, otherwise the encoding sniffing algorithm's result.
+func document_loading_xml_decoder(document: DomDocument*, data: const u8[], content_encoding: ak.String?, mime_type: MimeType?) -> text_codec.Decoder*:
+    var decoder: text_codec.Decoder*? = none
+    # The actual HTTP headers and other metadata, not the headers as mutated or implied by the algorithms given in this specification,
+    # are the ones that must be used when determining the character encoding according to the rules given in the above specifications.
+    if let encoding = content_encoding:
+        decoder = text_codec.decoder_for(ak.string_bytes_as_string_view(&encoding))
+    if decoder == none:
+        let encoding = html_run_encoding_sniffing_algorithm(document, data, mime_type)
+        decoder = text_codec.decoder_for(ak.byte_string_view(&encoding))
+    return decoder else trap("VERIFY: decoder.has_value()")
+
+## Ported from DocumentLoading.cpp:51 Web::build_xml_document.
+pub func build_xml_document(document: DomDocument*, data: ak.ByteBuffer, content_encoding: ak.String?) -> bool:
+    let bytes = ak.byte_buffer_bytes_const(&data)
+    let decoder = document_loading_xml_decoder(document, bytes, content_encoding, none)
+    # Well-formed XML documents contain only properly encoded characters
+    if not text_codec.decoder_validate(decoder, ak.string_view_from_bytes(bytes)):
+        convert_to_xml_error_document(document, ak.utf16_string_from_str("XML Document contains improperly-encoded characters"))
+        return false
+    let source = text_codec.decoder_to_utf8(decoder, ak.string_view_from_bytes(bytes)) else trap("release_value_but_fixme_should_propagate_errors: Decoder::to_utf8")
+    # XML::Parser parser(source, { .resolve_named_html_entity = resolve_named_html_entity });
+    # XMLDocumentBuilder builder { document };
+    # auto result = parser.parse_with_listener(builder);
+    let result = xml_parse_with_document_builder(document, source, XmlParserOptions())
+    return result.parse_error == none and not result.builder_has_error
+
+# mark: HTML documents ==========================================================================
+
+## load_html_document's about:srcdoc deferred parser start: `[parser, url] { parser->run(url); }`.
+struct DocumentLoadingRunParserWithUrl:
+    var parser: HtmlParser*
+    var url: web_url.Url
+
+    static func call(context: void*?):
+        let captures = (DocumentLoadingRunParserWithUrl*)(context else trap("run parser: no captures"))
+        html_parser_run_url(captures.parser, captures.url)
+
+## Ported from DocumentLoading.cpp:76 Web::load_html_document.
+# https://html.spec.whatwg.org/multipage/document-lifecycle.html#navigate-html
+func load_html_document(navigation_params: HtmlNavigationParams*) -> DomDocument*!:
+    # To load an HTML document, given navigation params navigationParams:
+    let response = navigation_params.response else trap("VERIFY: navigation params have a response")
+    let body = fetch_response_body(response) else trap("VERIFY: the response has a body")
+
+    # 1. Let document be the result of creating and initializing a Document object given "html", "text/html", and navigationParams.
+    let document = try dom_document_create_and_initialize(DocumentDomDocumentType.html, ak.string_from_str("text/html"), navigation_params)
+
+    # 2. If document's URL is about:blank, then populate with html/head/body given document.
+    # FIXME: The additional check for a non-empty body fixes issues with loading javascript urls in iframes, which
+    #        default to an "about:blank" url. Is this a spec bug?
+    let url_string = dom_document_url_string(document)
+    let body_length = fetch_body_length(body) else 0
+    let srcdoc_data = fetch_body_source_byte_buffer(body)
+    let document_url = dom_document_url(document)
+    if ak.string_eq_string_view(&url_string, ak.sv("about:blank")) and body_length == 0:
+        try dom_document_populate_with_html_head_and_body(document)
+        html_parser_the_end(document)
+
+    # AD-HOC: For about:srcdoc, the body bytes are always immediately available in the response source (the srcdoc
+    #         string was inlined when the navigation params were created). Bypass the async body-reading pipeline
+    #         and set up a deferred parser directly. Combined with running the post-activation update synchronously
+    #         when a deferred parser is set, this guarantees the body element exists before the document becomes
+    #         observable to the parent — matching Chrome and Firefox behavior for srcdoc iframes.
+    #
+    # FIXME: This only fixes the transient `contentDocument.body === null` race for srcdoc. The same race exists in
+    #        Ladybird for any other same-origin async iframe load (notably blob: URLs and same-origin HTTP), where
+    #        Chrome and Firefox also keep `contentDocument` pointed at the initial about:blank until the new document
+    #        reaches readyState="interactive". A spec-aligned fix would split "what the parent sees via
+    #        contentDocument" from the navigable's active document, swapping the parent-visible pointer only at
+    #        parser readiness.
+    elif srcdoc_data != none and web_url.url_eq(&document_url, web_url.about_srcdoc()):
+        let data = srcdoc_data else trap("unreachable: checked above")
+        let mime_type = fetch_extract_mime_type(fetch_response_header_list(response))
+        let url = fetch_response_url(response) else trap("VERIFY: the response has a URL")
+        let parser = html_parser_create_with_uncertain_encoding(document, ak.byte_buffer_clone(data), mime_type)
+        let captures = new DocumentLoadingRunParserWithUrl(parser = parser, url = url) else trap("out of memory")
+        dom_document_set_deferred_parser_start(document, gc.create_function0[unit](gc.cell_heap(document.cell()), ak.Function0[unit](call = DocumentLoadingRunParserWithUrl.call, context = captures)))
+
+    # 3. Otherwise, create an HTML parser and associate it with the document.
+    #    Each task that the networking task source places on the task queue while fetching runs must then fill the
+    #    parser's input byte stream with the fetched bytes and cause the HTML parser to perform the appropriate
+    #    processing of the input stream.
+    #    The first task that the networking task source places on the task queue while fetching runs must process link
+    #    headers given document, navigationParams's response, and "media", after the task has been processed by the
+    #    HTML parser.
+    #    Before any script execution occurs, the user agent must wait for scripts may run for the newly-created
+    #    document to be true for document.
+    #    When no more bytes are available, the user agent must queue a global task on the networking task source given
+    #    document's relevant global object to have the parser to process the implied EOF character, which eventually
+    #    causes a load event to be fired.
+    else:
+        let url = fetch_response_url(response) else trap("VERIFY: the response has a URL")
+        let parser = html_incremental_document_parser_create(document, body, url, fetch_extract_mime_type(fetch_response_header_list(response)))
+        html_incremental_document_parser_start(parser)
+
+    # 4. Return document.
+    return document
+
+# mark: XML documents (navigation) ==============================================================
+
+## load_xml_document's `run_xml_parser` lambda: `[document, source_string]`.
+struct DocumentLoadingRunXmlParser:
+    var document: DomDocument*
+    var source_string: ak.String
+
+    static func call(context: void*?):
+        let captures = (DocumentLoadingRunXmlParser*)(context else trap("run_xml_parser: no captures"))
+        let document = captures.document
+        # XML::Parser parser(source_string, { .preserve_cdata = true, .preserve_comments = true, .resolve_named_html_entity = resolve_named_html_entity });
+        # XMLDocumentBuilder builder { document };
+        # auto result = parser.parse_with_listener(builder);
+        let result = xml_parse_with_document_builder(document, captures.source_string, XmlParserOptions(preserve_cdata = true, preserve_comments = true))
+        if let parse_error = result.parse_error:
+            # FIXME: Insert error message into the document.
+            var builder = ak.string_builder_new()
+            ak.string_builder_append(&builder, "Failed to parse XML document: ")
+            ak.string_builder_append_string_view(&builder, ak.string_bytes_as_string_view(&parse_error))
+            ak.dbgln(f"{ak.string_view_text(ak.string_builder_string_view(&builder))}")
+            convert_to_xml_error_document(document, ak.utf16_string_from_string_builder(&builder))
+
+            # NB: XMLDocumentBuilder ensures that the `load` event gets fired. We don't need to do anything else here.
+
+## load_xml_document's `process_body` lambda: `[document, url, content_encoding, mime = type](ByteBuffer data)`.
+struct DocumentLoadingProcessXmlBody:
+    var document: DomDocument*
+    var url: web_url.Url
+    var content_encoding: ak.String?
+    var mime: MimeType
+
+    static func call(context: void*?, data: ak.ByteBuffer):
+        let captures = (DocumentLoadingProcessXmlBody*)(context else trap("process_body: no captures"))
+        let document = captures.document
+        let bytes = ak.byte_buffer_bytes_const(&data)
+        let decoder = document_loading_xml_decoder(document, bytes, captures.content_encoding, captures.mime)
+        # Well-formed XML documents contain only properly encoded characters
+        if not text_codec.decoder_validate(decoder, ak.string_view_from_bytes(bytes)):
+            # FIXME: Insert error message into the document.
+            ak.dbgln("XML Document contains improperly-encoded characters")
+            convert_to_xml_error_document(document, ak.utf16_string_from_str("XML Document contains improperly-encoded characters"))
+
+            # NB: This ensures that the `load` event gets fired for the frame loading this document.
+            dom_document_completely_finish_loading(document)
+            return
+        let source = text_codec.decoder_to_utf8(decoder, ak.string_view_from_bytes(bytes)) catch failure:
+            # FIXME: Insert error message into the document.
+            var builder = ak.string_builder_new()
+            ak.string_builder_append(&builder, "Failed to decode XML document: ")
+            ak.string_builder_append(&builder, failure.message)
+            ak.dbgln(f"{ak.string_view_text(ak.string_builder_string_view(&builder))}")
+            convert_to_xml_error_document(document, ak.utf16_string_from_string_builder(&builder))
+
+            # NB: This ensures that the `load` event gets fired for the frame loading this document.
+            dom_document_completely_finish_loading(document)
+            return
+        let run_xml_parser = new DocumentLoadingRunXmlParser(document = document, source_string = source) else trap("out of memory")
+        if dom_document_ready_to_run_scripts(document):
+            DocumentLoadingRunXmlParser.call(run_xml_parser)
+        else:
+            dom_document_set_deferred_parser_start(document, gc.create_function0[unit](gc.cell_heap(document.cell()), ak.Function0[unit](call = DocumentLoadingRunXmlParser.call, context = run_xml_parser)))
+
+## The `process_body_error` lambda of the XML and text loaders.
+func document_loading_process_body_error(context: void*?, body_error: JsValue):
+    ak.dbgln("FIXME: Load html page with an error if read of body failed.")
+
+## Ported from DocumentLoading.cpp:137 Web::load_xml_document.
+# https://html.spec.whatwg.org/multipage/document-lifecycle.html#read-xml
+func load_xml_document(navigation_params: HtmlNavigationParams*, type_: MimeType) -> DomDocument*!:
+    # When faced with displaying an XML file inline, provided navigation params navigationParams and a string type, user agents
+    # must follow the requirements defined in XML and Namespaces in XML, XML Media Types, DOM, and other relevant specifications
+    # to create and initialize a Document object document, given "xml", type, and navigationParams, and return that Document.
+    # They must also create a corresponding XML parser. [XML] [XMLNS] [RFC7303] [DOM]
+    #
+    # Note: At the time of writing, the XML specification community had not actually yet specified how XML and the DOM interact.
+    #
+    # The first task that the networking task source places on the task queue while fetching runs must process link headers
+    # given document, navigationParams's response, and "media", after the task has been processed by the XML parser.
+    #
+    # The actual HTTP headers and other metadata, not the headers as mutated or implied by the algorithms given in this
+    # specification, are the ones that must be used when determining the character encoding according to the rules given in the
+    # above specifications. Once the character encoding is established, the document's character encoding must be set to that
+    # character encoding.
+    #
+    # Before any script execution occurs, the user agent must wait for scripts may run for the newly-created document to be
+    # true for the newly-created Document.
+    #
+    # Once parsing is complete, the user agent must set document's during-loading navigation ID for WebDriver BiDi to null.
+    #
+    # Note: For HTML documents this is reset when parsing is complete, after firing the load event.
+    #
+    # Error messages from the parse process (e.g., XML namespace well-formedness errors) may be reported inline by mutating
+    # the Document.
+
+    # FIXME: Actually follow the spec! This is just the ad-hoc code we had before, modified somewhat.
+
+    let document = try dom_document_create_and_initialize(DocumentDomDocumentType.xml, mime_type_essence(&type_), navigation_params)
+
+    var content_encoding: ak.String? = none
+    if let maybe_encoding = ak.ordered_hash_map_get_k_const(mime_type_parameters(&type_), ak.string_from_str("charset")):
+        content_encoding = *maybe_encoding
+
+    let response = navigation_params.response else trap("VERIFY: navigation params have a response")
+    let url = fetch_response_url(response) else trap("VERIFY: the response has a URL")
+    let captures = new DocumentLoadingProcessXmlBody(document = document, url = url, content_encoding = content_encoding, mime = type_) else trap("out of memory")
+    let process_body = gc.create_function1[ak.ByteBuffer, unit](gc.cell_heap(document.cell()), ak.Function1[ak.ByteBuffer, unit](call = DocumentLoadingProcessXmlBody.call, context = captures))
+
+    let process_body_error = gc.create_function1[JsValue, unit](gc.cell_heap(document.cell()), ak.Function1[JsValue, unit](call = document_loading_process_body_error, context = none))
+
+    let realm = dom_document_realm(document)
+    let body = fetch_response_body(response) else trap("VERIFY: the response has a body")
+    fetch_body_fully_read(body, realm, process_body, process_body_error, (JsObject*)realm_global_object(realm))
+
+    return document
+
+# mark: Text documents ==========================================================================
+
+## load_text_document's `run_text_parser` lambda: `[document, data, url, encoding]`.
+struct DocumentLoadingRunTextParser:
+    var document: DomDocument*
+    var data: ak.ByteBuffer
+    var url: web_url.Url
+    var encoding: ak.ByteString
+
+    static func call(context: void*?):
+        let captures = (DocumentLoadingRunTextParser*)(context else trap("run_text_parser: no captures"))
+        let document = captures.document
+        let parser = html_parser_create_with_open_input_stream(document)
+        let tokenizer = html_parser_tokenizer(parser)
+        html_syntax.html_tokenizer_update_insertion_point(tokenizer)
+
+        html_syntax.html_tokenizer_insert_input_at_insertion_point(tokenizer, ak.sv("<pre>\n"))
+        html_parser_run_html_tokenizer_stop_at_inserti(parser)
+
+        html_syntax.html_tokenizer_switch_to_html_parser(tokenizer, html_syntax.HtmlTokenizerState.plaintext)
+        html_syntax.html_tokenizer_insert_input_at_insertion_point(tokenizer, ak.string_view_from_bytes(ak.byte_buffer_bytes_const(&captures.data)))
+        html_syntax.html_tokenizer_insert_eof(tokenizer)
+        html_parser_run_url(parser, captures.url)
+
+        dom_document_set_encoding(document, ak.string_from_byte_string(captures.encoding) else trap("MUST: String::from_byte_string"))
+
+        # 5. User agents may add content to the head element of document, e.g., linking to a style sheet, providing
+        #    script, or giving the document a title.
+        document_loading_insert_title(document, captures.url) else trap("MUST: insert the title")
+
+## `dbgln_if(HTML_PARSER_DEBUG, ...)` (AK/Debug.h; off by default).
+let document_loading_html_parser_debug: bool = false
+
+## load_text_document's `process_body` lambda: `[document, url, mime = type](ByteBuffer data)`.
+struct DocumentLoadingProcessTextBody:
+    var document: DomDocument*
+    var url: web_url.Url
+    var mime: MimeType
+
+    static func call(context: void*?, data: ak.ByteBuffer):
+        let captures = (DocumentLoadingProcessTextBody*)(context else trap("process_body: no captures"))
+        let document = captures.document
+        let encoding = html_run_encoding_sniffing_algorithm(document, ak.byte_buffer_bytes_const(&data), captures.mime)
+        if document_loading_html_parser_debug:
+            ak.dbgln(f"The encoding sniffing algorithm returned encoding '{ak.string_view_text(ak.byte_string_view(&encoding))}'")
+
+        let run_text_parser = new DocumentLoadingRunTextParser(document = document, data = data, url = captures.url, encoding = encoding) else trap("out of memory")
+        if dom_document_ready_to_run_scripts(document):
+            DocumentLoadingRunTextParser.call(run_text_parser)
+        else:
+            dom_document_set_deferred_parser_start(document, gc.create_function0[unit](gc.cell_heap(document.cell()), ak.Function0[unit](call = DocumentLoadingRunTextParser.call, context = run_text_parser)))
+
+## Ported from DocumentLoading.cpp:233 Web::load_text_document.
+# https://html.spec.whatwg.org/multipage/document-lifecycle.html#navigate-text
+func load_text_document(navigation_params: HtmlNavigationParams*, type_: MimeType) -> DomDocument*!:
+    # To load a text document, given a navigation params navigationParams and a string type:
+
+    # 1. Let document be the result of creating and initializing a Document object given "html", type, and navigationParams.
+    let document = try dom_document_create_and_initialize(DocumentDomDocumentType.html, mime_type_essence(&type_), navigation_params)
+
+    # 2. Set document's parser cannot change the mode flag to true.
+    dom_document_set_parser_cannot_change_the_mode(document, true)
+
+    # 3. Set document's mode to "no-quirks".
+    dom_document_set_quirks_mode(document, DomQuirksMode.no)
+
+    # 4. Create an HTML parser and associate it with the document. Act as if the tokenizer had emitted a start tag token
+    #    with the tag name "pre" followed by a single U+000A LINE FEED (LF) character, and switch the HTML parser's tokenizer
+    #    to the PLAINTEXT state. Each task that the networking task source places on the task queue while fetching runs must
+    #    then fill the parser's input byte stream with the fetched bytes and cause the HTML parser to perform the appropriate
+    #    processing of the input stream.
+    #    document's encoding must be set to the character encoding used to decode the document during parsing.
+    #    The first task that the networking task source places on the task queue while fetching runs must process link
+    #    headers given document, navigationParams's response, and "media", after the task has been processed by the HTML parser.
+    #    Before any script execution occurs, the user agent must wait for scripts may run for the newly-created document to be
+    #    true for document.
+    #    When no more bytes are available, the user agent must queue a global task on the networking task source given
+    #    document's relevant global object to have the parser to process the implied EOF character, which eventually causes a
+    #    load event to be fired.
+    # FIXME: Parse as we receive the document data, instead of waiting for the whole document to be fetched first.
+    let response = navigation_params.response else trap("VERIFY: navigation params have a response")
+    let url = fetch_response_url(response) else trap("VERIFY: the response has a URL")
+    let captures = new DocumentLoadingProcessTextBody(document = document, url = url, mime = type_) else trap("out of memory")
+    let process_body = gc.create_function1[ak.ByteBuffer, unit](gc.cell_heap(document.cell()), ak.Function1[ak.ByteBuffer, unit](call = DocumentLoadingProcessTextBody.call, context = captures))
+
+    let process_body_error = gc.create_function1[JsValue, unit](gc.cell_heap(document.cell()), ak.Function1[JsValue, unit](call = document_loading_process_body_error, context = none))
+
+    let realm = dom_document_realm(document)
+    let body = fetch_response_body(response) else trap("VERIFY: the response has a body")
+    fetch_body_fully_read(body, realm, process_body, process_body_error, (JsObject*)realm_global_object(realm))
+
+    # 6. Return document.
+    return document
