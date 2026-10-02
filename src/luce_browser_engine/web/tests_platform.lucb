@@ -1,0 +1,231 @@
+#==============================================================================================
+#
+#   tests_platform - the Platform plugins and Core::Timer over a test event loop
+#
+#   DESCRIPTION:
+#       The donor has no unit tests for Platform/ (LibCore's TestLibCoreTimer-style behaviour
+#       is covered by its own tests); these pin Core::Timer's state machine, Platform::Timer's
+#       dispatch and finalize, EventLoopPlugin's spin_until/deferred_invoke/quit, and the
+#       FontPlugin parts that need no font files, on a scripted event loop.
+#
+#==============================================================================================
+
+# mark: A scripted event loop ===================================================================
+
+## An event loop that records timer registrations and runs one deferred function per pump.
+struct TestEventLoop: CoreEventLoopImplementation:
+    var timers: (CoreTimer*?)[8]
+    var intervals: i32[8]
+    var reloads: bool[8]
+    var registrations: i32
+    var unregistrations: i32
+    var deferred: ak.Function0[unit]?
+    var pumps: i32
+    var quit_code: i32?
+
+    mutating func pump(mode: CoreEventLoopPumpMode) -> usize:
+        assert(mode == CoreEventLoopPumpMode.wait_for_events)
+        self.pumps += 1
+        if let function = self.deferred:
+            self.deferred = none
+            ak.function0_call(&function)
+        return 1
+
+    mutating func quit(code: i32):
+        self.quit_code = code
+
+    mutating func was_exit_requested() -> bool:
+        return false
+
+    mutating func deferred_invoke(function: ak.Function0[unit]):
+        self.deferred = function
+
+    mutating func register_timer(timer: CoreTimer*, milliseconds: i32, should_reload: bool) -> isize:
+        for i: usize in 0..<8:
+            if self.timers[i] == none:
+                self.timers[i] = timer
+                self.intervals[i] = milliseconds
+                self.reloads[i] = should_reload
+                self.registrations += 1
+                return (isize)i + 1
+        trap("TestEventLoop: too many timers")
+
+    mutating func unregister_timer(timer_id: isize):
+        assert(self.timers[(usize)timer_id - 1] != none)
+        self.timers[(usize)timer_id - 1] = none
+        self.unregistrations += 1
+
+var test_event_loop: TestEventLoop
+
+## A fresh scripted loop, installed as the process's event loop.
+func install_test_event_loop() -> TestEventLoop*:
+    test_event_loop = TestEventLoop()
+    core_event_loop_installed = &test_event_loop
+    return &test_event_loop
+
+## The loop fires the timer it registered as `timer_id`.
+func fire_test_timer(event_loop: TestEventLoop*, timer_id: isize):
+    let timer = event_loop.timers[(usize)timer_id - 1] else trap("no such timer")
+    core_timer_timer_event(timer)
+
+## A callback that counts its calls.
+struct TestCounter:
+    var count: i32
+
+    static func call(context: void*?):
+        let counter = (TestCounter*)(context else trap("no counter"))
+        counter.count += 1
+
+func test_counter_function(counter: TestCounter*) -> ak.Function0[unit]:
+    return ak.Function0[unit](call = TestCounter.call, context = counter)
+
+# mark: Core::Timer =============================================================================
+
+test "Core::Timer: a single-shot timer fires once and unregisters":
+    let event_loop = install_test_event_loop()
+    var counter = TestCounter()
+    let timer = core_timer_create_single_shot(10, test_counter_function(&counter))
+    assert(core_timer_is_single_shot(timer) and not core_timer_is_active(timer))
+
+    core_timer_start(timer)
+    assert(core_timer_is_active(timer))
+    assert(event_loop.registrations == 1 and event_loop.intervals[0] == 10 and event_loop.reloads[0])
+    # Starting an active timer does nothing.
+    core_timer_start_i32(timer, 99)
+    assert(event_loop.registrations == 1 and core_timer_interval(timer) == 10)
+
+    fire_test_timer(event_loop, 1)
+    assert(counter.count == 1)
+    assert(not core_timer_is_active(timer))
+    assert(event_loop.unregistrations == 1 and event_loop.timers[0] == none)
+
+    # A stale timer event after the stop is ignored.
+    core_timer_timer_event(timer)
+    assert(counter.count == 1)
+
+test "Core::Timer: a repeating timer picks up a new interval when it fires":
+    let event_loop = install_test_event_loop()
+    var counter = TestCounter()
+    let timer = core_timer_create_repeating(5, test_counter_function(&counter))
+    core_timer_start(timer)
+    core_timer_set_interval(timer, 7)
+    assert(core_timer_interval(timer) == 7 and event_loop.intervals[0] == 5)
+
+    fire_test_timer(event_loop, 1)
+    assert(counter.count == 1 and core_timer_is_active(timer))
+    assert(event_loop.registrations == 2 and event_loop.unregistrations == 1 and event_loop.intervals[0] == 7)
+
+    fire_test_timer(event_loop, 1)
+    assert(counter.count == 2 and event_loop.registrations == 2)
+
+    core_timer_restart_i32(timer, 3)
+    assert(event_loop.registrations == 3 and event_loop.intervals[0] == 3)
+    core_timer_set_active(timer, false)
+    assert(not core_timer_is_active(timer) and event_loop.timers[0] == none)
+    core_timer_stop(timer)
+    assert(event_loop.unregistrations == 3)
+    core_timer_set_active(timer, true)
+    assert(core_timer_is_active(timer) and event_loop.intervals[0] == 3)
+
+# mark: Platform::Timer and EventLoopPlugin =====================================================
+
+## A heap for one test, on the C heap, with no embedder roots.
+func create_platform_test_heap() -> gc.Heap*:
+    let heap = (new gc.Heap in memory.heap) else trap("out of memory")
+    gc.heap_construct(heap, ak.Function1[gc.GcHashMap[gc.HeapRoot]*, unit](call = no_platform_test_roots, context = none))
+    return heap
+
+func no_platform_test_roots(context: void*?, roots: gc.GcHashMap[gc.HeapRoot]*):
+    return
+
+test "Platform::Timer: dispatches to on_timeout and unregisters when finalized":
+    let event_loop = install_test_event_loop()
+    let heap = create_platform_test_heap()
+    var counter = TestCounter()
+    let handler = gc.create_function0(heap, test_counter_function(&counter))
+
+    let single_shot = platform_timer_create_single_shot(heap, 4, handler)
+    assert(is_platform_timer(single_shot))
+    assert(platform_timer_is_single_shot(single_shot) and platform_timer_interval(single_shot) == 4)
+    platform_timer_start(single_shot)
+    assert(platform_timer_is_active(single_shot))
+    fire_test_timer(event_loop, 1)
+    assert(counter.count == 1 and not platform_timer_is_active(single_shot))
+
+    let repeating = platform_timer_create_repeating(heap, 8, handler)
+    assert(not platform_timer_is_single_shot(repeating))
+    platform_timer_start(repeating)
+    fire_test_timer(event_loop, 1)
+    fire_test_timer(event_loop, 1)
+    assert(counter.count == 3 and platform_timer_is_active(repeating))
+
+    # A timer without a handler fires into nothing.
+    let silent = platform_timer_create(heap)
+    platform_timer_start_i32(silent, 1)
+    fire_test_timer(event_loop, 2)
+    assert(counter.count == 3)
+
+    # Destroying the heap finalizes the cells: the running timers are unregistered.
+    assert(event_loop.registrations - event_loop.unregistrations == 2)
+    gc.heap_destroy(heap)
+    free(heap) in memory.heap
+    assert(event_loop.registrations == event_loop.unregistrations)
+
+## A goal condition that holds once the loop has pumped three times.
+func test_pumped_three_times(context: void*?) -> bool:
+    return test_event_loop.pumps >= 3
+
+test "EventLoopPlugin: spin_until, deferred_invoke and quit":
+    let event_loop = install_test_event_loop()
+    let heap = create_platform_test_heap()
+    var plugin = PlatformEventLoopPlugin()
+    platform_s_the_2 = none
+    platform_event_loop_plugin_install(&plugin)
+    assert(platform_event_loop_plugin_the() == &plugin)
+
+    platform_event_loop_plugin_spin_until(&plugin, gc.create_function0(heap, ak.Function0[bool](call = test_pumped_three_times, context = none)))
+    assert(event_loop.pumps == 3)
+
+    var counter = TestCounter()
+    platform_event_loop_plugin_deferred_invoke(&plugin, gc.create_function0(heap, test_counter_function(&counter)))
+    assert(counter.count == 0)
+    discard(event_loop.pump(CoreEventLoopPumpMode.wait_for_events))
+    assert(counter.count == 1)
+
+    platform_event_loop_plugin_quit(&plugin)
+    assert(event_loop.quit_code == 0)
+
+    platform_s_the_2 = none
+    gc.heap_destroy(heap)
+    free(heap) in memory.heap
+
+# mark: FontPlugin ==============================================================================
+
+test "FontPlugin: generic families and the GenericFontKey traits":
+    var plugin = PlatformFontPlugin(m_is_layout_test_mode = true)
+    platform_font_plugin_update_generic_fonts(&plugin)
+    assert(ak.vector_size(&plugin.m_generic_font_fallbacks) == 9)
+    let ui_serif = ak.vector_at(&plugin.m_generic_font_fallbacks, (usize)PlatformGenericFont.ui_serif)
+    assert(ak.vector_size(ui_serif) == 11)
+    let first_serif = ak.fly_string_bytes_as_string_view(ak.vector_at(ui_serif, 0))
+    assert(ak.string_view_equals(&first_serif, "Times"))
+    let cursive = ak.vector_at(&plugin.m_generic_font_fallbacks, (usize)PlatformGenericFont.cursive)
+    let last_cursive = ak.fly_string_bytes_as_string_view(ak.vector_at(cursive, 7))
+    assert(ak.string_view_equals(&last_cursive, "Dancing Script"))
+
+    # Layout test mode maps every generic family to SerenitySans.
+    let name = platform_font_plugin_generic_font_name(&plugin, PlatformGenericFont.monospace, 700, 1)
+    let name_view = ak.fly_string_bytes_as_string_view(&name)
+    assert(ak.string_view_equals(&name_view, "SerenitySans"))
+    assert(platform_font_plugin_is_layout_test_mode(&plugin))
+
+    # pair_int_hash(pair_int_hash(to_underlying(generic_font), weight), slope), as the donor
+    # computes it.
+    var traits = PlatformGenericFontKeyTraits()
+    let key = PlatformGenericFontKey(generic_font = PlatformGenericFont.sans_serif, weight = 400, slope = 0)
+    assert(traits.hash_of(&key) == platform_test_generic_font_key_hash)
+    let other = PlatformGenericFontKey(generic_font = PlatformGenericFont.sans_serif, weight = 400, slope = 1)
+    assert(traits.equals(&key, &key) and not traits.equals(&key, &other))
+
+## The donor's AK::Traits<GenericFontKey>::hash({ GenericFont::SansSerif, 400, 0 }).
+let platform_test_generic_font_key_hash: u32 = 2703093480
