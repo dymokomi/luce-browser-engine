@@ -723,6 +723,10 @@ kept as a Luce enum when callers test it.
 The error codes are declared once in `ak` and `web` (`pub let webidl_exception: ErrorCode =
 ErrorCode.package(…)`).
 
+`else` binds looser than comparisons and associates to the right (`else_expr =
+conditional_expr ["else" else_expr]`): `x else trap("…") == y` is `x else (trap("…") == y)`, so
+a fallback that is compared is parenthesized, `(x else trap("…")) == y`.
+
 ### 2.11 Text formatting in dumps
 
 Layout dumps print floats (`rect: [8,8 27.15625x18] baseline: 13.796875`) through AK's
