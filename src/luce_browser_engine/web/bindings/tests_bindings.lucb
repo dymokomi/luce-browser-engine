@@ -1,0 +1,330 @@
+#==============================================================================================
+#
+#   tests_bindings - tests of the VM, realms, cell creation and Bindings (region r14)
+#
+#   DESCRIPTION:
+#       Ladybird has no unit tests for these files (LibWeb's bindings are tested through JS),
+#       so these pin the C++ behaviour of the phase-1 path every DOM region needs: a VM with
+#       its heap and roots, a realm made by create_a_new_javascript_realm with its intrinsics
+#       and HostDefined, `realm.create<T>` (the class's own cell allocator, the vtable and
+#       class id, DeferGC, initialize), PlatformObject's defaults, and the VM's roots (the
+#       pending exception, the execution context stack) keeping cells alive across collections.
+#
+#       The helpers at the top are for every region's tests: web_test_create_vm makes a VM (the
+#       main thread VM until web_test_destroy_vm) and web_test_create_realm a realm with a plain
+#       platform object as its global object, intrinsics and a HostDefined, in which
+#       `realm_create_<class>` works. A test that collects garbage follows the gc tests: its
+#       body is a noinline function run after clobber_stack(), and the VM's heap scans the
+#       stack only up to that function's caller.
+#
+#==============================================================================================
+
+# mark: Helpers =================================================================================
+
+## A VM for one test, which is the main thread VM (and VM::the) until web_test_destroy_vm. The
+## heap scans the stack up to the frame of the caller's caller (the test block), so that stale
+## words in the test runner's frames keep nothing alive.
+noinline func web_test_create_vm() -> Vm*:
+    let vm = vm_create()
+    bind_s_main_thread_vm = vm
+    let top = web_test_frame_top_of_caller_of_caller()
+    if top > web_test_stack_pointer() and top <= vm.m_heap.m_stack_info.m_top:
+        vm.m_heap.m_stack_info.m_top = top
+    return vm
+
+## The VM of web_test_create_vm destroyed: every cell collected and finalized, the heap given
+## back, the VM forgotten.
+func web_test_destroy_vm(vm: Vm*):
+    gc.conservative_vector_base_destroy(&vm.m_external_roots.base)
+    gc.heap_destroy(vm_heap(vm))
+    with memory.heap:
+        ak.vector_clear(&vm.m_execution_context_stack)
+    if vm_s_the == vm:
+        vm_s_the = none
+    if bind_s_main_thread_vm == vm:
+        bind_s_main_thread_vm = none
+    free(vm) in memory.heap
+
+## The global object of a test realm: a plain platform object (C++ makes a Window, or a
+## JS::GlobalObject when the host gives none).
+func web_test_create_global_object(context: void*?, realm: Realm*) -> JsObject*?:
+    return (JsObject*)realm_create_bind_platform_object_realm(realm, realm, JsObjectMayInterfereWithIndexedPropertyAccess.no)
+
+## A realm of `vm` made as LibWeb makes its realms (create_a_new_javascript_realm, then the
+## intrinsics and the HostDefined, as CSS::Parser's internal_css_realm does), with a plain
+## platform object as its global object.
+func web_test_create_realm(vm: Vm*) -> Realm*:
+    let execution_context = bind_create_a_new_javascript_realm(vm, ak.Function1[Realm*, JsObject*?](call = web_test_create_global_object, context = none), ak.Function1[Realm*, JsObject*?]())
+    let realm = execution_context.realm else trap("the execution context has no realm")
+    let intrinsics = realm_create_bind_intrinsics(realm, realm)
+    realm_set_host_defined(realm, bind_host_defined_create(intrinsics))
+    return realm
+
+## The stack pointer of the caller.
+noinline func web_test_stack_pointer() -> usize:
+    var sp: usize = 0
+    asm arm64 (out("x0") sp):
+        mov x0, sp
+    asm x86_64 (out("rax") sp):
+        mov %rsp, %rax
+    return sp
+
+## The address just above the frame of the function that called our caller: the frame-pointer
+## chain two links up (as the gc tests do).
+noinline func web_test_frame_top_of_caller_of_caller() -> usize:
+    var frame_pointer: usize = 0
+    asm arm64 (out("x0") frame_pointer):
+        ldr x0, [x29]
+        ldr x0, [x0]
+    asm x86_64 (out("rax") frame_pointer):
+        mov (%rbp), %rax
+        mov (%rax), %rax
+    return frame_pointer + 16
+
+## Overwrite the stack below the caller, so that dead frames hold no stale cell addresses.
+noinline func web_test_clobber_stack():
+    var junk: usize[8192]
+    for i in 0..<junk.length:
+        junk[i] = i
+    assert(junk[8191] == 8191)
+
+## `return exception;` from a function returning ExceptionOr<bool>: it always fails.
+func web_test_throw(exception: IdlException) -> bool!:
+    return try idl_throw(exception)
+
+## Whether the cell of `weak` lives, without leaving its address in the caller's frame.
+noinline func web_test_alive[T](weak: const gc.Weak[T]*) -> bool:
+    return gc.weak_ptr(weak) != none
+
+# mark: The VM ==================================================================================
+
+test "a VM owns a heap, is VM::the and starts with no agent, contexts or pending exception":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    assert(vm_the() == vm)
+    assert(bind_main_thread_vm() == vm)
+    assert(gc.heap_the() == vm_heap(vm))
+    assert(vm_agent(vm) == none)
+    assert(vm_execution_context_stack(vm).length == 0)
+    assert(not vm_has_pending_exception(vm))
+
+test "the execution context stack: push, running context, current realm, pop":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let realm = web_test_create_realm(vm)
+    let first = js_execution_context_create()
+    first.realm = realm
+    let second = js_execution_context_create()
+    vm_push_execution_context(vm, first)
+    vm_push_execution_context(vm, second)
+    assert(vm_running_execution_context(vm) == second)
+    assert(vm_current_realm(vm) == none)
+    assert(vm_pop_execution_context(vm) == second)
+    assert(vm_current_realm(vm) == realm)
+    assert(vm_pop_execution_context(vm) == first)
+    assert(vm_execution_context_stack(vm).length == 0)
+
+# mark: Realms ==================================================================================
+
+test "create_a_new_javascript_realm: a realm cell with its global object, popped off the stack":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let execution_context = bind_create_a_new_javascript_realm(vm, ak.Function1[Realm*, JsObject*?](call = web_test_create_global_object, context = none), ak.Function1[Realm*, JsObject*?]())
+    let realm = execution_context.realm else trap("no realm")
+    assert(execution_context.function == none)
+    # 3. Remove realm execution context from the JavaScript execution context stack.
+    assert(vm_execution_context_stack(vm).length == 0)
+    assert(realm.cell().vtable == (const gc.CellVTable*)&realm_vtable)
+    assert(gc.cell_state(realm.cell()) == gc.CellState.live)
+    assert(realm_heap(realm) == vm_heap(vm))
+    assert(realm_vm(realm) == vm)
+    assert(realm_host_defined(realm) == none)
+    let global = (BindPlatformObject*)realm_global_object(realm)
+    assert(is_bind_platform_object(global))
+    assert(bind_platform_object_realm(global) == realm)
+    let class_name = gc.cell_class_name(realm.cell())
+    assert(ak.string_view_equals(&class_name, "Realm"))
+
+test "a realm's HostDefined carries its intrinsics; PrincipalHostDefined adds the ESO and page":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let realm = web_test_create_realm(vm)
+    let intrinsics = bind_host_defined_intrinsics(realm)
+    assert(is_bind_intrinsics(intrinsics))
+    assert(intrinsics.m_realm == realm)
+    let host_defined = realm_host_defined(realm) else trap("no HostDefined")
+    assert(not is_bind_principal_host_defined(host_defined))
+
+    # A PrincipalHostDefined (the ESO and page are only stored, so any cells do).
+    let eso = (HtmlEnvironmentSettingsObject*)realm_create_bind_platform_object_realm(realm, realm, JsObjectMayInterfereWithIndexedPropertyAccess.no)
+    let page = (Page*)realm_create_bind_platform_object_realm(realm, realm, JsObjectMayInterfereWithIndexedPropertyAccess.no)
+    let principal = bind_principal_host_defined_create(eso, intrinsics, page)
+    realm_set_host_defined(realm, principal.bind_host_defined())
+    assert(is_bind_principal_host_defined(principal.bind_host_defined()))
+    assert(bind_principal_host_defined_is_principal_host_defined(principal))
+    assert(bind_host_defined_intrinsics(realm) == intrinsics)
+    assert(bind_principal_host_defined_environment_settings_object(realm) == eso)
+    assert(bind_principal_host_defined_environment_settings_object_2(realm) == eso)
+    assert(bind_principal_host_defined_page(realm) == page)
+
+test "realm.create<T>: the class's allocator, vtable and class id, a zeroed cell, initialize":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let realm = web_test_create_realm(vm)
+    let exception = idl_dom_exception_create(realm)
+    assert(exception.cell().vtable == (const gc.CellVTable*)&idl_dom_exception_vtable)
+    assert(exception.cell().class_id == idl_dom_exception_class.first_id)
+    assert(is_idl_dom_exception(exception) and is_bind_platform_object(exception) and is_js_cell(exception))
+    assert(not is_idl_quota_exceeded_error(exception))
+    assert(ak.fly_string_is_empty(&exception.m_name))
+    assert(bind_platform_object_realm(exception.bind_platform_object()) == realm)
+    assert(js_value_is_undefined(exception.platform_object.m_wrapper))
+    assert(not gc.heap_is_gc_deferred(vm_heap(vm)))
+    # The cell comes from DOMException's own allocator (GC_DECLARE_ALLOCATOR), sized for it.
+    let allocator = web_cell_allocator_for_class(&idl_dom_exception_class)
+    assert(gc.cell_allocator_cell_size(allocator) >= sizeof(IdlDomException))
+    assert(web_cell_allocator_for_class(&idl_dom_exception_class) == allocator)
+    assert(web_cell_allocator_for_class(&idl_quota_exceeded_error_class) != allocator)
+
+test "a class whose vtable overrides finalize gets an allocator whose blocks are finalized":
+    assert(web_cell_allocator_for_class(&dom_node_class).m_overrides_finalize)
+    assert(not web_cell_allocator_for_class(&idl_dom_exception_class).m_overrides_finalize)
+    assert(not web_cell_allocator_for_class(&idl_dom_exception_class).m_overrides_must_survive_garbage_collection)
+
+# mark: PlatformObject ==========================================================================
+
+test "PlatformObject's defaults: no named or indexed properties, no origin, no interface":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let realm = web_test_create_realm(vm)
+    let object = realm_create_bind_platform_object_realm(realm, realm, JsObjectMayInterfereWithIndexedPropertyAccess.no)
+    assert(bind_platform_object_item_value(object, 0) == none)
+    assert(not bind_platform_object_is_supported_property_index(object, 0))
+    assert(js_value_is_undefined(bind_platform_object_named_item_value(object, ak.fly_string_from_str("x"))))
+    let names = bind_platform_object_supported_property_names(object)
+    assert(ak.vector_is_empty(&names))
+    assert(not bind_platform_object_is_supported_property_name(object, ak.fly_string_from_str("x")))
+    assert(bind_platform_object_extract_an_origin(object) == none)
+    assert(not bind_platform_object_implements_interface(object, ak.string_from_str("PlatformObject")))
+    assert(not bind_platform_object_eligible_for_own_property_enumeration_fast_path(object))
+
+test "WEB_PLATFORM_OBJECT: interface_name and implements_interface of DOMException and QuotaExceededError":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let realm = web_test_create_realm(vm)
+    let dom_exception = idl_dom_exception_create(realm).bind_platform_object()
+    let quota = idl_quota_exceeded_error_create(realm).bind_platform_object()
+    assert(bind_platform_object_interface_name(dom_exception) == BindInterfaceName.dom_exception)
+    assert(bind_platform_object_interface_name(quota) == BindInterfaceName.quota_exceeded_error)
+    assert(bind_platform_object_implements_interface(dom_exception, ak.string_from_str("DOMException")))
+    assert(not bind_platform_object_implements_interface(dom_exception, ak.string_from_str("QuotaExceededError")))
+    assert(bind_platform_object_implements_interface(quota, ak.string_from_str("QuotaExceededError")))
+    assert(bind_platform_object_implements_interface(quota, ak.string_from_str("DOMException")))
+    assert(not bind_platform_object_implements_interface(quota, ak.string_from_str("Node")))
+
+test "Transferable's detached flag":
+    var transferable = BindTransferable(vtable = &bind_transferable_vtable, class_id = 0, m_detached = false)
+    assert(not bind_transferable_is_detached(&transferable))
+    bind_transferable_set_detached(&transferable, true)
+    assert(bind_transferable_is_detached(&transferable))
+
+test "the UnforgeableKey traits hash as AK does and compare all three members":
+    let a = BindUnforgeableKey(interface_name = ak.utf16_fly_string_from_str("Location"), attribute_name = ak.utf16_fly_string_from_str("href"), type_ = BindUnforgeableKeyType.getter)
+    var b = a
+    assert(bind_unforgeable_key_equals(&a, &b))
+    assert(bind_unforgeable_key_hash(&a) == ak.pair_int_hash(ak.pair_int_hash(ak.utf16_fly_string_hash(&a.attribute_name), ak.utf16_fly_string_hash(&a.interface_name)), 1))
+    b.type_ = BindUnforgeableKeyType.setter
+    assert(not bind_unforgeable_key_equals(&a, &b))
+
+# mark: Roots ===================================================================================
+
+test "the pending exception is a root: its DOMException lives until it is taken":
+    web_test_clobber_stack()
+    run_pending_exception_is_a_root()
+
+noinline func run_pending_exception_is_a_root():
+    let vm = web_test_create_vm()
+    let realm_context = make_test_realm_context(vm)
+    let weak = throw_test_dom_exception(realm_context)
+    web_test_clobber_stack()
+    gc.heap_collect_garbage(vm_heap(vm))
+    assert(web_test_alive(&weak))
+    assert(vm_has_pending_exception(vm))
+
+    discard_pending_exception(vm)
+    web_test_clobber_stack()
+    gc.heap_collect_garbage(vm_heap(vm))
+    assert(not web_test_alive(&weak))
+    discard(realm_context)
+    web_test_destroy_vm(vm)
+
+## A realm kept alive by an execution context on the VM's stack (a root of the VM).
+noinline func make_test_realm_context(vm: Vm*) -> JsExecutionContext*:
+    let context = js_execution_context_create()
+    context.realm = web_test_create_realm(vm)
+    vm_push_execution_context(vm, context)
+    return context
+
+## A HierarchyRequestError thrown in the realm of `context`, left pending; a Weak of it.
+noinline func throw_test_dom_exception(context: JsExecutionContext*) -> gc.Weak[IdlDomException]:
+    let realm = context.realm else trap("no realm")
+    let exception = idl_hierarchy_request_error_create(realm, ak.utf16_string_from_str("pending"))
+    let thrown = web_test_throw(.idl_dom_exception(exception)) catch failure:
+        assert(failure.code == webidl_exception)
+        recover true
+    assert(thrown)
+    return gc.make_weak[IdlDomException](exception)
+
+## The pending exception taken and dropped, without leaving its address in the caller's frame.
+noinline func discard_pending_exception(vm: Vm*):
+    discard(vm_take_pending_exception(vm))
+
+test "a realm on the execution context stack keeps its intrinsics and global object alive":
+    web_test_clobber_stack()
+    run_realm_on_the_stack_is_a_root()
+
+noinline func run_realm_on_the_stack_is_a_root():
+    let vm = web_test_create_vm()
+    let context = make_test_realm_context(vm)
+    let weak_intrinsics = weak_test_intrinsics(context)
+    let weak_global = weak_test_global(context)
+    web_test_clobber_stack()
+    gc.heap_collect_garbage(vm_heap(vm))
+    assert(web_test_alive(&weak_intrinsics))
+    assert(web_test_alive(&weak_global))
+    discard(vm_pop_execution_context(vm))
+    web_test_destroy_vm(vm)
+
+## A Weak of the intrinsics of the realm of `context`.
+noinline func weak_test_intrinsics(context: JsExecutionContext*) -> gc.Weak[BindIntrinsics]:
+    return gc.make_weak[BindIntrinsics](bind_host_defined_intrinsics(context.realm else trap("no realm")))
+
+## A Weak of the global object of the realm of `context`.
+noinline func weak_test_global(context: JsExecutionContext*) -> gc.Weak[BindPlatformObject]:
+    return gc.make_weak[BindPlatformObject]((BindPlatformObject*)realm_global_object(context.realm else trap("no realm")))
+
+test "vm_keep_alive: managed memory only a C-heap pointer refers to survives collections":
+    web_test_clobber_stack()
+    run_keep_alive()
+
+noinline func run_keep_alive():
+    let vm = web_test_create_vm()
+    let realm_context = make_test_realm_context(vm)
+    let kept = make_test_blob_holding_dom_exception(vm, realm_context, true)
+    let dropped = make_test_blob_holding_dom_exception(vm, realm_context, false)
+    web_test_clobber_stack()
+    gc.heap_collect_garbage(vm_heap(vm))
+    assert(web_test_alive(&kept))
+    assert(not web_test_alive(&dropped))
+    discard(vm_pop_execution_context(vm))
+    web_test_destroy_vm(vm)
+
+## A blob of `vm`'s heap holding the only pointer to a new DOMException, kept alive with
+## vm_keep_alive when `keep`; a Weak of the DOMException.
+noinline func make_test_blob_holding_dom_exception(vm: Vm*, context: JsExecutionContext*, keep: bool) -> gc.Weak[IdlDomException]:
+    let exception = idl_dom_exception_create(context.realm else trap("no realm"))
+    let blob = gc.heap_allocate_blob(vm_heap(vm), 64, 16, false) else trap("no blob")
+    memory.write[usize](blob.data, (usize)exception)
+    if keep:
+        vm_keep_alive(vm, blob.data)
+    return gc.make_weak[IdlDomException](exception)
