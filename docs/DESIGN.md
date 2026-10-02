@@ -563,7 +563,7 @@ pub struct LayoutImageBox:
 | `Span<T>`, `ReadonlySpan<T>`, `Bytes`, `ReadonlyBytes` | `T[]`, `const T[]`, `u8[]`, `const u8[]` | |
 | `Array<T, N>` | `T[N]` | |
 | `String` | `ak.String` (8-byte value: short-string inline or a pointer to immutable UTF-8 data) | equality blocked by a union member so `==` is a compile error (checked); use `.equals()` |
-| `FlyString` | `ak.FlyString` (8 bytes: inline short string or interned pointer) | `==` is correct structurally (pointer or inline identity), so it stays `==` |
+| `FlyString` | `ak.FlyString` (8 bytes: inline short string or interned pointer) | compared with `fly_string_eq_fly_string` (pointer or inline identity): it holds a union, and Luce gives `==` only to structs whose every component has equality (base.md §6) |
 | `StringView` | `ak.StringView` (a `const u8[]` in a struct) | not `str`: a StringView may hold non-UTF-8 bytes (ByteString), and `(str)` on non-UTF-8 is undefined |
 | `Utf16String`, `Utf16View`, `Utf16FlyString` | `ak.Utf16String` (ASCII storage or UTF-16), … | DOM text and layout offsets are UTF-16 code units (the dumps print them) |
 | `ByteString` | `ak.ByteString` | |
@@ -595,7 +595,7 @@ pub interface Traits[K]:
 pub struct FlyStringTraits: Traits[FlyString]:
     var unused: u8
     func hash_of(key: const FlyString*) -> u32: return key.hash()        # AK's FlyString hash
-    func equals(a: const FlyString*, b: const FlyString*) -> bool: return *a == *b
+    func equals(a: const FlyString*, b: const FlyString*) -> bool: return fly_string_eq_fly_string(*a, *b)
 
 pub struct HashMap[K, V, KT: Traits[K]]:
     var m_table: HashTable[HashMapEntry[K, V], HashMapEntryTraits[K, V, KT]]
@@ -644,7 +644,7 @@ immediately above the function that creates it.
 
 C++ operators on value types become named methods; one reads `a + b * c` as `a.add(b.mul(c))`.
 The names are fixed: `add`, `sub`, `mul`, `div`, `rem`, `neg`, `lt`, `le`, `gt`, `ge`, `cmp`
-(`<=>`), `eq` only where structural `==` would be wrong. Mixed-type C++ operators (`CSSPixels *
+(`<=>`), `eq` where structural `==` would be wrong or does not exist (a struct holding a union has no `==`). Mixed-type C++ operators (`CSSPixels *
 int`, `CSSPixels < float`) are spelled with an explicit conversion of the other operand
 (`a.mul(CssPixels.from_int(2))`, `a.to_float() < f`), which is what the C++ templates do.
 
