@@ -5,7 +5,8 @@
 #   DESCRIPTION:
 #       The allocation seam every generated realm_create_<class> helper calls (DESIGN.md §2.3, §3.2):
 #       allocate a zeroed cell of a class from the realm's heap under DeferGC and set its vtable and
-#       class id; then run the virtual initialize(realm). Region r14 ports these with the heap.
+#       class id; then run the virtual initialize(realm). Region r14 ported these with the heap
+#       (the WebIDL pending-exception slot of §2.10 is the VM's, external/lib_js/vm.lucb).
 #       Part of the skeleton generator's output (Ladybird 47c82b38d0).
 #
 #==============================================================================================
@@ -16,17 +17,6 @@ pub let webidl_exception: ErrorCode = ErrorCode.package(1)
 
 ## A pending JS completion (`JS::ThrowCompletionOr<T>` is `T!`), stored in the same slot (§2.10).
 pub let js_exception: ErrorCode = ErrorCode.package(2)
-
-## The pending WebIDL exception (DESIGN.md §2.10) until the VM holds the slot (region r14 moves it
-## into `Vm`). A thrower stores it and fails with webidl_exception; the catcher takes it.
-pub var idl_pending_exception: IdlException?
-
-## `return exception;` in a function returning WebIDL::ExceptionOr<T> (DESIGN.md §2.10): store the
-## exception as the pending one and fail with webidl_exception. Callers write
-## `try idl_throw(.idl_dom_exception(idl_hierarchy_request_error_create(realm, message)))`.
-pub func idl_throw(exception: IdlException) -> never!:
-    idl_pending_exception = exception
-    error(webidl_exception, "")
 
 ## Offsets of the stateful mixins (secondary bases) inside a cell class; a class that does not
 ## mix one in leaves it none (DESIGN.md §2.5).
@@ -264,10 +254,50 @@ pub func as_if_window_or_worker_global_scope_mixin[P: gc.IsCell](p: P*) -> HtmlW
     let offset = mixins.window_or_worker_global_scope_mixin else return none
     return (HtmlWindowOrWorkerGlobalScopeMixin*)((u8*)p + offset)
 
-## Allocate a zeroed cell of class `info` in `realm`'s heap (DeferGC held), vtable and class id set.
-pub func web_allocate_cell(realm: Realm*, info: const ak.ClassInfo*) -> gc.Cell*:
-    trap("unported: web_allocate_cell (JS::Realm::create / GC::Heap::allocate)")
+# mark: Cell allocation (region r14) ===========================================================
 
-## Run the virtual Cell::initialize(realm) of a freshly constructed cell.
+## The cell allocator of each class (GC_DECLARE_ALLOCATOR's TypeIsolatingCellAllocator), by the
+## address of the class's ClassInfo. C++ reaches T::cell_allocator through the type; the
+## creation helpers know only the ClassInfo, so the allocator is found here, created on first
+## use with the class's size and name and with the finalize / must-survive flags its vtable
+## implies (C++'s OVERRIDES_FINALIZE and OVERRIDES_MUST_SURVIVE_GARBAGE_COLLECTION). Like the
+## C++ statics, the table and the allocators live on the C heap.
+var web_cell_allocators: ak.HashMap[usize, gc.CellAllocator*, ak.UsizeTraits]
+
+## The cell allocator of the class `info` (see web_cell_allocators).
+pub func web_cell_allocator_for_class(info: const ak.ClassInfo*) -> gc.CellAllocator*:
+    if let allocator = ak.hash_map_get_k(&web_cell_allocators, (usize)info):
+        return *allocator
+    let vtable = (const gc.CellVTable*)info.vtable
+    let overrides_finalize = (void*)vtable.finalize != (void*)gc.cell_finalize_impl
+    let overrides_must_survive_garbage_collection = (void*)vtable.must_survive_garbage_collection != (void*)gc.cell_must_survive_garbage_collection_impl
+    with memory.heap:
+        let allocator = (new gc.CellAllocator) else trap("out of memory")
+        gc.cell_allocator_construct(allocator, info.size, ak.sv(info.name), overrides_must_survive_garbage_collection, overrides_finalize)
+        ak.hash_map_set(&web_cell_allocators, (usize)info, allocator)
+        return allocator
+
+## `heap.allocate_cell<T>()` for the class `info`: a zeroed live cell from the class's allocator
+## with its vtable and class id set (the C++ vptr of the most derived class, which the port sets
+## before the constructors run, DESIGN.md §2.3). The caller constructs it under DeferGC.
+pub func web_heap_allocate_cell(heap: gc.Heap*, info: const ak.ClassInfo*) -> gc.Cell*:
+    let cell = gc.heap_allocate_cell_of_size(heap, info.size, web_cell_allocator_for_class(info))
+    cell.vtable = (const gc.CellVTable*)info.vtable
+    cell.class_id = info.first_id
+    return cell
+
+## The first half of `realm.create<T>(args...)` (JS::Realm::create, Realm.h:44, over
+## GC::Heap::allocate): a zeroed cell of class `info` from `realm`'s heap, vtable and class id
+## set, with garbage collection deferred while the caller runs the constructor. The caller then
+## calls web_initialize_cell, which ends the deferral.
+pub func web_allocate_cell(realm: Realm*, info: const ak.ClassInfo*) -> gc.Cell*:
+    let heap = realm_heap(realm)
+    let cell = web_heap_allocate_cell(heap, info)
+    gc.heap_defer_gc(heap)
+    return cell
+
+## The second half of `realm.create<T>(args...)`: end the deferral web_allocate_cell began (the
+## end of GC::Heap::allocate), then run the virtual JS::Cell::initialize(realm).
 pub func web_initialize_cell(cell: gc.Cell*, realm: Realm*):
-    trap("unported: web_initialize_cell (JS::Cell::initialize)")
+    gc.heap_undefer_gc(gc.cell_heap(cell))
+    js_cell_initialize((JsCell*)cell, realm)

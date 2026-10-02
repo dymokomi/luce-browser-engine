@@ -1,0 +1,299 @@
+#==============================================================================================
+#
+#   vm - JS::VM, JS::Cell and the JS::Value seam of the web engine
+#
+#   DESCRIPTION:
+#       LibJS is not ported (DESIGN.md §1.1, §3.6): luce-js takes its place in phase 3. What
+#       LibWeb needs of JS::VM before scripting is ported from Libraries/LibJS/Runtime/VM.cpp/.h
+#       here: the one VM of the process (VM::the), its heap with the roots the VM gathers, the
+#       surrounding agent and the JavaScript execution context stack. The VM also holds the
+#       pending exception of DESIGN.md §2.10: a function returning `WebIDL::ExceptionOr<T>` or
+#       `JS::ThrowCompletionOr<T>` is `T!`, and it stores the exception in the VM before failing
+#       with webidl_exception or js_exception; the catcher takes it with
+#       vm_take_pending_exception. JS::Cell's initialize and vm() and the few JS::Value
+#       constructors LibWeb uses before phase 3 complete the seam.
+#
+#       Copyright (c) 2020-2023, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2020-2023, Linus Groh <linusg@serenityos.org>
+#       Copyright (c) 2021-2022, David Tuin <davidot@serenityos.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: The VM ==================================================================================
+
+## Ported from Libraries/LibJS/Runtime/VM.h:66 JS::VM::the.
+pub func vm_the() -> Vm*:
+    return vm_s_the else trap("JS::VM::the: no VM")
+
+## Ported from Libraries/LibJS/Runtime/VM.cpp:42 JS::VM::create and VM.cpp:73 JS::VM::VM: a VM
+## and its heap, on the C heap (the VM is reference counted in C++, never collected). The
+## cached strings and well-known symbols are JS values (phase 3). Unlike C++, which allows one
+## VM per process, a new VM may be created while another exists (the tests make several);
+## VM::the is the newest.
+pub func vm_create() -> Vm*:
+    let storage = (alloc Vm[1] in memory.heap) else trap("out of memory")
+    memory.set(u8[]((u8*)storage.data, sizeof(Vm)), 0)
+    let vm = (Vm*)storage.data
+    gc.heap_construct(&vm.m_heap, ak.Function1[gc.GcHashMap[gc.HeapRoot]*, unit](call = vm_gather_roots_callback, context = vm))
+    vm_s_the = vm
+
+    # Addition (DESIGN.md §2.10): the cell of the pending exception, a root of the VM.
+    let cell = web_heap_allocate_cell(&vm.m_heap, &js_pending_exception_class)
+    vm.m_pending_exception = (JsPendingException*)cell
+
+    # Addition (DESIGN.md §3.3 rule 4): the external roots (vm_keep_alive).
+    vm.m_external_roots.base.vtable = &js_vm_external_roots_vtable
+    gc.conservative_vector_base_construct(&vm.m_external_roots.base, &vm.m_heap)
+    return vm
+
+## The heap's gather_embedder_roots: the VM's gather_roots (the lambda of VM.cpp:74).
+func vm_gather_roots_callback(context: void*?, roots: gc.GcHashMap[gc.HeapRoot]*):
+    vm_gather_roots((Vm*)(context else trap("no VM")), roots)
+
+## Ported from Libraries/LibJS/Runtime/VM.cpp:273 JS::VM::gather_roots: what the VM holds in the
+## heap from outside it. The interned strings, symbols, finalization registries and promise jobs
+## are phase 3; the execution contexts' cells and the pending exception are here.
+pub func vm_gather_roots(this: Vm*, roots: gc.GcHashMap[gc.HeapRoot]*):
+    # Addition (DESIGN.md §2.10): the pending exception.
+    if let pending_exception = this.m_pending_exception:
+        gc.gc_hash_map_set(roots, (usize)pending_exception.cell(), gc.HeapRoot(type_ = gc.HeapRootType.vm))
+
+    # gather_roots_from_execution_context_stack: each context's visit_edges, as roots.
+    for execution_context in ak.vector_span(&this.m_execution_context_stack):
+        if let function = execution_context.function:
+            gc.gc_hash_map_set(roots, (usize)function, gc.HeapRoot(type_ = gc.HeapRootType.vm))
+        if let realm = execution_context.realm:
+            gc.gc_hash_map_set(roots, (usize)realm.cell(), gc.HeapRoot(type_ = gc.HeapRootType.vm))
+
+## Ported from Libraries/LibJS/Runtime/VM.h:68 JS::VM::heap.
+pub func vm_heap(this: Vm*) -> gc.Heap*:
+    return &this.m_heap
+
+## Ported from Libraries/LibJS/Runtime/VM.h:412 JS::VM::agent.
+pub func vm_agent(this: Vm*) -> HtmlAgent*?:
+    return this.m_agent
+
+## Ported from Libraries/LibJS/Runtime/VM.h:411 JS::VM::set_agent.
+pub func vm_set_agent(this: Vm*, agent: HtmlAgent*):
+    this.m_agent = agent
+
+# mark: External roots (DESIGN.md §3.3 rule 4) ==================================================
+
+## The vtable of the VM's external roots: a GC::ConservativeVector.
+let js_vm_external_roots_vtable: gc.ConservativeVectorBaseVTable = gc.ConservativeVectorBaseVTable(class_info = &gc.conservative_vector_base_class, possible_values = js_vm_external_roots_possible_values_impl)
+
+## The words the heap scans for the VM's external roots.
+func js_vm_external_roots_possible_values_impl(base: gc.ConservativeVectorBase*) -> const u64[]:
+    let this = (JsVmExternalRoots*)base
+    return ak.vector_span_const(&this.values)
+
+## Addition (DESIGN.md §3.3 rule 4): keep the managed memory `pointer` points into alive for as
+## long as the VM lives. For managed memory that only memory outside the heap refers to (a
+## module global, the C heap); a pointer to anything else is ignored by the scan.
+pub func vm_keep_alive(this: Vm*, pointer: const void*):
+    with memory.heap:
+        ak.vector_append_t(&this.m_external_roots.values, (u64)(usize)pointer)
+
+# mark: The execution context stack =============================================================
+
+## Ported from Libraries/LibJS/Runtime/VM.h:221 JS::VM::push_execution_context. The stack's
+## storage is on the C heap, as the VM; gather_roots reports what its contexts refer to. The
+## running execution context is the top of the stack (the bytecode interpreter's caller frames
+## and saved running contexts are phase 3).
+pub func vm_push_execution_context(this: Vm*, context: JsExecutionContext*):
+    with memory.heap:
+        ak.vector_append_t(&this.m_execution_context_stack, context)
+
+## Ported from Libraries/LibJS/Runtime/VM.h:232 JS::VM::pop_execution_context.
+pub func vm_pop_execution_context(this: Vm*) -> JsExecutionContext*:
+    assert(not ak.vector_is_empty(&this.m_execution_context_stack))
+    return ak.vector_take_last(&this.m_execution_context_stack)
+
+## Ported from Libraries/LibJS/Runtime/VM.h:247 JS::VM::running_execution_context.
+pub func vm_running_execution_context(this: Vm*) -> JsExecutionContext*:
+    assert(not ak.vector_is_empty(&this.m_execution_context_stack))
+    return *ak.vector_last(&this.m_execution_context_stack)
+
+## Ported from Libraries/LibJS/Runtime/VM.h:264 JS::VM::execution_context_stack.
+pub func vm_execution_context_stack(this: Vm*) -> JsExecutionContext*[]:
+    return ak.vector_span(&this.m_execution_context_stack)
+
+## Ported from Libraries/LibJS/Runtime/VM.h:315 JS::VM::current_realm.
+pub func vm_current_realm(this: Vm*) -> Realm*?:
+    return vm_running_execution_context(this).realm
+
+# mark: The pending exception (DESIGN.md §2.10) =================================================
+
+## The VM's pending-exception cell (made with the VM).
+func vm_pending_exception_cell(this: Vm*) -> JsPendingException*:
+    return this.m_pending_exception else trap("the VM has no pending-exception cell")
+
+## Addition (DESIGN.md §2.10): store `exception` as the VM's pending exception. A function
+## returning `T!` calls this (through idl_throw or vm_throw_completion) right before failing.
+pub func vm_set_pending_exception(this: Vm*, exception: IdlException):
+    vm_pending_exception_cell(this).exception = exception
+
+## Addition (DESIGN.md §2.10): whether an exception is pending.
+pub func vm_has_pending_exception(this: Vm*) -> bool:
+    return vm_pending_exception_cell(this).exception != none
+
+## Addition (DESIGN.md §2.10): the pending exception, taken out of the VM. The caller of a
+## failed `T!` (C++: `result.is_exception()` / `release_error()`) reads it here; it must be
+## pending.
+pub func vm_take_pending_exception(this: Vm*) -> IdlException:
+    let cell = vm_pending_exception_cell(this)
+    let exception = cell.exception else trap("no pending exception")
+    cell.exception = none
+    return exception
+
+## The pending-exception cell's name.
+func js_pending_exception_class_name_impl(this: gc.Cell*) -> ak.StringView:
+    return ak.sv("PendingException")
+
+## The pending-exception cell's edges: the DOMException it holds (a message String is a blob the
+## cell's bytes point to, found by the conservative scan of the cell).
+func js_pending_exception_visit_edges_impl(base: gc.Cell*, visitor: gc.CellVisitor*):
+    gc.cell_visit_edges_impl(base, visitor)
+    let this = (JsPendingException*)base
+    if let exception = this.exception:
+        match exception:
+            .idl_dom_exception(dom_exception):
+                gc.cell_visitor_visit_t_2(visitor, dom_exception)
+            _:
+                return
+
+## `vm.throw_completion<JS::ErrorType>(message)`: a JS error of a simple type thrown. Phase 1 has
+## no JS Error objects, so the completion is represented by the WebIDL SimpleException that
+## converts to it (Bindings::exception_to_throw_completion maps SimpleException{T, m} to exactly
+## this call); phase 3 creates the Error object in luce-js. Fails with js_exception.
+pub func vm_throw_completion(this: Vm*, type_: IdlSimpleExceptionType, message: ak.StringOrStringView) -> never!:
+    vm_set_pending_exception(this, .idl_simple_exception(IdlSimpleException(type_ = type_, message = message)))
+    error(js_exception, "")
+
+# mark: JS::Cell ================================================================================
+
+## Ported from Libraries/LibJS/Runtime/VM.h:583 JS::Cell::vm.
+pub func js_cell_vm(this: JsCell*) -> Vm*:
+    return vm_the()
+
+## Ported from Libraries/LibJS/Heap/Cell.h:20 JS::Cell::initialize (virtual): nothing to do.
+## (JS::Object::initialize, which PlatformObject inherits, only calls this.)
+pub func js_cell_initialize_impl(this: JsCell*, arg0: Realm*):
+    return
+
+## Ported from Libraries/LibJS/Heap/Cell.h:22 JS::Cell::is_environment (virtual).
+pub func js_cell_is_environment_impl(this: JsCell*) -> bool:
+    return false
+
+## `visitor.visit(GC::Ptr<JS::Object>)`: a JS object field visited. Before phase 3 the only
+## objects LibWeb holds as JS::Object are cells (platform objects such as the Window), so the
+## pointer is visited as a cell; phase 3 routes luce-js values through visit_js_value.
+pub func js_visit_object(visitor: gc.CellVisitor*, object: JsObject*?):
+    gc.cell_visitor_visit_cell(visitor, (gc.Cell*?)object)
+
+# mark: JS::Value ===============================================================================
+
+## LibJS's UNDEFINED_TAG (Libraries/LibJS/Runtime/Value.h:52).
+let js_undefined_tag: u64 = 0b110 | gc.base_tag
+
+## LibJS's NULL_TAG (Libraries/LibJS/Runtime/Value.h:53).
+let js_null_tag: u64 = 0b111 | gc.base_tag
+
+## A value of the given encoding (GC::NanBoxedValue's union, built through its `encoded` member).
+func js_value_from_encoded(encoded: u64) -> JsValue:
+    var result = JsValue()
+    result.nan_boxed_value.m_value.encoded = encoded
+    return result
+
+## Ported from Libraries/LibJS/Runtime/Value.h:530 JS::js_undefined.
+pub func js_undefined() -> JsValue:
+    return js_value_from_encoded(js_undefined_tag << gc.tag_shift)
+
+## Ported from Libraries/LibJS/Runtime/Value.h:535 JS::js_null.
+pub func js_null() -> JsValue:
+    return js_value_from_encoded(js_null_tag << gc.tag_shift)
+
+## Ported from Libraries/LibJS/Runtime/Value.h:100 JS::Value::is_undefined.
+pub func js_value_is_undefined(this: JsValue) -> bool:
+    return this.nan_boxed_value.m_value.encoded == js_undefined_tag << gc.tag_shift
+
+## LibJS's BOOLEAN_TAG (Libraries/LibJS/Runtime/Value.h:54).
+let js_boolean_tag: u64 = 0b001 | gc.base_tag
+
+## LibJS's INT32_TAG (Libraries/LibJS/Runtime/Value.h:55).
+let js_int32_tag: u64 = 0b010 | gc.base_tag
+
+## Ported from Libraries/LibJS/Runtime/Value.h:209 JS::Value::Value(bool).
+pub func js_value_from_bool(value: bool) -> JsValue:
+    return js_value_from_encoded((js_boolean_tag << gc.tag_shift) | (1 if value else 0))
+
+## Ported from Libraries/LibJS/Runtime/Value.h:221 JS::Value::Value(double): an integral value in
+## the i32 range (but not -0) is stored as an int32, NaN as the canonical NaN.
+pub func js_value_from_f64(value: f64) -> JsValue:
+    let is_negative_zero = value == 0.0 and math.signbit(value)
+    if value >= -2147483648.0 and value <= 2147483647.0 and math.trunc(value) == value and not is_negative_zero:
+        return js_value_from_encoded((js_int32_tag << gc.tag_shift) | ((u64)(u32)(i32)value))
+    if math.is_nan(value):
+        return js_value_from_encoded(gc.canon_nan_bits)
+    var result = JsValue()
+    result.nan_boxed_value.m_value.as_double = value
+    return result
+
+## The 16-bit tag of a value (JS::Value::tag, Value.h:96).
+func js_value_tag(this: JsValue) -> u64:
+    return this.nan_boxed_value.m_value.encoded >> gc.tag_shift
+
+## Ported from Libraries/LibJS/Runtime/Value.h:448 JS::Value::is_double.
+pub func js_value_is_double(this: JsValue) -> bool:
+    let encoded = this.nan_boxed_value.m_value.encoded
+    return (encoded & gc.canon_nan_bits) != gc.canon_nan_bits or encoded == gc.canon_nan_bits
+
+## Ported from Libraries/LibJS/Runtime/Value.h:449 JS::Value::is_int32.
+pub func js_value_is_int32(this: JsValue) -> bool:
+    return js_value_tag(this) == js_int32_tag
+
+## Ported from Libraries/LibJS/Runtime/Value.h:102 JS::Value::is_number.
+pub func js_value_is_number(this: JsValue) -> bool:
+    return js_value_is_double(this) or js_value_is_int32(this)
+
+## LibJS's OBJECT_TAG (Libraries/LibJS/Runtime/Value.h:36).
+let js_object_tag: u64 = 0b001 | gc.is_cell_bit
+
+## Ported from Libraries/LibJS/Runtime/Value.h:104 JS::Value::is_object.
+pub func js_value_is_object(this: JsValue) -> bool:
+    return js_value_tag(this) == js_object_tag
+
+## Ported from Libraries/LibJS/Runtime/Value.h:105 JS::Value::is_boolean.
+pub func js_value_is_boolean(this: JsValue) -> bool:
+    return js_value_tag(this) == js_boolean_tag
+
+## Ported from Libraries/LibJS/Runtime/Value.h:330 JS::Value::as_double.
+pub func js_value_as_double(this: JsValue) -> f64:
+    assert(js_value_is_number(this))
+    if js_value_is_int32(this):
+        return (f64)(i32)(u32)(this.nan_boxed_value.m_value.encoded & 0xFFFFFFFF)
+    return this.nan_boxed_value.m_value.as_double
+
+## Ported from Libraries/LibJS/Runtime/Value.cpp:779 JS::Value::to_number (to_number_slow_case):
+## 7.1.4 ToNumber ( argument ), https://tc39.es/ecma262/#sec-tonumber. Strings, objects, symbols
+## and BigInts are JS cells (phase 3).
+pub func js_value_to_number(vm: Vm*, this: JsValue) -> JsValue!:
+    # 1. If argument is a Number, return argument.
+    if js_value_is_number(this):
+        return this
+
+    let tag = js_value_tag(this)
+    # 3. If argument is undefined, return NaN.
+    if tag == js_undefined_tag:
+        return js_value_from_f64(math.nan)
+    # 4. If argument is either null or false, return +0𝔽.
+    if tag == js_null_tag:
+        return js_value_from_f64(0.0)
+    # 5. If argument is true, return 1𝔽.
+    if tag == js_boolean_tag:
+        return js_value_from_f64(1.0 if (this.nan_boxed_value.m_value.encoded & 1) != 0 else 0.0)
+    # 2. If argument is either a Symbol or a BigInt, throw a TypeError exception.
+    # 6. If argument is a String, return StringToNumber(argument).
+    # 7.-10. Otherwise argument is an Object: ? ToNumber(? ToPrimitive(argument, number)).
+    trap("unported (P3): JS::Value::to_number of a string, symbol, BigInt or object")
