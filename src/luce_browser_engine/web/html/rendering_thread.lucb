@@ -1,0 +1,255 @@
+#==============================================================================================
+#
+#   rendering_thread - HTML::RenderingThread: the compositor that rasterizes a navigable's
+#   display list into its backing stores, on the main thread in phase 1
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibWeb/HTML/RenderingThread.cpp (lines 1-347) for phase 1, taken by
+#       region r28 because every Navigable owns one (Navigable::Navigable starts it). The
+#       donor runs ThreadData::compositor_loop on a "Renderer" thread that waits on condition
+#       variables. Phase 1 runs threads on the main thread (DESIGN.md §3.3 rule 6), so there is
+#       no thread and no mutex: once started, the loop's body runs on the main thread whenever
+#       work arrives (a queued command, a frame to present, ready_to_paint after back
+#       pressure), with the same order of commands and the same presentation steps. Where the
+#       donor's thread would wait (back pressure, wait_for_frame), the work stays pending
+#       until ready_to_paint. The Skia player is luce-browser-render's DisplayListPlayerCpu
+#       (DESIGN.md §7.3); clearing a back store clears its pixels to transparent.
+#
+#       Copyright (c) 2025-2026, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: BackingStoreState =======================================================================
+
+## Ported from RenderingThread.cpp:29 Web::HTML::BackingStoreState::swap.
+func html_backing_store_state_swap(this: HtmlBackingStoreState*):
+    let front_store = this.front_store
+    this.front_store = this.back_store
+    this.back_store = front_store
+    let front_bitmap_id = this.front_bitmap_id
+    this.front_bitmap_id = this.back_bitmap_id
+    this.back_bitmap_id = front_bitmap_id
+
+## Ported from RenderingThread.cpp:35 Web::HTML::BackingStoreState::is_valid.
+func html_backing_store_state_is_valid(this: const HtmlBackingStoreState*) -> bool:
+    return this.front_store != none and this.back_store != none
+
+# mark: ThreadData ==============================================================================
+
+## Ported from RenderingThread.cpp:59 Web::HTML::RenderingThread::ThreadData::ThreadData, with the
+## default member initializers. (The donor's weak reference to the main thread's event loop is
+## the Core event loop seam, core_deferred_invoke.)
+func html_rendering_thread_thread_data_create(presentation_callback: ak.Function2[gfx.DevicePixelRect, i32, unit]) -> HtmlRenderingThreadThreadData*:
+    return new HtmlRenderingThreadThreadData(m_presentation_callback = presentation_callback, m_exit = false, m_command_queue = ak.Queue[HtmlCompositorCommand](), m_skia_player = none, m_cached_display_list = none, m_cached_scroll_state_snapshot = display_list.ScrollStateSnapshot(), m_backing_stores = HtmlBackingStoreState(), m_presentation_mode = HtmlRenderingThreadPresentationMode.present_to_ui, m_queued_rasterization_tasks = 0, m_needs_present = false, m_pending_viewport_rect = gfx.DevicePixelRect(), m_submitted_frame_id = 0, m_completed_frame_id = 0, m_started = false) else trap("out of memory")
+
+## Ported from RenderingThread.cpp:67 Web::HTML::RenderingThread::ThreadData::set_skia_player.
+func html_rendering_thread_thread_data_set_skia_player(this: HtmlRenderingThreadThreadData*, player: display_list.DisplayListPlayerCpu*?):
+    this.m_skia_player = player
+
+## Ported from RenderingThread.cpp:72 Web::HTML::RenderingThread::ThreadData::has_skia_player.
+func html_rendering_thread_thread_data_has_skia_player(this: const HtmlRenderingThreadThreadData*) -> bool:
+    return this.m_skia_player != none
+
+## Ported from RenderingThread.cpp:74 Web::HTML::RenderingThread::ThreadData::set_presentation_mode.
+func html_rendering_thread_thread_data_set_presentation_mode(this: HtmlRenderingThreadThreadData*, mode: HtmlRenderingThreadPresentationMode):
+    this.m_presentation_mode = mode
+
+## Ported from RenderingThread.cpp:80 Web::HTML::RenderingThread::ThreadData::exit.
+func html_rendering_thread_thread_data_exit(this: HtmlRenderingThreadThreadData*):
+    this.m_exit = true
+
+## Ported from RenderingThread.cpp:89 Web::HTML::RenderingThread::ThreadData::enqueue_command.
+## (Phase 1: the signal to the compositor runs its loop on the main thread.)
+func html_rendering_thread_thread_data_enqueue_command(this: HtmlRenderingThreadThreadData*, command: HtmlCompositorCommand):
+    ak.queue_enqueue(&this.m_command_queue, command)
+    html_rendering_thread_thread_data_run_compositor(this)
+
+## Ported from RenderingThread.cpp:96 Web::HTML::RenderingThread::ThreadData::set_needs_present.
+func html_rendering_thread_thread_data_set_needs_present(this: HtmlRenderingThreadThreadData*, viewport_rect: gfx.DevicePixelRect) -> u64:
+    this.m_needs_present = true
+    this.m_pending_viewport_rect = viewport_rect
+    this.m_submitted_frame_id += 1
+    let submitted_frame_id = this.m_submitted_frame_id
+    html_rendering_thread_thread_data_run_compositor(this)
+    return submitted_frame_id
+
+## Ported from RenderingThread.cpp:106 Web::HTML::RenderingThread::ThreadData::mark_frame_complete.
+func html_rendering_thread_thread_data_mark_frame_complete(this: HtmlRenderingThreadThreadData*, frame_id: u64):
+    this.m_completed_frame_id = frame_id
+
+## Ported from RenderingThread.cpp:113 Web::HTML::RenderingThread::ThreadData::wait_for_frame.
+## (Phase 1: the compositor runs on this thread, so a frame that is not complete now is held back
+## by back pressure, which only ready_to_paint releases; waiting would never return.)
+func html_rendering_thread_thread_data_wait_for_frame(this: HtmlRenderingThreadThreadData*, frame_id: u64):
+    if this.m_completed_frame_id < frame_id and not this.m_exit:
+        trap("RenderingThread::wait_for_frame: the frame is held back by back pressure (phase 1 has no rendering thread to wait for)")
+
+## The phase-1 form of the compositor thread's wake-up: when started, run the loop's body.
+func html_rendering_thread_thread_data_run_compositor(this: HtmlRenderingThreadThreadData*):
+    if this.m_started:
+        html_rendering_thread_thread_data_compositor_loop(this)
+
+## The captures of a screenshot callback invoked on the main thread.
+struct HtmlRenderingThreadScreenshotCallback:
+    var callback: ak.Function0[unit]
+
+## The deferred invocation of a screenshot's callback.
+func html_rendering_thread_call_screenshot_callback(context: void*?):
+    let captures = (HtmlRenderingThreadScreenshotCallback*)(context else trap("no captures"))
+    ak.function0_call(&captures.callback)
+
+## The captures of a presentation invoked on the main thread.
+struct HtmlRenderingThreadPresentation:
+    var thread_data: HtmlRenderingThreadThreadData*
+    var viewport_rect: gfx.DevicePixelRect
+    var rendered_bitmap_id: i32
+
+## The deferred invocation of the presentation callback.
+func html_rendering_thread_call_presentation_callback(context: void*?):
+    let captures = (HtmlRenderingThreadPresentation*)(context else trap("no captures"))
+    ak.function2_call(&captures.thread_data.m_presentation_callback, captures.viewport_rect, captures.rendered_bitmap_id)
+
+## Ported from RenderingThread.cpp:120 Web::HTML::RenderingThread::ThreadData::compositor_loop: one
+## pass of its `while (true)` (phase 1: the loop's waits return at once, see the header).
+func html_rendering_thread_thread_data_compositor_loop(this: HtmlRenderingThreadThreadData*):
+    if this.m_exit:
+        return
+
+    while true:
+        if ak.queue_is_empty(&this.m_command_queue):
+            break
+        let command = ak.queue_dequeue(&this.m_command_queue)
+
+        match command:
+            .update_display_list(new_display_list, scroll_state_snapshot):
+                this.m_cached_display_list = new_display_list
+                this.m_cached_scroll_state_snapshot = scroll_state_snapshot
+            .update_backing_stores(front_store, back_store, front_bitmap_id, back_bitmap_id):
+                this.m_backing_stores.front_store = front_store
+                this.m_backing_stores.back_store = back_store
+                this.m_backing_stores.front_bitmap_id = front_bitmap_id
+                this.m_backing_stores.back_bitmap_id = back_bitmap_id
+            .screenshot(target_surface, callback):
+                if let cached_display_list = this.m_cached_display_list:
+                    let player = this.m_skia_player else trap("the rendering thread has no player")
+                    display_list.display_list_player_execute((display_list.DisplayListPlayer*)player, cached_display_list, &this.m_cached_scroll_state_snapshot, target_surface)
+                    if let screenshot_callback = callback:
+                        let captures = new HtmlRenderingThreadScreenshotCallback(callback = screenshot_callback) else trap("out of memory")
+                        html_rendering_thread_thread_data_invoke_on_main_thread(this, ak.Function0[unit](call = html_rendering_thread_call_screenshot_callback, context = captures))
+
+        if this.m_exit:
+            break
+
+    if this.m_exit:
+        return
+
+    var should_present = false
+    var viewport_rect = gfx.DevicePixelRect()
+    var presenting_frame_id: u64 = 0
+    if this.m_needs_present:
+        # Block if we already have a frame queued (back pressure)
+        # (Phase 1: the frame stays pending; ready_to_paint runs the loop again.)
+        if this.m_queued_rasterization_tasks > 1:
+            return
+        should_present = true
+        viewport_rect = this.m_pending_viewport_rect
+        presenting_frame_id = this.m_submitted_frame_id
+        this.m_needs_present = false
+
+    if should_present:
+        let presentation_mode = this.m_presentation_mode
+
+        if this.m_cached_display_list != none and html_backing_store_state_is_valid(&this.m_backing_stores):
+            let cached_display_list = this.m_cached_display_list else trap("unreachable: checked above")
+            let back_store = this.m_backing_stores.back_store else trap("unreachable: the backing stores are valid")
+            let should_clear_back_store = match presentation_mode:
+                .present_to_ui => false
+                .publish_to_external_content(_) => true
+            if should_clear_back_store:
+                # Embedded navigables leave their PaintConfig canvas unfilled, so double-buffered back stores
+                # must be cleared before repainting.
+                # (canvas().clear(SK_ColorTRANSPARENT): transparent black is all zero bytes.)
+                gfx.painting_surface_lock_context(back_store)
+                var pixmap = gfx.painting_surface_begin_raster(back_store)
+                memory.set(pixmap.data_mut(), 0)
+                gfx.painting_surface_end_raster(back_store)
+                gfx.painting_surface_unlock_context(back_store)
+            let player = this.m_skia_player else trap("the rendering thread has no player")
+            display_list.display_list_player_execute((display_list.DisplayListPlayer*)player, cached_display_list, &this.m_cached_scroll_state_snapshot, back_store)
+            let rendered_bitmap_id = this.m_backing_stores.back_bitmap_id
+            html_backing_store_state_swap(&this.m_backing_stores)
+
+            match presentation_mode:
+                .present_to_ui:
+                    this.m_queued_rasterization_tasks += 1
+                    let captures = new HtmlRenderingThreadPresentation(thread_data = this, viewport_rect = viewport_rect, rendered_bitmap_id = rendered_bitmap_id) else trap("out of memory")
+                    html_rendering_thread_thread_data_invoke_on_main_thread(this, ak.Function0[unit](call = html_rendering_thread_call_presentation_callback, context = captures))
+                .publish_to_external_content(source):
+                    let front_store = this.m_backing_stores.front_store else trap("unreachable: the backing stores are valid")
+                    let snapshot = gfx.immutable_bitmap_create_snapshot_from_painting_surface(front_store)
+                    display_list.external_content_source_update(source, snapshot)
+        html_rendering_thread_thread_data_mark_frame_complete(this, presenting_frame_id)
+
+## Ported from RenderingThread.cpp:235 Web::HTML::RenderingThread::ThreadData::invoke_on_main_thread.
+func html_rendering_thread_thread_data_invoke_on_main_thread(this: HtmlRenderingThreadThreadData*, invokee: ak.Function0[unit]):
+    if this.m_exit:
+        return
+    core_deferred_invoke(invokee)
+
+## Ported from RenderingThread.cpp:276 Web::HTML::RenderingThread::ThreadData::decrement_queued_tasks.
+## (Phase 1: releasing the back pressure runs the loop again, as the signal wakes the thread.)
+func html_rendering_thread_thread_data_decrement_queued_tasks(this: HtmlRenderingThreadThreadData*):
+    assert(this.m_queued_rasterization_tasks >= 1 and this.m_queued_rasterization_tasks <= 2)
+    this.m_queued_rasterization_tasks -= 1
+    html_rendering_thread_thread_data_run_compositor(this)
+
+# mark: RenderingThread =========================================================================
+
+## Ported from RenderingThread.cpp:285 Web::HTML::RenderingThread::RenderingThread.
+pub func html_rendering_thread_construct(this: HtmlRenderingThread*, presentation_callback: ak.Function2[gfx.DevicePixelRect, i32, unit]):
+    this.m_thread_data = html_rendering_thread_thread_data_create(presentation_callback)
+    this.m_thread = none
+
+## Ported from RenderingThread.cpp:290 Web::HTML::RenderingThread::~RenderingThread.
+pub func html_rendering_thread_destruct(this: HtmlRenderingThread*):
+    html_rendering_thread_thread_data_exit(this.m_thread_data)
+
+## Ported from RenderingThread.cpp:295 Web::HTML::RenderingThread::start.
+## (Phase 1: no "Renderer" thread; the loop runs on the main thread from now on.)
+pub func html_rendering_thread_start(this: HtmlRenderingThread*, arg0: DisplayListPlayerType):
+    assert(html_rendering_thread_thread_data_has_skia_player(this.m_thread_data))
+    this.m_thread_data.m_started = true
+    html_rendering_thread_thread_data_run_compositor(this.m_thread_data)
+
+## Ported from RenderingThread.cpp:306 Web::HTML::RenderingThread::set_skia_player.
+pub func html_rendering_thread_set_skia_player(this: HtmlRenderingThread*, player: display_list.DisplayListPlayerCpu*?):
+    html_rendering_thread_thread_data_set_skia_player(this.m_thread_data, player)
+
+## Ported from RenderingThread.cpp:311 Web::HTML::RenderingThread::set_presentation_mode.
+pub func html_rendering_thread_set_presentation_mode(this: HtmlRenderingThread*, mode: HtmlRenderingThreadPresentationMode):
+    html_rendering_thread_thread_data_set_presentation_mode(this.m_thread_data, mode)
+
+## Ported from RenderingThread.cpp:316 Web::HTML::RenderingThread::update_display_list.
+pub func html_rendering_thread_update_display_list(this: HtmlRenderingThread*, new_display_list: display_list.DisplayList*, scroll_state_snapshot: display_list.ScrollStateSnapshot):
+    html_rendering_thread_thread_data_enqueue_command(this.m_thread_data, HtmlCompositorCommand.update_display_list(new_display_list, scroll_state_snapshot))
+
+## Ported from RenderingThread.cpp:321 Web::HTML::RenderingThread::update_backing_stores.
+pub func html_rendering_thread_update_backing_stores(this: HtmlRenderingThread*, front: gfx.PaintingSurface*?, back: gfx.PaintingSurface*?, front_id: i32, back_id: i32):
+    html_rendering_thread_thread_data_enqueue_command(this.m_thread_data, HtmlCompositorCommand.update_backing_stores(front, back, front_id, back_id))
+
+## Ported from RenderingThread.cpp:326 Web::HTML::RenderingThread::present_frame.
+pub func html_rendering_thread_present_frame(this: HtmlRenderingThread*, viewport_rect: gfx.DevicePixelRect) -> u64:
+    return html_rendering_thread_thread_data_set_needs_present(this.m_thread_data, viewport_rect)
+
+## Ported from RenderingThread.cpp:331 Web::HTML::RenderingThread::wait_for_frame.
+pub func html_rendering_thread_wait_for_frame(this: HtmlRenderingThread*, frame_id: u64):
+    html_rendering_thread_thread_data_wait_for_frame(this.m_thread_data, frame_id)
+
+## Ported from RenderingThread.cpp:336 Web::HTML::RenderingThread::request_screenshot.
+pub func html_rendering_thread_request_screenshot(this: HtmlRenderingThread*, target_surface: gfx.PaintingSurface*, callback: ak.Function0[unit]?):
+    html_rendering_thread_thread_data_enqueue_command(this.m_thread_data, HtmlCompositorCommand.screenshot(target_surface, callback))
+
+## Ported from RenderingThread.cpp:341 Web::HTML::RenderingThread::ready_to_paint.
+pub func html_rendering_thread_ready_to_paint(this: HtmlRenderingThread*):
+    html_rendering_thread_thread_data_decrement_queued_tasks(this.m_thread_data)

@@ -1,0 +1,556 @@
+#==============================================================================================
+#
+#   navigable_4 - HTML::Navigable: creating navigation params by fetching, and populating a
+#   session history entry's document
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibWeb/HTML/Navigable.cpp lines 1285-1804
+#       (create_navigation_params_by_fetching, Navigable::populate_session_history_entry_document).
+#       Requests, responses, bodies and the CSP response check are Fetch's (phase 2 closure stubs).
+#
+#       Copyright (c) 2022-2024, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2023-2025, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Creating navigation params by fetching ==================================================
+
+## The captures of create_navigation_params_by_fetching's fetch completion steps.
+struct HtmlCreateNavigationParamsByFetchingCompletion:
+    var realm: Realm*
+    var state_holder: HtmlNavigationParamsFetchStateHolder*
+    var user_involvement: HtmlUserNavigationInvolvement
+    var completion_steps: gc.Function1[HtmlInternalNavigationResult*, unit]*
+
+## Ported from Navigable.cpp:1286 Web::HTML::create_navigation_params_by_fetching.
+# https://html.spec.whatwg.org/multipage/browsing-the-web.html#create-navigation-params-by-fetching
+func html_create_navigation_params_by_fetching(url: web_url.Url, document_resource: EmptyOrStringOrHtmlPostResource, request_referrer: FetchRequestReferrerType, request_referrer_policy: ReferrerPolicyReferrerPolicy, initiator_origin: web_url.Origin?, history_policy_container: HtmlSerializedPolicyContainerOrHtmlDocumentStateClient, about_base_url: web_url.Url?, origin: web_url.Origin?, navigable_target_name: ak.String, reload_pending: bool, ever_populated: bool, navigable: HtmlNavigable*?, source_snapshot_params: HtmlSourceSnapshotParams*, target_snapshot_params: HtmlTargetSnapshotParams, csp_navigation_type: ContentSecurityPolicyNavigationType, user_involvement: HtmlUserNavigationInvolvement, navigation_id: ak.String?, completion_steps: gc.Function1[HtmlInternalNavigationResult*, unit]*):
+    let the_navigable = navigable else trap("no navigable")
+    let vm = js_cell_vm(the_navigable.js_cell())
+    let window = html_navigable_active_window(the_navigable) else trap("VERIFY: navigable->active_window()")
+    let realm = bind_platform_object_realm(window.bind_platform_object())
+    let active_document = html_navigable_active_document(the_navigable) else trap("no active document")
+
+    # FIXME: 1. Assert: this is running in parallel.
+
+    # 2. Let documentResource be entry's document state's resource.
+    # NOTE: documentResource is passed as a parameter.
+
+    # 3. Let request be a new request, with
+    #    url: entry's URL
+    #    client: sourceSnapshotParams's fetch client
+    #    destination: "document"
+    #    credentials mode: "include"
+    #    use-URL-credentials flag: set
+    #    redirect mode: "manual"
+    #    replaces client id: navigable's active document's relevant settings object's id
+    #    mode: "navigate"
+    #    referrer: entry's document state's request referrer
+    #    referrer policy: entry's document state's request referrer policy
+    #    policy container: sourceSnapshotParams's source policy container
+    let request = fetch_request_create(vm)
+    fetch_request_set_url(request, url)
+    fetch_request_set_client(request, source_snapshot_params.fetch_client)
+    fetch_request_set_destination(request, FetchRequestDestination.document)
+    fetch_request_set_credentials_mode(request, FetchRequestCredentialsMode.include)
+    fetch_request_set_use_url_credentials(request, true)
+    fetch_request_set_redirect_mode(request, FetchRequestRedirectMode.manual)
+    fetch_request_set_replaces_client_id(request, dom_document_relevant_settings_object(active_document).environment.id)
+    fetch_request_set_mode(request, FetchRequestMode.navigate)
+    fetch_request_set_referrer(request, request_referrer)
+    fetch_request_set_referrer_policy(request, request_referrer_policy)
+    fetch_request_set_policy_container(request, source_snapshot_params.source_policy_container)
+
+    # 4. If navigable is a top-level traversable, then set request's top-level navigation initiator origin to entry's
+    #    document state's initiator origin.
+    if html_navigable_is_top_level_traversable(the_navigable):
+        fetch_request_set_top_level_navigation_initiator_origin(request, initiator_origin)
+
+    # 5. If request's client is null:
+    if fetch_request_client(request) == none:
+        # Note: This only occurs in the case of a browser UI-initiated navigation.
+
+        # 1. Set request's origin to a new opaque origin.
+        fetch_request_set_origin(request, web_url.origin_create_opaque())
+
+        # 2. Set request's service-workers mode to "all".
+        fetch_request_set_service_workers_mode(request, FetchRequestServiceWorkersMode.all)
+
+        # 3. Set request's referrer to "no-referrer".
+        fetch_request_set_referrer(request, FetchRequestReferrerType.fetch_request_referrer(FetchRequestReferrer.no_referrer))
+
+    # 6. If documentResource is a POST resource:
+    match document_resource:
+        .html_post_resource(post_resource):
+            # 1. Set request's method to `POST`.
+            fetch_request_set_method(request, ak.sv("POST"))
+
+            # 2. Set request's body to documentResource's request body.
+            fetch_request_set_body(request, post_resource.request_body else trap("VERIFY: request_body.has_value()"))
+
+            # 3. Set `Content-Type` to documentResource's request content-type in request's header list.
+            var request_content_type = match post_resource.request_content_type:
+                .application_xwww_form_urlencoded => ak.sv("application/x-www-form-urlencoded")
+                .multipart_form_data => ak.sv("multipart/form-data")
+                .text_plain => ak.sv("text/plain")
+                _ => trap("VERIFY_NOT_REACHED")
+
+            var request_content_type_buffer = ak.string_builder_new()
+            if not ak.vector_is_empty(&post_resource.request_content_type_directives):
+                ak.string_builder_append_string_view(&request_content_type_buffer, request_content_type)
+
+                for directive in ak.vector_span_const(&post_resource.request_content_type_directives):
+                    # appendff("; {}={}", directive.type, directive.value)
+                    ak.string_builder_append(&request_content_type_buffer, "; ")
+                    ak.string_builder_append_string_view(&request_content_type_buffer, directive.type_)
+                    ak.string_builder_append(&request_content_type_buffer, "=")
+                    ak.string_builder_append_string_view(&request_content_type_buffer, ak.string_bytes_as_string_view(&directive.value))
+
+                request_content_type = ak.string_builder_string_view(&request_content_type_buffer)
+
+            # HTTP::Header::isomorphic_encode("Content-Type"sv, request_content_type), appended.
+            http_header_list_append(fetch_request_header_list(request), ak.sv("Content-Type"), request_content_type)
+        _:
+            discard(0)
+
+    # 7. If entry's document state's reload pending is true, then set request's reload-navigation flag.
+    if reload_pending:
+        fetch_request_set_reload_navigation(request, true)
+
+    # 8. Otherwise, if entry's document state's ever populated is true, then set request's history-navigation flag.
+    elif ever_populated:
+        fetch_request_set_history_navigation(request, true)
+
+    # 9. If sourceSnapshotParams's has transient activation is true, then set request's user-activation to true.
+    if source_snapshot_params.has_transient_activation:
+        fetch_request_set_user_activation(request, true)
+
+    # 10. If navigable's container is non-null:
+    if let container = html_navigable_container(the_navigable):
+        # 1. If the navigable's container has a browsing context scope origin, then set request's origin to that browsing context scope origin.
+        # FIXME: From "browsing context scope origin": This definition is broken and needs investigation to see what it was intended to express: see issue #4703.
+        #        The referenced issue suggests that it is a no-op to retrieve the browsing context scope origin.
+
+        # 2. Set request's destination to navigable's container's local name.
+        # FIXME: Are there other container types? If so, we need a helper here
+        let destination = FetchRequestDestination.i_frame if is_html_htmli_frame_element(container) else FetchRequestDestination.object
+        fetch_request_set_destination(request, destination)
+
+        # 3. If sourceSnapshotParams's fetch client is navigable's container document's relevant settings object,
+        #    then set request's initiator type to navigable's container's local name.
+        # NOTE: This ensure that only container-initiated navigations are reported to resource timing.
+        let container_document = html_navigable_container_document(the_navigable) else trap("no container document")
+        if source_snapshot_params.fetch_client == dom_document_relevant_settings_object(container_document):
+            # FIXME: Are there other container types? If so, we need a helper here
+            let initiator_type = FetchRequestInitiatorType.i_frame if is_html_htmli_frame_element(container) else FetchRequestInitiatorType.object
+            fetch_request_set_initiator_type(request, initiator_type)
+
+    # NOTE: We use a heap-allocated cell to hold all the following state because the callbacks below will use them
+    #       after this stack is freed.
+    # 11. Let response be null.
+    # 12. Let responseOrigin be null.
+    # 13. Let fetchController be null.
+
+    # 14. Let coopEnforcementResult be a new opener policy enforcement result, with
+    # - url: navigable's active document's URL
+    # - origin: navigable's active document's origin
+    # - opener policy: navigable's active document's opener policy
+    # - current context is navigation source: true if navigable's active document's origin is same origin with
+    #                                         entry's document state's initiator origin otherwise false
+    let active_origin = dom_document_origin(active_document)
+    var current_context_is_navigation_source = false
+    if let initiator = initiator_origin:
+        current_context_is_navigation_source = web_url.origin_is_same_origin(&active_origin, initiator)
+    let coop_enforcement_result = HtmlOpenerPolicyEnforcementResult(url = dom_document_url(active_document), origin = active_origin, opener_policy = dom_document_opener_policy(active_document), current_context_is_navigation_source = current_context_is_navigation_source)
+
+    # 15. Let finalSandboxFlags be an empty sandboxing flag set.
+    # 16. Let responsePolicyContainer be null.
+    # 17. Let responseCOOP be a new opener policy.
+    # 18. Let locationURL be null.
+    # 19. Let currentURL be request's current URL.
+    # 20. Let commitEarlyHints be null.
+    # AD-HOC: Store required variables on the state holder to keep them alive whilst waiting on the fetch to complete.
+    let state_holder = heap_allocate_html_navigation_params_fetch_state_holder(realm_heap(realm), coop_enforcement_result, fetch_request_current_url(request), request, initiator_origin, history_policy_container, about_base_url, source_snapshot_params, request_referrer, request_referrer_policy, origin, document_resource, ever_populated, navigable_target_name)
+    state_holder.navigable = navigable
+    state_holder.csp_navigation_type = csp_navigation_type
+    state_holder.target_snapshot_params = target_snapshot_params
+    state_holder.navigation_id = navigation_id
+
+    let captures = new HtmlCreateNavigationParamsByFetchingCompletion(realm = realm, state_holder = state_holder, user_involvement = user_involvement, completion_steps = completion_steps) else trap("out of memory")
+    html_perform_navigation_params_fetch(realm, state_holder, completion_steps, gc.create_function0(realm_heap(realm), ak.Function0[unit](call = html_create_navigation_params_by_fetching_complete, context = captures)))
+
+## create_navigation_params_by_fetching's fetch completion steps (steps 22-27).
+func html_create_navigation_params_by_fetching_complete(context: void*?):
+    let captures = (HtmlCreateNavigationParamsByFetchingCompletion*)(context else trap("no captures"))
+    let realm = captures.realm
+    let state_holder = captures.state_holder
+    let heap = realm_heap(realm)
+    let result = heap_allocate_html_internal_navigation_result(heap)
+    result.redirected_url = state_holder.redirected_url
+    state_holder.redirected_url = none
+    result.classic_history_api_state = state_holder.redirect_classic_history_api_state
+    state_holder.redirect_classic_history_api_state = none
+    result.replacement_document_state = state_holder.replacement_document_state
+    result.resource_cleared = state_holder.resource_cleared
+
+    # 22. If locationURL is a URL whose scheme is not a fetch scheme, then return a new non-fetch scheme navigation params, with
+    if not state_holder.location_url_is_error:
+        if let location_url = state_holder.location_url:
+            let location_scheme = web_url.url_scheme(&location_url)
+            if not fetch_is_fetch_scheme(ak.string_bytes_as_string_view(&location_scheme)):
+                # - id: navigationId
+                # - navigable: navigable
+                # - URL: locationURL
+                # - target snapshot sandboxing flags: targetSnapshotParams's sandboxing flags
+                # - source snapshot has transient activation: sourceSnapshotParams's has transient activation
+                # - initiator origin: responseOrigin
+                # FIXME: - navigation timing type: navTimingType
+                # - user involvement: userInvolvement
+                result.navigation_params = HtmlNavigableNavigationParamsVariant.html_non_fetch_scheme_navigation_params(heap_allocate_html_non_fetch_scheme_navigation_params(heap, state_holder.navigation_id, state_holder.navigable, location_url, state_holder.target_snapshot_params.sandboxing_flags, state_holder.source_snapshot_params.has_transient_activation, state_holder.response_origin else trap("no response origin"), captures.user_involvement))
+                ak.function1_call(&captures.completion_steps.function, result)
+                return
+
+    let response = state_holder.response else trap("the fetch has no response")
+
+    # 23. If any of the following are true:
+    #       - response is a network error;
+    #       - locationURL is failure; or
+    #       - locationURL is a URL whose scheme is a fetch scheme
+    #     then return null.
+    if fetch_response_is_network_error(response):
+        # AD-HOC: We pass the error message if we have one in NullWithError
+        result.navigation_params = HtmlNavigableNavigationParamsVariant.optional_string(fetch_response_network_error_message(response))
+        ak.function1_call(&captures.completion_steps.function, result)
+        return
+
+    if state_holder.location_url_is_error or state_holder.location_url != none:
+        # (A location URL here has a fetch scheme: step 22 returned for the others.)
+        result.navigation_params = HtmlNavigableNavigationParamsVariant.optional_string(none)
+        ak.function1_call(&captures.completion_steps.function, result)
+        return
+
+    # 24. Assert: locationURL is null and response is not a network error.
+    assert(state_holder.location_url == none)
+    assert(not fetch_response_is_network_error(response))
+
+    # 25. Let resultPolicyContainer be the result of determining navigation params policy container given response's URL,
+    #     entry's document state's history policy container, sourceSnapshotParams's source policy container, null, and responsePolicyContainer.
+    let history_policy_container = html_history_policy_container_from_variant(heap, state_holder.history_policy_container)
+    let result_policy_container = html_determine_navigation_params_policy_container(fetch_response_url(response) else trap("the response has no URL"), heap, history_policy_container, state_holder.source_snapshot_params.source_policy_container, none, state_holder.response_policy_container)
+
+    # 26. If navigable's container is an iframe, and response's timing allow passed flag is set,
+    #     then set navigable's container's pending resource-timing start time to null.
+    let navigable = state_holder.navigable else trap("the fetch has no navigable")
+    if html_navigable_container(navigable) != none and fetch_response_timing_allow_passed(response):
+        if let iframe_element = as_if_html_htmli_frame_element(html_navigable_container(navigable) else trap("unreachable: checked above")):
+            html_htmli_frame_element_set_pending_resource_start_time(iframe_element, none)
+
+    # 27. Return a new navigation params, with
+    #     id: navigationId
+    #     navigable: navigable
+    #     request: request
+    #     response: response
+    #     fetch controller: fetchController
+    #     commit early hints: commitEarlyHints
+    #     opener policy: responseCOOP
+    #     reserved environment: request's reserved client
+    #     origin: responseOrigin
+    #     policy container: resultPolicyContainer
+    #     final sandboxing flag set: finalSandboxFlags
+    #     COOP enforcement result: coopEnforcementResult
+    #     FIXME: navigation timing type: navTimingType
+    #     about base URL: entry's document state's about base URL
+    #     user involvement: userInvolvement
+    result.navigation_params = HtmlNavigableNavigationParamsVariant.html_navigation_params(heap_allocate_html_navigation_params(heap, state_holder.navigation_id, state_holder.navigable, state_holder.request, response, state_holder.fetch_controller, state_holder.commit_early_hints, state_holder.coop_enforcement_result, fetch_request_reserved_client(state_holder.request), state_holder.response_origin else trap("no response origin"), result_policy_container, state_holder.final_sandbox_flags, state_holder.response_coop, state_holder.about_base_url, captures.user_involvement))
+    ak.function1_call(&captures.completion_steps.function, result)
+
+## `heap.allocate<NonFetchSchemeNavigationParams>(...)`: a cell constructed under DeferGC.
+func heap_allocate_html_non_fetch_scheme_navigation_params(heap: gc.Heap*, id: ak.String?, navigable: HtmlNavigable*?, url: web_url.Url, target_snapshot_sandboxing_flags: HtmlSandboxingFlagSet, source_snapshot_has_transient_activation: bool, initiator_origin: web_url.Origin, user_involvement: HtmlUserNavigationInvolvement) -> HtmlNonFetchSchemeNavigationParams*:
+    let params = (HtmlNonFetchSchemeNavigationParams*)web_heap_allocate_cell(heap, &html_non_fetch_scheme_navigation_params_class)
+    gc.heap_defer_gc(heap)
+    html_non_fetch_scheme_navigation_params_construct(params, id, navigable, url, target_snapshot_sandboxing_flags, source_snapshot_has_transient_activation, initiator_origin, user_involvement)
+    gc.heap_undefer_gc(heap)
+    return params
+
+# mark: Populating a session history entry's document ===========================================
+
+## The captures of populate_session_history_entry_document's received_navigation_params.
+struct HtmlPopulateReceivedNavigationParams:
+    var this: HtmlNavigable*
+    var url: web_url.Url
+    var navigation_id: ak.String?
+    var user_involvement: HtmlUserNavigationInvolvement
+    var completion_steps: gc.Function1[HtmlPopulateSessionHistoryEntryDocumentOutput*?, unit]*?
+    var csp_navigation_type: ContentSecurityPolicyNavigationType
+
+## The captures of received_navigation_params's queued global task.
+struct HtmlPopulateReceivedNavigationParamsTask:
+    var steps: HtmlPopulateReceivedNavigationParams*
+    var result: HtmlInternalNavigationResult*
+
+## populate_session_history_entry_document's received_navigation_params (step 5).
+func html_populate_received_navigation_params(context: void*?, result: HtmlInternalNavigationResult*):
+    let captures = (HtmlPopulateReceivedNavigationParams*)(context else trap("no captures"))
+    let this = captures.this
+
+    # AD-HOC: Not in the spec but subsequent steps will fail if the navigable doesn't have an active window.
+    let window = html_navigable_active_window(this) else return
+
+    # 5. Queue a global task on the navigation and traversal task source, given navigable's active window, to run these steps:
+    let task = new HtmlPopulateReceivedNavigationParamsTask(steps = captures, result = result) else trap("out of memory")
+    discard(html_queue_global_task(HtmlTaskSource.navigation_and_traversal, (JsObject*)window, gc.create_function0(gc.cell_heap(this.cell()), ak.Function0[unit](call = html_populate_received_navigation_params_task, context = task))))
+
+## The captures of the error document's mutation in received_navigation_params.
+struct HtmlPopulateErrorDocument:
+    var this: HtmlNavigable*
+    var error_html: ak.String
+
+## The captures of the error document's queued end of parsing.
+struct HtmlPopulateErrorDocumentTheEnd:
+    var document: DomDocument*
+
+## The error document's queued task: HTMLParser::the_end.
+func html_populate_error_document_the_end(context: void*?):
+    let captures = (HtmlPopulateErrorDocumentTheEnd*)(context else trap("no captures"))
+    html_parser_the_end(captures.document)
+
+## The mutation of the error document (create_document_for_inline_content's lambda).
+func html_populate_error_document_mutate(context: void*?, document: DomDocument*):
+    let captures = (HtmlPopulateErrorDocument*)(context else trap("no captures"))
+    let scripting_mode = HtmlParserScriptingMode.normal if dom_node_is_scripting_enabled(document.dom_node()) else HtmlParserScriptingMode.disabled
+    let parser = html_parser_create(document, ak.string_bytes_as_string_view(&captures.error_html), scripting_mode, ak.sv("utf-8"))
+    dom_document_set_url(document, web_url.about_error())
+    html_parser_run_html_tokenizer_stop_at_inserti(parser)
+
+    # FIXME: This should go in create_document_for_inline_content() instead.
+    # FIXME: Directly calling parser->the_end results in a deadlock, because it waits for the warning image to load.
+    #        However the response is never processed when parser->the_end is called.
+    #        Queuing a global task is a workaround for now.
+    let the_end = new HtmlPopulateErrorDocumentTheEnd(document = document) else trap("out of memory")
+    discard(html_queue_a_task(HtmlTaskSource.unspecified, html_main_thread_event_loop(), document, gc.create_function0(gc.cell_heap(captures.this.cell()), ak.Function0[unit](call = html_populate_error_document_the_end, context = the_end))))
+
+## The captures of the asynchronous load of a document once its sniff bytes arrive.
+struct HtmlPopulateSniffBytes:
+    var output: HtmlPopulateSessionHistoryEntryDocumentOutput*
+    var nav_params: HtmlNavigationParams*
+    var navigation_params: HtmlNavigableNavigationParamsVariant
+    var completion_steps: gc.Function1[HtmlPopulateSessionHistoryEntryDocumentOutput*?, unit]*?
+
+## The asynchronous path of step 6: the sniff bytes arrived.
+func html_populate_sniff_bytes_arrived(context: void*?, sniff_bytes: const u8[]):
+    let captures = (HtmlPopulateSniffBytes*)(context else trap("no captures"))
+    # AD-HOC: The document may have been destroyed between when the fetch started and when the
+    #         bytes arrived.
+    let nav_navigable = captures.nav_params.navigable else trap("no navigable")
+    if html_navigable_active_browsing_context(nav_navigable) != none:
+        captures.output.document = load_document(captures.nav_params, sniff_bytes)
+    captures.output.navigation_params = captures.navigation_params
+    if let completion_steps = captures.completion_steps:
+        ak.function1_call(&completion_steps.function, captures.output)
+
+## Whether step 4's conditions hold: null navigation params, a CSP-blocked response, or a response
+## that X-Frame-Options forbids (the visit of the C++).
+func html_populate_navigation_params_are_blocked(this: HtmlNavigable*, navigation_params: HtmlNavigableNavigationParamsVariant, csp_navigation_type: ContentSecurityPolicyNavigationType) -> bool:
+    match navigation_params:
+        .optional_string(_):
+            return true
+        .html_navigation_params(params):
+            let policy_container = params.policy_container else trap("dereferencing a null policy container")
+            let csp_result = content_security_policy_should_navigation_response_to_navigation_request_of_type_in_target_be_blocked_by_content_security_policy(params.request, params.response else trap("no response"), policy_container.csp_list, csp_navigation_type, this)
+            if csp_result == ContentSecurityPolicyResult.blocked:
+                return true
+
+            # FIXME: Pass in navigationParams's policy container's CSP list
+            return not html_check_a_navigation_responses_adherence_to_x_frame_options(params.response, this, policy_container.csp_list, params.origin)
+        .html_non_fetch_scheme_navigation_params(_):
+            return false
+
+## received_navigation_params's queued global task (steps 5.1-5.6 of populating).
+func html_populate_received_navigation_params_task(context: void*?):
+    let task = (HtmlPopulateReceivedNavigationParamsTask*)(context else trap("no captures"))
+    let captures = task.steps
+    let this = captures.this
+    let result = task.result
+    let navigation_params = result.navigation_params
+
+    # 1. If navigable's ongoing navigation no longer equals navigationId, then run completionSteps and abort these steps.
+    if let navigation_id = captures.navigation_id:
+        if html_ongoing_navigation_differs_from_id(html_navigable_ongoing_navigation(this), navigation_id):
+            if let completion_steps = captures.completion_steps:
+                ak.function1_call(&completion_steps.function, none)
+            return
+
+    let output = heap_allocate_html_populate_session_history_entry_document_output(gc.cell_heap(this.cell()))
+    output.redirected_url = result.redirected_url
+    result.redirected_url = none
+    output.classic_history_api_state = result.classic_history_api_state
+    result.classic_history_api_state = none
+    output.replacement_document_state = result.replacement_document_state
+    output.resource_cleared = result.resource_cleared
+
+    # 2. Let saveExtraDocumentState be true.
+    output.save_extra_document_state = true
+
+    match navigation_params:
+        # 3. If navigationParams is a non-fetch scheme navigation params, then:
+        .html_non_fetch_scheme_navigation_params(non_fetch_params):
+            # 1. Set entry's document state's document to the result of running attempt to create a non-fetch scheme
+            #    document given navigationParams.
+            #    NOTE: This can result in setting entry's document state's document to null, e.g., when handing-off to
+            #    external software.
+            output.document = html_attempt_to_create_a_non_fetch_scheme_document(non_fetch_params)
+
+            # 2. Set saveExtraDocumentState to false.
+            output.save_extra_document_state = false
+        _:
+            # 4. Otherwise, if any of the following are true:
+            #  - navigationParams is null;
+            #  - the result of should navigation response to navigation request of type in target be blocked by Content Security Policy? given navigationParams's request, navigationParams's response, navigationParams's policy container's CSP list, cspNavigationType, and navigable is "Blocked";
+            #  - FIXME: navigationParams's reserved environment is non-null and the result of checking a navigation response's adherence to its embedder policy given navigationParams's response, navigable, and navigationParams's policy container's embedder policy is false; or
+            #  - the result of checking a navigation response's adherence to `X-Frame-Options` given navigationParams's response, navigable, navigationParams's policy container's CSP list, and navigationParams's origin is false,
+            #    then:
+            if html_populate_navigation_params_are_blocked(this, navigation_params, captures.csp_navigation_type):
+                # 1. Set entry's document state's document to the result of creating a document for inline content that doesn't have a DOM, given navigable, null, navTimingType, and userInvolvement. The inline content should indicate to the user the sort of error that occurred.
+                var error_message = ak.string_from_str("The request was denied.")
+                match navigation_params:
+                    .optional_string(message):
+                        error_message = message else ak.string_from_str("Unknown error")
+                    _:
+                        discard(0)
+
+                let error_url = output.redirected_url else captures.url
+                let error_message_view = ak.string_bytes_as_string_view(&error_message)
+                let error_html = load_error_page(error_url, error_message_view) else trap("FIXME: should propagate errors")
+                let mutate = new HtmlPopulateErrorDocument(this = this, error_html = error_html) else trap("out of memory")
+                output.document = create_document_for_inline_content(this, captures.navigation_id, captures.user_involvement, ak.Function1[DomDocument*, unit](call = html_populate_error_document_mutate, context = mutate))
+
+                # 2. Make document unsalvageable given entry's document state's document and "navigation-failure".
+                if let document = output.document:
+                    dom_document_make_unsalvageable(document, ak.string_from_str("navigation-failure"))
+
+                # 3. Set saveExtraDocumentState to false.
+                output.save_extra_document_state = false
+
+                # 4. If navigationParams is not null, then:
+                match navigation_params:
+                    .optional_string(_):
+                        discard(0)
+                    .html_navigation_params(params):
+                        # 1. Run the environment discarding steps for navigationParams's reserved environment.
+                        html_environment_discard_environment(params.reserved_environment else trap("dereferencing a null reserved environment"))
+
+                        # FIXME: 2. Invoke WebDriver BiDi navigation failed with navigable and a new WebDriver BiDi navigation status whose id is navigationId, status is "canceled", and url is navigationParams's response's URL.
+                    .html_non_fetch_scheme_navigation_params(_):
+                        discard(0)
+
+            # FIXME: 5. Otherwise, if navigationParams's response has a `Content-Disposition` header specifying the attachment
+            #    disposition type, then:
+            #    (C++: `else if (false) {}`.)
+
+            # 6. Otherwise, if navigationParams's response's status is not 204 and is not 205, then set entry's document state's document to the result of
+            #    loading a document given navigationParams, sourceSnapshotParams, and entry's document state's initiator origin.
+            else:
+                let nav_params = html_navigation_params_variant_navigation_params(navigation_params) else trap("Variant::get<NavigationParams>()")
+                let response = nav_params.response else trap("no response")
+                if fetch_response_status(response) != 204 and fetch_response_status(response) != 205:
+                    let body = fetch_response_body(response)
+
+                    # Get sniff bytes for MIME type detection. For streaming responses where bytes
+                    # haven't arrived yet, we must wait asynchronously.
+                    var sniff_bytes: (const u8[])? = none
+                    if let response_body = body:
+                        sniff_bytes = fetch_body_sniff_bytes_if_available(response_body)
+                    else:
+                        sniff_bytes = b""
+                    if sniff_bytes == none:
+                        # Async path: bytes not yet available, wait for them
+                        let sniff_captures = new HtmlPopulateSniffBytes(output = output, nav_params = nav_params, navigation_params = navigation_params, completion_steps = captures.completion_steps) else trap("out of memory")
+                        fetch_body_wait_for_sniff_bytes(body else trap("unreachable: checked above"), gc.create_function1(gc.cell_heap(this.cell()), ak.Function1[const u8[], unit](call = html_populate_sniff_bytes_arrived, context = sniff_captures)))
+                        return
+
+                    # Sync path: bytes available immediately
+                    output.document = load_document(nav_params, sniff_bytes else trap("unreachable: checked above"))
+
+    output.navigation_params = navigation_params
+    if let completion_steps = captures.completion_steps:
+        ak.function1_call(&completion_steps.function, output)
+
+## `document_resource.has<Empty>()`.
+pub func html_document_resource_is_empty(document_resource: EmptyOrStringOrHtmlPostResource) -> bool:
+    match document_resource:
+        .empty:
+            return true
+        _:
+            return false
+
+## `wrap_navigation_params` of populate_session_history_entry_document: a NavigationParamsVariant
+## in an InternalNavigationResult with no redirect mutations, handed to received_navigation_params.
+func html_populate_wrap_navigation_params(this: HtmlNavigable*, received_navigation_params: gc.Function1[HtmlInternalNavigationResult*, unit]*, navigation_params: HtmlNavigableNavigationParamsVariant):
+    let result = heap_allocate_html_internal_navigation_result(gc.cell_heap(this.cell()))
+    result.navigation_params = navigation_params
+    ak.function1_call(&received_navigation_params.function, result)
+
+## Ported from Navigable.cpp:1566 Web::HTML::Navigable::populate_session_history_entry_document.
+# https://html.spec.whatwg.org/multipage/browsing-the-web.html#populating-a-session-history-entry
+pub func html_navigable_populate_session_history_entry_document(this: HtmlNavigable*, url: web_url.Url, document_resource: EmptyOrStringOrHtmlPostResource, request_referrer: FetchRequestReferrerType, request_referrer_policy: ReferrerPolicyReferrerPolicy, initiator_origin: web_url.Origin?, origin: web_url.Origin?, history_policy_container: HtmlSerializedPolicyContainerOrHtmlDocumentStateClient, about_base_url: web_url.Url?, navigable_target_name: ak.String, reload_pending: bool, ever_populated: bool, source_snapshot_params: HtmlSourceSnapshotParams*, target_snapshot_params: HtmlTargetSnapshotParams, user_involvement: HtmlUserNavigationInvolvement, navigation_id: ak.String?, navigation_params: HtmlNavigableNavigationParamsVariant, csp_navigation_type: ContentSecurityPolicyNavigationType, allow_POST: bool, completion_steps: gc.Function1[HtmlPopulateSessionHistoryEntryDocumentOutput*?, unit]*?):
+    # AD-HOC: Not in the spec but subsequent steps will fail if the navigable doesn't have an active window.
+    if html_navigable_active_window(this) == none:
+        return
+
+    # FIXME: 1. Assert: this is running in parallel.
+
+    # 2. Assert: if navigationParams is non-null, then navigationParams's response is non-null.
+    match navigation_params:
+        .optional_string(_):
+            discard(0)
+        .html_navigation_params(params):
+            assert(params.response != none)
+        .html_non_fetch_scheme_navigation_params(_):
+            trap("VERIFY: navigation_params.has<GC::Ref<NavigationParams>>()")
+
+    # 3. Let documentResource be entry's document state's resource.
+    # NOTE: documentResource is passed as a parameter.
+
+    let captures = new HtmlPopulateReceivedNavigationParams(this = this, url = url, navigation_id = navigation_id, user_involvement = user_involvement, completion_steps = completion_steps, csp_navigation_type = csp_navigation_type) else trap("out of memory")
+    let received_navigation_params = gc.create_function1(gc.cell_heap(this.cell()), ak.Function1[HtmlInternalNavigationResult*, unit](call = html_populate_received_navigation_params, context = captures))
+
+    # 4. If navigationParams is null, then:
+    match navigation_params:
+        .optional_string(_):
+            let scheme = web_url.url_scheme(&url)
+            let is_fetch_scheme = fetch_is_fetch_scheme(ak.string_bytes_as_string_view(&scheme))
+            match document_resource:
+                # 1. If documentResource is a string, then set navigationParams to the result of creating navigation params
+                #    from a srcdoc resource given entry, navigable, targetSnapshotParams, userInvolvement, navigationId, and
+                #    navTimingType.
+                .string(_):
+                    html_populate_wrap_navigation_params(this, received_navigation_params, HtmlNavigableNavigationParamsVariant.html_navigation_params(html_create_navigation_params_from_a_srcdoc_resource(document_resource, origin, history_policy_container, about_base_url, this, target_snapshot_params, user_involvement, navigation_id)))
+                    return
+                _:
+                    discard(0)
+
+            # 2. Otherwise, if all of the following are true:
+            #    - entry's URL's scheme is a fetch scheme; and
+            #    - documentResource is null, or allowPOST is true and documentResource's request body is not failure,
+            #      (FIXME: check if request body is not failure)
+            #    then set navigationParams to the result of creating navigation params by fetching given entry, navigable,
+            #    sourceSnapshotParams, targetSnapshotParams, cspNavigationType, userInvolvement, navigationId, and
+            #    navTimingType.
+            if is_fetch_scheme and (html_document_resource_is_empty(document_resource) or allow_POST):
+                html_create_navigation_params_by_fetching(url, document_resource, request_referrer, request_referrer_policy, initiator_origin, history_policy_container, about_base_url, origin, navigable_target_name, reload_pending, ever_populated, this, source_snapshot_params, target_snapshot_params, csp_navigation_type, user_involvement, navigation_id, received_navigation_params)
+
+            # 3. Otherwise, if entry's URL's scheme is not a fetch scheme, then set navigationParams to a new non-fetch
+            #    scheme navigation params, with:
+            elif not is_fetch_scheme:
+                # - id: navigationId
+                # - navigable: navigable
+                # - URL: entry's URL
+                # - target snapshot sandboxing flags: targetSnapshotParams's sandboxing flags
+                # - source snapshot has transient activation: sourceSnapshotParams's has transient activation
+                # - initiator origin: entry's document state's initiator origin
+                # FIXME: - navigation timing type: navTimingType
+                # - user involvement: userInvolvement
+                html_populate_wrap_navigation_params(this, received_navigation_params, HtmlNavigableNavigationParamsVariant.html_non_fetch_scheme_navigation_params(heap_allocate_html_non_fetch_scheme_navigation_params(vm_heap(js_cell_vm(this.js_cell())), navigation_id, this, url, target_snapshot_params.sandboxing_flags, source_snapshot_params.has_transient_activation, initiator_origin else trap("dereferencing a null initiator origin"), user_involvement)))
+        _:
+            html_populate_wrap_navigation_params(this, received_navigation_params, navigation_params)

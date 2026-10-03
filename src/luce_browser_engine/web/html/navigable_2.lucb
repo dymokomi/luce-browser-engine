@@ -1,0 +1,562 @@
+#==============================================================================================
+#
+#   navigable_2 - HTML::Navigable: initializing a navigable, its active document, browsing
+#   context and window, the navigable tree, choosing a navigable and session history entries
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibWeb/HTML/Navigable.cpp lines 397-889 (initialize_navigable,
+#       get_the_target_history_entry, activate_history_entry, the active document / browsing
+#       context / WindowProxy / Window, target_name, container, container_document,
+#       traversable_navigable, top_level_traversable, set_ongoing_navigation,
+#       choose_a_navigable, find_a_navigable_by_target_name, get_session_history_entries).
+#
+#       Copyright (c) 2022-2024, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2023-2025, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Initializing a navigable ================================================================
+
+## The static next_id of initialize_navigable.
+var html_navigable_next_id: i32 = 0
+
+## Ported from Navigable.cpp:398 Web::HTML::Navigable::initialize_navigable.
+# https://html.spec.whatwg.org/multipage/document-sequences.html#initialize-the-navigable
+pub func html_navigable_initialize_navigable(this: HtmlNavigable*, document_state: HtmlDocumentState*, parent: HtmlNavigable*?, document: DomDocument*):
+    this.m_id = ak.string_number_i64(html_navigable_next_id)
+    html_navigable_next_id += 1
+
+    # 1. Assert: documentState's document is non-null.
+    # NOTE: DocumentState no longer owns the document; it is passed separately and owned by the Navigable.
+
+    # 2. Let entry be a new session history entry, with
+    let entry = html_session_history_entry_create()
+    # URL: document's URL
+    html_session_history_entry_set_url(entry, dom_document_url(document))
+    # document state: documentState
+    html_session_history_entry_set_document_state(entry, document_state)
+    html_document_state_set_document_id(document_state, dom_node_unique_id(document.dom_node()))
+
+    # 3. Set navigable's current session history entry to entry.
+    this.m_current_session_history_entry = entry
+
+    # 4. Set navigable's active session history entry to entry.
+    this.m_active_session_history_entry = entry
+    this.m_active_document = document
+    dom_document_set_navigable(document, this)
+
+    # 5. Set navigable's parent to parent.
+    this.m_parent = parent
+    if parent != none and not this.m_is_svg_page:
+        this.m_external_content_source = display_list.external_content_source_create()
+        html_rendering_thread_set_presentation_mode(&this.m_rendering_thread, HtmlRenderingThreadPresentationMode.publish_to_external_content(html_navigable_external_content_source(this)))
+
+    # 6. Set the initial visibility state of documentState's document to navigable's traversable navigable's system visibility state.
+    let traversable = html_navigable_traversable_navigable(this) else trap("no traversable navigable")
+    dom_document_set_initial_visibility_state(document, html_traversable_navigable_system_visibility_state(traversable))
+
+## Ported from Navigable.cpp:434 Web::HTML::Navigable::get_the_target_history_entry.
+# https://html.spec.whatwg.org/multipage/browsing-the-web.html#getting-the-target-history-entry
+pub func html_navigable_get_the_target_history_entry(this: HtmlNavigable*, target_step: i32) -> HtmlSessionHistoryEntry*?:
+    # 1. Let entries be the result of getting session history entries for navigable.
+    let entries = html_navigable_get_session_history_entries(this)
+
+    # 2. Return the item in entries that has the greatest step less than or equal to step.
+    var result: HtmlSessionHistoryEntry*? = none
+    for entry in ak.vector_span(entries):
+        let entry_step = html_session_history_entry_step_int(entry)
+        if entry_step <= target_step:
+            if result == none or html_session_history_entry_step_int(result else trap("unreachable: checked above")) < entry_step:
+                result = entry
+
+    return result
+
+## `entry->step().get<int>()`.
+func html_session_history_entry_step_int(entry: HtmlSessionHistoryEntry*) -> i32:
+    match html_session_history_entry_step(entry):
+        .i32_(step):
+            return step
+        .html_session_history_entry_pending(_):
+            trap("Variant::get<int>() on a pending step")
+
+## Ported from Navigable.cpp:454 Web::HTML::Navigable::activate_history_entry.
+# https://html.spec.whatwg.org/multipage/browsing-the-web.html#activate-history-entry
+pub func html_navigable_activate_history_entry(this: HtmlNavigable*, entry: HtmlSessionHistoryEntry*?, document: DomDocument*):
+    # FIXME: 1. Save persisted state to the navigable's active session history entry.
+
+    # 2. Let newDocument be entry's document.
+    let new_document = document
+
+    # 3. Assert: newDocument's is initial about:blank is false, i.e., we never traverse
+    #    back to the initial about:blank Document because it always gets replaced when we
+    #    navigate away from it.
+    assert(not dom_document_is_initial_about_blank(new_document))
+
+    # 4. Set navigable's active session history entry to entry.
+    this.m_active_session_history_entry = entry
+    if let active_document = this.m_active_document:
+        if active_document != new_document:
+            dom_document_set_navigable(active_document, none)
+    this.m_active_document = new_document
+    dom_document_set_navigable(new_document, this)
+
+    # 5. Make active newDocument.
+    dom_document_make_active(new_document)
+
+    # 6. Set the initial visibility state of newDocument to navigable's traversable navigable's system visibility state.
+    let traversable = html_navigable_traversable_navigable(this) else trap("no traversable navigable")
+    dom_document_set_initial_visibility_state(new_document, html_traversable_navigable_system_visibility_state(traversable))
+
+    # AD-HOC: In the async state machine, documents created during populate may have completed
+    #         their loading lifecycle before being activated (when they had no navigable).
+    #         Re-trigger the post-load steps that were skipped:
+    #         - completely_finish_loading: fires the iframe load event on the container
+    #         - clear_navigation_load_event_guard: clears the parent's load event delayer
+    #           that was set in finalize_a_cross_document_navigation
+    #         - schedule_html_parser_end_check: allows the parent's parser end state to progress
+    if dom_document_ready_for_post_load_tasks(new_document):
+        html_navigable_clear_navigation_load_event_guard(this)
+        if let nav_container = html_navigable_container(this):
+            dom_document_schedule_html_parser_end_check(dom_node_document(nav_container.dom_node()))
+    if dom_document_completely_loaded_deferred(new_document):
+        dom_document_completely_finish_loading(new_document)
+
+    if html_ongoing_navigation_is_empty(this.m_ongoing_navigation):
+        for navigation_observer in ak.intrusive_list_begin(&this.m_navigation_observers):
+            if let navigation_complete = html_navigation_observer_navigation_complete(navigation_observer):
+                ak.function0_call(&navigation_complete.function)
+
+# mark: The active document, browsing context, WindowProxy and Window ===========================
+
+## Ported from Navigable.cpp:503 Web::HTML::Navigable::active_document.
+# https://html.spec.whatwg.org/multipage/document-sequences.html#nav-document
+pub func html_navigable_active_document(this: HtmlNavigable*) -> DomDocument*?:
+    # A navigable's active document is its active session history entry's document.
+    return this.m_active_document
+
+## Ported from Navigable.cpp:509 Web::HTML::Navigable::active_document_id.
+pub func html_navigable_active_document_id(this: HtmlNavigable*) -> i64?:
+    let document = this.m_active_document else return none
+    return dom_node_unique_id(document.dom_node())
+
+## Ported from Navigable.cpp:516 Web::HTML::Navigable::set_active_document.
+pub func html_navigable_set_active_document(this: HtmlNavigable*, document: DomDocument*?):
+    if let active_document = this.m_active_document:
+        if document != active_document:
+            dom_document_set_navigable(active_document, none)
+    this.m_active_document = document
+    if let new_document = document:
+        dom_document_set_navigable(new_document, this)
+
+    let active_entry = this.m_active_session_history_entry else trap("VERIFY: m_active_session_history_entry")
+    var document_id: i64? = none
+    if let new_document = document:
+        document_id = dom_node_unique_id(new_document.dom_node())
+    html_document_state_set_document_id(html_session_history_entry_document_state(active_entry) else trap("no document state"), document_id)
+
+## Ported from Navigable.cpp:532 Web::HTML::Navigable::active_browsing_context.
+# https://html.spec.whatwg.org/multipage/document-sequences.html#nav-bc
+pub func html_navigable_active_browsing_context(this: HtmlNavigable*) -> HtmlBrowsingContext*?:
+    # A navigable's active browsing context is its active document's browsing context.
+    # If this navigable is a traversable navigable, then its active browsing context will be a top-level browsing context.
+    if let document = html_navigable_active_document(this):
+        return dom_document_browsing_context(document)
+    return none
+
+## Ported from Navigable.cpp:542 Web::HTML::Navigable::active_window_proxy.
+# https://html.spec.whatwg.org/multipage/document-sequences.html#nav-wp
+pub func html_navigable_active_window_proxy(this: HtmlNavigable*) -> HtmlWindowProxy*?:
+    # A navigable's active WindowProxy is its active browsing context's associated WindowProxy.
+    if let browsing_context = html_navigable_active_browsing_context(this):
+        return html_browsing_context_window_proxy(browsing_context)
+    return none
+
+## Ported from Navigable.cpp:551 Web::HTML::Navigable::active_window.
+# https://html.spec.whatwg.org/multipage/document-sequences.html#nav-window
+pub func html_navigable_active_window(this: HtmlNavigable*) -> HtmlWindow*?:
+    # A navigable's active window is its active WindowProxy's [[Window]].
+    if let window_proxy = html_navigable_active_window_proxy(this):
+        return html_window_proxy_window(window_proxy)
+    return none
+
+## Ported from Navigable.cpp:560 Web::HTML::Navigable::target_name.
+# https://html.spec.whatwg.org/multipage/document-sequences.html#nav-target
+pub func html_navigable_target_name(this: HtmlNavigable*) -> ak.String:
+    # A navigable's target name is its active session history entry's document state's navigable target name.
+    let entry = html_navigable_active_session_history_entry(this) else trap("no active session history entry")
+    return html_document_state_navigable_target_name(html_session_history_entry_document_state(entry) else trap("no document state"))
+
+# mark: The navigable tree ======================================================================
+
+## Ported from Navigable.cpp:567 Web::HTML::Navigable::container.
+# https://html.spec.whatwg.org/multipage/document-sequences.html#nav-container
+pub func html_navigable_container(this: HtmlNavigable*) -> HtmlNavigableContainer*?:
+    # The container of a navigable navigable is the navigable container whose nested navigable is navigable, or null if there is no such element.
+    return html_navigable_container_navigable_container_with_content_navigable(this)
+
+## Ported from Navigable.cpp:574 Web::HTML::Navigable::container_document.
+# https://html.spec.whatwg.org/multipage/document-sequences.html#nav-container-document
+pub func html_navigable_container_document(this: HtmlNavigable*) -> DomDocument*?:
+    # 1. If navigable's container is null, then return null.
+    let container = html_navigable_container(this) else return none
+
+    # 2. Return navigable's container's node document.
+    return dom_node_document(container.dom_node())
+
+## Ported from Navigable.cpp:587 Web::HTML::Navigable::traversable_navigable.
+# https://html.spec.whatwg.org/multipage/document-sequences.html#nav-traversable
+pub func html_navigable_traversable_navigable(this: HtmlNavigable*) -> HtmlTraversableNavigable*?:
+    # 1. Let navigable be inputNavigable.
+    var navigable: HtmlNavigable*? = this
+
+    # 2. While navigable is not a traversable navigable, set navigable to navigable's parent.
+    while let current = navigable:
+        if is_html_traversable_navigable(current):
+            break
+        navigable = html_navigable_parent(current)
+
+    # 3. Return navigable.
+    return (HtmlTraversableNavigable*?)navigable
+
+## Ported from Navigable.cpp:601 Web::HTML::Navigable::top_level_traversable.
+# https://html.spec.whatwg.org/multipage/document-sequences.html#nav-top
+pub func html_navigable_top_level_traversable(this: HtmlNavigable*) -> HtmlTraversableNavigable*?:
+    # 1. Let navigable be inputNavigable.
+    var navigable = this
+
+    # 2. While navigable's parent is not null, set navigable to navigable's parent.
+    while let parent = html_navigable_parent(navigable):
+        navigable = parent
+
+    # 3. Return navigable.
+    return as_html_traversable_navigable(navigable)
+
+## Ported from Navigable.cpp:615 Web::HTML::Navigable::set_ongoing_navigation.
+# https://html.spec.whatwg.org/multipage/browsing-the-web.html#set-the-ongoing-navigation
+pub func html_navigable_set_ongoing_navigation(this: HtmlNavigable*, ongoing_navigation: EmptyOrHtmlNavigableTraversalOrString):
+    # 1. If navigable's ongoing navigation is equal to newValue, then return.
+    if html_ongoing_navigation_equals(this.m_ongoing_navigation, ongoing_navigation):
+        return
+
+    # 2. Inform the navigation API about aborting navigation given navigable.
+    html_navigable_inform_the_navigation_api_about_aborting_navigation(this)
+
+    # 3. Set navigable's ongoing navigation to newValue.
+    let was_traversal = html_ongoing_navigation_is_traversal(this.m_ongoing_navigation)
+    this.m_ongoing_navigation = ongoing_navigation
+
+    for navigation_observer in ak.intrusive_list_begin(&this.m_navigation_observers):
+        if let ongoing_navigation_changed = html_navigation_observer_ongoing_navigation_changed(navigation_observer):
+            ak.function0_call(&ongoing_navigation_changed.function)
+
+    # AD-HOC: If we just finished a traversal and there are navigations that were deferred because the traversal was
+    #         ongoing, process them now.
+    if was_traversal and not html_ongoing_navigation_is_traversal(ongoing_navigation):
+        while not ak.vector_is_empty(&this.m_pending_navigations):
+            let navigation_params = ak.vector_take_first(&this.m_pending_navigations)
+            html_navigable_begin_navigation(this, navigation_params)
+
+## `a == b` on Variant<Empty, Traversal, String>: the same alternative holding equal values.
+pub func html_ongoing_navigation_equals(a: EmptyOrHtmlNavigableTraversalOrString, b: EmptyOrHtmlNavigableTraversalOrString) -> bool:
+    match a:
+        .empty:
+            return html_ongoing_navigation_is_empty(b)
+        .html_navigable_traversal(_):
+            return html_ongoing_navigation_is_traversal(b)
+        .string(a_string):
+            match b:
+                .string(b_string):
+                    return ak.string_equals(&a_string, &b_string)
+                _:
+                    return false
+
+## `ongoing_navigation.has<Empty>()`.
+pub func html_ongoing_navigation_is_empty(ongoing_navigation: EmptyOrHtmlNavigableTraversalOrString) -> bool:
+    match ongoing_navigation:
+        .empty:
+            return true
+        _:
+            return false
+
+## `ongoing_navigation.has<Traversal>()`.
+pub func html_ongoing_navigation_is_traversal(ongoing_navigation: EmptyOrHtmlNavigableTraversalOrString) -> bool:
+    match ongoing_navigation:
+        .html_navigable_traversal(_):
+            return true
+        _:
+            return false
+
+## `ongoing_navigation() != navigation_id` for an Optional<String> navigation ID: whether the
+## ongoing navigation is not that ID (a navigation ID is a String alternative).
+pub func html_ongoing_navigation_differs_from_id(ongoing_navigation: EmptyOrHtmlNavigableTraversalOrString, navigation_id: ak.String) -> bool:
+    match ongoing_navigation:
+        .string(id):
+            return not ak.string_equals(&id, &navigation_id)
+        _:
+            return true
+
+# mark: Choosing a navigable ====================================================================
+
+## The captures of choose_a_navigable's create_new_traversable closure.
+struct HtmlNavigableChooseANavigableCreateNewTraversable:
+    var this: HtmlNavigable*
+    var no_opener: HtmlNoOpener
+    var target_name: ak.String
+    var activate_tab: HtmlActivateTab
+    var window_features: ak.OrderedHashMap[ak.String, ak.String, ak.StringTraits]
+
+## choose_a_navigable's create_new_traversable closure: a new web view's top-level traversable.
+func html_navigable_choose_a_navigable_create_new_traversable(context: void*?, opener: HtmlBrowsingContext*?) -> HtmlNavigable*:
+    let captures = (HtmlNavigableChooseANavigableCreateNewTraversable*)(context else trap("no captures"))
+    let this = captures.this
+    let traversable_page = html_navigable_page((html_navigable_traversable_navigable(this) else trap("no traversable navigable")).html_navigable())
+    let hints = html_web_view_hints_from_tokenised_features(&captures.window_features, traversable_page)
+    let result = page_client_page_did_request_new_web_view(page_client(traversable_page), captures.activate_tab, hints, captures.no_opener)
+    let page = result.page else trap("the new web view has no page")
+    let traversable = html_traversable_navigable_create_a_new_top_level_traversable(page, opener, captures.target_name)
+    page_set_top_level_traversable(page, traversable)
+    html_traversable_navigable_set_window_handle(traversable, result.window_handle)
+    return traversable.html_navigable()
+
+## Ported from Navigable.cpp:644 Web::HTML::Navigable::choose_a_navigable.
+# https://html.spec.whatwg.org/multipage/document-sequences.html#the-rules-for-choosing-a-navigable
+pub func html_navigable_choose_a_navigable(this: HtmlNavigable*, name: ak.StringView, no_opener: HtmlNoOpener, activate_tab: HtmlActivateTab = HtmlActivateTab.yes, window_features: const ak.OrderedHashMap[ak.String, ak.String, ak.StringTraits]*? = none) -> HtmlNavigableChosenNavigable:
+    var the_name = name
+    var the_no_opener = no_opener
+
+    # 1. Let chosen be null.
+    var chosen: HtmlNavigable*? = none
+
+    # 2. Let windowType be "existing or none".
+    var window_type = HtmlWindowType.existing_or_none
+
+    # 3. Let sandboxingFlagSet be currentNavigable's active document's active sandboxing flag set.
+    let sandboxing_flag_set = dom_document_active_sandboxing_flag_set(html_navigable_active_document(this) else trap("no active document"))
+
+    # 4. If name is the empty string or an ASCII case-insensitive match for "_self", then set chosen to currentNavigable.
+    if ak.string_view_is_empty(&the_name) or ak.string_view_equals_ignoring_ascii_case(&the_name, ak.sv("_self")):
+        chosen = this
+
+    # 5. Otherwise, if name is an ASCII case-insensitive match for "_parent",
+    #    set chosen to currentNavigable's parent, if any, and currentNavigable otherwise.
+    elif ak.string_view_equals_ignoring_ascii_case(&the_name, ak.sv("_parent")):
+        if let parent = html_navigable_parent(this):
+            chosen = parent
+        else:
+            chosen = this
+
+    # 6. Otherwise, if name is an ASCII case-insensitive match for "_top",
+    #    set chosen to currentNavigable's traversable navigable.
+    elif ak.string_view_equals_ignoring_ascii_case(&the_name, ak.sv("_top")):
+        chosen = (HtmlNavigable*?)html_navigable_traversable_navigable(this)
+
+    # 7. Otherwise, if name is not an ASCII case-insensitive match for "_blank" and noopener is false, then set chosen
+    #    to the result of finding a navigable by target name given name and currentNavigable.
+    elif not ak.string_view_equals_ignoring_ascii_case(&the_name, ak.sv("_blank")) and the_no_opener == HtmlNoOpener.no:
+        chosen = html_navigable_find_a_navigable_by_target_name(this, the_name)
+
+    # 8. If chosen is null, then a new top-level traversable is being requested, and what happens depends on the user
+    #    agent's configuration and abilities — it is determined by the rules given for the first applicable option
+    #    from the following list:
+    if chosen == none:
+        # --> If currentNavigable's active window does not have transient activation and the user agent has been configured to
+        #     not show popups (i.e., the user agent has a "popup blocker" enabled)
+        let traversable_page = html_navigable_page((html_navigable_traversable_navigable(this) else trap("no traversable navigable")).html_navigable())
+        if html_navigable_active_window(this) != none and not html_window_has_transient_activation(html_navigable_active_window(this) else trap("unreachable: checked above")) and page_should_block_pop_ups(traversable_page):
+            # FIXME: The user agent may inform the user that a popup has been blocked.
+            ak.dbgln("Pop-up blocked!")
+
+        # --> If sandboxingFlagSet has the sandboxed auxiliary navigation browsing context flag set
+        elif html_has_flag(sandboxing_flag_set, HtmlSandboxingFlagSet.sandboxed_auxiliary_navigation):
+            # FIXME: The user agent may report to a developer console that a popup has been blocked.
+            ak.dbgln("Pop-up blocked!")
+
+        # --> If the user agent has been configured such that in this instance it will create a new top-level traversable
+        else:
+            # (C++: `else if (true) { // FIXME: When is this the case?`; the two `else if (false)` branches after it, which
+            #  would choose currentNavigable or not find a navigable, are never taken.)
+
+            # 1. Consume user activation of currentNavigable's active window.
+            html_window_consume_user_activation(html_navigable_active_window(this) else trap("no active window"))
+
+            # 2. Set windowType to "new and unrestricted".
+            window_type = HtmlWindowType.new_and_unrestricted
+
+            # 3. Let currentDocument be currentNavigable's active document.
+            let current_document = html_navigable_active_document(this) else trap("no active document")
+
+            # 4. If currentDocument's opener policy's value is "same-origin" or "same-origin-plus-COEP",
+            #    and currentDocument's origin is not same origin with currentDocument's relevant settings object's top-level origin, then:
+            let opener_policy = dom_document_opener_policy(current_document)
+            let current_origin = dom_document_origin(current_document)
+            if (opener_policy.value == HtmlOpenerPolicyValue.same_origin or opener_policy.value == HtmlOpenerPolicyValue.same_origin_plus_coep) and not web_url.origin_is_same_origin(&current_origin, html_relevant_settings_object_dom_node(current_document.dom_node()).environment.top_level_origin else trap("no top-level origin")):
+                # 1. Set noopener to true.
+                the_no_opener = HtmlNoOpener.yes
+
+                # 2. Set name to "_blank".
+                the_name = ak.sv("_blank")
+
+                # 3. Set windowType to "new with no opener".
+                window_type = HtmlWindowType.new_with_no_opener
+            # NOTE: In the presence of an opener policy,
+            #       nested documents that are cross-origin with their top-level browsing context's active document always set noopener to true.
+
+            # 5. Let targetName be the empty string.
+            var target_name = ak.string_new()
+
+            # 6. If name is not an ASCII case-insensitive match for "_blank", then set targetName to name.
+            if not ak.string_view_equals_ignoring_ascii_case(&the_name, ak.sv("_blank")):
+                target_name = ak.string_from_utf8(the_name) else trap("MUST: String::from_utf8")
+
+            var features = ak.OrderedHashMap[ak.String, ak.String, ak.StringTraits]()
+            if let given_features = window_features:
+                features = ak.ordered_hash_map_clone(given_features) else trap("MUST: OrderedHashMap::clone")
+            let captures = new HtmlNavigableChooseANavigableCreateNewTraversable(this = this, no_opener = the_no_opener, target_name = target_name, activate_tab = activate_tab, window_features = features) else trap("out of memory")
+            let create_new_traversable = gc.create_function1(gc.cell_heap(this.cell()), ak.Function1[HtmlBrowsingContext*?, HtmlNavigable*](call = html_navigable_choose_a_navigable_create_new_traversable, context = captures))
+
+            # 7. If noopener is true, then set chosen to the result of creating a new top-level traversable given null and targetName.
+            if the_no_opener == HtmlNoOpener.yes:
+                chosen = ak.function1_call(&create_new_traversable.function, none)
+
+            # 8. Otherwise:
+            else:
+                # 1. Set chosen to the result of creating a new top-level traversable given currentNavigable's active browsing context, targetName, and currentNavigable.
+                # FIXME: "and currentNavigable", which is the openerNavigableForWebDriver parameter.
+                let new_navigable = ak.function1_call(&create_new_traversable.function, html_navigable_active_browsing_context(this))
+                chosen = new_navigable
+
+                # 2. If sandboxingFlagSet's sandboxed navigation browsing context flag is set,
+                #    then set chosen's active browsing context's one permitted sandboxed navigator to currentNavigable's active browsing context.
+                if html_has_flag(sandboxing_flag_set, HtmlSandboxingFlagSet.sandboxed_navigation):
+                    html_browsing_context_set_the_one_permitted_sandboxed_navigator(html_navigable_active_browsing_context(new_navigable) else trap("no active browsing context"), html_navigable_active_browsing_context(this))
+
+            let chosen_navigable = chosen else trap("unreachable: chosen above")
+
+            # 9. If sandboxingFlagSet's sandbox propagates to auxiliary browsing contexts flag is set,
+            #     then all the flags that are set in sandboxingFlagSet must be set in chosen's active browsing context's popup sandboxing flag set.
+            if html_has_flag(sandboxing_flag_set, HtmlSandboxingFlagSet.sandbox_propagates_to_auxiliary_browsing_contexts):
+                let chosen_browsing_context = html_navigable_active_browsing_context(chosen_navigable) else trap("no active browsing context")
+                html_browsing_context_set_popup_sandboxing_flag_set(chosen_browsing_context, html_browsing_context_popup_sandboxing_flag_set(chosen_browsing_context) | sandboxing_flag_set)
+
+            # 10. Set chosen's is created by web content to true.
+            html_traversable_navigable_set_is_created_by_web_content(as_html_traversable_navigable(chosen_navigable), true)
+
+    # 9. Return chosen and windowType
+    return HtmlNavigableChosenNavigable(navigable = chosen, window_type = window_type)
+
+## Ported from Navigable.cpp:786 Web::HTML::Navigable::find_a_navigable_by_target_name.
+# https://html.spec.whatwg.org/multipage/document-sequences.html#find-a-navigable-by-target-name
+pub func html_navigable_find_a_navigable_by_target_name(this: HtmlNavigable*, name: ak.StringView) -> HtmlNavigable*?:
+    # 1. Let currentDocument be currentNavigable's active document.
+    let current_document = html_navigable_active_document(this) else trap("no active document")
+
+    # 2. Let sourceSnapshotParams be the result of snapshotting source snapshot params given currentDocument.
+    let source_snapshot_params = dom_document_snapshot_source_snapshot_params(current_document)
+
+    # 3. Let subtreesToSearch be an implementation-defined choice of one of the following:
+    #    - « currentNavigable's traversable navigable, currentNavigable »
+    #    - the inclusive ancestor navigables of currentDocument
+    # FIXME: Decide which to use, or wait until the spec picks one.
+    var subtrees_to_search = dom_document_inclusive_ancestor_navigables(current_document)
+
+    # 4. For each subtreeToSearch of subtreesToSearch, in reverse order:
+    var index = ak.vector_size(&subtrees_to_search)
+    while index > 0:
+        index -= 1
+        let subtree_to_search = *ak.vector_at(&subtrees_to_search, index) else trap("no subtree")
+
+        # 1. Let documentToSearch be subtreeToSearch's active document.
+        let document_to_search = html_navigable_active_document(subtree_to_search) else trap("no active document")
+
+        # 2. For each navigable of the inclusive descendant navigables of documentToSearch:
+        var descendants = dom_document_inclusive_descendant_navigables(document_to_search)
+        for maybe_navigable in ak.vector_span(&descendants):
+            let navigable = maybe_navigable else trap("no navigable")
+
+            # 1. If currentNavigable is not allowed by sandboxing to navigate navigable given sourceSnapshotParams, then optionally continue.
+            if not html_navigable_allowed_by_sandboxing_to_navigate(this, navigable, source_snapshot_params):
+                continue
+
+            # 2. If navigable's target name is name, then return navigable.
+            let target_name = html_navigable_target_name(navigable)
+            if ak.string_eq_string_view(&target_name, name):
+                return navigable
+
+    # 5. Let currentTopLevelBrowsingContext be currentNavigable's active browsing context's top-level browsing context.
+    let current_top_level_browsing_context = html_browsing_context_top_level_browsing_context(html_navigable_active_browsing_context(this) else trap("no active browsing context")) else trap("no top-level browsing context")
+
+    # 6. Let group be currentTopLevelBrowsingContext's group.
+    let group = html_browsing_context_group(current_top_level_browsing_context) else trap("no group")
+
+    # 7. For each topLevelBrowsingContext of group's browsing context set, in an implementation-defined order (the user agent should pick a consistent ordering, such as the most recently opened, most recently focused, or more closely related):
+    for top_level_browsing_context_pointer in ak.ordered_hash_table_begin(html_browsing_context_group_browsing_context_set(group)):
+        let top_level_browsing_context = *top_level_browsing_context_pointer
+
+        # 1. If currentTopLevelBrowsingContext is topLevelBrowsingContext, then continue.
+        if current_top_level_browsing_context == top_level_browsing_context:
+            continue
+
+        # 2. Let documentToSearch be topLevelBrowsingContext's active document.
+        let document_to_search = html_browsing_context_active_document(top_level_browsing_context) else trap("no active document")
+
+        # 3. For each navigable of the inclusive descendant navigables of documentToSearch:
+        var descendants = dom_document_inclusive_descendant_navigables(document_to_search)
+        for maybe_navigable in ak.vector_span(&descendants):
+            let navigable = maybe_navigable else trap("no navigable")
+
+            # 1. If currentNavigable's active browsing context is not familiar with navigable's active browsing context, then continue.
+            if not html_browsing_context_is_familiar_with(html_navigable_active_browsing_context(this) else trap("no active browsing context"), html_navigable_active_browsing_context(navigable) else trap("no active browsing context")):
+                continue
+
+            # 2. If currentNavigable is not allowed by sandboxing to navigate navigable given sourceSnapshotParams, then optionally continue.
+            if not html_navigable_allowed_by_sandboxing_to_navigate(this, navigable, source_snapshot_params):
+                continue
+
+            # 3. If navigable's target name is name, then return navigable.
+            let target_name = html_navigable_target_name(navigable)
+            if ak.string_eq_string_view(&target_name, name):
+                return navigable
+
+    # 8. Return null.
+    return none
+
+# mark: Session history entries =================================================================
+
+## Ported from Navigable.cpp:853 Web::HTML::Navigable::get_session_history_entries.
+# https://html.spec.whatwg.org/multipage/browsing-the-web.html#getting-session-history-entries
+pub func html_navigable_get_session_history_entries(this: HtmlNavigable*) -> ak.Vector[HtmlSessionHistoryEntry*]*:
+    # 1. Let traversable be navigable's traversable navigable.
+    let traversable = html_navigable_traversable_navigable(this) else trap("no traversable navigable")
+
+    # FIXME: 2. Assert: this is running within traversable's session history traversal queue.
+
+    # 3. If navigable is traversable, return traversable's session history entries.
+    if this == traversable.html_navigable():
+        return html_traversable_navigable_session_history_entries(traversable)
+
+    # 4. Let docStates be an empty ordered set of document states.
+    var doc_states = ak.Vector[HtmlDocumentState*?]()
+
+    # 5. For each entry of traversable's session history entries, append entry's document state to docStates.
+    for entry in ak.vector_span(html_traversable_navigable_session_history_entries(traversable)):
+        ak.vector_append_t(&doc_states, html_session_history_entry_document_state(entry))
+
+    # 6. For each docState of docStates:
+    var i: usize = 0
+    while i < ak.vector_size(&doc_states):
+        let doc_state = *ak.vector_at(&doc_states, i) else trap("dereferencing a null document state")
+        i += 1
+
+        # 1. For each nestedHistory of docState's nested histories:
+        for nested_history in &ak.vector_span(html_document_state_nested_histories(doc_state)):
+            # 1. If nestedHistory's id equals navigable's id, return nestedHistory's entries.
+            let id = html_navigable_id(this)
+            if ak.string_equals(&nested_history.id, &id):
+                return &nested_history.entries
+
+            # 2. For each entry of nestedHistory's entries, append entry's document state to docStates.
+            for entry in ak.vector_span(&nested_history.entries):
+                ak.vector_append_t(&doc_states, html_session_history_entry_document_state(entry))
+
+    trap("VERIFY_NOT_REACHED")

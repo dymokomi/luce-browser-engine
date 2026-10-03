@@ -1,0 +1,557 @@
+#==============================================================================================
+#
+#   navigable_7 - HTML::Navigable: the viewport, scrolling, the navigation API hooks, the
+#   selection, observers, stopping, and the rendering entry points
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibWeb/HTML/Navigable.cpp lines 2800-3262 (to_top_level_rect and
+#       _position, set_viewport_size, clamp_viewport_scroll_offset,
+#       perform_scroll_of_viewport_scrolling_box, has_a_rendering_opportunity, informing the
+#       navigation API, is_focused, visible_text_in_range, selected_text, select_all, paste, the
+#       snapshot containing block, navigation observers, stop_loading,
+#       set_has_session_history_entry_and_ready_for_navigation, ready_to_paint,
+#       external_content_source, record_display_list_and_scroll_state, paint_next_frame,
+#       render_screenshot, scroll_viewport_by_delta, perform_a_scroll_of_the_viewport,
+#       reset_zoom, has_inclusive_ancestor_with_visibility_hidden), with the remaining inline
+#       functions of Navigable.h (viewport_rect, taken ahead by region r43, is now here).
+#
+#       Copyright (c) 2022-2024, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2023-2025, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Top-level coordinates ===================================================================
+
+## Ported from Navigable.cpp:2801 Web::HTML::Navigable::to_top_level_rect.
+pub func html_navigable_to_top_level_rect(this: HtmlNavigable*, a_rect: gfx.CssPixelRect) -> gfx.CssPixelRect:
+    var rect = a_rect
+    gfx.css_pixel_rect_set_location(&rect, html_navigable_to_top_level_position(this, gfx.css_pixel_rect_location(&a_rect)))
+    return rect
+
+## Ported from Navigable.cpp:2808 Web::HTML::Navigable::to_top_level_position.
+pub func html_navigable_to_top_level_position(this: HtmlNavigable*, a_position: gfx.CssPixelPoint) -> gfx.CssPixelPoint:
+    var position = a_position
+    var ancestor: HtmlNavigable*? = this
+    while let current = ancestor:
+        if is_html_traversable_navigable(current):
+            break
+        let container = html_navigable_container(current) else return gfx.CssPixelPoint()
+        let paintable = dom_node_paintable(container.dom_node()) else return gfx.CssPixelPoint()
+
+        var transformed = false
+        if let paintable_box = as_if_paint_paintable_box(paintable):
+            if paint_paintable_box_accumulated_visual_context_index(paintable_box) != 0:
+                var point = paint_paintable_box_absolute_position(paintable_box)
+                gfx.css_pixel_point_translate_by_css_pixel_point(&point, position)
+                var point_rect: gfx.CssPixelRect = ---
+                gfx.css_pixel_rect_construct_css_pixel_point(&point_rect, point, gfx.CssPixelSize())
+                let viewport_rect = paint_paintable_box_transform_rect_to_viewport(paintable_box, point_rect)
+                position = gfx.css_pixel_rect_location(&viewport_rect)
+                transformed = true
+        if not transformed:
+            gfx.css_pixel_point_translate_by_css_pixel_point(&position, paint_paintable_box_type_agnostic_position(paintable))
+        ancestor = html_navigable_parent(current)
+    return position
+
+# mark: The viewport ============================================================================
+
+## Ported from Navigable.cpp:2832 Web::HTML::Navigable::set_viewport_size.
+pub func html_navigable_set_viewport_size(this: HtmlNavigable*, size: gfx.CssPixelSize, invalidate_display_list: InvalidateDisplayList = InvalidateDisplayList.no):
+    if gfx.css_pixel_size_eq(&this.m_viewport_size, size) and invalidate_display_list == InvalidateDisplayList.no:
+        return
+
+    this.m_viewport_size = size
+
+    if not this.m_is_svg_page:
+        paint_backing_store_manager_restart_resize_timer(this.m_backing_store_manager)
+        paint_backing_store_manager_resize_backing_stores_if_needed(this.m_backing_store_manager, PaintBackingStoreManagerWindowResizingInProgress.yes)
+        this.m_pending_set_browser_zoom_request = false
+
+    if let document = html_navigable_active_document(this):
+        # NOTE: Resizing the viewport changes the reference value for viewport-relative CSS lengths.
+        dom_node_invalidate_style(document.dom_node(), DomStyleInvalidationReason.navigable_set_viewport_size)
+        dom_document_set_needs_media_query_evaluation(document)
+        dom_node_set_needs_layout_update(document.dom_node(), DomSetNeedsLayoutReason.navigable_set_viewport_size)
+
+    if let document = html_navigable_active_document(this):
+        dom_document_set_needs_repaint_t(document, invalidate_display_list)
+
+        dom_document_inform_all_viewport_clients_about_the_current_viewport_rect(document)
+
+        # Schedule the HTML event loop to ensure that a `resize` event gets fired.
+        html_event_loop_schedule(html_main_thread_event_loop())
+
+## Ported from Navigable.cpp:2862 Web::HTML::Navigable::clamp_viewport_scroll_offset.
+pub func html_navigable_clamp_viewport_scroll_offset(this: HtmlNavigable*):
+    let document = html_navigable_active_document(this) else return
+    if not dom_document_layout_is_up_to_date(document):
+        return
+    let paintable_box = dom_node_paintable_box(document.dom_node()) else return
+    let scrollable_overflow_rect = paint_paintable_box_scrollable_overflow_rect(paintable_box) else return
+    let max_x = gfx.css_pixel_rect_width(&scrollable_overflow_rect).sub(gfx.css_pixel_size_width(&this.m_viewport_size))
+    let max_y = gfx.css_pixel_rect_height(&scrollable_overflow_rect).sub(gfx.css_pixel_size_height(&this.m_viewport_size))
+    let clamped = gfx.CssPixelPoint(m_x = html_css_pixels_max(gfx.CssPixels.from_int(0), html_css_pixels_min(gfx.css_pixel_point_x(&this.m_viewport_scroll_offset), max_x)), m_y = html_css_pixels_max(gfx.CssPixels.from_int(0), html_css_pixels_min(gfx.css_pixel_point_y(&this.m_viewport_scroll_offset), max_y)))
+    if not gfx.css_pixel_point_eq(&clamped, this.m_viewport_scroll_offset):
+        html_navigable_perform_scroll_of_viewport_scrolling_box(this, clamped)
+
+## AK::min of two CSSPixels.
+func html_css_pixels_min(a: gfx.CssPixels, b: gfx.CssPixels) -> gfx.CssPixels:
+    return a if a.lt(b) else b
+
+## AK::max of two CSSPixels.
+func html_css_pixels_max(a: gfx.CssPixels, b: gfx.CssPixels) -> gfx.CssPixels:
+    return b if a.lt(b) else a
+
+## Ported from Navigable.cpp:2882 Web::HTML::Navigable::perform_scroll_of_viewport_scrolling_box.
+pub func html_navigable_perform_scroll_of_viewport_scrolling_box(this: HtmlNavigable*, new_position: gfx.CssPixelPoint):
+    # NB: This method is ad-hoc, but is currently called where "perform a scroll of a scrolling box" would be,
+    #     where the box is the viewport.
+    #     https://drafts.csswg.org/cssom-view/#perform-a-scroll
+    if not gfx.css_pixel_point_eq(&this.m_viewport_scroll_offset, new_position):
+        this.m_viewport_scroll_offset = new_position
+        html_navigable_scroll_offset_did_change(this)
+
+        if let document = html_navigable_active_document(this):
+            dom_document_set_needs_repaint_t(document, InvalidateDisplayList.no)
+            dom_document_set_needs_to_refresh_scroll_state(document, true)
+            dom_document_inform_all_viewport_clients_about_the_current_viewport_rect(document)
+
+    # Schedule the HTML event loop to ensure that a `resize` event gets fired.
+    html_event_loop_schedule(html_main_thread_event_loop())
+
+## Ported from Navigable.cpp:2903 Web::HTML::Navigable::has_a_rendering_opportunity.
+# https://html.spec.whatwg.org/multipage/webappapis.html#rendering-opportunity
+pub func html_navigable_has_a_rendering_opportunity(this: HtmlNavigable*) -> bool:
+    # A navigable has a rendering opportunity if the user agent is currently able to present
+    # the contents of the navigable to the user,
+    # accounting for hardware refresh rate constraints and user agent throttling for performance reasons,
+    # but considering content presentable even if it's outside the viewport.
+
+    # A navigable's rendering opportunities are determined based on hardware constraints
+    # such as display refresh rates and other factors such as page performance
+    # or whether its active document's visibility state is "visible".
+    # Rendering opportunities typically occur at regular intervals.
+
+    # FIXME: Return `false` here if we're an inactive browser tab.
+    return true
+
+# mark: The navigation API ======================================================================
+
+## Ported from Navigable.cpp:2920 Web::HTML::Navigable::inform_the_navigation_api_about_child_navigable_destruction.
+# https://html.spec.whatwg.org/multipage/nav-history-apis.html#inform-the-navigation-api-about-child-navigable-destruction
+pub func html_navigable_inform_the_navigation_api_about_child_navigable_destruction(this: HtmlNavigable*):
+    # 1. Inform the navigation API about aborting navigation in navigable.
+    html_navigable_inform_the_navigation_api_about_aborting_navigation(this)
+
+    # FIXME: 2. Let navigation be navigable's active window's navigation API.
+
+    # FIXME: 3. Let traversalAPIMethodTrackers be a clone of navigation's upcoming traverse API method trackers.
+
+    # FIXME: 4. For each apiMethodTracker of traversalAPIMethodTrackers: reject the finished promise for apiMethodTracker with a new "AbortError" DOMException created in navigation's relevant realm.
+
+## Ported from Navigable.cpp:2933 Web::HTML::Navigable::inform_the_navigation_api_about_aborting_navigation.
+# https://html.spec.whatwg.org/multipage/nav-history-apis.html#inform-the-navigation-api-about-aborting-navigation
+func html_navigable_inform_the_navigation_api_about_aborting_navigation(this: HtmlNavigable*):
+    # 1. If this algorithm is running on navigable's active window's relevant agent's event loop, then continue on to the following steps.
+    #    Otherwise, queue a global task on the navigation and traversal task source given navigable's active window to run the following steps.
+    # NB: WebContent uses a single main-thread event loop, so the active window's relevant agent is always running on
+    #     the current event loop and we run the steps inline. Queuing here would defer the abort past the creation of
+    #     a new ongoing navigate event by a subsequent fire_a_push_replace_reload_navigate_event, causing the deferred
+    #     abort to cancel that newer event.
+
+    # AD-HOC: Not in the spec but subsequent steps will fail if the navigable doesn't have an active window.
+    let window = html_navigable_active_window(this) else return
+
+    var execution_context: HtmlTemporaryExecutionContext = ---
+    html_temporary_execution_context_construct_realm(&execution_context, bind_platform_object_realm(window.bind_platform_object()), HtmlTemporaryExecutionContextCallbacksEnabled.no)
+    defer html_temporary_execution_context_destruct(&execution_context)
+
+    # 2. Let navigation be navigable's active window's navigation API.
+    let navigation = html_window_navigation(window)
+
+    # 3. If navigation's ongoing navigate event is null, then return.
+    if html_navigation_ongoing_navigate_event(navigation) == none:
+        return
+
+    # 4. Abort the ongoing navigation given navigation.
+    html_navigation_abort_the_ongoing_navigation(navigation)
+
+## Ported from Navigable.cpp:2959 Web::HTML::Navigable::is_focused.
+pub func html_navigable_is_focused(this: HtmlNavigable*) -> bool:
+    return page_focused_navigable(this.m_page) == this
+
+# mark: The selection ===========================================================================
+
+## `static_cast<DOM::Text const&>(node).data()` of a Text node.
+func html_text_data(node: DomNode*) -> ak.Utf16String:
+    return dom_character_data_data(as_dom_character_data(node))
+
+## Ported from Navigable.cpp:2964 Web::HTML::visible_text_in_range.
+func html_visible_text_in_range(range: DomRange*) -> ak.String:
+    # NOTE: This is an adaption of Range stringification, but we skip over DOM nodes that don't have a corresponding layout node.
+    var builder = ak.string_builder_new()
+    let abstract_range = range.dom_abstract_range()
+    let start_container = dom_abstract_range_start_container(abstract_range)
+    let end_container = dom_abstract_range_end_container(abstract_range)
+    let start_offset = dom_abstract_range_start_offset(abstract_range)
+    let end_offset = dom_abstract_range_end_offset(abstract_range)
+
+    if start_container == end_container and is_dom_text(start_container):
+        if dom_node_layout_node(start_container) == none:
+            return ak.string_new()
+        let data = html_text_data(start_container)
+        let view = ak.utf16_string_base_substring_view_usize(&data.utf16_string_base, (usize)start_offset, (usize)(end_offset - start_offset))
+        return ak.utf16_view_to_utf8_but_should_be_ported_to_utf16(&view)
+
+    if is_dom_text(start_container) and dom_node_layout_node(start_container) != none:
+        let data = html_text_data(start_container)
+        ak.string_builder_append_utf16_view(&builder, ak.utf16_string_base_substring_view(&data.utf16_string_base, (usize)start_offset))
+
+    var captures = HtmlVisibleTextInRangeCaptures(builder = &builder)
+    dom_range_for_each_contained_const(range, ak.Function1[DomNode*, ak.IterationDecision](call = html_visible_text_in_range_contained, context = &captures))
+
+    if is_dom_text(end_container) and dom_node_layout_node(end_container) != none:
+        let data = html_text_data(end_container)
+        ak.string_builder_append_utf16_view(&builder, ak.utf16_string_base_substring_view_usize(&data.utf16_string_base, 0, (usize)end_offset))
+
+    return ak.string_builder_to_string(&builder) else trap("MUST: StringBuilder::to_string")
+
+## The captures of visible_text_in_range's for_each_contained callback.
+struct HtmlVisibleTextInRangeCaptures:
+    var builder: ak.StringBuilder*
+
+## visible_text_in_range's for_each_contained callback.
+func html_visible_text_in_range_contained(context: void*?, node: DomNode*) -> ak.IterationDecision:
+    let captures = (HtmlVisibleTextInRangeCaptures*)(context else trap("no captures"))
+    if is_dom_text(node) and dom_node_layout_node(node) != none:
+        let data = html_text_data(node)
+        ak.string_builder_append_utf16_view(captures.builder, ak.utf16_string_base_utf16_view(&data.utf16_string_base))
+    return ak.IterationDecision.continue_
+
+## Ported from Navigable.cpp:2990 Web::HTML::Navigable::selected_text.
+pub func html_navigable_selected_text(this: HtmlNavigable*) -> ak.String:
+    let document = html_navigable_active_document(this) else return ak.string_new()
+
+    dom_document_update_layout(document, DomUpdateLayoutReason.navigable_selected_text)
+
+    if let active_element = dom_document_active_element(document):
+        if let input_element = as_if_html_input_element(active_element):
+            if html_input_element_type_state(input_element) == HtmlInputElementTypeAttributeState.password:
+                # Apparently nobody wants bullet characters. We leave the clipboard alone here like other browsers.
+                return ak.string_new()
+    let selection = dom_document_get_selection(document) else trap("dereferencing a null selection")
+    if let form_text = selection_selection_try_form_control_selected_text_for_stringifier(selection):
+        return ak.utf16_string_base_to_utf8(&form_text.utf16_string_base)
+
+    let range = selection_selection_range(selection) else return ak.string_new()
+    return html_visible_text_in_range(range)
+
+## Ported from Navigable.cpp:3013 Web::HTML::Navigable::select_all.
+pub func html_navigable_select_all(this: HtmlNavigable*):
+    let document = html_navigable_active_document(this) else return
+
+    let selection = dom_document_get_selection(document) else return
+
+    if let target = dom_document_active_input_events_target(document):
+        input_events_target_select_all(target)
+    elif let body = dom_document_body(document):
+        selection_selection_select_all_children(selection, body.dom_node()) catch:
+            recover ()
+
+## Ported from Navigable.cpp:3030 Web::HTML::Navigable::paste.
+pub func html_navigable_paste(this: HtmlNavigable*, text: ak.Utf16String):
+    if html_navigable_active_document(this) == none:
+        return
+
+    discard(event_handler_handle_paste(&this.m_event_handler, text))
+
+## Ported from Navigable.cpp:3040 Web::HTML::Navigable::snapshot_containing_block.
+# https://drafts.csswg.org/css-view-transitions-1/#snapshot-containing-block
+pub func html_navigable_snapshot_containing_block(this: HtmlNavigable*) -> gfx.CssPixelRect:
+    # The snapshot containing block is a rectangle that covers all areas of the window that could potentially display
+    # page content (and is therefore consistent regardless of root scrollbars or interactive widgets).
+
+    # Within a child navigable, the snapshot containing block is the union of the navigable’s viewport with any scrollbar gutters.
+    # FIXME: Actually get the correct rectangle here.
+    return html_navigable_viewport_rect(this)
+
+## Ported from Navigable.cpp:3050 Web::HTML::Navigable::snapshot_containing_block_size.
+# https://drafts.csswg.org/css-view-transitions-1/#snapshot-containing-block-size
+pub func html_navigable_snapshot_containing_block_size(this: HtmlNavigable*) -> gfx.CssPixelSize:
+    let rect = html_navigable_snapshot_containing_block(this)
+    return gfx.css_pixel_rect_size(&rect)
+
+# mark: Observers, stopping and pending navigations =============================================
+
+## Ported from Navigable.cpp:3055 Web::HTML::Navigable::register_navigation_observer.
+pub func html_navigable_register_navigation_observer(this: HtmlNavigable*, navigation_observer: HtmlNavigationObserver*):
+    ak.intrusive_list_append(&this.m_navigation_observers, navigation_observer, offsetof(HtmlNavigationObserver, m_list_node))
+
+## Ported from Navigable.cpp:3060 Web::HTML::Navigable::unregister_navigation_observer.
+pub func html_navigable_unregister_navigation_observer(this: HtmlNavigable*, navigation_observer: HtmlNavigationObserver*):
+    ak.intrusive_list_remove(&this.m_navigation_observers, navigation_observer, offsetof(HtmlNavigationObserver, m_list_node))
+
+## Ported from Navigable.cpp:3066 Web::HTML::Navigable::stop_loading.
+# https://html.spec.whatwg.org/multipage/document-lifecycle.html#nav-stop
+pub func html_navigable_stop_loading(this: HtmlNavigable*):
+    # 1. Let document be navigable's active document.
+    let document = html_navigable_active_document(this) else trap("no active document")
+
+    # 2. If document's unload counter is 0, and navigable's ongoing navigation is a navigation ID, then set the ongoing navigation for navigable to null.
+    if dom_document_unload_counter(document) == 0:
+        match html_navigable_ongoing_navigation(this):
+            .string(_):
+                html_navigable_set_ongoing_navigation(this, EmptyOrHtmlNavigableTraversalOrString.empty)
+            _:
+                discard(0)
+
+    # 3. Abort a document and its descendants given document.
+    dom_document_abort_a_document_and_its_descendants(document)
+
+## Ported from Navigable.cpp:3079 Web::HTML::Navigable::set_has_session_history_entry_and_ready_for_navigation.
+pub func html_navigable_set_has_session_history_entry_and_ready_for_navigation(this: HtmlNavigable*):
+    this.m_has_session_history_entry_and_ready_for_navigation = true
+    while not ak.vector_is_empty(&this.m_pending_navigations):
+        let navigation_params = ak.vector_take_first(&this.m_pending_navigations)
+        html_navigable_begin_navigation(this, navigation_params)
+
+# mark: Rendering ===============================================================================
+
+## Ported from Navigable.cpp:3088 Web::HTML::Navigable::ready_to_paint.
+pub func html_navigable_ready_to_paint(this: HtmlNavigable*):
+    html_rendering_thread_ready_to_paint(&this.m_rendering_thread)
+
+## Ported from Navigable.cpp:3093 Web::HTML::Navigable::external_content_source.
+pub func html_navigable_external_content_source(this: HtmlNavigable*) -> display_list.ExternalContentSource*:
+    return this.m_external_content_source else trap("VERIFY: m_external_content_source")
+
+## Ported from Navigable.cpp:3099 Web::HTML::Navigable::record_display_list_and_scroll_state.
+pub func html_navigable_record_display_list_and_scroll_state(this: HtmlNavigable*, paint_config: HtmlPaintConfig):
+    this.m_needs_repaint = false
+    let document = html_navigable_active_document(this) else return
+
+    let recorded_display_list = dom_document_record_display_list(document, paint_config) else return
+
+    let document_paintable = dom_document_paintable(document) else trap("dereferencing a null paintable")
+    paint_viewport_paintable_refresh_scroll_state(document_paintable)
+
+    html_rendering_thread_update_display_list(&this.m_rendering_thread, recorded_display_list, paint_viewport_paintable_scroll_state_snapshot(document_paintable))
+
+## Ported from Navigable.cpp:3116 Web::HTML::Navigable::paint_next_frame.
+pub func html_navigable_paint_next_frame(this: HtmlNavigable*):
+    let viewport_rect = page_css_to_device_rect(this.m_page, html_navigable_viewport_rect(this))
+    var paint_config = HtmlPaintConfig(paint_overlay = true, should_show_line_box_borders = this.m_should_show_line_box_borders)
+    if html_navigable_is_top_level_traversable(this):
+        paint_config.canvas_fill_rect = gfx.DevicePixelRect(m_location = gfx.IntPoint(), m_size = viewport_rect.m_size)
+    else:
+        # Nested navigables publish transparent bitmaps to their preconfigured ExternalContentSource instead of filling
+        # the canvas for the UI process.
+        assert(this.m_external_content_source != none)
+
+    html_navigable_record_display_list_and_scroll_state(this, paint_config)
+
+    let frame_id = html_rendering_thread_present_frame(&this.m_rendering_thread, viewport_rect)
+    if not html_navigable_is_top_level_traversable(this):
+        html_rendering_thread_wait_for_frame(&this.m_rendering_thread, frame_id)
+
+## Ported from Navigable.cpp:3135 Web::HTML::Navigable::render_screenshot.
+pub func html_navigable_render_screenshot(this: HtmlNavigable*, painting_surface: gfx.PaintingSurface*, paint_config: HtmlPaintConfig, callback: ak.Function0[unit]):
+    html_navigable_record_display_list_and_scroll_state(this, paint_config)
+    html_rendering_thread_request_screenshot(&this.m_rendering_thread, painting_surface, callback)
+
+# mark: Scrolling the viewport ==================================================================
+
+## Ported from Navigable.cpp:3141 Web::HTML::Navigable::scroll_viewport_by_delta.
+pub func html_navigable_scroll_viewport_by_delta(this: HtmlNavigable*, delta: gfx.CssPixelPoint) -> JsPromiseCapability*:
+    let vv = dom_document_visual_viewport(html_navigable_active_document(this) else trap("no active document"))
+    let page_position = gfx.CssPixelPoint(m_x = gfx.CssPixels.from_f64(css_visual_viewport_page_left(vv)), m_y = gfx.CssPixels.from_f64(css_visual_viewport_page_top(vv)))
+    return html_navigable_perform_a_scroll_of_the_viewport(this, gfx.css_pixel_point_add(&page_position, delta))
+
+## Ported from Navigable.cpp:3149 Web::HTML::Navigable::perform_a_scroll_of_the_viewport.
+# https://drafts.csswg.org/cssom-view/#viewport-perform-a-scroll
+pub func html_navigable_perform_a_scroll_of_the_viewport(this: HtmlNavigable*, position: gfx.CssPixelPoint) -> JsPromiseCapability*:
+    # 1. Let doc be the viewport’s associated Document.
+    let doc = html_navigable_active_document(this) else trap("no active document")
+
+    # 2. Let vv be the VisualViewport whose associated document is doc.
+    let vv = dom_document_visual_viewport(doc)
+
+    var viewport_rect: gfx.CssPixelRect = ---
+    gfx.css_pixel_rect_construct_css_pixel_point(&viewport_rect, this.m_viewport_scroll_offset, this.m_viewport_size)
+
+    # 3. Let maxX be the difference between viewport’s scrolling box’s width and the value of vv’s width attribute.
+    let max_x = gfx.css_pixel_rect_width(&viewport_rect).to_double() - css_visual_viewport_width(vv)
+
+    # 4. Let maxY be the difference between viewport’s scrolling box’s height and the value of vv’s height attribute.
+    let max_y = gfx.css_pixel_rect_height(&viewport_rect).to_double() - css_visual_viewport_height(vv)
+
+    # 5. Let dx be the horizontal component of position - the value vv’s pageLeft attribute
+    let dx = gfx.css_pixel_point_x(&position).to_double() - css_visual_viewport_page_left(vv)
+
+    # 6. Let dy be the vertical component of position - the value of vv’s pageTop attribute
+    let dy = gfx.css_pixel_point_y(&position).to_double() - css_visual_viewport_page_top(vv)
+
+    # 7. Let visual x be the value of vv’s offsetLeft attribute.
+    let visual_x = css_visual_viewport_offset_left(vv)
+
+    # 8. Let visual y be the value of vv’s offsetTop attribute.
+    let visual_y = css_visual_viewport_offset_top(vv)
+
+    # 9. Let visual dx be min(maxX, max(0, visual x + dx)) - visual x.
+    let visual_dx = ak.min_f64(max_x, ak.max_f64(0.0, visual_x + dx)) - visual_x
+
+    # 10. Let visual dy be min(maxY, max(0, visual y + dy)) - visual y.
+    let visual_dy = ak.min_f64(max_y, ak.max_f64(0.0, visual_y + dy)) - visual_y
+
+    # 11. Let layout dx be dx - visual dx
+    let layout_dx = dx - visual_dx
+
+    # 12. Let layout dy be dy - visual dy
+    let layout_dy = dy - visual_dy
+
+    # 13. Let element be doc’s root element if there is one, null otherwise.
+
+    # 14. Perform a scroll of the viewport’s scrolling box to its current scroll position + (layout dx, layout dy)
+    #     with element as the associated element, and behavior as the scroll behavior. Let scrollPromise1 be the
+    #     Promise returned from this step.
+    let realm = bind_platform_object_realm(doc.bind_platform_object())
+    var temporary_execution_context: HtmlTemporaryExecutionContext = ---
+    html_temporary_execution_context_construct_realm(&temporary_execution_context, realm, HtmlTemporaryExecutionContextCallbacksEnabled.no)
+    defer html_temporary_execution_context_destruct(&temporary_execution_context)
+
+    # NB: Must update layout before accessing paintables.
+    dom_document_update_layout(doc, DomUpdateLayoutReason.navigable_viewport_scroll)
+
+    # AD-HOC: Skip scrolling unscrollable boxes.
+    let paintable_box = dom_node_paintable_box(doc.dom_node()) else trap("dereferencing a null paintable box")
+    if not paint_paintable_box_could_be_scrolled_by_wheel_event(paintable_box):
+        return idl_create_resolved_promise(realm, js_undefined())
+
+    let overflow_rect = paint_paintable_box_scrollable_overflow_rect(paintable_box) else trap("dereferencing an empty scrollable overflow rect")
+    let scrolling_area_width = f64(gfx.css_pixel_rect_width(&overflow_rect).to_float())
+    let scrolling_area_height = f64(gfx.css_pixel_rect_height(&overflow_rect).to_float())
+    var new_viewport_scroll_offset_x = gfx.css_pixel_point_x(&this.m_viewport_scroll_offset).to_double() + layout_dx
+    var new_viewport_scroll_offset_y = gfx.css_pixel_point_y(&this.m_viewport_scroll_offset).to_double() + layout_dy
+    # NOTE: Clamp to the scrolling area.
+    new_viewport_scroll_offset_x = ak.max_f64(0.0, ak.min_f64(new_viewport_scroll_offset_x, scrolling_area_width - gfx.css_pixel_size_width(&this.m_viewport_size).to_double()))
+    new_viewport_scroll_offset_y = ak.max_f64(0.0, ak.min_f64(new_viewport_scroll_offset_y, scrolling_area_height - gfx.css_pixel_size_height(&this.m_viewport_size).to_double()))
+    let new_viewport_scroll_offset = gfx.CssPixelPoint(m_x = gfx.CssPixels.from_f64(new_viewport_scroll_offset_x), m_y = gfx.CssPixels.from_f64(new_viewport_scroll_offset_y))
+
+    # AD-HOC: If the scroll position would not change, return early to avoid unnecessary display invalidation
+    #         and event loop scheduling (e.g. during momentum scrolling against a boundary).
+    if gfx.css_pixel_point_eq(&new_viewport_scroll_offset, this.m_viewport_scroll_offset) and visual_dx == 0.0 and visual_dy == 0.0:
+        return idl_create_resolved_promise(realm, js_undefined())
+
+    # FIXME: Get a Promise from this.
+    html_navigable_perform_scroll_of_viewport_scrolling_box(this, new_viewport_scroll_offset)
+
+    # 15. Perform a scroll of vv’s scrolling box to its current scroll position + (visual dx, visual dy) with element
+    #     as the associated element, and behavior as the scroll behavior. Let scrollPromise2 be the Promise returned
+    #     from this step.
+    # FIXME: Get a Promise from this.
+    css_visual_viewport_scroll_by(vv, gfx.CssPixelPoint(m_x = gfx.CssPixels.from_f64(visual_dx), m_y = gfx.CssPixels.from_f64(visual_dy)))
+    if visual_dx != 0.0 or visual_dy != 0.0:
+        dom_document_set_needs_accumulated_visual_contexts_update(doc, true)
+        dom_document_set_needs_repaint_t(doc, InvalidateDisplayList.yes)
+    else:
+        dom_document_set_needs_repaint_t(doc, InvalidateDisplayList.no)
+
+    # 16. Let scrollPromise be a new Promise.
+    let scroll_promise = idl_create_promise(realm)
+
+    # 17. Return scrollPromise, and run the remaining steps in parallel.
+    # 18. Resolve scrollPromise when both scrollPromise1 and scrollPromise2 have settled.
+    # FIXME: Actually wait for scroll to occur. For now, all our scrolls are instant.
+    idl_resolve_promise(realm, scroll_promise, js_undefined())
+    return scroll_promise
+
+## Ported from Navigable.cpp:3239 Web::HTML::Navigable::reset_zoom.
+pub func html_navigable_reset_zoom(this: HtmlNavigable*):
+    let document = html_navigable_active_document(this) else return
+    css_visual_viewport_reset(dom_document_visual_viewport(document))
+
+## Ported from Navigable.cpp:3247 Web::HTML::Navigable::has_inclusive_ancestor_with_visibility_hidden.
+pub func html_navigable_has_inclusive_ancestor_with_visibility_hidden(this: HtmlNavigable*) -> bool:
+    if let container = html_navigable_container(this):
+        if let container_computed_properties = dom_element_computed_properties(container.dom_element()):
+            if css_computed_properties_visibility(container_computed_properties) == css_data.Visibility.hidden:
+                return true
+        if let ancestor_navigable = dom_document_navigable(dom_node_document(container.dom_node())):
+            if html_navigable_container(ancestor_navigable) != none:
+                return html_navigable_has_inclusive_ancestor_with_visibility_hidden(ancestor_navigable)
+    return false
+
+# mark: Navigable.h =============================================================================
+
+## Ported from Navigable.h:193 Web::HTML::Navigable::viewport_scroll_offset.
+pub func html_navigable_viewport_scroll_offset(this: HtmlNavigable*) -> gfx.CssPixelPoint:
+    return this.m_viewport_scroll_offset
+
+## Ported from Navigable.h:194 Web::HTML::Navigable::viewport_rect.
+## (Taken ahead by region r43 in html/navigable_taken_ahead, which is merged here.)
+pub func html_navigable_viewport_rect(this: HtmlNavigable*) -> gfx.CssPixelRect:
+    var rect: gfx.CssPixelRect = ---
+    gfx.css_pixel_rect_construct_css_pixel_point(&rect, this.m_viewport_scroll_offset, this.m_viewport_size)
+    return rect
+
+## Ported from Navigable.h:195 Web::HTML::Navigable::viewport_size.
+pub func html_navigable_viewport_size(this: HtmlNavigable*) -> gfx.CssPixelSize:
+    return this.m_viewport_size
+
+## Ported from Navigable.h:200 Web::HTML::Navigable::backing_store_manager.
+pub func html_navigable_backing_store_manager(this: HtmlNavigable*) -> PaintBackingStoreManager*:
+    return this.m_backing_store_manager
+
+## Ported from Navigable.h:214 Web::HTML::Navigable::event_handler.
+pub func html_navigable_event_handler(this: HtmlNavigable*) -> EventHandler*:
+    return &this.m_event_handler
+
+## Ported from Navigable.h:215 Web::HTML::Navigable::event_handler (const).
+pub func html_navigable_event_handler_const(this: HtmlNavigable*) -> EventHandler:
+    return this.m_event_handler
+
+## Ported from Navigable.h:222 Web::HTML::Navigable::has_session_history_entry_and_ready_for_navigation.
+pub func html_navigable_has_session_history_entry_and_ready_for_navigation(this: HtmlNavigable*) -> bool:
+    return this.m_has_session_history_entry_and_ready_for_navigation
+
+## Ported from Navigable.h:227 Web::HTML::Navigable::has_pending_navigations.
+pub func html_navigable_has_pending_navigations(this: HtmlNavigable*) -> bool:
+    return not ak.vector_is_empty(&this.m_pending_navigations)
+
+## Ported from Navigable.h:228 Web::HTML::Navigable::clear_pending_navigations.
+pub func html_navigable_clear_pending_navigations(this: HtmlNavigable*):
+    ak.vector_clear(&this.m_pending_navigations)
+
+## Ported from Navigable.h:235 Web::HTML::Navigable::needs_repaint.
+pub func html_navigable_needs_repaint(this: HtmlNavigable*) -> bool:
+    return this.m_needs_repaint
+
+## Ported from Navigable.h:236 Web::HTML::Navigable::set_needs_repaint.
+pub func html_navigable_set_needs_repaint(this: HtmlNavigable*):
+    this.m_needs_repaint = true
+
+## Ported from Navigable.h:240 Web::HTML::Navigable::rendering_thread.
+pub func html_navigable_rendering_thread(this: HtmlNavigable*) -> HtmlRenderingThread*:
+    return &this.m_rendering_thread
+
+## Ported from Navigable.h:244 Web::HTML::Navigable::set_pending_set_browser_zoom_request.
+pub func html_navigable_set_pending_set_browser_zoom_request(this: HtmlNavigable*, value: bool):
+    this.m_pending_set_browser_zoom_request = value
+
+## Ported from Navigable.h:245 Web::HTML::Navigable::pending_set_browser_zoom_request.
+pub func html_navigable_pending_set_browser_zoom_request(this: HtmlNavigable*) -> bool:
+    return this.m_pending_set_browser_zoom_request
+
+## Ported from Navigable.h:247 Web::HTML::Navigable::set_should_show_line_box_borders.
+pub func html_navigable_set_should_show_line_box_borders(this: HtmlNavigable*, value: bool):
+    this.m_should_show_line_box_borders = value
+
+## Ported from Navigable.h:249 Web::HTML::Navigable::is_svg_page.
+pub func html_navigable_is_svg_page(this: HtmlNavigable*) -> bool:
+    return this.m_is_svg_page
+
+## Ported from Navigable.h:272 Web::HTML::Navigable::reset_cursor_blink_cycle.
+## (Declared in Navigable.h but defined nowhere in the donor, and never called.)
+pub func html_navigable_reset_cursor_blink_cycle(this: HtmlNavigable*):
+    trap("Web::HTML::Navigable::reset_cursor_blink_cycle is declared but never defined in the donor")

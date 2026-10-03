@@ -1,0 +1,559 @@
+#==============================================================================================
+#
+#   navigable_6 - HTML::Navigable: javascript: URLs, reloading, sandboxed navigation, target
+#   snapshots, finalizing a cross-document navigation and the URL and history update steps
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibWeb/HTML/Navigable.cpp lines 2288-2800 (evaluate_javascript_url,
+#       navigate_to_a_javascript_url, reload, navigation_must_be_a_replace,
+#       allowed_by_sandboxing_to_navigate, snapshot_target_snapshot_params,
+#       finalize_a_cross_document_navigation, perform_url_and_history_update_steps,
+#       scroll_offset_did_change). Running a classic script is phase 3; the History object is
+#       phase 3 (closure stubs).
+#
+#       Copyright (c) 2022-2024, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2023-2025, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: javascript: URLs ========================================================================
+
+## Ported from Navigable.cpp:2289 Web::HTML::Navigable::evaluate_javascript_url.
+# https://html.spec.whatwg.org/multipage/browsing-the-web.html#evaluate-a-javascript:-url
+pub func html_navigable_evaluate_javascript_url(this: HtmlNavigable*, url: web_url.Url, new_document_origin: web_url.Origin, user_involvement: HtmlUserNavigationInvolvement, navigation_id: ak.String) -> DomDocument*?:
+    let vm = js_cell_vm(this.js_cell())
+    let window = html_navigable_active_window(this) else trap("VERIFY: active_window()")
+    let realm = bind_platform_object_realm(window.bind_platform_object())
+    let active_document = html_navigable_active_document(this) else trap("no active document")
+
+    # 1. Let urlString be the result of running the URL serializer on url.
+    let url_string = web_url.url_serialize(&url)
+
+    # 2. Let encodedScriptSource be the result of removing the leading "javascript:" from urlString.
+    let url_string_view = ak.string_bytes_as_string_view(&url_string)
+    let encoded_script_source = ak.string_view_substring_view(&url_string_view, 11)
+
+    # 3. Let scriptSource be the UTF-8 decoding of the percent-decoding of encodedScriptSource.
+    let script_source = web_url.percent_decode(encoded_script_source)
+
+    # 4. Let settings be targetNavigable's active document's relevant settings object.
+    let settings = dom_document_relevant_settings_object(active_document)
+
+    # 5. Let baseURL be settings's API base URL.
+    let base_url = html_environment_settings_object_api_base_url(settings)
+
+    # 6. Let script be the result of creating a classic script given scriptSource, settings, baseURL, and the default classic script fetch options.
+    let script = html_classic_script_create(ak.sv("(javascript url)"), ak.byte_string_view(&script_source), settings, base_url)
+
+    # 7. Let evaluationStatus be the result of running the classic script script.
+    # 8. Let result be null.
+    # 9. If evaluationStatus is a normal completion, and evaluationStatus.[[Value]] is a String, then set result to evaluationStatus.[[Value]].
+    # 10. Otherwise, return null.
+    let result = html_classic_script_run_for_string_result(script) else return none
+
+    # 11. Let response be a new response with
+    #     URL: targetNavigable's active document's URL
+    #     header list: «(`Content-Type`, `text/html;charset=utf-8`)»
+    #     body: the UTF-8 encoding of result, as a body
+    let response = fetch_infrastructure_response_create(vm)
+    ak.vector_append_t(fetch_response_url_list(response), dom_document_url(active_document))
+    http_header_list_append(fetch_response_header_list(response), ak.sv("Content-Type"), ak.sv("text/html"))
+    let result_view = ak.string_bytes_as_string_view(&result)
+    fetch_response_set_body(response, fetch_byte_sequence_as_body(realm, ak.string_view_bytes(&result_view)))
+
+    # 12. Let policyContainer be targetNavigable's active document's policy container.
+    let policy_container = dom_document_policy_container(active_document)
+
+    # 13. Let finalSandboxFlags be policyContainer's CSP list's CSP-derived sandboxing flags.
+    let final_sandbox_flags = content_security_policy_policy_list_csp_derived_sandboxing_flags(policy_container.csp_list)
+
+    # 14. Let coop be targetNavigable's active document's opener policy.
+    let coop = dom_document_opener_policy(active_document)
+
+    # 15. Let coopEnforcementResult be a new opener policy enforcement result with
+    #     url: url
+    #     origin: newDocumentOrigin
+    #     opener policy: coop
+    let coop_enforcement_result = HtmlOpenerPolicyEnforcementResult(url = url, origin = new_document_origin, opener_policy = coop)
+
+    # 16. Let navigationParams be a new navigation params, with
+    #     id: navigationId
+    #     navigable: targetNavigable
+    #     request: null
+    #     response: response
+    #     fetch controller: null
+    #     commit early hints: null
+    #     COOP enforcement result: coopEnforcementResult
+    #     reserved environment: null
+    #     origin: newDocumentOrigin
+    #     policy container: policyContainer
+    #     final sandboxing flag set: finalSandboxFlags
+    #     opener policy: coop
+    #     FIXME: navigation timing type: "navigate"
+    #     about base URL: targetNavigable's active document's about base URL
+    #     user involvement: userInvolvement
+    let navigation_params = heap_allocate_html_navigation_params(vm_heap(vm), navigation_id, this, none, response, none, none, coop_enforcement_result, none, new_document_origin, policy_container, final_sandbox_flags, coop, dom_document_about_base_url(active_document), user_involvement)
+
+    # 17. Return the result of loading an HTML document given navigationParams.
+    # NB: The response body is a known byte sequence, so we can pass it directly for sniffing.
+    return load_document(navigation_params, ak.string_view_bytes(&result_view))
+
+## The captures of navigate_to_a_javascript_url's session history traversal steps.
+struct HtmlNavigableNavigateToAJavascriptUrlSteps:
+    var this: HtmlNavigable*
+    var new_document: DomDocument*
+    var history_entry: HtmlSessionHistoryEntry*
+    var history_handling: HtmlHistoryHandlingBehavior
+    var user_involvement: HtmlUserNavigationInvolvement
+
+## navigate_to_a_javascript_url's step 14: finalize a cross-document navigation.
+func html_navigable_navigate_to_a_javascript_url_steps(context: void*?, signal: CorePromise[ak.Empty, ak.AkError]*):
+    let captures = (HtmlNavigableNavigateToAJavascriptUrlSteps*)(context else trap("no captures"))
+    let this = captures.this
+    let resolve = new HtmlNavigableResolveSignal(signal = signal) else trap("out of memory")
+    html_finalize_a_cross_document_navigation(this, captures.history_handling, captures.user_involvement, captures.history_entry, captures.new_document, gc.create_function1(gc.cell_heap(this.cell()), ak.Function1[HtmlHistoryStepResult, unit](call = html_navigable_resolve_signal, context = resolve)))
+
+## Ported from Navigable.cpp:2393 Web::HTML::Navigable::navigate_to_a_javascript_url.
+# https://html.spec.whatwg.org/multipage/browsing-the-web.html#navigate-to-a-javascript:-url
+func html_navigable_navigate_to_a_javascript_url(this: HtmlNavigable*, url: web_url.Url, history_handling: HtmlHistoryHandlingBehavior, source_snapshot_params: HtmlSourceSnapshotParams*, initiator_origin: web_url.Origin, user_involvement: HtmlUserNavigationInvolvement, csp_navigation_type: ContentSecurityPolicyNavigationType, initial_insertion: HtmlInitialInsertion, navigation_id: ak.String):
+    let vm = js_cell_vm(this.js_cell())
+
+    # 1. Assert: historyHandling is "replace".
+    assert(history_handling == HtmlHistoryHandlingBehavior.replace)
+
+    # 2. If targetNavigable's ongoing navigation is no longer navigationId, then return.
+    # AD-HOC: See https://github.com/whatwg/html/issues/12120, other browsers only cancel pending navigations for form submissions.
+    # if (ongoing_navigation() != navigation_id)
+    #     return;
+
+    # 3. Set the ongoing navigation for targetNavigable to null.
+    html_navigable_set_ongoing_navigation(this, EmptyOrHtmlNavigableTraversalOrString.empty)
+
+    # 4. If initiatorOrigin is not same origin-domain with targetNavigable's active document's origin, then return.
+    let active_document = html_navigable_active_document(this) else trap("no active document")
+    if not web_url.origin_is_same_origin_domain(&initiator_origin, dom_document_origin(active_document)):
+        return
+
+    # 5. Let request be a new request whose URL is url and whose policy container is sourceSnapshotParams's source policy container.
+    let request = fetch_request_create(vm)
+    fetch_request_set_url(request, url)
+    fetch_request_set_policy_container(request, source_snapshot_params.source_policy_container)
+
+    # AD-HOC: See https://github.com/whatwg/html/issues/4651, requires some investigation to figure out what we should be setting here.
+    fetch_request_set_client(request, source_snapshot_params.fetch_client)
+
+    # 6. If the result of should navigation request of type be blocked by Content Security Policy? given request and cspNavigationType is "Blocked", then return.
+    if content_security_policy_should_navigation_request_of_type_be_blocked_by_content_security_policy(request, csp_navigation_type) == ContentSecurityPolicyResult.blocked:
+        return
+
+    # 7. Let newDocument be the result of evaluating a javascript: URL given targetNavigable, url, initiatorOrigin, and userInvolvement.
+    let maybe_new_document = html_navigable_evaluate_javascript_url(this, url, initiator_origin, user_involvement, navigation_id)
+
+    # 8. If newDocument is null:
+    if maybe_new_document == none:
+        # 1. If initialInsertion is true and targetNavigable's active document's is initial about:blank is true,
+        #    then run the iframe load event steps given targetNavigable's container.
+        if initial_insertion == HtmlInitialInsertion.yes and dom_document_is_initial_about_blank(html_navigable_active_document(this) else trap("no active document")):
+            html_run_iframe_load_event_steps(as_html_htmli_frame_element(html_navigable_container(this) else trap("no container")))
+
+        # AD-HOC: Clear the delaying_load_events flag that was set by begin_navigation step 15.
+        #         Since no new document was created, no finalize_a_cross_document_navigation will
+        #         run to clear it, which would leave the parent's load event delayed indefinitely.
+        html_navigable_set_delaying_load_events(this, false)
+
+        # 2. Return.
+        # NOTE: In this case, some JavaScript code was executed, but no new Document was created, so we will not perform a navigation.
+        return
+    let new_document = maybe_new_document else trap("unreachable: checked above")
+
+    # 9. Assert: initiatorOrigin is newDocument's origin.
+    assert(web_url.origin_eq(&initiator_origin, dom_document_origin(new_document)))
+
+    # 10. Let entryToReplace be targetNavigable's active session history entry.
+    let entry_to_replace = html_navigable_active_session_history_entry(this) else trap("no active session history entry")
+
+    # 11. Let oldDocState be entryToReplace's document state.
+    let old_doc_state = html_session_history_entry_document_state(entry_to_replace) else trap("no document state")
+
+    # 12. Let documentState be a new document state with
+    #     document: newDocument
+    #     history policy container: a clone of the oldDocState's history policy container if it is non-null; null otherwise
+    #     request referrer: oldDocState's request referrer
+    #     request referrer policy: oldDocState's request referrer policy
+    #     initiator origin: initiatorOrigin
+    #     origin: initiatorOrigin
+    #     about base URL: oldDocState's about base URL
+    #     resource: null
+    #     ever populated: true
+    #     navigable target name: oldDocState's navigable target name
+    let document_state = html_document_state_create()
+    html_document_state_set_history_policy_container(document_state, html_document_state_history_policy_container(old_doc_state))
+    html_document_state_set_request_referrer(document_state, html_document_state_request_referrer(old_doc_state))
+    html_document_state_set_request_referrer_policy(document_state, html_document_state_request_referrer_policy(old_doc_state))
+    html_document_state_set_initiator_origin(document_state, initiator_origin)
+    html_document_state_set_origin(document_state, initiator_origin)
+    html_document_state_set_about_base_url(document_state, html_document_state_about_base_url(old_doc_state))
+    html_document_state_set_ever_populated(document_state, true)
+    html_document_state_set_navigable_target_name(document_state, html_document_state_navigable_target_name(old_doc_state))
+    html_document_state_set_document_id(document_state, dom_node_unique_id(new_document.dom_node()))
+
+    # 13. Let historyEntry be a new session history entry, with
+    #     URL: entryToReplace's URL
+    #     document state: documentState
+    let history_entry = html_session_history_entry_create()
+    html_session_history_entry_set_url(history_entry, html_session_history_entry_url(entry_to_replace))
+    html_session_history_entry_set_document_state(history_entry, document_state)
+
+    # 14. Append session history traversal steps to targetNavigable's traversable to finalize a cross-document navigation with targetNavigable, historyHandling, userInvolvement, and historyEntry.
+    let steps = new HtmlNavigableNavigateToAJavascriptUrlSteps(this = this, new_document = new_document, history_entry = history_entry, history_handling = history_handling, user_involvement = user_involvement) else trap("out of memory")
+    html_traversable_navigable_append_session_history_traversal_steps(html_navigable_traversable_navigable(this) else trap("no traversable navigable"), gc.create_function1(gc.cell_heap(this.cell()), ak.Function1[CorePromise[ak.Empty, ak.AkError]*, unit](call = html_navigable_navigate_to_a_javascript_url_steps, context = steps)))
+
+# mark: Reload ==================================================================================
+
+## The captures of reload's session history traversal steps.
+struct HtmlNavigableReloadSteps:
+    var traversable: HtmlTraversableNavigable*
+    var user_involvement: HtmlUserNavigationInvolvement
+
+## reload's step 4: apply the reload history step.
+func html_navigable_reload_steps(context: void*?, signal: CorePromise[ak.Empty, ak.AkError]*):
+    let captures = (HtmlNavigableReloadSteps*)(context else trap("no captures"))
+    let traversable = captures.traversable
+
+    # 1. Apply the reload history step to traversable given userInvolvement.
+    let resolve = new HtmlNavigableResolveSignal(signal = signal) else trap("out of memory")
+    html_traversable_navigable_apply_the_reload_history_step(traversable, captures.user_involvement, gc.create_function1(gc.cell_heap(traversable.cell()), ak.Function1[HtmlHistoryStepResult, unit](call = html_navigable_resolve_signal, context = resolve)))
+
+## Ported from Navigable.cpp:2492 Web::HTML::Navigable::reload.
+# https://html.spec.whatwg.org/multipage/browsing-the-web.html#reload
+pub func html_navigable_reload(this: HtmlNavigable*, navigation_api_state: ak.Vector[u8]? = none, user_involvement: HtmlUserNavigationInvolvement = HtmlUserNavigationInvolvement.none_):
+    let active_entry = html_navigable_active_session_history_entry(this) else trap("no active session history entry")
+
+    # 1. If userInvolvement is not "browser UI", then:
+    if user_involvement != HtmlUserNavigationInvolvement.browser_ui:
+        # 1. Let navigation be navigable's active window's navigation API.
+        let active_window = html_navigable_active_window(this) else trap("VERIFY: active_window")
+        let navigation = html_window_navigation(active_window)
+
+        # 2. Let destinationNavigationAPIState be navigable's active session history entry's navigation API state.
+        var destination_navigation_api_state = html_session_history_entry_navigation_api_state(active_entry)
+
+        # 3. If navigationAPIState is not null, then set destinationNavigationAPIState to navigationAPIState.
+        if let state = navigation_api_state:
+            destination_navigation_api_state = state
+
+        # 4. Let continue be the result of firing a push/replace/reload navigate event at navigation with
+        #    navigationType set to "reload", isSameDocument set to false, userInvolvement set to userInvolvement,
+        #    destinationURL set to navigable's active session history entry's URL, navigationAPIState set to
+        #    destinationNavigationAPIState, and apiMethodTracker set to apiMethodTracker.
+        let continue_ = html_navigation_fire_a_push_replace_reload_navigate_event(navigation, BindNavigationType.reload, html_session_history_entry_url(active_entry), false, user_involvement, none, none, destination_navigation_api_state)
+
+        # 5. If continue is false, then return.
+        if not continue_:
+            return
+
+    # 1. If navigationAPIState is not null, then set navigable's active session history entry's navigation API state
+    #    to navigationAPIState.
+    if let state = navigation_api_state:
+        html_session_history_entry_set_navigation_api_state(active_entry, state)
+
+    # 2. Set navigable's active session history entry's document state's reload pending to true.
+    html_document_state_set_reload_pending(html_session_history_entry_document_state(active_entry) else trap("no document state"), true)
+
+    # 3. Let traversable be navigable's traversable navigable.
+    let traversable = html_navigable_traversable_navigable(this) else trap("no traversable navigable")
+
+    # 4. Append the following session history traversal steps to traversable:
+    let steps = new HtmlNavigableReloadSteps(traversable = traversable, user_involvement = user_involvement) else trap("out of memory")
+    html_traversable_navigable_append_session_history_traversal_steps(traversable, gc.create_function1(gc.cell_heap(this.cell()), ak.Function1[CorePromise[ak.Empty, ak.AkError]*, unit](call = html_navigable_reload_steps, context = steps)))
+
+# mark: Sandboxed navigation and target snapshots ===============================================
+
+## Ported from Navigable.cpp:2540 Web::HTML::navigation_must_be_a_replace.
+# https://html.spec.whatwg.org/multipage/browsing-the-web.html#the-navigation-must-be-a-replace
+pub func html_navigation_must_be_a_replace(url: web_url.Url, document: DomDocument*) -> bool:
+    let scheme = web_url.url_scheme(&url)
+    return ak.string_eq_string_view(&scheme, ak.sv("javascript")) or dom_document_is_initial_about_blank(document)
+
+## allowed_by_sandboxing_to_navigate's is_ancestor_of lambda.
+func html_navigable_allowed_by_sandboxing_is_ancestor_of(a: HtmlNavigable*, b: HtmlNavigable*) -> bool:
+    var parent = html_navigable_parent(b)
+    while let current = parent:
+        if current == a:
+            return true
+        parent = html_navigable_parent(current)
+    return false
+
+## Ported from Navigable.cpp:2546 Web::HTML::Navigable::allowed_by_sandboxing_to_navigate.
+# https://html.spec.whatwg.org/multipage/browsing-the-web.html#allowed-to-navigate
+pub func html_navigable_allowed_by_sandboxing_to_navigate(this: HtmlNavigable*, target: HtmlNavigable*, source_snapshot_params: HtmlSourceSnapshotParams*) -> bool:
+    let source = this
+
+    # A navigable source is allowed by sandboxing to navigate a second navigable target,
+    # given a source snapshot params sourceSnapshotParams, if the following steps return true:
+
+    # 1. If source is target, then return true.
+    if source == target:
+        return true
+
+    # 2. If source is an ancestor of target, then return true.
+    if html_navigable_allowed_by_sandboxing_is_ancestor_of(source, target):
+        return true
+
+    # 3. If target is an ancestor of source, then:
+    if html_navigable_allowed_by_sandboxing_is_ancestor_of(target, source):
+        # 1. If target is not a top-level traversable, then return true.
+        if not html_navigable_is_top_level_traversable(target):
+            return true
+
+        # 2. If sourceSnapshotParams's has transient activation is true, and sourceSnapshotParams's sandboxing flags's
+        #    sandboxed top-level navigation with user activation browsing context flag is set, then return false.
+        if source_snapshot_params.has_transient_activation and html_has_flag(source_snapshot_params.sandboxing_flags, HtmlSandboxingFlagSet.sandboxed_top_level_navigation_with_user_activation):
+            return false
+
+        # 3. If sourceSnapshotParams's has transient activation is false, and sourceSnapshotParams's sandboxing flags's
+        #    sandboxed top-level navigation without user activation browsing context flag is set, then return false.
+        if not source_snapshot_params.has_transient_activation and html_has_flag(source_snapshot_params.sandboxing_flags, HtmlSandboxingFlagSet.sandboxed_top_level_navigation_without_user_activation):
+            return false
+
+        # 4. Return true.
+        return true
+
+    # 4. If target is a top-level traversable:
+    if html_navigable_is_top_level_traversable(target):
+        # FIXME: 1. If source is the one permitted sandboxed navigator of target, then return true.
+
+        # 2. If sourceSnapshotParams's sandboxing flags's sandboxed navigation browsing context flag is set, then return false.
+        if html_has_flag(source_snapshot_params.sandboxing_flags, HtmlSandboxingFlagSet.sandboxed_navigation):
+            return false
+
+        # 3. Return true.
+        return true
+
+    # 5. If sourceSnapshotParams's sandboxing flags's sandboxed navigation browsing context flag is set, then return false.
+    # 6. Return true.
+    return not html_has_flag(source_snapshot_params.sandboxing_flags, HtmlSandboxingFlagSet.sandboxed_navigation)
+
+## Ported from Navigable.cpp:2608 Web::HTML::Navigable::snapshot_target_snapshot_params.
+# https://html.spec.whatwg.org/multipage/browsing-the-web.html#snapshotting-target-snapshot-params
+pub func html_navigable_snapshot_target_snapshot_params(this: HtmlNavigable*) -> HtmlTargetSnapshotParams:
+    # To snapshot target snapshot params given a navigable targetNavigable, return a new target snapshot params
+    # with sandboxing flags set to the result of determining the creation sandboxing flags given targetNavigable's
+    # active browsing context and targetNavigable's container.
+    let container = html_navigable_container(this)
+    return HtmlTargetSnapshotParams(sandboxing_flags = html_determine_the_creation_sandboxing_flags(html_navigable_active_browsing_context(this) else trap("no active browsing context"), (DomElement*?)container))
+
+# mark: Finalizing a cross-document navigation ==================================================
+
+## The captures of finalize_a_cross_document_navigation's on-complete wrapper.
+struct HtmlFinalizeACrossDocumentNavigationComplete:
+    var on_complete: gc.Function1[HtmlHistoryStepResult, unit]*
+    var navigable: HtmlNavigable*
+
+## finalize_a_cross_document_navigation's on-complete wrapper.
+func html_finalize_a_cross_document_navigation_complete(context: void*?, result: HtmlHistoryStepResult):
+    let captures = (HtmlFinalizeACrossDocumentNavigationComplete*)(context else trap("no captures"))
+    # AD-HOC: Trigger a relayout in the container document for size negotiation with SVG documents.
+    if let container = html_navigable_container(captures.navigable):
+        dom_node_set_needs_layout_update(container.dom_node(), DomSetNeedsLayoutReason.finalize_a_cross_document_navigation)
+    ak.function1_call(&captures.on_complete.function, result)
+
+## Ported from Navigable.cpp:2618 Web::HTML::finalize_a_cross_document_navigation.
+# https://html.spec.whatwg.org/multipage/browsing-the-web.html#finalize-a-cross-document-navigation
+pub func html_finalize_a_cross_document_navigation(navigable: HtmlNavigable*, history_handling: HtmlHistoryHandlingBehavior, user_involvement: HtmlUserNavigationInvolvement, history_entry: HtmlSessionHistoryEntry*, pending_document: DomDocument*?, on_complete: gc.Function1[HtmlHistoryStepResult, unit]*):
+    # NOTE: This is not in the spec but we should not navigate destroyed navigable.
+    if html_navigable_has_been_destroyed(navigable):
+        ak.function1_call(&on_complete.function, HtmlHistoryStepResult.applied)
+        return
+
+    # 1. FIXME: Assert: this is running on navigable's traversable navigable's session history traversal queue.
+
+    # 2. Set navigable's is delaying load events to false.
+    # AD-HOC: Without this guard, decrementing the navigable's delay counter triggers schedule_load_event_delay_check
+    #         on the parent, which can see the about:blank (ready_for_post_load_tasks=true) before the session
+    #         history traversal activates the new document. The guard is cleared when the new document becomes ready
+    #         for post-load tasks (via set_ready_for_post_load_tasks).
+    if let container_doc = html_navigable_container_document(navigable):
+        if pending_document != none:
+            html_navigable_set_navigation_load_event_guard(navigable, container_doc)
+
+    html_navigable_set_delaying_load_events(navigable, false)
+
+    # 3. If historyEntry's document is null, then return.
+    # NOTE: pending_document corresponds to historyEntry's document — it is the document produced by
+    #       populate_session_history_entry_document, threaded here explicitly instead of being stored on the entry.
+    if pending_document == none:
+        ak.function1_call(&on_complete.function, HtmlHistoryStepResult.applied)
+        return
+    let document = pending_document else trap("unreachable: checked above")
+
+    # 4. If all of the following are true:
+    #    - navigable's parent is null;
+    #    - historyEntry's document's browsing context is not an auxiliary browsing context whose opener browsing context is non-null; and
+    #    - historyEntry's document's origin is not navigable's active document's origin
+    #    then set historyEntry's document state's navigable target name to the empty string.
+    let document_browsing_context = dom_document_browsing_context(document) else trap("no browsing context")
+    let document_origin = dom_document_origin(document)
+    if html_navigable_parent(navigable) == none and not (html_browsing_context_is_auxiliary(document_browsing_context) and html_browsing_context_opener_browsing_context(document_browsing_context) != none) and not web_url.origin_eq(&document_origin, dom_document_origin(html_navigable_active_document(navigable) else trap("no active document"))):
+        html_document_state_set_navigable_target_name(html_session_history_entry_document_state(history_entry) else trap("no document state"), ak.string_new())
+
+    # 5. Let entryToReplace be navigable's active session history entry if historyHandling is "replace", otherwise null.
+    let entry_to_replace: HtmlSessionHistoryEntry*? = html_navigable_active_session_history_entry(navigable) if history_handling == HtmlHistoryHandlingBehavior.replace else none
+
+    # 6. Let traversable be navigable's traversable navigable.
+    let traversable = html_navigable_traversable_navigable(navigable) else trap("no traversable navigable")
+
+    # 7. Let targetStep be null.
+    var target_step: i32 = 0
+
+    # 8. Let targetEntries be the result of getting session history entries for navigable.
+    let target_entries = html_navigable_get_session_history_entries(navigable)
+
+    # 9. If entryToReplace is null, then:
+    if let replaced = entry_to_replace:
+        # 1. Replace entryToReplace with historyEntry in targetEntries.
+        var replaced_one = false
+        for slot in &ak.vector_span(target_entries):
+            if *slot == replaced:
+                *slot = history_entry
+                replaced_one = true
+                break
+        assert(replaced_one)
+
+        # 2. Set historyEntry's step to entryToReplace's step.
+        html_session_history_entry_set_step(history_entry, html_session_history_entry_step(replaced))
+
+        # 3. If historyEntry's document state's origin is same origin with entryToReplace's document state's origin,
+        #    then set historyEntry's navigation API key to entryToReplace's navigation API key.
+        let history_origin = html_document_state_origin(html_session_history_entry_document_state(history_entry) else trap("no document state"))
+        let replaced_origin = html_document_state_origin(html_session_history_entry_document_state(replaced) else trap("no document state"))
+        if let history_origin_value = history_origin:
+            if let replaced_origin_value = replaced_origin:
+                if web_url.origin_is_same_origin(&history_origin_value, replaced_origin_value):
+                    html_session_history_entry_set_navigation_api_key(history_entry, html_session_history_entry_navigation_api_key(replaced))
+
+        # 4. Set targetStep to traversable's current session history step.
+        target_step = html_traversable_navigable_current_session_history_step(traversable)
+    else:
+        # 1. Clear the forward session history of traversable.
+        html_traversable_navigable_clear_the_forward_session_history(traversable)
+
+        # 2. Set targetStep to traversable's current session history step + 1.
+        target_step = html_traversable_navigable_current_session_history_step(traversable) + 1
+
+        # 3. Set historyEntry's step to targetStep.
+        html_session_history_entry_set_step(history_entry, I32OrHtmlSessionHistoryEntryPending.i32_(target_step))
+
+        # 4. Append historyEntry to targetEntries.
+        ak.vector_append_t(target_entries, history_entry)
+
+    # 10. Apply the push/replace history step targetStep to traversable given historyHandling and userInvolvement.
+    let captures = new HtmlFinalizeACrossDocumentNavigationComplete(on_complete = on_complete, navigable = navigable) else trap("out of memory")
+    html_traversable_navigable_apply_the_push_or_replace_history_step(traversable, target_step, history_handling, user_involvement, HtmlTraversableNavigableSynchronousNavigation.no, pending_document, gc.create_function1(gc.cell_heap(navigable.cell()), ak.Function1[HtmlHistoryStepResult, unit](call = html_finalize_a_cross_document_navigation_complete, context = captures)))
+
+# mark: The URL and history update steps ========================================================
+
+## The captures of perform_url_and_history_update_steps's synchronous navigation steps.
+struct HtmlPerformUrlAndHistoryUpdateStepsSteps:
+    var traversable: HtmlTraversableNavigable*
+    var navigable: HtmlNavigable*
+    var new_entry: HtmlSessionHistoryEntry*
+    var entry_to_replace: HtmlSessionHistoryEntry*?
+    var history_handling: HtmlHistoryHandlingBehavior
+
+## perform_url_and_history_update_steps's step 13: finalize a same-document navigation.
+func html_perform_url_and_history_update_steps_steps(context: void*?, signal: CorePromise[ak.Empty, ak.AkError]*):
+    let captures = (HtmlPerformUrlAndHistoryUpdateStepsSteps*)(context else trap("no captures"))
+
+    # 1. Finalize a same-document navigation given traversable, navigable, newEntry, entryToReplace, historyHandling, and "none".
+    let resolve = new HtmlNavigableResolveSignal(signal = signal) else trap("out of memory")
+    html_finalize_a_same_document_navigation(captures.traversable, captures.navigable, captures.new_entry, captures.entry_to_replace, captures.history_handling, HtmlUserNavigationInvolvement.none_, gc.create_function1(gc.cell_heap(captures.traversable.cell()), ak.Function1[HtmlHistoryStepResult, unit](call = html_navigable_resolve_signal, context = resolve)))
+    # 2. FIXME: Invoke WebDriver BiDi history updated with navigable.
+
+## Ported from Navigable.cpp:2710 Web::HTML::perform_url_and_history_update_steps.
+# https://html.spec.whatwg.org/multipage/browsing-the-web.html#url-and-history-update-steps
+pub func html_perform_url_and_history_update_steps(document: DomDocument*, new_url: web_url.Url, serialized_data: ak.Vector[u8]? = none, history_handling: HtmlHistoryHandlingBehavior = HtmlHistoryHandlingBehavior.replace):
+    var the_history_handling = history_handling
+
+    # 1. Let navigable be document's node navigable.
+    let navigable = dom_document_navigable(document) else trap("the document has no navigable")
+
+    # 2. Let activeEntry be navigable's active session history entry.
+    let active_entry = html_navigable_active_session_history_entry(navigable) else trap("no active session history entry")
+
+    # 3. Let newEntry be a new session history entry, with
+    #      URL: newURL
+    #      serialized state: if serializedData is not null, serializedData; otherwise activeEntry's classic history API state
+    #      document state: activeEntry's document state
+    #      scroll restoration mode: activeEntry's scroll restoration mode
+    # FIXME: persisted user state: activeEntry's persisted user state
+    let new_entry = html_session_history_entry_create()
+    html_session_history_entry_set_url(new_entry, new_url)
+    html_session_history_entry_set_classic_history_api_state(new_entry, serialized_data else html_session_history_entry_classic_history_api_state(active_entry))
+    html_session_history_entry_set_document_state(new_entry, html_session_history_entry_document_state(active_entry))
+    html_session_history_entry_set_scroll_restoration_mode(new_entry, html_session_history_entry_scroll_restoration_mode(active_entry))
+
+    # 4. If document's is initial about:blank is true, then set historyHandling to "replace".
+    if dom_document_is_initial_about_blank(document):
+        the_history_handling = HtmlHistoryHandlingBehavior.replace
+
+    # 5. Let entryToReplace be activeEntry if historyHandling is "replace", otherwise null.
+    let entry_to_replace: HtmlSessionHistoryEntry*? = active_entry if the_history_handling == HtmlHistoryHandlingBehavior.replace else none
+
+    # 6. If historyHandling is "push", then:
+    if the_history_handling == HtmlHistoryHandlingBehavior.push:
+        let history = dom_document_history(document)
+
+        # 1. Increment document's history object's index.
+        html_history_set_index(history, html_history_index(history) + 1)
+
+        # 2. Set document's history object's length to its index + 1.
+        html_history_set_length(history, html_history_index(history) + 1)
+
+    # If serializedData is not null, then restore the history object state given document and newEntry.
+    if serialized_data != none:
+        dom_document_restore_the_history_object_state(document, new_entry)
+
+    # 8. Set the URL given document to newURL.
+    dom_document_set_url(document, new_url)
+
+    # 9. Set document's latest entry to newEntry.
+    dom_document_set_latest_entry(document, new_entry)
+
+    # 10. Set navigable's active session history entry to newEntry.
+    html_navigable_set_active_session_history_entry(navigable, new_entry)
+
+    # 11. Update the navigation API entries for a same-document navigation given document's relevant global object's navigation API, newEntry, and historyHandling.
+    let relevant_global_object = as_html_window((gc.Cell*)html_relevant_global_object((JsObject*)document))
+    let navigation_type = BindNavigationType.push if the_history_handling == HtmlHistoryHandlingBehavior.push else BindNavigationType.replace
+    html_navigation_update_the_navigation_api_entries_for_a_same_document_navigation(html_window_navigation(relevant_global_object), new_entry, navigation_type)
+
+    # 12. Let traversable be navigable's traversable navigable.
+    let traversable = html_navigable_traversable_navigable(navigable) else trap("no traversable navigable")
+
+    # 13. Append the following session history synchronous navigation steps involving navigable to traversable:
+    let steps = new HtmlPerformUrlAndHistoryUpdateStepsSteps(traversable = traversable, navigable = navigable, new_entry = new_entry, entry_to_replace = entry_to_replace, history_handling = the_history_handling) else trap("out of memory")
+    html_traversable_navigable_append_session_history_synchronous_navigation_steps(traversable, navigable, gc.create_function1(realm_heap(bind_platform_object_realm(document.bind_platform_object())), ak.Function1[CorePromise[ak.Empty, ak.AkError]*, unit](call = html_perform_url_and_history_update_steps_steps, context = steps)))
+
+## Ported from Navigable.cpp:2779 Web::HTML::Navigable::scroll_offset_did_change.
+func html_navigable_scroll_offset_did_change(this: HtmlNavigable*):
+    # https://w3c.github.io/csswg-drafts/cssom-view-1/#scrolling-events
+    # Whenever a viewport gets scrolled (whether in response to user interaction or by an API), the user agent must
+    # run these steps:
+
+    # 1. Let doc be the viewport’s associated Document.
+    let doc = html_navigable_active_document(this) else trap("VERIFY: doc")
+
+    # FIXME: 2. If doc is a snap container, run the steps to update scrollsnapchanging targets for doc with doc’s eventual
+    #    snap target in the block axis as newBlockTarget and doc’s eventual snap target in the inline axis as
+    #    newInlineTarget.
+
+    # 3. If (doc, "scroll") is already in doc’s pending scroll events, abort these steps.
+    let pending_scroll_events = dom_document_pending_scroll_events(doc)
+    for pending in ak.vector_span(pending_scroll_events):
+        if pending.event_target == doc.dom_event_target() and ak.fly_string_eq_fly_string(&pending.event_type, &html_event_names_scroll):
+            return
+
+    # 4. Append (doc, "scroll") to doc’s pending scroll events.
+    ak.vector_append_t(pending_scroll_events, DomDocumentPendingScrollEvent(event_target = doc.dom_event_target(), event_type = html_event_names_scroll))
