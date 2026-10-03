@@ -1,0 +1,323 @@
+#==============================================================================================
+#
+#   paintable_with_lines_2 - Painting::PaintableWithLines: text decorations
+#
+#   DESCRIPTION:
+#       Port of LibWeb/Painting/PaintableWithLines.cpp (lines 482-817): the segments of an
+#       underline or overline that skip the glyphs' ink (text-decoration-skip-ink), painting
+#       the decoration lines of a span (underline, overline and line-through in the solid,
+#       double, dashed, dotted and wavy styles, spelling and grammar errors) and the triangle
+#       wave path of wavy lines.
+#
+#       Copyright (c) 2022-2023, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2022-2025, Sam Atkins <sam@ladybird.org>
+#       Copyright (c) 2024-2025, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
+#       Copyright (c) 2025-2026, Jelle Raaijmakers <jelle@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Skip ink ===================================================================================
+
+## The single segment of a decoration that skips nothing.
+func paint_whole_decoration_segment(start_x: i32, end_x: i32) -> ak.Vector[PaintDecorationSegment]:
+    var segments: ak.Vector[PaintDecorationSegment]
+    ak.vector_append_t(&segments, PaintDecorationSegment(start_x = start_x, end_x = end_x))
+    return segments
+
+## Ported from Libraries/LibWeb/Painting/PaintableWithLines.cpp:488 Web::Painting::compute_skip_ink_segments.
+# https://drafts.csswg.org/css-text-decor-4/#text-decoration-skip-ink-property
+func paint_compute_skip_ink_segments(fragment: const PaintPaintableFragment*, context: const DisplayListRecordingContext*, span_start_x: i32, span_end_x: i32, line_y: i32, line_thickness: i32, font_size: f32) -> ak.Vector[PaintDecorationSegment]:
+    let glyph_run = paint_paintable_fragment_glyph_run(fragment) else return paint_whole_decoration_segment(span_start_x, span_end_x)
+
+    # The text blob is drawn at baseline_start on the canvas. Compute that same origin so we can convert between
+    # device-pixel coordinates and blob-local coordinates.
+    let scale = display_list_recording_context_device_pixels_per_css_pixel(context)
+    let fragment_absolute_rect = paint_paintable_fragment_absolute_rect(fragment)
+    let blob_origin_x: f32 = gfx.css_pixel_rect_x(&fragment_absolute_rect).to_float() * (f32)scale
+    let blob_origin_y: f32 = (gfx.css_pixel_rect_y(&fragment_absolute_rect).to_float() + paint_paintable_fragment_baseline(fragment).to_float()) * (f32)scale
+
+    # Convert the underline's y-band from device pixels to blob-local coordinates.
+    let half_thickness = (f32)line_thickness / 2.0
+    let y_top = (f32)line_y - half_thickness - blob_origin_y
+    let y_bottom = (f32)line_y + half_thickness - blob_origin_y
+
+    var intervals = web_fonts.glyph_run_get_glyph_intercepts(glyph_run, (f32)scale, y_top, y_bottom)
+    if ak.vector_is_empty(&intervals):
+        return paint_whole_decoration_segment(span_start_x, span_end_x)
+
+    # Use the full fragment's X range for gap computation so intercepts aren't cut off at span boundaries.
+    let full_fragment_rect = display_list_recording_context_rounded_device_rect(context, fragment_absolute_rect)
+    let fragment_start_x = gfx.device_pixel_rect_left(&full_fragment_rect)
+
+    # Convert intercepts from blob-local x to device pixels, and dilate to create visible gaps.
+    let dilation = ak.max_f32(font_size / 20.0, 2.0) * (f32)scale
+
+    var segments: ak.Vector[PaintDecorationSegment]
+    var current_x = fragment_start_x
+    var i: usize = 0
+    while i + 1 < ak.vector_size(&intervals):
+        let gap_start = (i32)(f32)math.floor((f64)(*ak.vector_at(&intervals, i) + blob_origin_x - dilation))
+        let gap_end = (i32)(f32)math.ceil((f64)(*ak.vector_at(&intervals, i + 1) + blob_origin_x + dilation))
+
+        let seg_start = ak.max(current_x, span_start_x)
+        let seg_end = ak.min(gap_start, span_end_x)
+        if seg_start < seg_end:
+            ak.vector_append_t(&segments, PaintDecorationSegment(start_x = seg_start, end_x = seg_end))
+        current_x = ak.max(gap_end, current_x)
+        i += 2
+
+    let seg_start = ak.max(current_x, span_start_x)
+    if seg_start < span_end_x:
+        ak.vector_append_t(&segments, PaintDecorationSegment(start_x = seg_start, end_x = span_end_x))
+
+    return segments
+
+# mark: Decoration lines ===========================================================================
+
+## The `draw_line_for_segment` lambda of paint_text_decoration.
+func paint_draw_line_for_segment(recorder: display_list.DisplayListRecorder*, segment: PaintDecorationSegment, y: i32, color: gfx.Color, thickness: i32, style: gfx.LineStyle = gfx.LineStyle.solid):
+    display_list.display_list_recorder_draw_line(recorder, gfx.IntPoint(m_x = segment.start_x, m_y = y), gfx.IntPoint(m_x = segment.end_x, m_y = y), color, thickness, style)
+
+## The `underline_top_edge` lambda of paint_text_decoration.
+# https://drafts.csswg.org/css-text-decor-4/#text-underline-position-property
+func paint_underline_top_edge(fragment: const PaintPaintableFragment*, font: const web_fonts.Font*, text_underline_position: CssTextUnderlinePosition, text_underline_offset: gfx.CssPixels) -> gfx.CssPixels:
+    # FIXME: Support text-decoration: underline on vertical text
+    match text_underline_position.horizontal:
+        .auto:
+            # The user agent may use any algorithm to determine the underline’s position; however it must be
+            # placed at or under the alphabetic baseline.
+
+            # Spec Note: It is suggested that the default underline position be close to the alphabetic
+            #            baseline,
+            # FIXME:     unless that would either cross subscripted (or otherwise lowered) text or draw over
+            #            glyphs from Asian scripts such as Han or Tibetan for which an alphabetic underline is
+            #            too high: in such cases, shifting the underline lower or aligning to the em box edge
+            #            as described for under may be more appropriate.
+            return paint_paintable_fragment_baseline(fragment).add(text_underline_offset)
+        .from_font:
+            # FIXME: If the first available font has metrics indicating a preferred underline offset, use that
+            #        offset, otherwise behaves as auto.
+            return paint_paintable_fragment_baseline(fragment).add(text_underline_offset)
+        .under:
+            # The underline is positioned under the element’s text content. In this case the underline usually
+            # does not cross the descenders. (This is sometimes called “accounting” underline.)
+            return paint_paintable_fragment_baseline(fragment).add(gfx.CssPixels.from_f32(web_fonts.font_pixel_metrics(font).descent)).add(text_underline_offset)
+        _: trap("VERIFY_NOT_REACHED")
+
+## Ported from Libraries/LibWeb/Painting/PaintableWithLines.cpp:546 Web::Painting::paint_text_decoration.
+func paint_paint_text_decoration(context: DisplayListRecordingContext*, paintable: PaintTextPaintable*, span: PaintPaintableFragmentFragmentSpan):
+    let fragment = span.fragment
+    let recorder = display_list_recording_context_display_list_recorder(context)
+    let font = layout_node_first_available_font(paint_paintable_fragment_layout_node(fragment))
+    let glyph_height = gfx.css_pixels_nearest_value_for_f32(web_fonts.font_pixel_size(font))
+    let baseline = paint_paintable_fragment_baseline(fragment)
+    let computed_values = &paint_paintable_computed_values(paintable.paint_paintable()).computed_values
+
+    # Use span's text decoration if explicitly set, otherwise use the element's computed values.
+    var line_color = gfx.Color()
+    var line_style = css_data.TextDecorationStyle.solid
+    var text_decoration_lines: ak.Vector[css_data.TextDecorationLine]
+    if let text_decoration = span.text_decoration:
+        line_color = text_decoration.color
+        line_style = text_decoration.style
+        text_decoration_lines = text_decoration.line
+    else:
+        line_color = css_computed_values_text_decoration_color(computed_values)
+        line_style = css_computed_values_text_decoration_style(computed_values)
+        text_decoration_lines = css_computed_values_text_decoration_line(computed_values)
+
+    # Compute the decoration box for this span.
+    var fragment_box = paint_paintable_fragment_absolute_rect(fragment)
+    if span.start_code_unit != 0 or span.end_code_unit != paint_paintable_fragment_length_in_code_units(fragment):
+        let span_rect = paint_paintable_fragment_range_rect(fragment, PaintPaintableSelectionState.start_and_end,
+                                                            paint_paintable_fragment_start_offset(fragment) + span.start_code_unit,
+                                                            paint_paintable_fragment_start_offset(fragment) + span.end_code_unit)
+        gfx.css_pixel_rect_set_x(&fragment_box, gfx.css_pixel_rect_x(&span_rect))
+        gfx.css_pixel_rect_set_width(&fragment_box, gfx.css_pixel_rect_width(&span_rect))
+    var text_underline_offset = css_computed_values_text_underline_offset(computed_values)
+    let text_underline_position = css_computed_values_text_underline_position(computed_values)
+    for decoration_line in ak.vector_span(&text_decoration_lines):
+        var line = decoration_line
+        var line_thickness = paint_paintable_fragment_text_decoration_thickness(fragment)
+
+        if line == css_data.TextDecorationLine.spelling_error:
+            # https://drafts.csswg.org/css-text-decor-4/#valdef-text-decoration-line-spelling-error
+            # This value indicates the type of text decoration used by the user agent to highlight spelling mistakes.
+            # Its appearance is UA-defined, and may be platform-dependent. It is often rendered as a red wavy underline.
+            line_color = gfx.color_new_named_color(gfx.ColorNamedColor.red)
+            line_thickness = gfx.CssPixels.from_int(1)
+            line_style = css_data.TextDecorationStyle.wavy
+            line = css_data.TextDecorationLine.underline
+
+            # https://drafts.csswg.org/css-text-decor-4/#underline-offset
+            # When the value of the text-decoration-line property is either spelling-error or grammar-error, the UA
+            # must ignore the value of text-underline-position.
+            text_underline_offset = css_initial_values_text_underline_offset()
+        elif line == css_data.TextDecorationLine.grammar_error:
+            # https://drafts.csswg.org/css-text-decor-4/#valdef-text-decoration-line-grammar-error
+            # This value indicates the type of text decoration used by the user agent to highlight grammar mistakes.
+            # Its appearance is UA defined, and may be platform-dependent. It is often rendered as a green wavy underline.
+            line_color = gfx.color_new_named_color(gfx.ColorNamedColor.dark_green)
+            line_thickness = gfx.CssPixels.from_int(1)
+            line_style = css_data.TextDecorationStyle.wavy
+            line = css_data.TextDecorationLine.underline
+
+            # https://drafts.csswg.org/css-text-decor-4/#underline-offset
+            # When the value of the text-decoration-line property is either spelling-error or grammar-error, the UA
+            # must ignore the value of text-underline-position.
+            text_underline_offset = css_initial_values_text_underline_offset()
+
+        let device_line_thickness = display_list_recording_context_rounded_device_pixels(context, line_thickness)
+
+        # Compute the center Y of the decoration stroke. For underline and overline, offset by half the thickness
+        # so the near edge of the stroke aligns with the intended position.
+        var line_center_y = gfx.CssPixels.from_int(0)
+        match line:
+            .none_:
+                return
+            .underline:
+                let underline_top_edge = paint_underline_top_edge(fragment, font, text_underline_position, text_underline_offset)
+                line_center_y = underline_top_edge.add(layout_div_int(line_thickness, 2))
+            .overline:
+                line_center_y = baseline.sub(glyph_height).sub(layout_div_int(line_thickness, 2))
+            .line_through:
+                let x_height = web_fonts.font_x_height(font)
+                line_center_y = baseline.sub(gfx.mul_int_css_pixels(x_height, gfx.CssPixels.from_f32(0.5)))
+            .blink:
+                # Conforming user agents may simply not blink the text
+                return
+            _:
+                # SpellingError, GrammarError: handled above.
+                trap("VERIFY_NOT_REACHED")
+
+        let top_left = gfx.css_pixel_rect_top_left(&fragment_box)
+        let top_right = gfx.css_pixel_rect_top_right(&fragment_box)
+        let line_start_point = display_list_recording_context_rounded_device_point(context, gfx.css_pixel_point_translated_css_pixels_css_pixels(&top_left, gfx.CssPixels.from_int(0), line_center_y))
+        let line_end_point = display_list_recording_context_rounded_device_point(context, gfx.css_pixel_point_translated_css_pixels_css_pixels(&top_right, gfx.CssPixels.from_int(0), line_center_y))
+
+        # https://drafts.csswg.org/css-text-decor-4/#text-decoration-skip-ink-property
+        # FIXME: For text-decoration-skip-ink: auto, skip CJK ideographs and symbols from the intercept
+        #        computation, since their complex strokes would create too many gaps in the decoration line.
+        let skip_ink = css_computed_values_text_decoration_skip_ink(computed_values)
+        let should_skip_ink = skip_ink != css_data.TextDecorationSkipInk.none_ and (line == css_data.TextDecorationLine.underline or line == css_data.TextDecorationLine.overline)
+
+        var segments: ak.Vector[PaintDecorationSegment]
+        if not should_skip_ink:
+            segments = paint_whole_decoration_segment(line_start_point.m_x, line_end_point.m_x)
+        else:
+            segments = paint_compute_skip_ink_segments(fragment, context, line_start_point.m_x, line_end_point.m_x,
+                                                       line_start_point.m_y, device_line_thickness, web_fonts.font_pixel_size(font))
+
+        let line_y = line_start_point.m_y
+
+        match line_style:
+            .solid:
+                for segment in ak.vector_span(&segments):
+                    paint_draw_line_for_segment(recorder, segment, line_y, line_color, device_line_thickness)
+            .double:
+                # Two parallel lines with a 1px gap, expanding away from the text.
+                let step = device_line_thickness + 1
+                var first_y = line_y
+                var second_y = line_y
+                match line:
+                    .underline:
+                        second_y += step
+                    .overline:
+                        second_y -= step
+                    .line_through:
+                        first_y -= step // 2
+                        second_y = first_y + step
+                    _: trap("VERIFY_NOT_REACHED")
+                for segment in ak.vector_span(&segments):
+                    paint_draw_line_for_segment(recorder, segment, first_y, line_color, device_line_thickness)
+                    paint_draw_line_for_segment(recorder, segment, second_y, line_color, device_line_thickness)
+            .dashed:
+                for segment in ak.vector_span(&segments):
+                    paint_draw_line_for_segment(recorder, segment, line_y, line_color, device_line_thickness, gfx.LineStyle.dashed)
+            .dotted:
+                for segment in ak.vector_span(&segments):
+                    paint_draw_line_for_segment(recorder, segment, line_y, line_color, device_line_thickness, gfx.LineStyle.dotted)
+            .wavy:
+                # The wave oscillates amplitude/2 above and below its center, so shift the center away from the text so the
+                # near peaks don’t overlap it.
+                let amplitude = device_line_thickness * 3
+                var wave_y = line_y
+                match line:
+                    .underline:
+                        wave_y += device_line_thickness // 2 + 1
+                    .overline:
+                        wave_y -= device_line_thickness // 2 + 1
+                    .line_through:
+                        discard(0)
+                    _: trap("VERIFY_NOT_REACHED")
+                for segment in ak.vector_span(&segments):
+                    let from_ = gfx.IntPoint(m_x = segment.start_x, m_y = wave_y)
+                    let to = gfx.IntPoint(m_x = segment.end_x, m_y = wave_y)
+                    display_list.display_list_recorder_stroke_path(recorder, display_list.DisplayListRecorderStrokePathParams(
+                        cap_style = gfx.PathCapStyle.round,
+                        join_style = gfx.PathJoinStyle.round,
+                        miter_limit = 0.0,
+                        dash_array = ak.Vector[f32](),
+                        dash_offset = 0.0,
+                        path = paint_build_triangle_wave_path(from_, to, (f32)amplitude),
+                        paint_style_or_color = display_list.PaintStyleOrColor.color(line_color),
+                        thickness = (f32)device_line_thickness,
+                    ))
+            _: trap("VERIFY_NOT_REACHED")
+
+# mark: Wavy lines ================================================================================
+
+## `abs(x)` on a float.
+func paint_abs_f32(x: f32) -> f32:
+    return -x if x < 0.0 else x
+
+## Ported from Libraries/LibWeb/Painting/PaintableWithLines.cpp:765 Web::Painting::build_triangle_wave_path.
+func paint_build_triangle_wave_path(from_: gfx.IntPoint, to: gfx.IntPoint, amplitude: f32) -> gfx.Path:
+    var path = gfx.Path()
+    if from_.m_y != to.m_y:
+        ak.dbgln("FIXME: Support more than horizontal waves")
+        return path
+
+    gfx.path_move_to(&path, gfx.FloatPoint(m_x = (f32)from_.m_x, m_y = (f32)from_.m_y))
+
+    let wavelength = amplitude * 2.0
+    let half_wavelength = amplitude
+    let quarter_wavelength = amplitude / 2.0
+
+    var position = gfx.FloatPoint(m_x = (f32)from_.m_x, m_y = (f32)from_.m_y)
+    var remaining = paint_abs_f32((f32)to.m_x - position.m_x)
+    while remaining > wavelength:
+        # Draw a whole wave
+        gfx.path_line_to(&path, gfx.FloatPoint(m_x = position.m_x + quarter_wavelength, m_y = position.m_y - quarter_wavelength))
+        gfx.path_line_to(&path, gfx.FloatPoint(m_x = position.m_x + quarter_wavelength + half_wavelength, m_y = position.m_y + quarter_wavelength))
+        gfx.path_line_to(&path, gfx.FloatPoint(m_x = position.m_x + wavelength, m_y = position.m_y))
+        position.m_x += wavelength
+        remaining = paint_abs_f32((f32)to.m_x - position.m_x)
+
+    # Up
+    if remaining > quarter_wavelength:
+        gfx.path_line_to(&path, gfx.FloatPoint(m_x = position.m_x + quarter_wavelength, m_y = position.m_y - quarter_wavelength))
+        position.m_x += quarter_wavelength
+        remaining = paint_abs_f32((f32)to.m_x - position.m_x)
+    elif remaining >= 1.0:
+        let fraction = remaining / quarter_wavelength
+        gfx.path_line_to(&path, gfx.FloatPoint(m_x = position.m_x + (fraction * quarter_wavelength), m_y = position.m_y - (fraction * quarter_wavelength)))
+        remaining = 0.0
+
+    # Down
+    if remaining > half_wavelength:
+        gfx.path_line_to(&path, gfx.FloatPoint(m_x = position.m_x + half_wavelength, m_y = position.m_y + quarter_wavelength))
+        position.m_x += half_wavelength
+        remaining = paint_abs_f32((f32)to.m_x - position.m_x)
+    elif remaining >= 1.0:
+        let fraction = remaining / half_wavelength
+        gfx.path_line_to(&path, gfx.FloatPoint(m_x = position.m_x + (fraction * half_wavelength), m_y = position.m_y - quarter_wavelength + (fraction * half_wavelength)))
+        remaining = 0.0
+
+    # Back to middle
+    if remaining >= 1.0:
+        let fraction = remaining / quarter_wavelength
+        gfx.path_line_to(&path, gfx.FloatPoint(m_x = position.m_x + (fraction * quarter_wavelength), m_y = position.m_y + ((1.0 - fraction) * quarter_wavelength)))
+
+    return path

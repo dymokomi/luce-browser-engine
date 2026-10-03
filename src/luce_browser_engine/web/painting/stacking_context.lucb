@@ -1,0 +1,495 @@
+#==============================================================================================
+#
+#   stacking_context - Painting::StackingContext: painting order and hit testing
+#
+#   DESCRIPTION:
+#       Port of LibWeb/Painting/StackingContext.cpp (lines 1-492) and StackingContext.h: a
+#       stacking context of the paint tree with its child contexts sorted by z-index and tree
+#       order, the positioned descendants and floats it paints, painting in CSS 2.1 Appendix
+#       E order (with the per-phase command cache of each paintable box, masks and clips),
+#       hit testing in reverse painting order, and the stacking context tree dump of the
+#       Layout tests.
+#
+#       Copyright (c) 2020-2022, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2022, Sam Atkins <atkinssj@serenityos.org>
+#       Copyright (c) 2024-2026, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
+#       Copyright (c) 2025, Jelle Raaijmakers <jelle@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Painting one node ==========================================================================
+
+## Ported from Libraries/LibWeb/Painting/StackingContext.cpp:29 Web::Painting::paint_node.
+func paint_paint_node(paintable: PaintPaintable*, context: DisplayListRecordingContext*, phase: PaintPhase):
+    let recorder = display_list_recording_context_display_list_recorder(context)
+    # TemporaryChange save_nesting_level(context.display_list_recorder().m_save_nesting_level, 0);
+    let saved_nesting_level = recorder.m_save_nesting_level
+    recorder.m_save_nesting_level = 0
+    defer recorder.m_save_nesting_level = saved_nesting_level
+
+    let paintable_box_or_none = as_if_paint_paintable_box(paintable)
+
+    if let paintable_box = paintable_box_or_none:
+        # Text fragments in a PaintableWithLines are content of the block container.
+        # They need the descendants' visual context, not the element's own visual context.
+        if is_paint_paintable_with_lines(paintable) and phase == PaintPhase.foreground:
+            display_list.display_list_recorder_set_accumulated_visual_context(recorder, paint_paintable_box_accumulated_visual_context_for_descendants_index(paintable_box))
+        else:
+            display_list.display_list_recorder_set_accumulated_visual_context(recorder, paint_paintable_box_accumulated_visual_context_index(paintable_box))
+
+    let skip_cache = paintable_box_or_none == none or display_list_recording_context_should_show_line_box_borders(context)
+    if not skip_cache:
+        let paintable_box = paintable_box_or_none else trap("unreachable")
+        if paint_paintable_box_has_cached_commands(paintable_box, phase):
+            let commands = paint_paintable_box_cached_commands(paintable_box, phase)
+            display_list.display_list_recorder_replay_cached_commands(recorder, ak.vector_span_const(&commands))
+        else:
+            var capture = display_list.display_list_recorder_begin_command_capture(recorder)
+            defer display_list.display_list_recorder_command_capture_destroy(&capture)
+            paint_paintable_paint(paintable, context, phase)
+            paint_paintable_box_set_cached_commands(paintable_box, phase, display_list.display_list_recorder_command_capture_take(&capture))
+    else:
+        paint_paintable_paint(paintable, context, phase)
+
+    display_list.display_list_recorder_set_accumulated_visual_context(recorder, 0)
+
+    assert(recorder.m_save_nesting_level == 0)
+
+# mark: Construction ===============================================================================
+
+## Ported from Libraries/LibWeb/Painting/StackingContext.cpp:61 Web::Painting::StackingContext::StackingContext.
+pub func paint_stacking_context_construct(this: PaintStackingContext*, paintable: PaintPaintableBox*, parent: PaintStackingContext*?, index_in_tree_order: usize):
+    this.m_paintable = paintable
+    this.m_parent = parent
+    this.m_index_in_tree_order = index_in_tree_order
+    assert(this.m_parent != this)
+    if let parent_context = this.m_parent:
+        ak.vector_append_t(&parent_context.m_children, this)
+
+## `heap.allocate<StackingContext>(paintable, parent, index_in_tree_order)`.
+pub func paint_stacking_context_create(heap: gc.Heap*, paintable: PaintPaintableBox*, parent: PaintStackingContext*?, index_in_tree_order: usize) -> PaintStackingContext*:
+    let this = (PaintStackingContext*)web_heap_allocate_cell(heap, &paint_stacking_context_class)
+    gc.heap_defer_gc(heap)
+    paint_stacking_context_construct(this, paintable, parent, index_in_tree_order)
+    gc.heap_undefer_gc(heap)
+    return this
+
+## Ported from Libraries/LibWeb/Painting/StackingContext.h:23 Web::Painting::StackingContext::parent.
+pub func paint_stacking_context_parent(this: PaintStackingContext*) -> PaintStackingContext*?:
+    return this.m_parent
+
+## Ported from Libraries/LibWeb/Painting/StackingContext.h:24 Web::Painting::StackingContext::parent.
+pub func paint_stacking_context_parent_const(this: PaintStackingContext*) -> PaintStackingContext*?:
+    return this.m_parent
+
+## Ported from Libraries/LibWeb/Painting/StackingContext.h:26 Web::Painting::StackingContext::paintable_box.
+pub func paint_stacking_context_paintable_box(this: PaintStackingContext*) -> PaintPaintableBox*:
+    return this.m_paintable
+
+## The comparator of StackingContext::sort: z-index (auto as 0), then tree order.
+func paint_stacking_context_sort_less_than(context: void*?, a: const (PaintStackingContext*)*, b: const (PaintStackingContext*)*) -> bool:
+    discard(context)
+    let a_z_index = paint_paintable_box_effective_z_index(paint_stacking_context_paintable_box(*a)) else 0
+    let b_z_index = paint_paintable_box_effective_z_index(paint_stacking_context_paintable_box(*b)) else 0
+    if a_z_index == b_z_index:
+        return (*a).m_index_in_tree_order < (*b).m_index_in_tree_order
+    return a_z_index < b_z_index
+
+## Ported from Libraries/LibWeb/Painting/StackingContext.cpp:71 Web::Painting::StackingContext::sort.
+pub func paint_stacking_context_sort(this: PaintStackingContext*):
+    ak.quick_sort_t_collection_t_less_than(ak.vector_span(&this.m_children), ak.Function2[const (PaintStackingContext*)*, const (PaintStackingContext*)*, bool](call = paint_stacking_context_sort_less_than, context = none))
+
+    for child in ak.vector_span(&this.m_children):
+        paint_stacking_context_sort(child)
+
+## Ported from Libraries/LibWeb/Painting/StackingContext.cpp:85 Web::Painting::StackingContext::visit_edges (override).
+pub func paint_stacking_context_visit_edges_impl(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (PaintStackingContext*)base
+    gc.cell_visit_edges_impl(base, visitor)
+    gc.cell_visitor_visit_t_2(visitor, this.m_paintable)
+    gc.cell_visitor_visit_vector(visitor, &this.m_non_positioned_floating_descendants)
+    gc.cell_visitor_visit_vector(visitor, &this.m_positioned_descendants_and_stacking_contexts_with_stack_level_0)
+    gc.cell_visitor_visit_t(visitor, this.m_parent)
+    gc.cell_visitor_visit_vector(visitor, &this.m_children)
+
+## Ported from Libraries/LibWeb/Painting/StackingContext.cpp:95 Web::Painting::StackingContext::set_last_paint_generation_id.
+pub func paint_stacking_context_set_last_paint_generation_id(this: PaintStackingContext*, generation_id: u64):
+    if let last = this.m_last_paint_generation_id:
+        if last >= generation_id:
+            let description = layout_node_debug_description(paint_paintable_layout_node(this.m_paintable.paint_paintable()))
+            let description_view = ak.string_bytes_as_string_view(&description)
+            ak.dbgln(f"FIXME: Painting commands are recorded twice for stacking context: {ak.string_view_text(description_view)}")
+    this.m_last_paint_generation_id = generation_id
+
+## Ported from Libraries/LibWeb/Painting/StackingContext.cpp:103 Web::Painting::to_paint_phase.
+func paint_to_paint_phase(phase: PaintStackingContextStackingContextPaintPhase) -> PaintPhase:
+    # There are not a fully correct mapping since some stacking context phases are combined.
+    match phase:
+        .floats, .background_and_borders_for_inline_level_and_replaced, .background_and_borders:
+            return PaintPhase.background
+        .foreground:
+            return PaintPhase.foreground
+        _: trap("VERIFY_NOT_REACHED")
+
+# mark: Painting ===================================================================================
+
+## Ported from Libraries/LibWeb/Painting/StackingContext.cpp:119 Web::Painting::StackingContext::paint_node_as_stacking_context.
+pub func paint_stacking_context_paint_node_as_stacking_context(paintable: PaintPaintable*, context: DisplayListRecordingContext*):
+    if paint_paintable_is_svg_svg_paintable(paintable):
+        paint_stacking_context_paint_svg(context, (PaintPaintableBox*)paintable, PaintPhase.foreground)
+        return
+
+    paint_paint_node(paintable, context, PaintPhase.background)
+    paint_paint_node(paintable, context, PaintPhase.border)
+    paint_stacking_context_paint_descendants(context, paintable, PaintStackingContextStackingContextPaintPhase.background_and_borders)
+    paint_stacking_context_paint_descendants(context, paintable, PaintStackingContextStackingContextPaintPhase.floats)
+    paint_stacking_context_paint_descendants(context, paintable, PaintStackingContextStackingContextPaintPhase.background_and_borders_for_inline_level_and_replaced)
+    paint_paint_node(paintable, context, PaintPhase.foreground)
+    paint_stacking_context_paint_descendants(context, paintable, PaintStackingContextStackingContextPaintPhase.foreground)
+    paint_paint_node(paintable, context, PaintPhase.outline)
+    paint_paint_node(paintable, context, PaintPhase.overlay)
+
+## Ported from Libraries/LibWeb/Painting/StackingContext.cpp:137 Web::Painting::StackingContext::paint_svg.
+pub func paint_stacking_context_paint_svg(context: DisplayListRecordingContext*, paintable: PaintPaintableBox*, phase: PaintPhase):
+    if phase != PaintPhase.foreground:
+        return
+
+    paint_paint_node(paintable.paint_paintable(), context, PaintPhase.background)
+    paint_paint_node(paintable.paint_paintable(), context, PaintPhase.border)
+    paint_svgsvg_paintable_paint_svg_box(context, paintable, phase)
+
+## Ported from Libraries/LibWeb/Painting/StackingContext.cpp:147 Web::Painting::StackingContext::paint_descendants.
+pub func paint_stacking_context_paint_descendants(context: DisplayListRecordingContext*, paintable: PaintPaintable*, phase: PaintStackingContextStackingContextPaintPhase):
+    for child in paint_paintable_children(paintable):
+        if paint_paintable_has_stacking_context(child):
+            continue
+
+        if paint_paintable_is_svg_svg_paintable(child):
+            paint_stacking_context_paint_svg(context, (PaintPaintableBox*)child, paint_to_paint_phase(phase))
+            continue
+
+        # NOTE: Grid specification https://www.w3.org/TR/css-grid-2/#z-order says that grid items should be treated
+        #       the same way as CSS2 defines for inline-blocks:
+        #       "For each one of these, treat the element as if it created a new stacking context, but any positioned
+        #       descendants and descendants which actually create a new stacking context should be considered part of
+        #       the parent stacking context, not this new one."
+        let z_index = css_computed_values_z_index(&paint_paintable_computed_values(child).computed_values)
+        if layout_node_is_grid_item(paint_paintable_layout_node(child)) and z_index == none:
+            # FIXME: This may not be fully correct with respect to the paint phases.
+            if phase == PaintStackingContextStackingContextPaintPhase.foreground:
+                paint_stacking_context_paint_node_as_stacking_context(child, context)
+            continue
+
+        # https://drafts.csswg.org/css2/#painting-order
+        # All non-positioned floating descendants, in tree order. For each one of these, treat the
+        # element as if it created a new stacking context, but any positioned descendants and
+        # descendants which actually create a new stacking context should be considered part of the
+        # parent stacking context, not this new one.
+        if paint_paintable_is_floating(child) and not paint_paintable_is_positioned(child) and z_index == none:
+            if phase == PaintStackingContextStackingContextPaintPhase.floats:
+                paint_stacking_context_paint_node_as_stacking_context(child, context)
+            continue
+
+        if paint_paintable_is_positioned(child) and (z_index else 0) == 0:
+            continue
+
+        let child_is_inline_or_replaced = paint_paintable_is_inline(child) or is_layout_replaced_box(paint_paintable_layout_node(child))
+        match phase:
+            .background_and_borders:
+                if not child_is_inline_or_replaced and not paint_paintable_is_floating(child):
+                    paint_paint_node(child, context, PaintPhase.background)
+                    paint_paint_node(child, context, PaintPhase.border)
+                    paint_stacking_context_paint_descendants(context, child, phase)
+                    paint_paint_node(child, context, PaintPhase.table_collapsed_border)
+            .floats:
+                if paint_paintable_is_floating(child):
+                    paint_paint_node(child, context, PaintPhase.background)
+                    paint_paint_node(child, context, PaintPhase.border)
+                    paint_stacking_context_paint_descendants(context, child, PaintStackingContextStackingContextPaintPhase.background_and_borders)
+                paint_stacking_context_paint_descendants(context, child, phase)
+            .background_and_borders_for_inline_level_and_replaced:
+                if child_is_inline_or_replaced:
+                    paint_paint_node(child, context, PaintPhase.background)
+                    paint_paint_node(child, context, PaintPhase.border)
+                    paint_paint_node(child, context, PaintPhase.table_collapsed_border)
+                    paint_stacking_context_paint_descendants(context, child, PaintStackingContextStackingContextPaintPhase.background_and_borders)
+                paint_stacking_context_paint_descendants(context, child, phase)
+            .foreground:
+                paint_paint_node(child, context, PaintPhase.foreground)
+                paint_stacking_context_paint_descendants(context, child, phase)
+                paint_paint_node(child, context, PaintPhase.outline)
+                paint_paint_node(child, context, PaintPhase.overlay)
+            _: trap("VERIFY_NOT_REACHED")
+
+## Ported from Libraries/LibWeb/Painting/StackingContext.cpp:220 Web::Painting::StackingContext::paint_child.
+func paint_stacking_context_paint_child(context: DisplayListRecordingContext*, child: PaintStackingContext*):
+    assert(not paint_paintable_is_svg_paintable(paint_stacking_context_paintable_box(child).paint_paintable()))
+    paint_stacking_context_set_last_paint_generation_id(child, display_list_recording_context_paint_generation_id(context))
+    paint_stacking_context_paint(child, context)
+
+## Ported from Libraries/LibWeb/Painting/StackingContext.cpp:227 Web::Painting::StackingContext::paint_internal.
+func paint_stacking_context_paint_internal(this: PaintStackingContext*, context: DisplayListRecordingContext*):
+    let box = paint_stacking_context_paintable_box(this)
+    let paintable = box.paint_paintable()
+    assert(not paint_paintable_is_svg_paintable(paintable))
+    if paint_paintable_is_svg_svg_paintable(paintable):
+        paint_paint_node(paintable, context, PaintPhase.background)
+        paint_paint_node(paintable, context, PaintPhase.border)
+
+        paint_svgsvg_paintable_paint_descendants(context, box, PaintPhase.foreground)
+
+        paint_paint_node(paintable, context, PaintPhase.outline)
+        if display_list_recording_context_should_paint_overlay(context):
+            paint_paint_node(paintable, context, PaintPhase.overlay)
+        return
+
+    # For a more elaborate description of the algorithm, see CSS 2.1 Appendix E
+    # Draw the background and borders for the context root (steps 1, 2)
+    paint_paint_node(paintable, context, PaintPhase.background)
+    paint_paint_node(paintable, context, PaintPhase.border)
+
+    # Stacking contexts formed by positioned descendants with negative z-indices (excluding 0) in z-index order
+    # (most negative first) then tree order. (step 3)
+    # Here, we treat non-positioned stacking contexts as if they were positioned, because CSS 2.0 spec does not
+    # account for new properties like `transform` and `opacity` that can create stacking contexts.
+    # https://github.com/w3c/csswg-drafts/issues/2717
+    for child in ak.vector_span(&this.m_children):
+        if let z_index = paint_paintable_box_effective_z_index(paint_stacking_context_paintable_box(child)):
+            if z_index < 0:
+                paint_stacking_context_paint_child(context, child)
+
+    # Draw the background and borders for block-level children (step 4)
+    paint_stacking_context_paint_descendants(context, paintable, PaintStackingContextStackingContextPaintPhase.background_and_borders)
+    # Draw the non-positioned floats (step 5)
+    paint_stacking_context_paint_descendants(context, paintable, PaintStackingContextStackingContextPaintPhase.floats)
+    # Draw inline content, replaced content, etc. (steps 6, 7)
+    paint_stacking_context_paint_descendants(context, paintable, PaintStackingContextStackingContextPaintPhase.background_and_borders_for_inline_level_and_replaced)
+    paint_paint_node(paintable, context, PaintPhase.foreground)
+    paint_stacking_context_paint_descendants(context, paintable, PaintStackingContextStackingContextPaintPhase.foreground)
+
+    # Draw positioned descendants with z-index `0` or `auto` in tree order. (step 8)
+    # Here, we treat non-positioned stacking contexts as if they were positioned, because CSS 2.0 spec does not
+    # account for new properties like `transform` and `opacity` that can create stacking contexts.
+    # https://github.com/w3c/csswg-drafts/issues/2717
+    for positioned in ak.vector_span(&this.m_positioned_descendants_and_stacking_contexts_with_stack_level_0):
+        # At this point, `paintable_box` is a positioned descendant with z-index: auto.
+        # FIXME: This is basically duplicating logic found elsewhere in this same function. Find a way to make this more elegant.
+        if let child = paint_paintable_box_stacking_context(positioned):
+            paint_stacking_context_paint_child(context, child)
+        else:
+            paint_stacking_context_paint_node_as_stacking_context(positioned.paint_paintable(), context)
+
+    # Stacking contexts formed by positioned descendants with z-indices greater than or equal to 1 in z-index order
+    # (smallest first) then tree order. (Step 9)
+    # Here, we treat non-positioned stacking contexts as if they were positioned, because CSS 2.0 spec does not
+    # account for new properties like `transform` and `opacity` that can create stacking contexts.
+    # https://github.com/w3c/csswg-drafts/issues/2717
+    for child in ak.vector_span(&this.m_children):
+        if let z_index = paint_paintable_box_effective_z_index(paint_stacking_context_paintable_box(child)):
+            if z_index >= 1:
+                paint_stacking_context_paint_child(context, child)
+
+    paint_paint_node(paintable, context, PaintPhase.outline)
+
+    if display_list_recording_context_should_paint_overlay(context):
+        paint_paint_node(paintable, context, PaintPhase.overlay)
+
+## Ported from Libraries/LibWeb/Painting/StackingContext.cpp:296 Web::Painting::StackingContext::paint.
+pub func paint_stacking_context_paint(this: PaintStackingContext*, context: DisplayListRecordingContext*):
+    let box = paint_stacking_context_paintable_box(this)
+    # https://drafts.csswg.org/css-transforms-1/#transform-function-lists
+    # If a transform function causes the current transformation matrix of an object to be non-invertible, the object
+    # and its content do not get displayed.
+    if paint_paintable_box_has_non_invertible_css_transform(box):
+        return
+
+    let computed_values = &paint_paintable_computed_values(box.paint_paintable()).computed_values
+    if css_computed_values_opacity(computed_values) == 0.0:
+        return
+
+    let recorder = display_list_recording_context_display_list_recorder(context)
+    # TemporaryChange save_nesting_level(context.display_list_recorder().m_save_nesting_level, 0);
+    let saved_nesting_level = recorder.m_save_nesting_level
+    recorder.m_save_nesting_level = 0
+    defer recorder.m_save_nesting_level = saved_nesting_level
+    # ScopeGuard verify_save_and_restore_are_balanced (runs before the TemporaryChange restores).
+    defer assert(recorder.m_save_nesting_level == 0)
+
+    let mask_image = css_computed_values_mask_image(computed_values)
+
+    if let image = mask_image:
+        let padding_box_rect = paint_paintable_box_absolute_padding_box_rect(box)
+        css_abstract_image_style_value_resolve_for_size(image, paint_paintable_box_layout_node_with_style_and_box_metrics(box).layout_node_with_style(), gfx.css_pixel_rect_size(&padding_box_rect))
+
+    let effective_context_index = paint_paintable_box_accumulated_visual_context_index(box)
+    display_list.display_list_recorder_set_accumulated_visual_context(recorder, effective_context_index)
+
+    # For elements with SVG filters, emit a transparent FillRect to trigger filter application.
+    # This ensures content-generating filters (feFlood, feImage) work even with empty source.
+    let filter = paint_paintable_box_filter(box)
+    if let bounds = filter.svg_filter_bounds:
+        let device_rect = display_list_recording_context_enclosing_device_rect(context, bounds)
+        display_list.display_list_recorder_fill_rect_transparent(recorder, device_rect)
+
+    # Collect all masks (CSS mask-image, SVG <mask>, SVG <clipPath>).
+    var masks: ak.Vector[display_list.DisplayListRecorderMaskInfo]
+
+    if let image = mask_image:
+        let mask_display_list = display_list.display_list_create(display_list.accumulated_visual_context_tree_create())
+        var display_list_recorder: display_list.DisplayListRecorder = ---
+        display_list.display_list_recorder_construct(&display_list_recorder, mask_display_list)
+        var mask_painting_context = display_list_recording_context_clone(context, &display_list_recorder)
+        let mask_rect_in_device_pixels = display_list_recording_context_enclosing_device_rect(context, paint_paintable_box_absolute_padding_box_rect(box))
+        css_abstract_image_style_value_paint(image, &mask_painting_context, gfx.DevicePixelRect(m_location = gfx.IntPoint(), m_size = gfx.device_pixel_rect_size(&mask_rect_in_device_pixels)), css_data.ImageRendering.auto)
+        ak.vector_append_t(&masks, display_list.DisplayListRecorderMaskInfo(display_list = mask_display_list, rect = mask_rect_in_device_pixels, kind = gfx.MaskKind.alpha))
+
+    if let mask_area = paint_paintable_box_get_mask_area(box):
+        if let mask_display_list = paint_paintable_box_calculate_mask(box, context, mask_area):
+            let rect = display_list_recording_context_enclosing_device_rect(context, mask_area)
+            let kind = paint_paintable_box_get_mask_type(box) else gfx.MaskKind.alpha
+            ak.vector_append_t(&masks, display_list.DisplayListRecorderMaskInfo(display_list = mask_display_list, rect = rect, kind = kind))
+
+    if let clip_area = paint_paintable_box_get_clip_area(box):
+        if let clip_display_list = paint_paintable_box_calculate_clip(box, context, clip_area):
+            let rect = display_list_recording_context_enclosing_device_rect(context, clip_area)
+            ak.vector_append_t(&masks, display_list.DisplayListRecorderMaskInfo(display_list = clip_display_list, rect = rect, kind = gfx.MaskKind.alpha))
+
+    display_list.display_list_recorder_begin_masks(recorder, ak.vector_span_const(&masks))
+
+    let context_before_children = display_list.display_list_recorder_accumulated_visual_context(recorder)
+
+    paint_stacking_context_paint_internal(this, context)
+
+    display_list.display_list_recorder_set_accumulated_visual_context(recorder, context_before_children)
+
+    display_list.display_list_recorder_end_masks(recorder, ak.vector_span_const(&masks))
+
+# mark: Hit testing ================================================================================
+
+## Ported from Libraries/LibWeb/Painting/StackingContext.cpp:372 Web::Painting::StackingContext::hit_test.
+pub func paint_stacking_context_hit_test(this: PaintStackingContext*, position: gfx.CssPixelPoint, type_: PaintHitTestType, callback: ak.Function1[PaintHitTestResult, TraversalDecision]) -> TraversalDecision:
+    let box = paint_stacking_context_paintable_box(this)
+    let paintable = box.paint_paintable()
+    # AD-HOC: Elements with non-invertible transforms are not displayed per the spec,
+    #         so they should not be hit-testable either.
+    if paint_paintable_box_has_non_invertible_css_transform(box):
+        return TraversalDecision.continue_
+
+    let is_visible = css_computed_values_visibility(&paint_paintable_computed_values(paintable).computed_values) == css_data.Visibility.visible
+
+    # NOTE: Hit testing basically happens in reverse painting order.
+    # https://drafts.csswg.org/css2/#z-index
+
+    # 7. the child stacking contexts with positive stack levels (least positive first).
+    # NOTE: Hit testing follows reverse painting order, that's why the conditions here are reversed.
+    var index = ak.vector_size(&this.m_children)
+    while index > 0:
+        index -= 1
+        let child = *ak.vector_at(&this.m_children, index)
+        if (paint_paintable_box_effective_z_index(paint_stacking_context_paintable_box(child)) else 0) <= 0:
+            break
+        if paint_stacking_context_hit_test(child, position, type_, callback) == TraversalDecision.break_:
+            return TraversalDecision.break_
+
+    # 6. the child stacking contexts with stack level 0 and the positioned descendants with stack level 0.
+    index = ak.vector_size(&this.m_positioned_descendants_and_stacking_contexts_with_stack_level_0)
+    while index > 0:
+        index -= 1
+        let paintable_box = *ak.vector_at(&this.m_positioned_descendants_and_stacking_contexts_with_stack_level_0, index)
+        if let stacking_context = paint_paintable_box_stacking_context(paintable_box):
+            if paint_stacking_context_hit_test(stacking_context, position, type_, callback) == TraversalDecision.break_:
+                return TraversalDecision.break_
+        else:
+            if paint_paintable_hit_test(paintable_box.paint_paintable(), position, type_, callback) == TraversalDecision.break_:
+                return TraversalDecision.break_
+
+    # 5. the in-flow, inline-level, non-positioned descendants, including inline tables and inline blocks.
+    let layout_node = paint_paintable_layout_node(paintable)
+    if layout_node_children_are_inline(layout_node) and is_layout_block_container(layout_node):
+        var child_or_none = tree_node_last_child(paintable)
+        while let child = child_or_none:
+            child_or_none = tree_node_previous_sibling(child)
+            if paint_paintable_is_inline(child) and not paint_paintable_is_absolutely_positioned(child) and not paint_paintable_has_stacking_context(child):
+                if paint_paintable_hit_test(child, position, type_, callback) == TraversalDecision.break_:
+                    return TraversalDecision.break_
+
+        # Hit test the stacking context root's own fragments if it's a PaintableWithLines.
+        if is_paint_paintable_with_lines(paintable):
+            let paintable_with_lines = as_paint_paintable_with_lines(paintable)
+            if let local_position = paint_paintable_box_transform_point_to_local(box, position):
+                if paint_paintable_with_lines_hit_test_fragments(paintable_with_lines, position, local_position, type_, callback) == TraversalDecision.break_:
+                    return TraversalDecision.break_
+
+    # 4. the non-positioned floats.
+    index = ak.vector_size(&this.m_non_positioned_floating_descendants)
+    while index > 0:
+        index -= 1
+        let paintable_box = *ak.vector_at(&this.m_non_positioned_floating_descendants, index)
+        if paint_paintable_hit_test(paintable_box.paint_paintable(), position, type_, callback) == TraversalDecision.break_:
+            return TraversalDecision.break_
+
+    # 3. the in-flow, non-inline-level, non-positioned descendants.
+    if not layout_node_children_are_inline(layout_node):
+        var child_or_none = tree_node_last_child(paintable)
+        while let child = child_or_none:
+            child_or_none = tree_node_previous_sibling(child)
+            if not paint_paintable_is_paintable_box(child):
+                continue
+
+            let paintable_box = as_paint_paintable_box(child)
+            if not paint_paintable_is_absolutely_positioned(child) and not paint_paintable_is_floating(child) and paint_paintable_box_stacking_context(paintable_box) == none:
+                if paint_paintable_hit_test(child, position, type_, callback) == TraversalDecision.break_:
+                    return TraversalDecision.break_
+
+    # 2. the child stacking contexts with negative stack levels (most negative first).
+    # NB: Hit testing follows reverse painting order, so we visit the least negative stack levels first.
+    index = ak.vector_size(&this.m_children)
+    while index > 0:
+        index -= 1
+        let child = *ak.vector_at(&this.m_children, index)
+        # Skip positive/ zero index child stacking contexts, which have already been handled above.
+        if (paint_paintable_box_effective_z_index(paint_stacking_context_paintable_box(child)) else 0) >= 0:
+            continue
+        if paint_stacking_context_hit_test(child, position, type_, callback) == TraversalDecision.break_:
+            return TraversalDecision.break_
+
+    # Hidden elements and elements with pointer-events: none shouldn't be hit.
+    if not is_visible or not paint_paintable_visible_for_hit_testing(paintable):
+        return TraversalDecision.continue_
+
+    let local_position = paint_paintable_box_transform_point_to_local(box, position) else return TraversalDecision.continue_
+
+    let border_box_rect = paint_paintable_box_absolute_border_box_rect(box)
+    if gfx.css_pixel_rect_contains_css_pixel_point(&border_box_rect, local_position):
+        if ak.function1_call(&callback, PaintHitTestResult(paintable = paintable)) == TraversalDecision.break_:
+            return TraversalDecision.break_
+
+    return TraversalDecision.continue_
+
+# mark: Dump =======================================================================================
+
+## Ported from Libraries/LibWeb/Painting/StackingContext.cpp:470 Web::Painting::StackingContext::dump.
+pub func paint_stacking_context_dump(this: PaintStackingContext*, builder: ak.StringBuilder*, indent: i32 = 0):
+    for i in 0..<indent:
+        discard(i)
+        ak.string_builder_append(builder, " ")
+    let box = paint_stacking_context_paintable_box(this)
+    let rect = paint_paintable_box_absolute_rect(box)
+    let description = layout_node_debug_description(paint_paintable_layout_node(box.paint_paintable()))
+    dump_appendff(builder, "SC for {} ", [dump_arg_string(&description)])
+    dump_append_css_pixel_rect(builder, rect)
+    dump_appendff(builder, " [children: {}] (z-index: ", [ak.arg_u64((u64)ak.vector_size(&this.m_children))])
+
+    if let z_index = paint_paintable_box_effective_z_index(box):
+        dump_appendff(builder, "{}", [ak.arg_i64((i64)z_index)])
+    else:
+        ak.string_builder_append(builder, "auto")
+    ak.string_builder_append(builder, ")")
+
+    if paint_paintable_box_has_css_transform(box):
+        ak.string_builder_append(builder, ", has_transform")
+
+    ak.string_builder_append(builder, "\n")
+    for child in ak.vector_span(&this.m_children):
+        paint_stacking_context_dump(child, builder, indent + 1)

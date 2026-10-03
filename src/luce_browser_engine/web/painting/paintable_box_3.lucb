@@ -1,0 +1,351 @@
+#==============================================================================================
+#
+#   paintable_box_3 - Painting::PaintableBox: resizers, hit testing, transforms and scroll
+#                     frames
+#
+#   DESCRIPTION:
+#       Port of LibWeb/Painting/PaintableBox.cpp (lines 994-1349): whether a box has a resizer
+#       and its chrome is mirrored, mouse wheel scrolling, hit testing (chrome, children,
+#       continuations and the box itself), repaint invalidation, the transform reference box,
+#       border radii and outlines, the nearest scroll frame and scrollable ancestor, and the
+#       physical resize axes.
+#
+#       Copyright (c) 2022-2023, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2022-2025, Sam Atkins <sam@ladybird.org>
+#       Copyright (c) 2024-2026, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
+#       Copyright (c) 2025, Jelle Raaijmakers <jelle@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Resizers ==================================================================================
+
+## Ported from Libraries/LibWeb/Painting/PaintableBox.cpp:994 Web::Painting::PaintableBox::has_resizer.
+pub func paint_paintable_box_has_resizer(this: PaintPaintableBox*) -> bool:
+    # https://drafts.csswg.org/css-ui#resize
+    if paint_paintable_is_viewport_paintable(this.paint_paintable()):
+        return false
+
+    # The effect of the resize property on generated content is undefined.
+    # Implementations should not apply the resize property to generated content.
+
+    if layout_node_generated_for_pseudo_element(paint_paintable_layout_node(this.paint_paintable())) != none:
+        return false
+
+    let axes = paint_paintable_box_physical_resize_axes(this)
+    return axes.horizontal or axes.vertical
+
+## Ported from Libraries/LibWeb/Painting/PaintableBox.cpp:1009 Web::Painting::PaintableBox::is_chrome_mirrored.
+pub func paint_paintable_box_is_chrome_mirrored(this: PaintPaintableBox*) -> bool:
+    let computed_values = &paint_paintable_computed_values(this.paint_paintable()).computed_values
+    let writing_mode = css_computed_values_writing_mode(computed_values)
+    return (writing_mode == css_data.WritingMode.horizontal_tb and css_computed_values_direction(computed_values) == css_data.Direction.rtl) or writing_mode == css_data.WritingMode.vertical_rl or writing_mode == css_data.WritingMode.sideways_rl
+
+## Ported from Libraries/LibWeb/Painting/PaintableBox.cpp:1017 Web::Painting::PaintableBox::resize_handle.
+pub func paint_paintable_box_resize_handle(this: PaintPaintableBox*) -> PaintResizeHandle*?:
+    return this.m_resize_handle
+
+## Ported from Libraries/LibWeb/Painting/PaintableBox.cpp:1022 Web::Painting::PaintableBox::ensure_resize_handle.
+pub func paint_paintable_box_ensure_resize_handle(this: PaintPaintableBox*) -> PaintResizeHandle*:
+    if this.m_resize_handle == none:
+        this.m_resize_handle = paint_resize_handle_create(gc.cell_heap(this.cell()), this)
+    return this.m_resize_handle else trap("unreachable: created above")
+
+## Ported from Libraries/LibWeb/Painting/PaintableBox.cpp:1029 Web::Painting::PaintableBox::handle_mousewheel (override).
+pub func paint_paintable_box_handle_mousewheel_impl(base: PaintPaintable*, arg0: gfx.CssPixelPoint, buttons: u32, modifiers: u32, wheel_delta_x: i32, wheel_delta_y: i32) -> bool:
+    discard(arg0)
+    discard(buttons)
+    discard(modifiers)
+    let this = (PaintPaintableBox*)base
+    # if none of the axes we scrolled with can be accepted by this element, don't handle scroll.
+    if (wheel_delta_x == 0 or not paint_paintable_box_could_be_scrolled_by_wheel_event_paint_paintable_box_scroll_dir(this, PaintPaintableBoxScrollDirection.horizontal)) and (wheel_delta_y == 0 or not paint_paintable_box_could_be_scrolled_by_wheel_event_paint_paintable_box_scroll_dir(this, PaintPaintableBoxScrollDirection.vertical)):
+        return false
+
+    let scroll_handled = paint_paintable_box_scroll_by(this, wheel_delta_x, wheel_delta_y)
+    return scroll_handled == PaintPaintableBoxScrollHandled.yes
+
+# mark: Hit testing ===============================================================================
+
+## The `check_scrollbar` lambda of PaintableBox::hit_test_chrome.
+func paint_paintable_box_check_scrollbar(this: PaintPaintableBox*, result: PaintHitTestResult*, adjusted_position: gfx.CssPixelPoint, metrics: ChromeMetrics, direction: PaintPaintableBoxScrollDirection, callback: ak.Function1[PaintHitTestResult, TraversalDecision]) -> TraversalDecision:
+    let scrollbar = paint_paintable_box_ensure_scrollbar(this, direction)
+    if paint_scrollbar_contains(scrollbar, adjusted_position, metrics):
+        result.chrome_widget = scrollbar.paint_chrome_widget()
+        return ak.function1_call(&callback, *result)
+    return TraversalDecision.continue_
+
+## Ported from Libraries/LibWeb/Painting/PaintableBox.cpp:1040 Web::Painting::PaintableBox::hit_test_chrome.
+pub func paint_paintable_box_hit_test_chrome(this: PaintPaintableBox*, adjusted_position: gfx.CssPixelPoint, callback: ak.Function1[PaintHitTestResult, TraversalDecision]) -> TraversalDecision:
+    # The vast majority of paintable boxes have no resizer and no scrollable axis. Reject those before constructing
+    # ChromeMetrics or allocating any Scrollbar.
+    let has_resizer = paint_paintable_box_has_resizer(this)
+    let can_scroll_horizontally = paint_paintable_box_could_be_scrolled_by_wheel_event_paint_paintable_box_scroll_dir(this, PaintPaintableBoxScrollDirection.horizontal)
+    let can_scroll_vertically = paint_paintable_box_could_be_scrolled_by_wheel_event_paint_paintable_box_scroll_dir(this, PaintPaintableBoxScrollDirection.vertical)
+    if not has_resizer and not can_scroll_horizontally and not can_scroll_vertically:
+        return TraversalDecision.continue_
+
+    # FIXME: This const_cast is not great, but this method is invoked from overrides of virtual const methods.
+    var result = PaintHitTestResult(paintable = this.paint_paintable())
+    let metrics = page_chrome_metrics(dom_document_page(paint_paintable_document(this.paint_paintable())))
+
+    if has_resizer and paint_paintable_box_resizer_contains(this, adjusted_position, metrics):
+        result.chrome_widget = paint_paintable_box_ensure_resize_handle(this).paint_chrome_widget()
+        return ak.function1_call(&callback, result)
+
+    if can_scroll_horizontally and paint_paintable_box_check_scrollbar(this, &result, adjusted_position, metrics, PaintPaintableBoxScrollDirection.horizontal, callback) == TraversalDecision.break_:
+        return TraversalDecision.break_
+    if can_scroll_vertically and paint_paintable_box_check_scrollbar(this, &result, adjusted_position, metrics, PaintPaintableBoxScrollDirection.vertical, callback) == TraversalDecision.break_:
+        return TraversalDecision.break_
+
+    return TraversalDecision.continue_
+
+## Ported from Libraries/LibWeb/Painting/PaintableBox.cpp:1075 Web::Painting::PaintableBox::resizer_contains.
+pub func paint_paintable_box_resizer_contains(this: PaintPaintableBox*, adjusted_position: gfx.CssPixelPoint, metrics: ChromeMetrics) -> bool:
+    var handle_rect = paint_paintable_box_absolute_resizer_rect(this, metrics) else return false
+    let bottom_left_resizer = paint_paintable_box_is_chrome_mirrored(this)
+    let zero = gfx.CssPixels.from_int(0)
+    let border = this.m_box_model.border
+    gfx.css_pixel_rect_inflate_css_pixels_css_pixels_css_pixels(&handle_rect, zero, zero if bottom_left_resizer else border.right, border.bottom, border.left if bottom_left_resizer else zero)
+
+    return gfx.css_pixel_rect_contains_css_pixel_point(&handle_rect, adjusted_position)
+
+## Ported from Libraries/LibWeb/Painting/PaintableBox.cpp:1086 Web::Painting::PaintableBox::hit_test (override).
+pub func paint_paintable_box_hit_test_impl(base: PaintPaintable*, position: gfx.CssPixelPoint, type_: PaintHitTestType, callback: ak.Function1[PaintHitTestResult, TraversalDecision]) -> TraversalDecision:
+    let this = (PaintPaintableBox*)base
+    let is_visible = css_computed_values_visibility(&paint_paintable_computed_values(base).computed_values) == css_data.Visibility.visible
+
+    let local_position = paint_paintable_box_transform_point_to_local(this, position)
+
+    # Only hit test chrome (scrollbars, etc.) for visible elements.
+    if is_visible and paint_paintable_visible_for_hit_testing(base):
+        if paint_paintable_box_hit_test_chrome(this, local_position else position, callback) == TraversalDecision.break_:
+            return TraversalDecision.break_
+
+    if paint_paintable_is_viewport_paintable(base):
+        let viewport_paintable = (PaintViewportPaintable*)this
+        paint_viewport_paintable_build_stacking_context_tree_if_needed(viewport_paintable)
+        dom_document_update_paint_and_hit_testing_properties_if_needed(paint_paintable_document(base))
+        paint_viewport_paintable_refresh_scroll_state(viewport_paintable)
+        let stacking_context = paint_paintable_box_stacking_context(this) else trap("the viewport has no stacking context")
+        return paint_stacking_context_hit_test(stacking_context, position, type_, callback)
+
+    if paint_paintable_box_stacking_context(this) != none:
+        return TraversalDecision.continue_
+
+    if paint_paintable_box_hit_test_children(this, position, type_, callback) == TraversalDecision.break_:
+        return TraversalDecision.break_
+
+    # Hidden elements and elements with pointer-events: none shouldn't be hit.
+    if not is_visible or not paint_paintable_visible_for_hit_testing(base):
+        return TraversalDecision.continue_
+
+    let local_point = local_position else return TraversalDecision.continue_
+
+    let border_box_rect = paint_paintable_box_absolute_border_box_rect(this)
+    if not gfx.css_pixel_rect_contains_css_pixel_point(&border_box_rect, local_point):
+        return TraversalDecision.continue_
+
+    let radii = paint_paintable_box_border_radii_data(this)
+    if display_list.border_radii_data_has_any_radius(&radii):
+        if not display_list.border_radii_data_contains(&radii, local_point, border_box_rect):
+            return TraversalDecision.continue_
+
+    if paint_paintable_box_hit_test_continuation(this, callback) == TraversalDecision.break_:
+        return TraversalDecision.break_
+
+    return ak.function1_call(&callback, PaintHitTestResult(paintable = base))
+
+## Ported from Libraries/LibWeb/Painting/PaintableBox.cpp:1136 Web::Painting::PaintableBox::hit_test_continuation.
+pub func paint_paintable_box_hit_test_continuation(this: PaintPaintableBox*, callback: ak.Function1[PaintHitTestResult, TraversalDecision]) -> TraversalDecision:
+    # If we're hit testing the "middle" part of a continuation chain, we are dealing with an anonymous box that is
+    # linked to a parent inline node. Since our block element children did not match the hit test, but we did, we
+    # should walk the continuation chain up to the inline parent and return a hit on that instead.
+    var continuation_node = layout_node_with_style_and_box_model_metrics_continuation_of_node(paint_paintable_box_layout_node_with_style_and_box_metrics(this)) else return TraversalDecision.continue_
+    if not layout_node_is_anonymous(paint_paintable_layout_node(this.paint_paintable())):
+        return TraversalDecision.continue_
+
+    while let next = layout_node_with_style_and_box_model_metrics_continuation_of_node(continuation_node):
+        continuation_node = next
+    let paintable = layout_node_first_paintable(continuation_node.layout_node()) else trap("a continuation without a paintable")
+    if not paint_paintable_visible_for_hit_testing(paintable):
+        return TraversalDecision.continue_
+
+    return ak.function1_call(&callback, PaintHitTestResult(paintable = paintable))
+
+## The state of the callback of PaintableBox::hit_test(position, type): the best candidate so far.
+struct PaintPaintableBoxHitTestBest:
+    var result: PaintHitTestResult?
+    var type_: PaintHitTestType
+
+## The callback lambda of PaintableBox::hit_test(position, type).
+func paint_paintable_box_hit_test_best_candidate(context: void*?, candidate: PaintHitTestResult) -> TraversalDecision:
+    let best = (PaintPaintableBoxHitTestBest*)(context else trap("no hit test state"))
+    let max_value = gfx.CssPixels.from_int(gfx.css_pixels_max_integer_value)
+    if let current = best.result:
+        if (candidate.vertical_distance else max_value).lt(current.vertical_distance else max_value) or (candidate.horizontal_distance else max_value).lt(current.horizontal_distance else max_value):
+            best.result = candidate
+    else:
+        best.result = candidate
+
+    if let current = best.result:
+        if best.type_ == PaintHitTestType.exact or (current.vertical_distance == gfx.CssPixels.from_int(0) and current.horizontal_distance == gfx.CssPixels.from_int(0)):
+            return TraversalDecision.break_
+    return TraversalDecision.continue_
+
+## Ported from Libraries/LibWeb/Painting/PaintableBox.cpp:1155 Web::Painting::PaintableBox::hit_test.
+pub func paint_paintable_box_hit_test(this: PaintPaintableBox*, position: gfx.CssPixelPoint, type_: PaintHitTestType) -> PaintHitTestResult?:
+    var best = PaintPaintableBoxHitTestBest(result = none, type_ = type_)
+    discard(paint_paintable_box_hit_test_impl(this.paint_paintable(), position, type_, ak.Function1[PaintHitTestResult, TraversalDecision](call = paint_paintable_box_hit_test_best_candidate, context = &best)))
+    return best.result
+
+## Ported from Libraries/LibWeb/Painting/PaintableBox.cpp:1173 Web::Painting::PaintableBox::hit_test_children.
+pub func paint_paintable_box_hit_test_children(this: PaintPaintableBox*, position: gfx.CssPixelPoint, type_: PaintHitTestType, callback: ak.Function1[PaintHitTestResult, TraversalDecision]) -> TraversalDecision:
+    var child_or_none = tree_node_last_child(this.paint_paintable())
+    while let child = child_or_none:
+        child_or_none = tree_node_previous_sibling(child)
+        if paint_paintable_is_positioned(child) and (css_computed_values_z_index(&paint_paintable_computed_values(child).computed_values) else 0) == 0:
+            continue
+        if paint_paintable_has_stacking_context(child):
+            continue
+        if paint_paintable_hit_test(child, position, type_, callback) == TraversalDecision.break_:
+            return TraversalDecision.break_
+    return TraversalDecision.continue_
+
+# mark: Repainting ================================================================================
+
+## Ported from Libraries/LibWeb/Painting/PaintableBox.cpp:1186 Web::Painting::PaintableBox::set_needs_repaint (override).
+pub func paint_paintable_box_set_needs_repaint_impl(base: PaintPaintable*, should_invalidate_display_list: InvalidateDisplayList):
+    let this = (PaintPaintableBox*)base
+    if should_invalidate_display_list == InvalidateDisplayList.yes:
+        paint_paintable_box_invalidate_paint_cache(this)
+
+        # Recurse into anonymous child nodes so we properly invalidate nested contents of e.g. <button>s.
+        for child in paint_paintable_children(base):
+            if not is_paint_paintable_box(child):
+                continue
+            if layout_node_is_anonymous(paint_paintable_layout_node(child)):
+                paint_paintable_set_needs_repaint(child, should_invalidate_display_list)
+    paint_paintable_set_needs_repaint_impl(base, should_invalidate_display_list)
+
+# mark: Transforms, radii and outlines ============================================================
+
+## Ported from Libraries/LibWeb/Painting/PaintableBox.cpp:1202 Web::Painting::PaintableBox::transform_reference_box.
+# https://www.w3.org/TR/css-transforms-1/#reference-box
+pub func paint_paintable_box_transform_reference_box(this: PaintPaintableBox*) -> gfx.CssPixelRect:
+    var transform_box = css_computed_values_transform_box(&paint_paintable_computed_values(this.paint_paintable()).computed_values)
+    # For SVG elements without associated CSS layout box, the used value for content-box is fill-box and for
+    # border-box is stroke-box.
+    # FIXME: This currently detects any SVG element except the <svg> one. Is that correct?
+    #        And is it correct to use `else` below?
+    if is_paint_svg_paintable(this):
+        match transform_box:
+            .content_box: transform_box = css_data.TransformBox.fill_box
+            .border_box: transform_box = css_data.TransformBox.stroke_box
+            _: discard(0)
+    # For elements with associated CSS layout box, the used value for fill-box is content-box and for
+    # stroke-box and view-box is border-box.
+    else:
+        match transform_box:
+            .fill_box: transform_box = css_data.TransformBox.content_box
+            .stroke_box, .view_box: transform_box = css_data.TransformBox.border_box
+            _: discard(0)
+
+    match transform_box:
+        .content_box:
+            # Uses the content box as reference box.
+            # FIXME: The reference box of a table is the border box of its table wrapper box, not its table box.
+            return paint_paintable_box_absolute_rect(this)
+        .border_box:
+            # Uses the border box as reference box.
+            # FIXME: The reference box of a table is the border box of its table wrapper box, not its table box.
+            return paint_paintable_box_absolute_border_box_rect(this)
+        .fill_box:
+            # Uses the object bounding box as reference box.
+            # FIXME: For now we're using the content rect as an approximation.
+            return paint_paintable_box_absolute_rect(this)
+        .stroke_box:
+            # Uses the stroke bounding box as reference box.
+            # FIXME: For now we're using the border rect as an approximation.
+            return paint_paintable_box_absolute_border_box_rect(this)
+        .view_box:
+            # Uses the nearest SVG viewport as reference box.
+            # FIXME: If a viewBox attribute is specified for the SVG viewport creating element:
+            #  - The reference box is positioned at the origin of the coordinate system established by the viewBox attribute.
+            #  - The dimension of the reference box is set to the width and height values of the viewBox attribute.
+            let svg_paintable = tree_node_first_ancestor_of_type(this.paint_paintable(), &paint_svgsvg_paintable_class) else return paint_paintable_box_absolute_border_box_rect(this)
+            return paint_paintable_box_absolute_rect((PaintPaintableBox*)svg_paintable)
+        _: trap("VERIFY_NOT_REACHED")
+
+## Ported from Libraries/LibWeb/Painting/PaintableBox.cpp:1271 Web::Painting::PaintableBox::border_radii_data.
+pub func paint_paintable_box_border_radii_data(this: PaintPaintableBox*) -> display_list.BorderRadiiData:
+    let computed_values = &paint_paintable_computed_values(this.paint_paintable()).computed_values
+    if not css_computed_values_has_noninitial_border_radii(computed_values):
+        return display_list.BorderRadiiData()
+    let border_rect = gfx.CssPixelRect(gfx.CssPixelPoint(), gfx.CssPixelSize(paint_paintable_box_border_box_width(this), paint_paintable_box_border_box_height(this)))
+    return paint_normalize_border_radii_data(paint_paintable_layout_node(this.paint_paintable()), border_rect, border_rect,
+                                             css_computed_values_border_top_left_radius(computed_values), css_computed_values_border_top_right_radius(computed_values),
+                                             css_computed_values_border_bottom_right_radius(computed_values), css_computed_values_border_bottom_left_radius(computed_values))
+
+## Ported from Libraries/LibWeb/Painting/PaintableBox.cpp:1282 Web::Painting::PaintableBox::outline_data.
+pub func paint_paintable_box_outline_data(this: PaintPaintableBox*) -> display_list.BordersData?:
+    let computed_values = &paint_paintable_computed_values(this.paint_paintable()).computed_values
+    return paint_borders_data_for_outline(paint_paintable_layout_node(this.paint_paintable()), css_computed_values_outline_color(computed_values), css_computed_values_outline_style(computed_values), css_computed_values_outline_width(computed_values))
+
+## Ported from Libraries/LibWeb/Painting/PaintableBox.cpp:1288 Web::Painting::PaintableBox::outline_offset.
+pub func paint_paintable_box_outline_offset(this: PaintPaintableBox*) -> gfx.CssPixels:
+    let outline_offset = css_computed_values_outline_offset(&paint_paintable_computed_values(this.paint_paintable()).computed_values)
+    return css_length_to_px_layout_node(&outline_offset, paint_paintable_layout_node(this.paint_paintable()))
+
+# mark: Scroll frames ==============================================================================
+
+## Ported from Libraries/LibWeb/Painting/PaintableBox.cpp:1293 Web::Painting::PaintableBox::nearest_scroll_frame_index.
+pub func paint_paintable_box_nearest_scroll_frame_index(this: PaintPaintableBox*) -> u64:
+    if paint_paintable_is_fixed_position(this.paint_paintable()):
+        return 0
+    var paintable_or_none = paint_paintable_containing_block(this.paint_paintable())
+    while let paintable = paintable_or_none:
+        if paint_paintable_box_own_scroll_frame_index(paintable) != 0:
+            return paint_paintable_box_own_scroll_frame_index(paintable)
+        # Sticky elements need to find a scroll container even through fixed-position ancestors,
+        # because they must reference a scrollport for their sticky offset computation.
+        if paint_paintable_is_fixed_position(paintable.paint_paintable()) and not paint_paintable_is_sticky_position(this.paint_paintable()):
+            return 0
+        paintable_or_none = paint_paintable_containing_block(paintable.paint_paintable())
+    return 0
+
+## Ported from Libraries/LibWeb/Painting/PaintableBox.cpp:1310 Web::Painting::PaintableBox::nearest_scrollable_ancestor.
+pub func paint_paintable_box_nearest_scrollable_ancestor(this: PaintPaintableBox*) -> PaintPaintableBox*?:
+    var paintable_or_none = paint_paintable_containing_block(this.paint_paintable())
+    while let paintable = paintable_or_none:
+        if paint_paintable_box_could_be_scrolled_by_wheel_event(paintable):
+            return paintable
+        if paint_paintable_is_fixed_position(paintable.paint_paintable()):
+            return none
+        paintable_or_none = paint_paintable_containing_block(paintable.paint_paintable())
+    return none
+
+## Ported from Libraries/LibWeb/Painting/PaintableBox.cpp:1323 Web::Painting::PaintableBox::physical_resize_axes.
+pub func paint_paintable_box_physical_resize_axes(this: PaintPaintableBox*) -> PaintPaintableBoxPhysicalResizeAxes:
+    let computed = &paint_paintable_computed_values(this.paint_paintable()).computed_values
+
+    # https://drafts.csswg.org/css-ui/#resize
+    let resize = css_computed_values_resize(computed)
+    if resize == css_data.Resize.none_:
+        return PaintPaintableBoxPhysicalResizeAxes()
+
+    # 4.1. ... The resize property applies to elements that are scroll containers. UAs may also apply it,
+    # regardless of the value of the overflow property, to:
+    # - Replaced elements representing images or videos, such as img, video, picture, svg, object, or canvas.
+    # - The <iframe> element.
+    let display = css_computed_values_display(computed)
+    if css_display_is_inline_outside(&display) and css_display_is_flow_inside(&display):
+        return PaintPaintableBoxPhysicalResizeAxes()
+
+    let horizontal_writing_mode = css_computed_values_writing_mode(computed) == css_data.WritingMode.horizontal_tb
+    let overflow_x = css_computed_values_overflow_x(computed)
+    let overflow_y = css_computed_values_overflow_y(computed)
+
+    return PaintPaintableBoxPhysicalResizeAxes(
+        horizontal = overflow_x != css_data.Overflow.visible and overflow_x != css_data.Overflow.clip and (resize == css_data.Resize.both or resize == css_data.Resize.horizontal or (resize == css_data.Resize.inline and horizontal_writing_mode) or (resize == css_data.Resize.block and not horizontal_writing_mode)),
+        vertical = overflow_y != css_data.Overflow.visible and overflow_y != css_data.Overflow.clip and (resize == css_data.Resize.both or resize == css_data.Resize.vertical or (resize == css_data.Resize.inline and not horizontal_writing_mode) or (resize == css_data.Resize.block and horizontal_writing_mode)),
+    )

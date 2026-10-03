@@ -1,13 +1,16 @@
 #==============================================================================================
 #
-#   backing_store_manager - Painting::BackingStoreManager: construction and GC edges
+#   backing_store_manager - Painting::BackingStoreManager: the front and back backing stores of
+#                           a navigable
 #
 #   DESCRIPTION:
-#       Port of Libraries/LibWeb/Painting/BackingStoreManager.cpp lines 24-36
-#       (BackingStoreManager::BackingStoreManager and visit_edges), taken ahead of region r50
-#       (which owns BackingStoreManager.cpp) by region r28: every Navigable makes one in its
-#       constructor, so a top-level traversable cannot be created without it. Region r50 ports
-#       the rest of the file around these.
+#       Port of Libraries/LibWeb/Painting/BackingStoreManager.cpp (lines 1-171): construction
+#       and GC edges (taken ahead of region r50 by region r28: every Navigable makes one in its
+#       constructor), the shrink timer, publishing a backing store pair to the page client,
+#       making the pair of shareable bitmap stores, and reallocating them when the viewport
+#       outgrows them. The shared image buffers themselves (LibGfx's SharedImageBuffer over
+#       anonymous shared memory) are not in luce-browser-render, so making a pair traps; Vulkan
+#       and Skia GPU surfaces do not exist in the port (there is no Skia backend context).
 #
 #       Copyright (c) 2024-2026, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
 #       SPDX-License-Identifier: BSD-2-Clause
@@ -31,3 +34,72 @@ pub func paint_backing_store_manager_visit_edges_impl(base: gc.Cell*, visitor: g
     let this = (PaintBackingStoreManager*)base
     gc.cell_visit_edges_impl(base, visitor)
     gc.cell_visitor_visit_t_2(visitor, this.m_navigable)
+
+## Ported from Libraries/LibWeb/Painting/BackingStoreManager.cpp:38 Web::Painting::BackingStoreManager::restart_resize_timer.
+pub func paint_backing_store_manager_restart_resize_timer(this: PaintBackingStoreManager*):
+    let timer = this.m_backing_store_shrink_timer else trap("no backing store shrink timer")
+    core_timer_restart(timer)
+
+## Ported from Libraries/LibWeb/Painting/BackingStoreManager.cpp:43 Web::Painting::publish_backing_store_pair_if_needed.
+pub func paint_publish_backing_store_pair_if_needed(navigable: HtmlNavigable*, front_bitmap_id: i32, front_backing_store: gfx.SharedImage, back_bitmap_id: i32, back_backing_store: gfx.SharedImage):
+    if not html_navigable_is_top_level_traversable(navigable):
+        return
+
+    let traversable = html_navigable_top_level_traversable(navigable) else trap("a top-level traversable without its traversable")
+    let client = page_client(html_navigable_page(traversable.html_navigable()))
+    page_client_page_did_allocate_backing_stores(client, front_bitmap_id, front_backing_store, back_bitmap_id, back_backing_store)
+
+## Ported from Libraries/LibWeb/Painting/BackingStoreManager.cpp:69 Web::Painting::create_shareable_bitmap_backing_stores.
+## There is no SharedImageBuffer in luce-browser-render (LibGfx's anonymous shared memory images), so this traps
+## where C++ creates the two buffers; the GPU branches (Skia on macOS, Vulkan) have no counterpart in the port.
+func paint_create_shareable_bitmap_backing_stores(navigable: HtmlNavigable*, size: gfx.IntSize, front_bitmap_id: i32, back_bitmap_id: i32, skia_backend_context: gfx.SkiaBackendContext*?) -> PaintBackingStorePair:
+    discard(navigable)
+    discard(size)
+    discard(front_bitmap_id)
+    discard(back_bitmap_id)
+    discard(skia_backend_context)
+    # auto front_buffer = Gfx::SharedImageBuffer::create(size);
+    # auto back_buffer = Gfx::SharedImageBuffer::create(size);
+    # publish_backing_store_pair_if_needed(navigable, front_bitmap_id, front_buffer.export_shared_image(), back_bitmap_id, back_buffer.export_shared_image());
+    # return { .front = Gfx::PaintingSurface::wrap_bitmap(*front_buffer.bitmap()), .back = Gfx::PaintingSurface::wrap_bitmap(*back_buffer.bitmap()) };
+    trap("unported: Gfx::SharedImageBuffer::create (shared memory images are not in luce-browser-render)")
+
+## Ported from Libraries/LibWeb/Painting/BackingStoreManager.cpp:119 Web::Painting::BackingStoreManager::reallocate_backing_stores.
+pub func paint_backing_store_manager_reallocate_backing_stores(this: PaintBackingStoreManager*, size: gfx.IntSize):
+    # Gfx::SkiaBackendContext::the(): the port has no Skia backend context.
+    let skia_backend_context: gfx.SkiaBackendContext*? = none
+
+    this.m_front_bitmap_id = this.m_next_bitmap_id
+    this.m_next_bitmap_id += 1
+    this.m_back_bitmap_id = this.m_next_bitmap_id
+    this.m_next_bitmap_id += 1
+
+    # (USE_VULKAN_DMABUF_IMAGES: not in the port.)
+
+    let backing_stores = paint_create_shareable_bitmap_backing_stores(this.m_navigable, size, this.m_front_bitmap_id, this.m_back_bitmap_id, skia_backend_context)
+    # The `update_backing_stores` lambda.
+    this.m_allocated_size = size
+    html_rendering_thread_update_backing_stores(html_navigable_rendering_thread(this.m_navigable), backing_stores.front, backing_stores.back, this.m_front_bitmap_id, this.m_back_bitmap_id)
+
+## Ported from Libraries/LibWeb/Painting/BackingStoreManager.cpp:146 Web::Painting::BackingStoreManager::resize_backing_stores_if_needed.
+pub func paint_backing_store_manager_resize_backing_stores_if_needed(this: PaintBackingStoreManager*, window_resize_in_progress: PaintBackingStoreManagerWindowResizingInProgress):
+    if html_navigable_is_svg_page(this.m_navigable):
+        return
+
+    let device_rect = page_css_to_device_rect(html_navigable_page(this.m_navigable), html_navigable_viewport_rect(this.m_navigable))
+    let viewport_size = gfx.device_pixel_rect_size(&device_rect)
+    if gfx.int_size_is_empty(&viewport_size):
+        return
+
+    var minimum_needed_size = gfx.IntSize()
+    var force_reallocate = false
+    if window_resize_in_progress == PaintBackingStoreManagerWindowResizingInProgress.yes and html_navigable_is_top_level_traversable(this.m_navigable):
+        # Pad the minimum needed size so that we don't have to keep reallocating backing stores while the window is being resized.
+        minimum_needed_size = gfx.IntSize(m_width = viewport_size.m_width + 256, m_height = viewport_size.m_height + 256)
+    else:
+        # If we're not in the middle of a resize, we can shrink the backing store size to match the viewport size.
+        minimum_needed_size = viewport_size
+        force_reallocate = this.m_allocated_size != minimum_needed_size
+
+    if force_reallocate or gfx.int_size_is_empty(&this.m_allocated_size) or not gfx.int_size_contains(&this.m_allocated_size, minimum_needed_size):
+        paint_backing_store_manager_reallocate_backing_stores(this, minimum_needed_size)
