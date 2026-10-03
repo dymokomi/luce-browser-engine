@@ -1526,6 +1526,21 @@ which need the C++ build, happen on the porter's machine before the commit.
 
 ## 7. Dependencies and what is replaced
 
+### 7.0 Our own libraries first (owner, 2026-10-03)
+
+Where a Luce library covers a need, the browser uses it and improves it instead of porting
+Ladybird's implementation, so the work benefits the whole ecosystem. Decisions:
+
+| Need | Library | Notes |
+| --- | --- | --- |
+| Fonts and shaping | **luce-fonts** | The browser's `web_fonts` (OpenType reader, CFF, GSUB/GPOS, shaper; render r09) moves into luce-fonts as its portable engine, beside its platform text; the browser depends on luce-fonts. |
+| SVG rendering | **luce-svg** | luce-svg is extended until it is fully featured (use/symbol, clip paths, masks, patterns, filters, text, style sheets, every CSS color), measured against resvg's test suite. Inline SVG in HTML stays the engine's DOM port (r55/r56), which is DOM + CSS by nature. |
+| Image decoding (P2) | **luce-png**, **luce-jpeg**, new sibling decoders | `ImageCodecPlugin` adapts them; GIF, WebP, BMP, ICO, APNG become luce-base packages over luce-raster. Ladybird's decoders are not ported. |
+| Compression | **luce-compress** | gzip framing and Brotli (WOFF2, `Content-Encoding: br`) are added there. |
+| Networking (P2) | **luce-std** `net`, **luce-tls** | The `RequestClient` seam sits on them. |
+| Files, Unicode tables | **luce-std** | `files`/`paths`, `unicode`. |
+| Rasterizer | stays in luce-browser-render | `raster` (tiny-skia made Skia-exact) remains the browser's own (§7.3). |
+
 ### 7.1 Seams
 
 | Concern | Donor | Seam | P1 implementation | Later | Luce package |
