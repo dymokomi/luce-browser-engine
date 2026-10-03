@@ -1,0 +1,481 @@
+#==============================================================================================
+#
+#   tree_builder_3 - Layout::TreeBuilder: before and after children, build, the table fixup
+#
+#   DESCRIPTION:
+#       Port of LibWeb/Layout/TreeBuilder.cpp (lines 899-1379): the ::before box, the SVG mask,
+#       clip-path and pattern subtrees, the ::marker and ::after boxes and the anonymous
+#       fieldset content box, TreeBuilder::build, and the CSS tables fixup algorithm (removing
+#       irrelevant boxes, generating missing child wrappers and parents, table wrappers, and
+#       missing cells).
+#       https://drafts.csswg.org/css-tables-3/#fixup-algorithm
+#
+#       Copyright (c) 2018-2025, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2022-2023, Sam Atkins <atkinssj@serenityos.org>
+#       Copyright (c) 2025, Manuel Zahariev <manuel@duck.com>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Before and after the children ===========================================================
+
+## Ported from Libraries/LibWeb/Layout/TreeBuilder.cpp:899 Web::Layout::TreeBuilder::update_layout_tree_before_children.
+func layout_tree_builder_update_layout_tree_before_children(this: LayoutTreeBuilder*, dom_node: DomNode*, layout_node: LayoutNode*, arg2: LayoutTreeBuilderContext*, element_has_content_visibility_hidden: bool):
+    discard(arg2)
+    # Add node for the ::before pseudo-element.
+    if is_dom_element(dom_node) and layout_node_can_have_children(layout_node) and not element_has_content_visibility_hidden:
+        let element = (DomElement*)dom_node
+        layout_tree_builder_push_parent(this, as_layout_node_with_style(layout_node))
+        discard(layout_tree_builder_create_pseudo_element_if_needed(this, element, css_data.PseudoElement.before, LayoutTreeBuilderAppendOrPrepend.prepend))
+
+        layout_tree_builder_pop_parent(this)
+
+## `layout_mask_or_clip_path`: a lambda of update_layout_tree_after_children.
+func layout_tree_builder_layout_mask_or_clip_path(this: LayoutTreeBuilder*, layout_node: LayoutNode*, context: LayoutTreeBuilderContext*, mask_or_clip_path: SvgElement*):
+    let saved = context.layout_svg_mask_or_clip_path
+    context.layout_svg_mask_or_clip_path = true
+    defer context.layout_svg_mask_or_clip_path = saved
+    layout_tree_builder_push_parent(this, as_layout_node_with_style(layout_node))
+
+    # Check for reference cycle
+    for ancestor in ak.vector_span_const(&this.m_ancestor_stack):
+        if layout_node_dom_node(ancestor.layout_node()) == (DomNode*?)mask_or_clip_path.dom_node():
+            # FIXME: Somehow either remove ancestor from the layout tree or mark it as invalid.
+            layout_tree_builder_pop_parent(this)
+            return
+    layout_tree_builder_update_layout_tree(this, mask_or_clip_path.dom_node(), context, LayoutTreeBuilderMustCreateSubtree.yes)
+    layout_tree_builder_pop_parent(this)
+
+## `layout_pattern`: a lambda of update_layout_tree_after_children.
+func layout_tree_builder_layout_pattern(this: LayoutTreeBuilder*, layout_node: LayoutNode*, context: LayoutTreeBuilderContext*, seen_content_elements: ak.HashTable[SvgPatternElement*, ak.PtrTraits[SvgPatternElement]]*, pattern: SvgPatternElement*?):
+    let found_pattern = pattern else return
+    let content_element = svg_pattern_element_pattern_content_element(found_pattern) else return
+    if ak.hash_table_set(seen_content_elements, content_element) != ak.HashSetResult.inserted_new_entry:
+        return
+    let saved = context.layout_svg_pattern
+    context.layout_svg_pattern = true
+    defer context.layout_svg_pattern = saved
+    layout_tree_builder_push_parent(this, as_layout_node_with_style(layout_node))
+    for ancestor in ak.vector_span_const(&this.m_ancestor_stack):
+        if layout_node_dom_node(ancestor.layout_node()) == (DomNode*?)content_element.dom_node():
+            layout_tree_builder_pop_parent(this)
+            return
+    layout_tree_builder_update_layout_tree(this, content_element.dom_node(), context, LayoutTreeBuilderMustCreateSubtree.yes)
+    layout_tree_builder_pop_parent(this)
+
+## Ported from Libraries/LibWeb/Layout/TreeBuilder.cpp:911 Web::Layout::TreeBuilder::update_layout_tree_after_children.
+func layout_tree_builder_update_layout_tree_after_children(this: LayoutTreeBuilder*, dom_node: DomNode*, layout_node: LayoutNode*, context: LayoutTreeBuilderContext*, element_has_content_visibility_hidden: bool):
+    if is_svg_graphics_element(dom_node):
+        let graphics_element = (SvgGraphicsElement*)dom_node
+        # Create the layout tree for the SVG mask/clip paths as a child of the masked element.
+        # Note: This will create a new subtree for each use of the mask (so there's  not a 1-to-1 mapping
+        # from DOM node to mask layout node). Each use of a mask may be laid out differently so this
+        # duplication is necessary.
+        if let mask = svg_graphics_element_mask(graphics_element):
+            layout_tree_builder_layout_mask_or_clip_path(this, layout_node, context, mask.svg_element())
+        if let clip_path = svg_graphics_element_clip_path(graphics_element):
+            layout_tree_builder_layout_mask_or_clip_path(this, layout_node, context, clip_path.svg_element())
+
+        var seen_content_elements: ak.HashTable[SvgPatternElement*, ak.PtrTraits[SvgPatternElement]]
+        if let fill = svg_graphics_element_fill_pattern(graphics_element):
+            layout_tree_builder_layout_pattern(this, layout_node, context, &seen_content_elements, fill)
+        if let stroke = svg_graphics_element_stroke_pattern(graphics_element):
+            layout_tree_builder_layout_pattern(this, layout_node, context, &seen_content_elements, stroke)
+
+    # Add nodes for the ::after pseudo-element.
+    if is_dom_element(dom_node) and layout_node_can_have_children(layout_node) and not element_has_content_visibility_hidden:
+        let element = (DomElement*)dom_node
+        layout_tree_builder_push_parent(this, as_layout_node_with_style(layout_node))
+
+        # https://drafts.csswg.org/css-lists-3/#marker-pseudo
+        # The marker box is generated by the ::marker pseudo-element of a list item as the list item’s first child,
+        # before the ::before pseudo-element (if it exists on the element). It is filled with content as defined
+        # in § 3.2 Generating Marker Contents.
+        # NOTE: This happens in update_layout_tree_after_children (and not in ..._before_...), since potential
+        #       block container wrapper children are created after update_layout_tree_before_children.
+        if layout_node_is_list_item_box(layout_node):
+            discard(layout_tree_builder_create_pseudo_element_if_needed(this, element, css_data.PseudoElement.marker, LayoutTreeBuilderAppendOrPrepend.prepend))
+
+        discard(layout_tree_builder_create_pseudo_element_if_needed(this, element, css_data.PseudoElement.after, LayoutTreeBuilderAppendOrPrepend.append))
+        layout_tree_builder_pop_parent(this)
+
+    # https://html.spec.whatwg.org/multipage/rendering.html#the-fieldset-and-legend-elements
+    # The anonymous fieldset content box is expected to appear after the rendered legend and is expected to contain the
+    # content (including the '::before' and '::after' pseudo-elements) of the fieldset element except for the rendered
+    # legend, if there is one.
+    if let fieldset_box = as_if_layout_field_set_box(layout_node):
+        if let legend = layout_field_set_box_rendered_legend(fieldset_box):
+            let wrapper = layout_node_with_style_create_anonymous_wrapper(fieldset_box.layout_node_with_style())
+            let wrapper_mutable_values = layout_node_with_style_mutable_computed_values(wrapper)
+            css_mutable_computed_values_set_display(wrapper_mutable_values, css_display_from_short(CssDisplayShort.flow_root))
+
+            # https://html.spec.whatwg.org/multipage/rendering.html#the-fieldset-and-legend-elements
+            # The following properties are expected to inherit from the fieldset element:
+            #     align-content, align-items, border-radius, column-count, column-fill, column-gap, column-rule,
+            #     column-width, flex-direction, flex-wrap, grid (grid-auto-columns, grid-auto-flow, grid-auto-rows,
+            #     grid-column-gap, grid-row-gap, grid-template-areas, grid-template-columns, grid-template-rows),
+            #     justify-content, justify-items, overflow, padding, text-overflow, unicode-bidi
+            # FIXME: Transfer all of these properties, not just overflow.
+            let fieldset_mutable_values = layout_node_with_style_mutable_computed_values(fieldset_box.layout_node_with_style())
+
+            css_mutable_computed_values_set_overflow_x(wrapper_mutable_values, css_computed_values_overflow_x(&layout_node_with_style_computed_values(fieldset_box.layout_node_with_style()).computed_values))
+            css_mutable_computed_values_set_overflow_x(fieldset_mutable_values, css_initial_values_overflow())
+
+            css_mutable_computed_values_set_overflow_y(wrapper_mutable_values, css_computed_values_overflow_y(&layout_node_with_style_computed_values(fieldset_box.layout_node_with_style()).computed_values))
+            css_mutable_computed_values_set_overflow_y(fieldset_mutable_values, css_initial_values_overflow())
+
+            var child = tree_node_first_child(fieldset_box.layout_node())
+            while let current = child:
+                let next = tree_node_next_sibling(current)
+                if current != legend.layout_node():
+                    tree_node_remove_child(fieldset_box.layout_node(), current)
+                    tree_node_append_child(wrapper.layout_node(), current)
+                child = next
+            tree_node_append_child(fieldset_box.layout_node(), wrapper.layout_node())
+
+# mark: build ===================================================================================
+
+## Ported from Libraries/LibWeb/Layout/TreeBuilder.cpp:1021 Web::Layout::TreeBuilder::build.
+pub func layout_tree_builder_build(this: LayoutTreeBuilder*, dom_node: DomNode*) -> LayoutNode*?:
+    assert(dom_node_is_document(dom_node))
+
+    css_style_computer_reset_ancestor_filter(dom_document_style_computer(dom_node_document(dom_node)))
+
+    var context = LayoutTreeBuilderContext()
+    this.m_quote_nesting_level = 0
+    layout_tree_builder_update_layout_tree(this, dom_node, &context, LayoutTreeBuilderMustCreateSubtree.no)
+
+    # NB: Called during layout tree construction.
+    if let root = dom_document_unsafe_layout_node(dom_node_document(dom_node)):
+        layout_tree_builder_fixup_tables(this, root.layout_node_with_style())
+
+    return this.m_layout_root
+
+## for_each_in_tree_with_internal_display<internal> where the callback only reads the tree: the boxes of `root`'s
+## inclusive subtree whose display is that internal display, in tree order.
+func layout_boxes_with_internal_display(root: LayoutNodeWithStyle*, internal: css_data.DisplayInternal) -> ak.Vector[LayoutBox*]:
+    var boxes: ak.Vector[LayoutBox*]
+    for node in layout_node_inclusive_subtree(root.layout_node()):
+        let box = as_if_layout_box(node) else continue
+        let display = layout_node_display(box.layout_node())
+        if css_display_is_internal(&display) and css_display_internal(&display) == internal:
+            ak.vector_append_t(&boxes, box)
+    return boxes
+
+## for_each_in_tree_with_internal_display<internal> with the callback of generate_missing_child_wrappers: wraps each
+## matching sequence of children of every box of that internal display, visiting the tree in pre-order as it changes.
+func layout_wrap_children_in_tree_with_internal_display(root: LayoutNodeWithStyle*, internal: css_data.DisplayInternal, matcher: func(LayoutNode*) -> bool, wrapper_class: const ak.ClassInfo*, wrapper_display: CssDisplay):
+    for node in layout_node_inclusive_subtree(root.layout_node()):
+        let box = as_if_layout_box(node) else continue
+        let display = layout_node_display(box.layout_node())
+        if css_display_is_internal(&display) and css_display_internal(&display) == internal:
+            layout_wrap_matching_children(box.layout_node_with_style(), matcher, wrapper_class, wrapper_display)
+
+## for_each_in_tree_with_inside_display<inside> with the callback of generate_missing_child_wrappers.
+func layout_wrap_children_in_tree_with_inside_display(root: LayoutNodeWithStyle*, inside: css_data.DisplayInside, matcher: func(LayoutNode*) -> bool, wrapper_class: const ak.ClassInfo*, wrapper_display: CssDisplay):
+    for node in layout_node_inclusive_subtree(root.layout_node()):
+        let box = as_if_layout_box(node) else continue
+        let display = layout_node_display(box.layout_node())
+        if css_display_is_outside_and_inside(&display) and css_display_inside(&display) == inside:
+            layout_wrap_matching_children(box.layout_node_with_style(), matcher, wrapper_class, wrapper_display)
+
+# mark: The table fixup =========================================================================
+
+## Ported from Libraries/LibWeb/Layout/TreeBuilder.cpp:1061 Web::Layout::TreeBuilder::fixup_tables.
+# https://drafts.csswg.org/css-tables-3/#fixup-algorithm
+func layout_tree_builder_fixup_tables(this: LayoutTreeBuilder*, root: LayoutNodeWithStyle*):
+    layout_tree_builder_remove_irrelevant_boxes(this, root)
+    layout_tree_builder_generate_missing_child_wrappers(this, root)
+    let table_root_boxes = layout_tree_builder_generate_missing_parents(this, root)
+    layout_tree_builder_missing_cells_fixup(this, &table_root_boxes)
+
+## Ported from Libraries/LibWeb/Layout/TreeBuilder.cpp:1071 Web::Layout::TreeBuilder::remove_irrelevant_boxes.
+# https://drafts.csswg.org/css-tables-3/#fixup-algorithm
+# 1. Remove irrelevant boxes:
+func layout_tree_builder_remove_irrelevant_boxes(this: LayoutTreeBuilder*, root: LayoutNodeWithStyle*):
+    discard(this)
+    # The following boxes are discarded as if they were display:none:
+
+    var to_remove: ak.Vector[LayoutNode*]
+
+    # 1. Children of a table-column.
+    let table_columns = layout_boxes_with_internal_display(root, css_data.DisplayInternal.table_column)
+    for table_column in ak.vector_span_const(&table_columns):
+        for child in layout_node_children(table_column.layout_node()):
+            ak.vector_append_t(&to_remove, child)
+
+    # 2. Children of a table-column-group which are not a table-column.
+    let table_column_groups = layout_boxes_with_internal_display(root, css_data.DisplayInternal.table_column_group)
+    for table_column_group in ak.vector_span_const(&table_column_groups):
+        for child in layout_node_children(table_column_group.layout_node()):
+            let display = layout_node_display(child)
+            if not css_display_is_table_column(&display):
+                ak.vector_append_t(&to_remove, child)
+
+    # FIXME:
+    # 3. Anonymous inline boxes which contain only white space and are between two immediate siblings each of which is a table-non-root box.
+    # 4. Anonymous inline boxes which meet all of the following criteria:
+    #    - they contain only white space
+    #    - they are the first and/or last child of a tabular container
+    #    - whose immediate sibling, if any, is a table-non-root box
+
+    for box in ak.vector_span_const(&to_remove):
+        let parent = tree_node_parent(box) else trap("VERIFY: a removed box has a parent")
+        tree_node_remove_child(parent, box)
+
+## Ported from Libraries/LibWeb/Layout/TreeBuilder.cpp:1105 Web::Layout::is_table_track.
+func layout_is_table_track(display: CssDisplay) -> bool:
+    return css_display_is_table_row(&display) or css_display_is_table_column(&display)
+
+## Ported from Libraries/LibWeb/Layout/TreeBuilder.cpp:1110 Web::Layout::is_table_track_group.
+func layout_is_table_track_group(display: CssDisplay) -> bool:
+    # Unless explicitly mentioned otherwise, mentions of table-row-groups in this spec also encompass the specialized
+    # table-header-groups and table-footer-groups.
+    return css_display_is_table_row_group(&display) or css_display_is_table_header_group(&display) or css_display_is_table_footer_group(&display) or css_display_is_table_column_group(&display)
+
+## Ported from Libraries/LibWeb/Layout/TreeBuilder.cpp:1120 Web::Layout::is_proper_table_child.
+func layout_is_proper_table_child(node: LayoutNode*) -> bool:
+    let display = layout_node_display(node)
+    return layout_is_table_track_group(display) or layout_is_table_track(display) or css_display_is_table_caption(&display)
+
+## Ported from Libraries/LibWeb/Layout/TreeBuilder.cpp:1126 Web::Layout::is_not_proper_table_child.
+func layout_is_not_proper_table_child(node: LayoutNode*) -> bool:
+    if not layout_node_has_style(node):
+        return true
+    return not layout_is_proper_table_child(node)
+
+## Ported from Libraries/LibWeb/Layout/TreeBuilder.cpp:1133 Web::Layout::is_not_table_row.
+func layout_is_not_table_row(node: LayoutNode*) -> bool:
+    if not layout_node_has_style(node):
+        return true
+    return not layout_table_grid_is_table_row(node)
+
+## Ported from Libraries/LibWeb/Layout/TreeBuilder.cpp:1140 Web::Layout::is_table_column.
+func layout_is_table_column_layout_node(node: LayoutNode*) -> bool:
+    let display = layout_node_display(node)
+    return css_display_is_table_column(&display)
+
+## Ported from Libraries/LibWeb/Layout/TreeBuilder.cpp:1145 Web::Layout::is_table_cell.
+func layout_is_table_cell(node: LayoutNode*) -> bool:
+    let display = layout_node_display(node)
+    return css_display_is_table_cell(&display)
+
+## Ported from Libraries/LibWeb/Layout/TreeBuilder.cpp:1150 Web::Layout::is_not_table_cell.
+func layout_is_not_table_cell(node: LayoutNode*) -> bool:
+    if not layout_node_has_style(node):
+        return true
+    return not layout_is_table_cell(node)
+
+## Ported from Libraries/LibWeb/Layout/TreeBuilder.cpp:1157 Web::Layout::is_table_row_group_column_group_or_caption.
+func layout_is_table_row_group_column_group_or_caption(node: LayoutNode*) -> bool:
+    let display = layout_node_display(node)
+    return layout_is_table_track_group(display) or css_display_is_table_caption(&display)
+
+## The callbacks of for_each_sequence_of_consecutive_children_matching: each wraps a sequence of children.
+interface LayoutConsecutiveChildrenCallback:
+    mutating func call(sequence: ak.Vector[LayoutNode*]*, nearest_sibling: LayoutNode*?)
+
+## `[&](auto& sequence, auto nearest_sibling) { wrap_in_anonymous<WrapperBoxType>(sequence, nearest_sibling, display); }`:
+## every callback the table fixup passes, with the wrapper's class and display.
+struct LayoutWrapInAnonymousCallback: LayoutConsecutiveChildrenCallback:
+    var wrapper_class: const ak.ClassInfo*
+    var display: CssDisplay
+
+    mutating func call(sequence: ak.Vector[LayoutNode*]*, nearest_sibling: LayoutNode*?):
+        layout_wrap_in_anonymous(self.wrapper_class, sequence, nearest_sibling, self.display)
+
+## Ported from Libraries/LibWeb/Layout/TreeBuilder.cpp:1164 Web::Layout::for_each_sequence_of_consecutive_children_matching.
+func layout_for_each_sequence_of_consecutive_children_matching[TCallback: LayoutConsecutiveChildrenCallback](parent: LayoutNodeWithStyle*, matcher: func(LayoutNode*) -> bool, callback: TCallback*):
+    var sequence: ak.Vector[LayoutNode*]
+
+    var child = tree_node_first_child(parent.layout_node())
+    while let current = child:
+        if matcher(current) or (not ak.vector_is_empty(&sequence) and layout_is_ignorable_whitespace(current)):
+            ak.vector_append_t(&sequence, current)
+        else:
+            if not ak.vector_is_empty(&sequence):
+                if not layout_sequence_is_all_ignorable_whitespace(&sequence):
+                    callback.call(&sequence, current)
+                ak.vector_clear(&sequence)
+        child = tree_node_next_sibling(current)
+    if not ak.vector_is_empty(&sequence) and not layout_sequence_is_all_ignorable_whitespace(&sequence):
+        callback.call(&sequence, none)
+
+## `sequence_is_all_ignorable_whitespace`: the lambda of for_each_sequence_of_consecutive_children_matching.
+func layout_sequence_is_all_ignorable_whitespace(sequence: const ak.Vector[LayoutNode*]*) -> bool:
+    for node in ak.vector_span_const(sequence):
+        if not layout_is_ignorable_whitespace(node):
+            return false
+    return true
+
+## Ported from Libraries/LibWeb/Layout/TreeBuilder.cpp:1192 Web::Layout::wrap_in_anonymous. The template's
+## WrapperBoxType is `wrapper_class`, Box or BlockContainer (DESIGN.md §2.4).
+func layout_wrap_in_anonymous(wrapper_class: const ak.ClassInfo*, sequence: ak.Vector[LayoutNode*]*, nearest_sibling: LayoutNode*?, display: CssDisplay):
+    assert(not ak.vector_is_empty(sequence))
+    let parent = layout_node_parent(*ak.vector_first(sequence)) else trap("VERIFY: the sequence has a parent")
+    let computed_values = css_computed_values_clone_inherited_values(&layout_node_computed_values(parent.layout_node()).computed_values)
+    css_mutable_computed_values_set_display((CssMutableComputedValues*)computed_values, display)
+    let document = layout_node_document(parent.layout_node())
+    var wrapper: LayoutNode* = ---
+    if wrapper_class == &layout_block_container_class:
+        wrapper = realm_create_layout_block_container_css_computed_values(layout_document_realm(document), document, none, computed_values).layout_node()
+    else:
+        assert(wrapper_class == &layout_box_class)
+        wrapper = realm_create_layout_box_css_computed_values(layout_document_realm(document), document, none, computed_values).layout_node()
+    for child in ak.vector_span_const(sequence):
+        tree_node_remove_child(parent.layout_node(), child)
+        tree_node_append_child(wrapper, child)
+    layout_node_set_children_are_inline(wrapper, layout_node_children_are_inline(parent.layout_node()))
+    if let sibling = nearest_sibling:
+        tree_node_insert_before(parent.layout_node(), wrapper, sibling)
+    else:
+        tree_node_append_child(parent.layout_node(), wrapper)
+
+## `wrap_in_anonymous<WrapperBoxType>(..., Display { internal })` around each matching sequence of `parent`'s children.
+func layout_wrap_matching_children(parent: LayoutNodeWithStyle*, matcher: func(LayoutNode*) -> bool, wrapper_class: const ak.ClassInfo*, display: CssDisplay):
+    var callback = LayoutWrapInAnonymousCallback(wrapper_class = wrapper_class, display = display)
+    layout_for_each_sequence_of_consecutive_children_matching(parent, matcher, &callback)
+
+## Ported from Libraries/LibWeb/Layout/TreeBuilder.cpp:1212 Web::Layout::TreeBuilder::generate_missing_child_wrappers.
+# https://drafts.csswg.org/css-tables-3/#fixup-algorithm
+# 2. Generate missing child wrappers:
+func layout_tree_builder_generate_missing_child_wrappers(this: LayoutTreeBuilder*, root: LayoutNodeWithStyle*):
+    discard(this)
+    let table_row = css_display_new_display_internal(css_data.DisplayInternal.table_row)
+
+    # 1. An anonymous table-row box must be generated around each sequence of consecutive children of a table-root box
+    #    which are not proper table child boxes.
+    layout_wrap_children_in_tree_with_inside_display(root, css_data.DisplayInside.table, layout_is_not_proper_table_child, &layout_box_class, table_row)
+
+    # 2. An anonymous table-row box must be generated around each sequence of consecutive children of a table-row-group
+    #    box which are not table-row boxes.
+    layout_wrap_children_in_tree_with_internal_display(root, css_data.DisplayInternal.table_row_group, layout_is_not_table_row, &layout_box_class, table_row)
+    # Unless explicitly mentioned otherwise, mentions of table-row-groups in this spec also encompass the specialized
+    # table-header-groups and table-footer-groups.
+    layout_wrap_children_in_tree_with_internal_display(root, css_data.DisplayInternal.table_header_group, layout_is_not_table_row, &layout_box_class, table_row)
+    layout_wrap_children_in_tree_with_internal_display(root, css_data.DisplayInternal.table_footer_group, layout_is_not_table_row, &layout_box_class, table_row)
+
+    # 3. An anonymous table-cell box must be generated around each sequence of consecutive children of a table-row box
+    #    which are not table-cell boxes.
+    layout_wrap_children_in_tree_with_internal_display(root, css_data.DisplayInternal.table_row, layout_is_not_table_cell, &layout_block_container_class, css_display_new_display_internal(css_data.DisplayInternal.table_cell))
+
+## Ported from Libraries/LibWeb/Layout/TreeBuilder.cpp:1253 Web::Layout::TreeBuilder::generate_missing_parents.
+# https://drafts.csswg.org/css-tables-3/#fixup-algorithm
+# 3. Generate missing parents:
+func layout_tree_builder_generate_missing_parents(this: LayoutTreeBuilder*, root: LayoutNodeWithStyle*) -> ak.Vector[LayoutBox*]:
+    discard(this)
+    var table_roots_to_wrap: ak.Vector[LayoutBox*]
+    for node in layout_node_inclusive_subtree(root.layout_node()):
+        let parent = as_if_layout_node_with_style(node) else continue
+        # 1. An anonymous table-row box must be generated around each sequence of consecutive table-cell boxes whose
+        #    parent is not a table-row.
+        if layout_is_not_table_row(parent.layout_node()):
+            layout_wrap_matching_children(parent, layout_is_table_cell, &layout_box_class, css_display_new_display_internal(css_data.DisplayInternal.table_row))
+
+        # 2. An anonymous table or inline-table box must be generated around each sequence of consecutive proper table
+        #    child boxes which are misparented.
+        # If the box’s parent is an inline, run-in, or ruby box (or any box that would perform inlinification of
+        # its children), then an inline-table box must be generated; otherwise it must be a table box.
+        # FIXME: run-in and ruby boxes
+        let parent_display = layout_node_display(parent.layout_node())
+        let display = css_display_from_short(CssDisplayShort.inline_table if css_display_is_inline_outside(&parent_display) else CssDisplayShort.table)
+
+        # A table-row is misparented if its parent is neither a table-row-group nor a table-root box.
+        if not layout_table_grid_is_table_row_group(parent.layout_node()) and not css_display_is_table_inside(&parent_display):
+            layout_wrap_matching_children(parent, layout_table_grid_is_table_row, &layout_box_class, display)
+
+        # A table-column box is misparented if its parent is neither a table-column-group box nor a table-root box.
+        if not layout_table_grid_is_table_column_group(parent.layout_node()) and not css_display_is_table_inside(&parent_display):
+            layout_wrap_matching_children(parent, layout_is_table_column_layout_node, &layout_box_class, display)
+
+        # A table-row-group, table-column-group, or table-caption box is misparented if its parent is not a table-root box.
+        if not css_display_is_table_inside(&parent_display):
+            layout_wrap_matching_children(parent, layout_is_table_row_group_column_group_or_caption, &layout_box_class, display)
+
+        # 3. An anonymous table-wrapper box must be generated around each table-root.
+        if let box = as_if_layout_box(parent):
+            let box_display = layout_node_display(box.layout_node())
+            if css_display_is_table_inside(&box_display):
+                if layout_node_has_been_wrapped_in_table_wrapper(box.layout_node()):
+                    let box_parent = layout_node_parent(box.layout_node()) else trap("VERIFY: parent.parent()")
+                    assert(layout_node_is_table_wrapper(box_parent.layout_node()))
+                    continue
+
+                ak.vector_append_t(&table_roots_to_wrap, box)
+
+    for table_box in ak.vector_span_const(&table_roots_to_wrap):
+        let nearest_sibling = tree_node_next_sibling(table_box.layout_node())
+        let parent = layout_node_parent(table_box.layout_node()) else trap("VERIFY: a table root has a parent")
+
+        let wrapper_computed_values = css_computed_values_clone_inherited_values(&layout_node_computed_values(table_box.layout_node()).computed_values)
+        layout_node_with_style_transfer_table_box_computed_values_to_wrapper_computed_values(table_box.layout_node_with_style(), wrapper_computed_values)
+
+        if layout_node_is_table_wrapper(parent.layout_node()):
+            let existing_wrapper = (LayoutTableWrapper*)parent
+            layout_node_with_style_set_computed_values(existing_wrapper.layout_node_with_style(), wrapper_computed_values)
+            continue
+
+        let document = layout_node_document(parent.layout_node())
+        let wrapper = realm_create_layout_table_wrapper_css_computed_values(layout_document_realm(document), document, none, wrapper_computed_values)
+
+        tree_node_remove_child(parent.layout_node(), table_box.layout_node())
+        tree_node_append_child(wrapper.layout_node(), table_box.layout_node())
+
+        if let sibling = nearest_sibling:
+            tree_node_insert_before(parent.layout_node(), wrapper.layout_node(), sibling)
+        else:
+            tree_node_append_child(parent.layout_node(), wrapper.layout_node())
+
+        layout_node_set_has_been_wrapped_in_table_wrapper(table_box.layout_node(), true)
+
+    return table_roots_to_wrap
+
+## Ported from Libraries/LibWeb/Layout/TreeBuilder.cpp:1338 Web::Layout::fixup_row.
+func layout_fixup_row(row_box: LayoutBox*, table_grid: const LayoutTableGrid*, row_index: usize):
+    for column_index in 0..<layout_table_grid_column_count(table_grid):
+        let occupancy_grid = layout_table_grid_occupancy_grid(table_grid)
+        if ak.hash_map_contains_k(&occupancy_grid, LayoutTableGridGridPosition(x = column_index, y = row_index)):
+            continue
+
+        let computed_values = css_computed_values_clone_inherited_values(&layout_node_computed_values(row_box.layout_node()).computed_values)
+        let mutable_computed_values = (CssMutableComputedValues*)computed_values
+        css_mutable_computed_values_set_display(mutable_computed_values, css_display_new_display_internal(css_data.DisplayInternal.table_cell))
+        # Ensure that the cell (with zero content height) will have the same height as the row by setting vertical-align to middle.
+        css_mutable_computed_values_set_vertical_align(mutable_computed_values, VerticalAlignOrCssLengthPercentage.vertical_align(css_data.VerticalAlign.middle))
+        let document = layout_node_document(row_box.layout_node())
+        let cell_box = realm_create_layout_block_container_css_computed_values(layout_document_realm(document), document, none, computed_values)
+        tree_node_append_child(row_box.layout_node(), cell_box.layout_node())
+
+## The callback missing_cells_fixup passes for each row: fixes the row up and counts it.
+struct LayoutMissingCellsFixupRow:
+    var table_grid: const LayoutTableGrid*
+    var row_index: usize*
+
+    mutating func call(row_box: LayoutBox*):
+        layout_fixup_row(row_box, self.table_grid, *self.row_index)
+        *self.row_index += 1
+
+## The callback missing_cells_fixup passes for each row group: fixes its rows up.
+struct LayoutMissingCellsFixupRowGroup:
+    var table_grid: const LayoutTableGrid*
+    var row_index: usize*
+
+    mutating func call(row_group_box: LayoutBox*):
+        var row_callback = LayoutMissingCellsFixupRow(table_grid = self.table_grid, row_index = self.row_index)
+        layout_table_grid_for_each_child_box_matching_2(row_group_box, layout_table_grid_is_table_row, &row_callback)
+
+## Ported from Libraries/LibWeb/Layout/TreeBuilder.cpp:1355 Web::Layout::TreeBuilder::missing_cells_fixup.
+# https://drafts.csswg.org/css-tables-3/#missing-cells-fixup
+func layout_tree_builder_missing_cells_fixup(this: LayoutTreeBuilder*, table_root_boxes: const ak.Vector[LayoutBox*]*):
+    discard(this)
+    # Once the amount of columns in a table is known, any table-row box must be modified such that it owns enough
+    # cells to fill all the columns of the table, when taking spans into account. New table-cell anonymous boxes must
+    # be appended to its rows content until this condition is met.
+    for table_box in ak.vector_span_const(table_root_boxes):
+        let table_grid = layout_table_grid_calculate_row_column_grid(table_box)
+        var row_index: usize = 0
+        var row_group_callback = LayoutMissingCellsFixupRowGroup(table_grid = &table_grid, row_index = &row_index)
+        layout_table_grid_for_each_child_box_matching_2(table_box, layout_table_grid_is_table_row_group, &row_group_callback)
+
+        var row_callback = LayoutMissingCellsFixupRow(table_grid = &table_grid, row_index = &row_index)
+        layout_table_grid_for_each_child_box_matching_2(table_box, layout_table_grid_is_table_row, &row_callback)

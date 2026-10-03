@@ -1,0 +1,216 @@
+#==============================================================================================
+#
+#   tests_layout_tree_2 - focused tests of the layout tree's helpers
+#
+#   DESCRIPTION:
+#       What the oracle cases of tests_layout_tree do not print: DominantBaseline.h's offsets
+#       and metric resolution, the formatting context type names, scroll containers,
+#       Node::set_needs_layout_update's propagation, NodeWithStyle::create_anonymous_wrapper,
+#       GraphemeEdgeTracker's measure_text_width over a text node, and the Animatable state
+#       region r43 takes ahead (CSS-defined animations, transition attributes). The documents
+#       are built as tests_layout_tree builds them.
+#
+#==============================================================================================
+
+# mark: Documents ===============================================================================
+
+## Builds `html`'s layout tree as tests_layout_tree's cases do (the C heap, collection deferred, the user-agent
+## sheets installed) and runs `check` on its document.
+func test_layout_tree_2_with_document(html: str, check: func(DomDocument*) -> unit):
+    web_initialize_strings()
+    test_fonts_setup()
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    test_fonts_defer_collections(realm)
+    defer test_fonts_end_deferral(realm)
+    with memory.heap:
+        test_page_client_color_scheme = CssPreferredColorScheme.light
+        defer test_page_client_color_scheme = CssPreferredColorScheme.auto
+        test_media_invalidation_install_user_agent_sheets(realm)
+        defer test_style_computer_release_user_agent_sheets()
+        var (document, navigable) = test_layout_tree_build(vm_heap(vm), realm, html, "")
+        defer gc.root_release(&navigable)
+        check(document)
+
+## The element with id `id`.
+func test_layout_tree_2_element(document: DomDocument*, id: str) -> DomElement*:
+    return dom_parent_node_get_element_by_id(document.dom_parent_node(), ak.fly_string_from_str(id)) else trap("no such element")
+
+## The layout node of the element with id `id`.
+func test_layout_tree_2_layout_node(document: DomDocument*, id: str) -> LayoutNode*:
+    return dom_node_unsafe_layout_node(test_layout_tree_2_element(document, id).dom_node()) else trap("no layout node")
+
+# mark: DominantBaseline.h ======================================================================
+
+test "dominant_baseline_offset: each baseline metric's offset from the font metrics":
+    let metrics = web_fonts.FontPixelMetrics(size = 16.0, x_height = 8.0, advance_of_ascii_zero = 9.0, ascent = 12.0, descent = 4.0, line_gap = 0.0)
+    assert(layout_dominant_baseline_offset(css_data.BaselineMetric.central, metrics) == 4.0)
+    assert(layout_dominant_baseline_offset(css_data.BaselineMetric.middle, metrics) == 4.0)
+    assert(layout_dominant_baseline_offset(css_data.BaselineMetric.hanging, metrics) == 12.0f32 * 0.8f32)
+    assert(layout_dominant_baseline_offset(css_data.BaselineMetric.ideographic, metrics) == -4.0)
+    assert(layout_dominant_baseline_offset(css_data.BaselineMetric.mathematical, metrics) == 6.0)
+    assert(layout_dominant_baseline_offset(css_data.BaselineMetric.alphabetic, metrics) == 0.0)
+    assert(layout_dominant_baseline_offset(css_data.BaselineMetric.text_top, metrics) == 0.0)
+    assert(layout_dominant_baseline_offset(css_data.BaselineMetric.text_bottom, metrics) == 0.0)
+
+test "resolve_dominant_baseline_metric: auto follows the writing mode, an explicit metric wins":
+    with memory.heap:
+        var values: CssMutableComputedValues = ---
+        css_computed_values_construct(&values.computed_values)
+        assert(layout_resolve_dominant_baseline_metric(&values.computed_values) == css_data.BaselineMetric.alphabetic)
+        css_mutable_computed_values_set_writing_mode(&values, css_data.WritingMode.vertical_rl)
+        assert(layout_resolve_dominant_baseline_metric(&values.computed_values) == css_data.BaselineMetric.central)
+        css_mutable_computed_values_set_writing_mode(&values, css_data.WritingMode.sideways_lr)
+        assert(layout_resolve_dominant_baseline_metric(&values.computed_values) == css_data.BaselineMetric.alphabetic)
+        css_mutable_computed_values_set_dominant_baseline(&values, css_data.BaselineMetric.hanging)
+        assert(layout_resolve_dominant_baseline_metric(&values.computed_values) == css_data.BaselineMetric.hanging)
+
+# mark: Formatting contexts and scroll containers ===============================================
+
+## Whether FormattingContext::type_name(type_) is `name`.
+func test_layout_tree_2_type_name_is(type_: LayoutFormattingContextType, name: str) -> bool:
+    let view = layout_formatting_context_type_name(type_)
+    return ak.string_view_equals(&view, name)
+
+test "FormattingContext::type_name names every formatting context type":
+    assert(test_layout_tree_2_type_name_is(LayoutFormattingContextType.block, "BFC"))
+    assert(test_layout_tree_2_type_name_is(LayoutFormattingContextType.inline, "IFC"))
+    assert(test_layout_tree_2_type_name_is(LayoutFormattingContextType.flex, "FFC"))
+    assert(test_layout_tree_2_type_name_is(LayoutFormattingContextType.grid, "GFC"))
+    assert(test_layout_tree_2_type_name_is(LayoutFormattingContextType.table, "TFC"))
+    assert(test_layout_tree_2_type_name_is(LayoutFormattingContextType.svg, "SVG"))
+    assert(test_layout_tree_2_type_name_is(LayoutFormattingContextType.replaced_with_children, "Replaced, with children"))
+    assert(test_layout_tree_2_type_name_is(LayoutFormattingContextType.internal_replaced, "Replaced"))
+    assert(test_layout_tree_2_type_name_is(LayoutFormattingContextType.internal_dummy, "Dummy"))
+
+test "overflow_value_makes_box_a_scroll_container: auto, hidden and scroll do, clip and visible do not":
+    assert(layout_overflow_value_makes_box_a_scroll_container(css_data.Overflow.auto))
+    assert(layout_overflow_value_makes_box_a_scroll_container(css_data.Overflow.hidden))
+    assert(layout_overflow_value_makes_box_a_scroll_container(css_data.Overflow.scroll))
+    assert(not layout_overflow_value_makes_box_a_scroll_container(css_data.Overflow.clip))
+    assert(not layout_overflow_value_makes_box_a_scroll_container(css_data.Overflow.visible))
+
+# mark: Layout updates ==========================================================================
+
+## Clears every node's needs-layout-update flag, marks the box `#a` and checks where the mark went.
+func test_layout_tree_2_check_needs_layout_update(document: DomDocument*):
+    let root = dom_document_unsafe_layout_node(document) else trap("no layout tree")
+    for node in layout_node_inclusive_subtree(root.layout_node()):
+        node.m_needs_layout_update = false
+    let a = test_layout_tree_2_layout_node(document, "a")
+    let inner = test_layout_tree_2_layout_node(document, "inner")
+    let p = test_layout_tree_2_layout_node(document, "p")
+    # #a's text is wrapped in an anonymous block (it has a block sibling).
+    let anonymous = tree_node_first_child(a) else trap("no first child")
+    assert(layout_node_is_anonymous(anonymous))
+    layout_node_set_needs_layout_update(a, DomSetNeedsLayoutReason.style_change)
+    assert(a.m_needs_layout_update)
+    assert(anonymous.m_needs_layout_update)
+    assert(not inner.m_needs_layout_update)
+    assert(not p.m_needs_layout_update)
+    # Every ancestor up to the viewport.
+    var ancestor = layout_node_parent(a)
+    var ancestors: usize = 0
+    while let current = ancestor:
+        assert(current.node.m_needs_layout_update)
+        ancestors += 1
+        ancestor = layout_node_parent(current.layout_node())
+    assert(ancestors == 3)  # body, html, the viewport
+
+test "set_needs_layout_update marks the node, its anonymous children and its ancestors":
+    test_layout_tree_2_with_document("<body><div id=a>text<div id=inner>block</div></div><p id=p>x</p></body>", test_layout_tree_2_check_needs_layout_update)
+
+## create_anonymous_wrapper over a block and over an empty inline-block.
+func test_layout_tree_2_check_anonymous_wrapper(document: DomDocument*):
+    let block = as_layout_node_with_style(test_layout_tree_2_layout_node(document, "block"))
+    let wrapper = layout_node_with_style_create_anonymous_wrapper(block)
+    assert(layout_node_is_anonymous(wrapper.layout_node()))
+    assert(layout_node_dom_node(wrapper.layout_node()) == none)
+    assert(is_layout_block_container(wrapper))
+    let display = layout_node_display(wrapper.layout_node())
+    assert(css_display_is_block_outside(&display))
+    assert(css_display_is_flow_inside(&display))
+    # Inherited values come along: the block's color.
+    let wrapper_color = css_computed_values_color(&layout_node_with_style_computed_values(wrapper).computed_values)
+    let block_color = css_computed_values_color(&layout_node_with_style_computed_values(block).computed_values)
+    assert(wrapper_color.m_value == block_color.m_value)
+
+    let inline_block = as_layout_node_with_style(test_layout_tree_2_layout_node(document, "empty"))
+    let inline_block_wrapper = layout_node_with_style_create_anonymous_wrapper(inline_block)
+    let inline_block_display = layout_node_display(inline_block_wrapper.layout_node())
+    assert(css_display_is_inline_block(&inline_block_display))
+
+test "create_anonymous_wrapper makes an anonymous block container with the inherited values":
+    test_layout_tree_2_with_document("<body><div id=block style=\"color: rgb(1, 2, 3)\">x</div><span id=empty style=\"display: inline-block\"></span></body>", test_layout_tree_2_check_anonymous_wrapper)
+
+# mark: Text measurement ========================================================================
+
+## measure_text_width over `#t`'s text node.
+func test_layout_tree_2_check_measure_text_width(document: DomDocument*):
+    let element = test_layout_tree_2_layout_node(document, "t")
+    let text_node = as_if_layout_text_node(tree_node_first_child(element) else trap("no text")) else trap("not a text node")
+    let one = ak.utf16_string_from_str("a")
+    let two = ak.utf16_string_from_str("aa")
+    let empty = ak.utf16_string_from_str("")
+    let width_one = measure_text_width(text_node, ak.utf16_string_base_utf16_view(&one.utf16_string_base))
+    let width_two = measure_text_width(text_node, ak.utf16_string_base_utf16_view(&two.utf16_string_base))
+    assert(width_one > 0.0)
+    assert(width_two == width_one * 2.0)
+    assert(measure_text_width(text_node, ak.utf16_string_base_utf16_view(&empty.utf16_string_base)) == 0.0)
+
+## measure_text_width with `letter-spacing: 3px`: three more pixels a code point.
+func test_layout_tree_2_check_letter_spacing(document: DomDocument*):
+    let plain = as_if_layout_text_node(tree_node_first_child(test_layout_tree_2_layout_node(document, "t")) else trap("no text")) else trap("not a text node")
+    let spaced = as_if_layout_text_node(tree_node_first_child(test_layout_tree_2_layout_node(document, "s")) else trap("no text")) else trap("not a text node")
+    let text = ak.utf16_string_from_str("ab")
+    let view = ak.utf16_string_base_utf16_view(&text.utf16_string_base)
+    assert(measure_text_width(spaced, view) == measure_text_width(plain, view) + 6.0)
+
+test "measure_text_width sums the chunks' widths":
+    test_layout_tree_2_with_document("<body><div id=t>abc</div></body>", test_layout_tree_2_check_measure_text_width)
+
+test "measure_text_width adds the text node's letter spacing":
+    test_layout_tree_2_with_document("<body><div id=t>abc</div><div id=s style=\"letter-spacing: 3px\">abc</div></body>", test_layout_tree_2_check_letter_spacing)
+
+# mark: Animatable ==============================================================================
+
+## An element's Animatable state: CSS-defined animation maps and transition attributes.
+func test_layout_tree_2_check_animatable(document: DomDocument*):
+    let animatable = test_layout_tree_2_element(document, "a").animatable.animations_animatable()
+    assert(not animations_animatable_has_css_defined_animations(animatable))
+    animations_animatable_set_has_css_defined_animations(animatable)
+    assert(animations_animatable_has_css_defined_animations(animatable))
+
+    # One map per pseudo-element, made once.
+    let map = animations_animatable_css_defined_animations(animatable, none) else trap("no map")
+    assert((animations_animatable_css_defined_animations(animatable, none) else trap("no map")) == map)
+    let before_map = animations_animatable_css_defined_animations(animatable, css_data.PseudoElement.before) else trap("no map")
+    assert(before_map != map)
+
+    # Transition attributes by property (what the style computation registered cleared first).
+    animations_animatable_clear_registered_transitions(animatable, none)
+    var properties = ak.Vector[css_data.PropertyId]()
+    ak.vector_append_t(&properties, css_data.PropertyId.opacity)
+    ak.vector_append_t(&properties, css_data.PropertyId.color)
+    let easing = CssEasingFunction(variant = CssLinearEasingFunctionOrCssCubicBezierEasingFunctionOrCssStepsEasingFunction.css_cubic_bezier_easing_function(CssCubicBezierEasingFunction(x1 = 0.25, y1 = 0.1, x2 = 0.25, y2 = 1.0, stringified = ak.string_from_str("ease"))))
+    var transitions = ak.Vector[CssTransitionProperties]()
+    ak.vector_append_t(&transitions, CssTransitionProperties(properties = properties, duration = 200.0, timing_function = easing, delay = 50.0, transition_behavior = css_data.TransitionBehavior.normal))
+    animations_animatable_add_transitioned_properties(animatable, none, &transitions)
+    let attributes = animations_animatable_property_transition_attributes(animatable, none, css_data.PropertyId.color) else trap("no attributes")
+    assert(attributes.duration == 200.0)
+    assert(attributes.delay == 50.0)
+    assert(animations_animatable_property_transition_attributes(animatable, none, css_data.PropertyId.width) == none)
+    let ids = animations_animatable_property_ids_with_matching_transition_property_entry(animatable, none)
+    assert(ak.vector_size(&ids) == 2)
+    assert(animations_animatable_property_transition(animatable, none, css_data.PropertyId.color) == none)
+    let existing = animations_animatable_property_ids_with_existing_transitions(animatable, none)
+    assert(ak.vector_size(&existing) == 0)
+    animations_animatable_clear_registered_transitions(animatable, none)
+    assert(animations_animatable_property_transition_attributes(animatable, none, css_data.PropertyId.color) == none)
+
+    # No animations are associated with it.
+    let animations = animations_animatable_get_animations_internal(animatable, AnimationsAnimatableGetAnimationsSorted.yes) else trap("get_animations failed")
+    assert(ak.vector_size(&animations) == 0)
+
+test "Animatable: CSS-defined animation maps and transition attributes":
+    test_layout_tree_2_with_document("<body><div id=a>x</div></body>", test_layout_tree_2_check_animatable)

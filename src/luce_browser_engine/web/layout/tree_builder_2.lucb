@@ -1,0 +1,535 @@
+#==============================================================================================
+#
+#   tree_builder_2 - Layout::TreeBuilder: inline continuations and building the tree
+#
+#   DESCRIPTION:
+#       Port of LibWeb/Layout/TreeBuilder.cpp (lines 431-897): the restructuring of a block
+#       inside inline ancestors into "before", "middle" and "after" anonymous wrappers with
+#       continuations, ignorable white space, clearing stale layout and paint nodes,
+#       update_layout_tree (the walk over the DOM, shadow trees, slots and the top layer that
+#       creates or reuses each node's layout node) and the anonymous button content boxes.
+#
+#       Copyright (c) 2018-2025, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2025, Jelle Raaijmakers <jelle@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Blocks in inline parents ================================================================
+
+## `nearest_block_ancestor`: the lambda of restructure_block_node_in_inline_parent.
+func layout_nearest_block_ancestor(parent: LayoutNodeWithStyle*) -> LayoutNodeWithStyle*:
+    var ancestor = layout_node_parent(parent.layout_node())
+    while let current = ancestor:
+        let display = layout_node_display(current.layout_node())
+        if is_layout_block_container(current) and not css_display_is_contents(&display) and not layout_node_is_anonymous(current.layout_node()):
+            return current
+        ancestor = layout_node_parent(current.layout_node())
+    trap("VERIFY_NOT_REACHED")
+
+# Block nodes inside inline nodes are allowed, but to maintain the invariant that either all layout children are
+# inline or non-inline, we need to rearrange the tree a bit. All inline ancestors up to the node we've inserted are
+# wrapped in an anonymous block, which is inserted into the nearest non-inline ancestor. We then recreate the inline
+# ancestors in another anonymous block inserted after the node so we can continue adding children.
+#
+# Effectively, we try to turn this:
+#
+#     InlineNode 1
+#       TextNode 1
+#       InlineNode N
+#         TextNode N
+#         BlockContainer (node)
+#
+# Into this:
+#
+#     BlockContainer (anonymous "before")
+#       InlineNode 1
+#         TextNode 1
+#         InlineNode N
+#           TextNode N
+#     BlockContainer (anonymous "middle") continuation
+#       BlockContainer (node)
+#     BlockContainer (anonymous "after")
+#       InlineNode 1 continuation
+#         InlineNode N
+#
+# To be able to reconstruct their relation after restructuring, layout nodes keep track of their continuation. The
+# top-most inline node of the "after" wrapper points to the "middle" wrapper, which points to the top-most inline node
+# of the "before" wrapper. All other inline nodes in the "after" wrapper point to their counterparts in the "before"
+# wrapper, to make it easier to create the right paintables since a DOM::Node only has a single Layout::Node.
+#
+# Appending then continues in the "after" tree. If a new block node is then inserted, we can reuse the "middle" wrapper
+# if no inline siblings exist for node or its ancestors, and leave the existing "after" wrapper alone. Otherwise, we
+# create new wrappers and extend the continuation chain.
+#
+# Inspired by: https://webkit.org/blog/115/webcore-rendering-ii-blocks-and-inlines/
+
+## Ported from Libraries/LibWeb/Layout/TreeBuilder.cpp:431 Web::Layout::TreeBuilder::restructure_block_node_in_inline_parent.
+func layout_tree_builder_restructure_block_node_in_inline_parent(this: LayoutTreeBuilder*, node: LayoutNodeWithStyleAndBoxModelMetrics*):
+    # Mark parent as inline again
+    let parent = layout_node_parent(node.layout_node()) else trap("VERIFY: the node has a parent")
+    assert(not layout_node_children_are_inline(parent.layout_node()))
+    layout_node_set_children_are_inline(parent.layout_node(), true)
+
+    # Find nearest ancestor that establishes a BFC (block container) and is not display: contents or anonymous.
+    let nearest_block_ancestor = layout_nearest_block_ancestor(parent)
+    layout_node_set_children_are_inline(nearest_block_ancestor.layout_node(), false)
+
+    # Find the topmost inline ancestor.
+    var topmost_inline_ancestor: LayoutNodeWithStyleAndBoxModelMetrics*? = none
+    var ancestor: LayoutNodeWithStyle*? = parent
+    while let current = ancestor:
+        if current == nearest_block_ancestor:
+            break
+        if layout_node_is_inline(current.layout_node()):
+            topmost_inline_ancestor = (LayoutNodeWithStyleAndBoxModelMetrics*)current
+        ancestor = layout_node_parent(current.layout_node())
+    var topmost = topmost_inline_ancestor else trap("VERIFY: topmost_inline_ancestor")
+
+    # We need to host the topmost inline ancestor and its previous siblings in an anonymous "before" wrapper. If an
+    # inline wrapper does not already exist, we create a new one and add it to the nearest block ancestor.
+    var before_wrapper: LayoutNode* = ---
+    let last_child = tree_node_last_child(nearest_block_ancestor.layout_node()) else trap("the block ancestor has children")
+    if layout_node_is_anonymous(last_child) and layout_node_children_are_inline(last_child):
+        before_wrapper = last_child
+    else:
+        before_wrapper = layout_node_with_style_create_anonymous_wrapper(nearest_block_ancestor).layout_node()
+
+        layout_node_set_children_are_inline(before_wrapper, true)
+        tree_node_append_child(nearest_block_ancestor.layout_node(), before_wrapper)
+    if layout_node_parent(topmost.layout_node()) != (LayoutNodeWithStyle*?)before_wrapper:
+        var inline_to_move: LayoutNode*? = topmost.layout_node()
+        while let moving = inline_to_move:
+            let next = tree_node_previous_sibling(moving)
+            tree_node_remove(moving)
+            tree_node_insert_before(before_wrapper, moving, tree_node_first_child(before_wrapper))
+            inline_to_move = next
+
+    # If we are part of an existing continuation and all inclusive ancestors have no previous siblings, we can reuse
+    # the existing middle wrapper. Otherwiser, we create a new middle wrapper to contain the block node and add it to
+    # the nearest block ancestor.
+    var needs_new_continuation = true
+    var middle_wrapper: LayoutNodeWithStyleAndBoxModelMetrics*? = none
+    if layout_node_with_style_and_box_model_metrics_continuation_of_node(topmost) != none:
+        needs_new_continuation = false
+        var walk: LayoutNode*? = node.layout_node()
+        while let current = walk:
+            if current == topmost.layout_node():
+                break
+            if tree_node_previous_sibling(current) != none:
+                needs_new_continuation = true
+                break
+            walk = (LayoutNode*?)layout_node_parent(current)
+        if not needs_new_continuation:
+            middle_wrapper = layout_node_with_style_and_box_model_metrics_continuation_of_node(topmost)
+    if middle_wrapper == none:
+        let wrapper = (LayoutNodeWithStyleAndBoxModelMetrics*)layout_node_with_style_create_anonymous_wrapper(nearest_block_ancestor)
+        tree_node_append_child(nearest_block_ancestor.layout_node(), wrapper.layout_node())
+        layout_node_with_style_and_box_model_metrics_set_continuation_of_node(wrapper, topmost)
+        middle_wrapper = wrapper
+    let middle = middle_wrapper else trap("unreachable: a middle wrapper")
+
+    # Move the block node to the middle wrapper.
+    tree_node_remove(node.layout_node())
+    tree_node_append_child(middle.layout_node(), node.layout_node())
+
+    # If we need a new continuation, recreate inline ancestors in another anonymous block so we can continue adding new
+    # nodes. We don't need to do this if we are within an existing continuation and there were no previous siblings in
+    # any inclusive ancestor of node in the after wrapper.
+    if needs_new_continuation:
+        let after_wrapper = layout_node_with_style_create_anonymous_wrapper(nearest_block_ancestor)
+        var current_parent = after_wrapper.layout_node()
+        var inline_node: LayoutNode*? = topmost.layout_node()
+        while let current_inline = inline_node:
+            let dom_node = layout_node_dom_node(current_inline) else break
+            if not is_dom_element(dom_node):
+                break
+            let element = (DomElement*)dom_node
+
+            let style = dom_element_computed_properties(element) else trap("VERIFY: the element has computed properties")
+            let created = dom_element_create_layout_node(element, style) else trap("VERIFY: an inline element makes a layout node")
+            let new_inline_node = (LayoutNodeWithStyleAndBoxModelMetrics*)created
+            if current_inline == topmost.layout_node():
+                # The topmost inline ancestor points to the middle wrapper, which in turns points to the original node.
+                layout_node_with_style_and_box_model_metrics_set_continuation_of_node(new_inline_node, middle)
+                topmost = new_inline_node
+            else:
+                # We need all other inline nodes to point to their original node so we can walk the continuation chain
+                # in LayoutState and create the right paintables.
+                layout_node_with_style_and_box_model_metrics_set_continuation_of_node(new_inline_node, (LayoutNodeWithStyleAndBoxModelMetrics*)current_inline)
+
+            tree_node_append_child(current_parent, new_inline_node.layout_node())
+            current_parent = new_inline_node.layout_node()
+
+            # Replace the node in the ancestor stack with the new node.
+            let node_with_style = (LayoutNodeWithStyle*)current_inline
+            if let stack_index = ak.vector_find_first_index(&this.m_ancestor_stack, node_with_style):
+                *ak.vector_at(&this.m_ancestor_stack, stack_index) = new_inline_node.layout_node_with_style()
+
+            # Stop recreating nodes when we've reached node's parent.
+            if current_inline == parent.layout_node():
+                break
+            inline_node = tree_node_last_child(current_inline)
+
+        layout_node_set_children_are_inline(after_wrapper.layout_node(), true)
+        tree_node_append_child(nearest_block_ancestor.layout_node(), after_wrapper.layout_node())
+
+# mark: Ignorable white space and stale nodes ===================================================
+
+## Ported from Libraries/LibWeb/Layout/TreeBuilder.cpp:545 Web::Layout::is_ignorable_whitespace.
+func layout_is_ignorable_whitespace(node: LayoutNode*) -> bool:
+    if let text_node = as_if_layout_text_node(node):
+        if ak.utf16_string_base_is_ascii_whitespace(&layout_text_node_text_for_rendering(text_node).utf16_string_base):
+            return true
+
+    if layout_node_is_anonymous(node) and layout_node_is_block_container(node) and layout_node_children_are_inline(node):
+        var contains_only_white_space = true
+        for descendant in layout_node_inclusive_subtree(node):
+            if let text_node = as_if_layout_text_node(descendant):
+                if not ak.utf16_string_base_is_ascii_whitespace(&layout_text_node_text_for_rendering(text_node).utf16_string_base):
+                    contains_only_white_space = false
+                    break
+            elif layout_node_is_out_of_flow(descendant) or not layout_node_is_anonymous(descendant):
+                contains_only_white_space = false
+                break
+        if contains_only_white_space:
+            return true
+
+    return false
+
+## Ported from Libraries/LibWeb/Layout/TreeBuilder.cpp:571 Web::Layout::is_svg_resource_box.
+func layout_is_svg_resource_box(layout_node: LayoutNode*) -> bool:
+    return is_layout_svg_pattern_box(layout_node) or is_layout_svg_mask_box(layout_node) or is_layout_svg_clip_box(layout_node)
+
+## Ported from Libraries/LibWeb/Layout/TreeBuilder.cpp:576 Web::Layout::layout_node_is_attached_to_dom_subtree.
+func layout_layout_node_is_attached_to_dom_subtree(layout_node: LayoutNode*, subtree_root: DomNode*) -> bool:
+    var ancestor = layout_node_parent(layout_node)
+    while let current = ancestor:
+        if let dom_node = layout_node_dom_node(current.layout_node()):
+            if dom_node_is_shadow_including_inclusive_descendant_of(dom_node, subtree_root):
+                return true
+        ancestor = layout_node_parent(current.layout_node())
+    return false
+
+## Ported from Libraries/LibWeb/Layout/TreeBuilder.cpp:586 Web::Layout::TreeBuilder::clear_stale_layout_and_paint_node.
+func layout_tree_builder_clear_stale_layout_and_paint_node(this: LayoutTreeBuilder*, node: DomNode*, content_visibility_hidden_root: DomNode*? = none) -> TraversalDecision:
+    discard(this)
+    dom_node_set_needs_layout_tree_update(node, false, DomSetNeedsLayoutTreeUpdateReason.none_)
+    dom_node_set_child_needs_layout_tree_update(node, false)
+
+    # NB: Called during layout tree construction.
+    let layout_node = dom_node_unsafe_layout_node(node)
+    # SVGPatternBox, SVGMaskBox, and SVGClipBox are created on behalf of a referencing
+    # element and attached to that element's layout subtree. Skip them so they survive
+    # cleanup of their DOM ancestor, unless their layout attachment is inside the
+    # subtree being hidden too.
+    if let resource_box = layout_node:
+        if layout_is_svg_resource_box(resource_box):
+            var keep = true
+            if let hidden_root = content_visibility_hidden_root:
+                keep = not layout_layout_node_is_attached_to_dom_subtree(resource_box, hidden_root)
+            if keep:
+                return TraversalDecision.skip_children_and_continue
+
+    if let stale = layout_node:
+        if tree_node_parent(stale) != none:
+            tree_node_remove(stale)
+
+    dom_node_detach_layout_node(node)
+    dom_node_clear_paintable(node)
+
+    if is_dom_element(node):
+        dom_element_clear_pseudo_element_nodes((DomElement*)node)
+
+    return TraversalDecision.continue_
+
+## `dom_node.for_each_in_inclusive_subtree([&](auto& node) { return clear_stale_layout_and_paint_node(node); })`.
+func layout_tree_builder_clear_stale_subtree(this: LayoutTreeBuilder*, dom_node: DomNode*):
+    var iterator = dom_node_inclusive_subtree(dom_node).iterator()
+    while let node = iterator.next():
+        if layout_tree_builder_clear_stale_layout_and_paint_node(this, node) == TraversalDecision.skip_children_and_continue:
+            iterator.skip_children()
+
+## The captures of the lambda update_layout_tree passes to for_each_shadow_including_descendant.
+struct LayoutTreeBuilderUpdateLayoutTreeClearStale:
+    var this: LayoutTreeBuilder*
+    var content_visibility_hidden_root: DomNode*
+
+    static func call(context: void*?, node: DomNode*) -> TraversalDecision:
+        let captures = (LayoutTreeBuilderUpdateLayoutTreeClearStale*)(context else trap("for_each_shadow_including_descendant: no captures"))
+        return layout_tree_builder_clear_stale_layout_and_paint_node(captures.this, node, captures.content_visibility_hidden_root)
+
+# mark: update_layout_tree ======================================================================
+
+## `MustCreateSubtree::Yes` where the layout node is created, else MustCreateSubtree::No.
+func layout_tree_builder_must_create_subtree(should_create_layout_node: bool) -> LayoutTreeBuilderMustCreateSubtree:
+    return LayoutTreeBuilderMustCreateSubtree.yes if should_create_layout_node else LayoutTreeBuilderMustCreateSubtree.no
+
+## Ported from Libraries/LibWeb/Layout/TreeBuilder.cpp:614 Web::Layout::TreeBuilder::update_layout_tree.
+func layout_tree_builder_update_layout_tree(this: LayoutTreeBuilder*, dom_node: DomNode*, context: LayoutTreeBuilderContext*, must_create_subtree: LayoutTreeBuilderMustCreateSubtree):
+    let document = dom_node_document(dom_node)
+    # NB: Called during layout tree construction.
+    let should_create_layout_node = must_create_subtree == LayoutTreeBuilderMustCreateSubtree.yes or dom_node_needs_layout_tree_update(dom_node) or dom_document_needs_full_layout_tree_update(document) or (dom_node_is_document(dom_node) and dom_node_unsafe_layout_node(dom_node) == none)
+
+    if dom_node_is_element(dom_node):
+        let element = (DomElement*)dom_node
+        if dom_element_rendered_in_top_layer(element) and not context.layout_top_layer:
+            return
+    if dom_node_is_element(dom_node):
+        css_style_computer_push_ancestor(dom_document_style_computer(document), (DomElement*)dom_node)
+
+    # pop_ancestor_guard
+    defer:
+        if dom_node_is_element(dom_node):
+            css_style_computer_pop_ancestor(dom_document_style_computer(document), (DomElement*)dom_node)
+
+    # NB: Called during layout tree construction.
+    let old_layout_node = dom_node_unsafe_layout_node(dom_node)
+    var layout_node: LayoutNode*? = none
+    # has_svg_root_change: TemporaryChange<bool> of context.has_svg_root, restored when this returns.
+    let saved_has_svg_root = context.has_svg_root
+    var has_svg_root_change = false
+    defer:
+        if has_svg_root_change:
+            context.has_svg_root = saved_has_svg_root
+
+    # remove_stale_layout_node_guard
+    defer:
+        # If we didn't create a layout node for this DOM node,
+        # go through the DOM tree and remove any old layout & paint nodes since they are now all stale.
+        if layout_node == none:
+            layout_tree_builder_clear_stale_subtree(this, dom_node)
+
+    if dom_node_is_svg_container(dom_node):
+        has_svg_root_change = true
+        context.has_svg_root = true
+    elif dom_node_requires_svg_container(dom_node) and not context.has_svg_root:
+        return
+
+    let style_computer = dom_document_style_computer(document)
+    let realm = layout_document_realm(document)
+    var style: CssComputedProperties*? = none
+    var display = css_display_new(css_data.DisplayOutside.block, css_data.DisplayInside.flow)
+
+    if not should_create_layout_node:
+        if is_dom_element(dom_node):
+            let element = (DomElement*)dom_node
+            let element_style = dom_element_computed_properties(element) else trap("VERIFY: the element has computed properties")
+            style = element_style
+            display = css_computed_properties_display(element_style)
+        # NB: Called during layout tree construction.
+        layout_node = dom_node_unsafe_layout_node(dom_node)
+    else:
+        if is_dom_element(dom_node):
+            let element = (DomElement*)dom_node
+            # ::backdrop is a sibling of the element, not a child, so unlike other pseudo-elements, it's not
+            # automatically discarded when element's layout is recomputed. We must remove it manually.
+            if let old_backdrop_node = dom_element_get_pseudo_element_node(element, css_data.PseudoElement.backdrop):
+                tree_node_remove(old_backdrop_node.layout_node())
+            dom_element_clear_pseudo_element_nodes(element)
+            assert(not dom_node_needs_style_update(dom_node))
+            let element_style = dom_element_computed_properties(element) else trap("VERIFY: the element has computed properties")
+            style = element_style
+            display = css_computed_properties_display(element_style)
+            if css_display_is_none(&display):
+                return
+            # TODO: Implement changing element contents with the `content` property.
+            if context.layout_svg_mask_or_clip_path:
+                if is_svg_mask_element(dom_node):
+                    layout_node = realm_create_layout_svg_mask_box(realm, document, (SvgMaskElement*)dom_node, element_style).layout_node()
+                elif is_svg_clip_path_element(dom_node):
+                    layout_node = realm_create_layout_svg_clip_box(realm, document, (SvgClipPathElement*)dom_node, element_style).layout_node()
+                else:
+                    trap("VERIFY_NOT_REACHED")
+                # Only layout direct uses of SVG masks/clipPaths.
+                context.layout_svg_mask_or_clip_path = false
+            elif context.layout_svg_pattern:
+                layout_node = realm_create_layout_svg_pattern_box(realm, document, as_svg_pattern_element(dom_node), element_style).layout_node()
+                context.layout_svg_pattern = false
+            else:
+                layout_node = dom_element_create_layout_node(element, element_style)
+        elif is_dom_document(dom_node):
+            let document_style = css_style_computer_create_document_style(style_computer)
+            style = document_style
+            display = css_computed_properties_display(document_style)
+            layout_node = realm_create_layout_viewport(realm, (DomDocument*)dom_node, document_style).layout_node()
+        elif is_dom_text(dom_node):
+            layout_node = realm_create_layout_text_node(realm, document, (DomText*)dom_node).layout_node()
+            display = layout_inline_flow_display()
+
+    let created = layout_node else return
+
+    # Decide whether to replace an existing node (partial tree update) or insert a new one appropriately.
+    var may_replace_existing_layout_node = false
+    if let old = old_layout_node:
+        may_replace_existing_layout_node = must_create_subtree == LayoutTreeBuilderMustCreateSubtree.no and tree_node_parent(old) != none and old != created
+
+    if dom_node_is_element(dom_node) and should_create_layout_node:
+        let element = (DomElement*)dom_node
+        # Each element rendered in the top layer has a ::backdrop pseudo-element, for which it is the originating element.
+        if dom_element_rendered_in_top_layer(element) and context.layout_top_layer:
+            # If we're inserting a new element, we can append the ::backdrop node now, before layout_node is appended.
+            # Otherwise, we need to insert the ::backdrop before old_layout_node so it's behind the layout_node.
+            if may_replace_existing_layout_node:
+                if let backdrop_node = layout_tree_builder_create_pseudo_element_if_needed(this, element, css_data.PseudoElement.backdrop, none):
+                    let old = old_layout_node else trap("unreachable: an old layout node")
+                    let old_parent = tree_node_parent(old) else trap("unreachable: the old layout node has a parent")
+                    tree_node_insert_before(old_parent, backdrop_node.layout_node(), old)
+            else:
+                discard(layout_tree_builder_create_pseudo_element_if_needed(this, element, css_data.PseudoElement.backdrop, LayoutTreeBuilderAppendOrPrepend.append))
+
+    if dom_node_is_document(dom_node):
+        this.m_layout_root = created
+    elif should_create_layout_node:
+        if may_replace_existing_layout_node:
+            let old = old_layout_node else trap("unreachable: an old layout node")
+            let old_parent = tree_node_parent(old) else trap("unreachable: the old layout node has a parent")
+            tree_node_replace_child(old_parent, created, old)
+        elif layout_node_is_svg_box(created):
+            tree_node_append_child((*ak.vector_last(&this.m_ancestor_stack)).layout_node(), created)
+        else:
+            layout_tree_builder_insert_node_into_inline_or_block_ancestor(this, created, display, LayoutTreeBuilderAppendOrPrepend.append)
+
+    var shadow_root: DomShadowRoot*? = none
+    if let dom_element = as_if_dom_element(dom_node):
+        shadow_root = dom_element_shadow_root(dom_element)
+
+    var element_has_content_visibility_hidden = false
+    if is_dom_element(dom_node):
+        let element_style = dom_element_computed_properties((DomElement*)dom_node) else trap("VERIFY: the element has computed properties")
+        element_has_content_visibility_hidden = css_computed_properties_content_visibility(element_style) == css_data.ContentVisibility.hidden
+
+    let prior_quote_nesting_level = this.m_quote_nesting_level
+
+    if should_create_layout_node:
+        # Resolve counters now that we exist in the layout tree.
+        if let element = as_if_dom_element(dom_node):
+            var element_reference = dom_element_abstract_element(element)
+            css_resolve_counters(&element_reference)
+
+        layout_tree_builder_update_layout_tree_before_children(this, dom_node, created, context, element_has_content_visibility_hidden)
+
+    if element_has_content_visibility_hidden:
+        var captures = LayoutTreeBuilderUpdateLayoutTreeClearStale(this = this, content_visibility_hidden_root = dom_node)
+        discard(dom_node_for_each_shadow_including_descendant(dom_node, ak.Function1[DomNode*, TraversalDecision](call = LayoutTreeBuilderUpdateLayoutTreeClearStale.call, context = &captures)))
+
+    let children_must_create_subtree = layout_tree_builder_must_create_subtree(should_create_layout_node)
+    if should_create_layout_node or dom_node_child_needs_layout_tree_update(dom_node):
+        if (tree_node_has_children(dom_node) or shadow_root != none) and layout_node_can_have_children(created) and not element_has_content_visibility_hidden:
+            layout_tree_builder_push_parent(this, as_layout_node_with_style(created))
+            if let shadow = shadow_root:
+                # For replaced elements with shadow DOM children, wrap the children in an
+                # anonymous BlockContainer so that a BFC handles their layout.
+                if layout_node_is_replaced_box_with_children(created):
+                    var needs_wrapper = true
+                    if let first_child = tree_node_first_child(created):
+                        needs_wrapper = not layout_node_is_anonymous(first_child)
+                    if needs_wrapper:
+                        let wrapper = layout_node_with_style_create_anonymous_wrapper(as_layout_node_with_style(created))
+                        tree_node_append_child((*ak.vector_last(&this.m_ancestor_stack)).layout_node(), wrapper.layout_node())
+                    layout_tree_builder_push_parent(this, as_layout_node_with_style(tree_node_first_child(created) else trap("the replaced box has a wrapper")))
+                for node in dom_node_children(shadow.dom_node()):
+                    layout_tree_builder_update_layout_tree(this, node, context, children_must_create_subtree)
+                if layout_node_is_replaced_box_with_children(created):
+                    layout_tree_builder_pop_parent(this)
+                dom_node_set_child_needs_layout_tree_update(shadow.dom_node(), false)
+                dom_node_set_needs_layout_tree_update(shadow.dom_node(), false, DomSetNeedsLayoutTreeUpdateReason.none_)
+            else:
+                # This is the same as as<DOM::ParentNode>(dom_node).for_each_child
+                for node in dom_node_children(dom_node):
+                    layout_tree_builder_update_layout_tree(this, node, context, children_must_create_subtree)
+
+            if dom_node_is_document(dom_node):
+                # Elements in the top layer do not lay out normally based on their position in the document; instead they
+                # generate boxes as if they were siblings of the root element.
+                let saved_layout_top_layer = context.layout_top_layer
+                context.layout_top_layer = true
+                let top_layer_elements = ak.ordered_hash_table_values(dom_document_top_layer_elements(document))
+                for top_layer_element in ak.vector_span_const(&top_layer_elements):
+                    if dom_element_rendered_in_top_layer(top_layer_element):
+                        layout_tree_builder_update_layout_tree(this, top_layer_element.dom_node(), context, children_must_create_subtree)
+                context.layout_top_layer = saved_layout_top_layer
+            layout_tree_builder_pop_parent(this)
+
+    if let slot_element = as_if_html_slot_element(dom_node):
+        let slot_style = dom_element_computed_properties(slot_element.dom_element()) else trap("VERIFY: the slot has computed properties")
+        if css_computed_properties_content_visibility(slot_style) != css_data.ContentVisibility.hidden:
+            let slottables = dom_slot_assigned_nodes_internal(&slot_element.slot)
+            layout_tree_builder_push_parent(this, as_layout_node_with_style(created))
+
+            var must_create_subtree_for_slottable = must_create_subtree
+            if dom_node_needs_layout_tree_update(dom_node):
+                must_create_subtree_for_slottable = LayoutTreeBuilderMustCreateSubtree.yes
+
+            for slottable in slottables:
+                match slottable:
+                    .dom_element(node):
+                        layout_tree_builder_update_layout_tree(this, node.dom_node(), context, must_create_subtree_for_slottable)
+                    .dom_text(node):
+                        layout_tree_builder_update_layout_tree(this, node.dom_node(), context, must_create_subtree_for_slottable)
+
+            layout_tree_builder_pop_parent(this)
+
+    if should_create_layout_node:
+        layout_tree_builder_update_layout_tree_after_children(this, dom_node, created, context, element_has_content_visibility_hidden)
+        layout_tree_builder_wrap_in_button_layout_tree_if_needed(this, dom_node, created)
+
+        # If we completely finished inserting a block level element into an inline parent, we need to fix up the tree so
+        # that we can maintain the invariant that all children are either inline or non-inline. We can't do this earlier,
+        # because the restructuring adds new children after this node that become part of the ancestor stack.
+        if let node_with_metrics = as_if_layout_node_with_style_and_box_model_metrics(created):
+            if layout_node_with_style_and_box_model_metrics_should_create_inline_continuation(node_with_metrics):
+                layout_tree_builder_restructure_block_node_in_inline_parent(this, node_with_metrics)
+
+    # https://www.w3.org/TR/css-contain-2/#containment-style
+    # Giving an element style containment has the following effects:
+    # 2. The effects of the 'content' property’s 'open-quote', 'close-quote', 'no-open-quote' and 'no-close-quote' must
+    #    be scoped to the element’s sub-tree.
+    if layout_node_has_style_containment(created):
+        this.m_quote_nesting_level = prior_quote_nesting_level
+
+    dom_node_set_needs_layout_tree_update(dom_node, false, DomSetNeedsLayoutTreeUpdateReason.none_)
+    dom_node_set_child_needs_layout_tree_update(dom_node, false)
+
+# mark: Button layout ===========================================================================
+
+## Ported from Libraries/LibWeb/Layout/TreeBuilder.cpp:856 Web::Layout::TreeBuilder::wrap_in_button_layout_tree_if_needed.
+func layout_tree_builder_wrap_in_button_layout_tree_if_needed(this: LayoutTreeBuilder*, dom_node: DomNode*, layout_node: LayoutNode*):
+    discard(this)
+    let html_element = as_if_html_element(dom_node) else return
+    if not html_element_uses_button_layout(html_element):
+        return
+
+    # https://html.spec.whatwg.org/multipage/rendering.html#button-layout
+    # If the element is an input element, or if it is a button element and its computed value for 'display' is not
+    # 'inline-grid', 'grid', 'inline-flex', or 'flex', then the element's box has a child anonymous button content box
+    # with the following behaviors:
+    let display = layout_node_display(layout_node)
+    if not css_display_is_grid_inside(&display) and not css_display_is_flex_inside(&display):
+        let parent = as_layout_node_with_style(layout_node)
+
+        # If the box does not overflow in the vertical axis, then it is centered vertically.
+        # FIXME: Only apply alignment when box overflows
+        let flex_wrapper = layout_node_with_style_create_anonymous_wrapper(parent)
+        let flex_computed_values = layout_node_with_style_mutable_computed_values(flex_wrapper)
+        css_mutable_computed_values_set_display(flex_computed_values, css_display_new(css_data.DisplayOutside.block, css_data.DisplayInside.flex))
+        css_mutable_computed_values_set_justify_content(flex_computed_values, css_data.JustifyContent.center)
+        css_mutable_computed_values_set_flex_direction(flex_computed_values, css_data.FlexDirection.column)
+        css_mutable_computed_values_set_height(flex_computed_values, css_size_make_percentage(css_percentage_new(100.0)))
+        css_mutable_computed_values_set_min_height(flex_computed_values, css_computed_values_min_height(&layout_node_with_style_computed_values(parent).computed_values))
+
+        let content_box_wrapper = layout_node_with_style_create_anonymous_wrapper(parent)
+        layout_node_set_children_are_inline(content_box_wrapper.layout_node(), layout_node_children_are_inline(parent.layout_node()))
+
+        var sequence: ak.Vector[LayoutNode*]
+        for child in layout_node_children(parent.layout_node()):
+            ak.vector_append_t(&sequence, child)
+
+        for node in ak.vector_span_const(&sequence):
+            tree_node_remove_child(parent.layout_node(), node)
+            tree_node_append_child(content_box_wrapper.layout_node(), node)
+
+        tree_node_append_child(flex_wrapper.layout_node(), content_box_wrapper.layout_node())
+
+        tree_node_append_child(parent.layout_node(), flex_wrapper.layout_node())
+        layout_node_set_children_are_inline(parent.layout_node(), false)

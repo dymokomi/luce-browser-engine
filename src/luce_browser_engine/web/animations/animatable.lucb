@@ -1,0 +1,193 @@
+#==============================================================================================
+#
+#   animatable - Animations::Animatable: an element's animations and transitions state
+#
+#   DESCRIPTION:
+#       Port of LibWeb/Animations/Animatable.cpp (lines 15-17, 69-129 and 137-301): the
+#       relevant animations of an element, its CSS-defined animations per pseudo-element, its
+#       registered transitions and their attributes, and visit_edges. Taken ahead of phase 4 by
+#       region r43, because StyleComputer::compute_style_impl asks every element for these
+#       (process_animation_definitions, get_animations_internal, the transitions) and the
+#       layout tree is built from computed styles. Animatable::animate, get_animations and
+#       the (un)association and CSS animation registry members stay with phase 4.
+#
+#       Copyright (c) 2024, Matthew Olsson <mattco@serenityos.org>
+#       Copyright (c) 2024, Sam Atkins <sam@ladybird.org>
+#       Copyright (c) 2025, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Animations ==============================================================================
+
+## The `[](GC::Ref<Animation>& a, GC::Ref<Animation>& b)` comparator of get_animations_internal's quick_sort.
+func animations_animatable_composite_order_less_than(context: void*?, a: const (AnimationsAnimation*)*, b: const (AnimationsAnimation*)*) -> bool:
+    discard(context)
+    let a_effect = (AnimationsKeyframeEffect*)(animations_animation_effect(*a) else trap("as<KeyframeEffect>: no effect"))
+    let b_effect = (AnimationsKeyframeEffect*)(animations_animation_effect(*b) else trap("as<KeyframeEffect>: no effect"))
+    return animations_keyframe_effect_composite_order(a_effect, b_effect) < 0
+
+## Ported from Libraries/LibWeb/Animations/Animatable.cpp:69 Web::Animations::Animatable::get_animations_internal.
+pub func animations_animatable_get_animations_internal(this: AnimationsAnimatable*, sorted: AnimationsAnimatableGetAnimationsSorted, options: AnimationsGetAnimationsOptions? = none) -> ak.Vector[AnimationsAnimation*]!:
+    # The element this Animatable is mixed into (`*static_cast<DOM::Element*>(this)`).
+    let target = (DomElement*)((u8*)this - offsetof(DomElement, animatable))
+
+    # 1. Let object be the object on which this method was called.
+
+    # 2. Let pseudoElement be the result of pseudo-element parsing applied to pseudoElement of options, or null if options is not passed.
+    # FIXME: Currently only DOM::Element includes Animatable, but that might not always be true.
+    var pseudo_element: CssSelectorPseudoElementSelector? = none
+    if let given = options:
+        if given.pseudo_element != none:
+            let realm = dom_element_realm(target)
+            pseudo_element = try animations_pseudo_element_parsing(realm, given.pseudo_element)
+
+    # 3. If pseudoElement is not null, then let target be the pseudo-element identified by pseudoElement with object as the originating element.
+    #    Otherwise, let target be object.
+    # FIXME: We can't refer to pseudo-elements directly, and they also can't be animated yet.
+    discard(pseudo_element)
+
+    # 4. If options is passed with subtree set to true, then return the set of relevant animations for a subtree of target.
+    #    Otherwise, return the set of relevant animations for target.
+    var relevant_animations: ak.Vector[AnimationsAnimation*]
+    if let impl = this.m_impl:
+        for animation in ak.vector_span_const(&impl.associated_animations):
+            if animations_animation_is_relevant(animation):
+                ak.vector_append_t(&relevant_animations, animation)
+
+    if let given = options:
+        if given.subtree:
+            for child_node in dom_node_children(target.dom_node()):
+                let child = as_if_dom_element(child_node) else continue
+                let child_animations = try animations_animatable_get_animations_internal(&child.animatable, AnimationsAnimatableGetAnimationsSorted.no, options)
+                for animation in ak.vector_span_const(&child_animations):
+                    ak.vector_append_t(&relevant_animations, animation)
+
+    # The returned list is sorted using the composite order described for the associated animations of effects in
+    # §5.4.2 The effect stack.
+    if sorted == AnimationsAnimatableGetAnimationsSorted.yes:
+        ak.quick_sort_t_collection_t_less_than(ak.vector_span(&relevant_animations), ak.Function2[const (AnimationsAnimation*)*, const (AnimationsAnimation*)*, bool](call = animations_animatable_composite_order_less_than, context = none))
+
+    return relevant_animations
+
+# mark: Transitions =============================================================================
+
+## Ported from Libraries/LibWeb/Animations/Animatable.cpp:137 Web::Animations::Animatable::add_transitioned_properties.
+pub func animations_animatable_add_transitioned_properties(this: AnimationsAnimatable*, pseudo_element: css_data.PseudoElement?, transitions: const ak.Vector[CssTransitionProperties]*):
+    let transition = animations_animatable_ensure_transition(this, pseudo_element) else return
+
+    for i in 0..<ak.vector_size(transitions):
+        let entry = ak.vector_at_const(transitions, i)
+        let index_of_this_transition = ak.vector_size(&transition.transition_attributes)
+        ak.vector_append_t(&transition.transition_attributes, AnimationsAnimatableTransitionAttributes(delay = entry.delay, duration = entry.duration, timing_function = entry.timing_function, transition_behavior = entry.transition_behavior))
+
+        for property in ak.vector_span_const(&entry.properties):
+            discard(ak.hash_map_set(&transition.transition_attribute_indices, property, index_of_this_transition))
+
+## Ported from Libraries/LibWeb/Animations/Animatable.cpp:154 Web::Animations::Animatable::property_ids_with_matching_transition_property_entry.
+pub func animations_animatable_property_ids_with_matching_transition_property_entry(this: AnimationsAnimatable*, pseudo_element: css_data.PseudoElement?) -> ak.Vector[css_data.PropertyId]:
+    let transition = animations_animatable_ensure_transition(this, pseudo_element) else return ak.Vector[css_data.PropertyId]()
+
+    return ak.hash_map_keys(&transition.transition_attribute_indices)
+
+## Ported from Libraries/LibWeb/Animations/Animatable.cpp:164 Web::Animations::Animatable::property_transition_attributes.
+pub func animations_animatable_property_transition_attributes(this: AnimationsAnimatable*, pseudo_element: css_data.PseudoElement?, property_id: css_data.PropertyId) -> const AnimationsAnimatableTransitionAttributes*?:
+    let transition = animations_animatable_ensure_transition(this, pseudo_element) else return none
+    if let attribute_index = ak.hash_map_get_k(&transition.transition_attribute_indices, property_id):
+        return ak.vector_at(&transition.transition_attributes, *attribute_index)
+    return none
+
+## Ported from Libraries/LibWeb/Animations/Animatable.cpp:175 Web::Animations::Animatable::property_ids_with_existing_transitions.
+pub func animations_animatable_property_ids_with_existing_transitions(this: AnimationsAnimatable*, pseudo_element: css_data.PseudoElement?) -> ak.Vector[css_data.PropertyId]:
+    let transition = animations_animatable_ensure_transition(this, pseudo_element) else return ak.Vector[css_data.PropertyId]()
+
+    return ak.hash_map_keys(&transition.associated_transitions)
+
+## Ported from Libraries/LibWeb/Animations/Animatable.cpp:185 Web::Animations::Animatable::property_transition.
+pub func animations_animatable_property_transition(this: AnimationsAnimatable*, pseudo_element: css_data.PseudoElement?, property_id: css_data.PropertyId) -> CssTransition*?:
+    let transition = animations_animatable_ensure_transition(this, pseudo_element) else return none
+    if let animation = ak.hash_map_get_k(&transition.associated_transitions, property_id):
+        return *animation
+    return none
+
+## Ported from Libraries/LibWeb/Animations/Animatable.cpp:206 Web::Animations::Animatable::remove_transition.
+pub func animations_animatable_remove_transition(this: AnimationsAnimatable*, pseudo_element: css_data.PseudoElement?, property_id: css_data.PropertyId):
+    let transition = animations_animatable_ensure_transition(this, pseudo_element) else return
+    assert(ak.hash_map_contains_k(&transition.associated_transitions, property_id))
+    discard(ak.hash_map_remove_k(&transition.associated_transitions, property_id))
+
+## Ported from Libraries/LibWeb/Animations/Animatable.cpp:216 Web::Animations::Animatable::clear_registered_transitions.
+pub func animations_animatable_clear_registered_transitions(this: AnimationsAnimatable*, pseudo_element: css_data.PseudoElement?):
+    let transition = animations_animatable_ensure_transition(this, pseudo_element) else return
+
+    ak.hash_map_clear(&transition.transition_attribute_indices)
+    ak.vector_clear(&transition.transition_attributes)
+
+# mark: Edges and CSS-defined animations ========================================================
+
+## Ported from Libraries/LibWeb/Animations/Animatable.cpp:228 Web::Animations::Animatable::visit_edges.
+pub func animations_animatable_visit_edges(this: AnimationsAnimatable*, visitor: gc.CellVisitor*):
+    if let impl = this.m_impl:
+        animations_animatable_impl_visit_edges(impl, visitor)
+
+## Ported from Libraries/LibWeb/Animations/Animatable.cpp:234 Web::Animations::Animatable::Impl::visit_edges.
+# (Animation, CSSAnimation and CSSTransition are opaque until phase 4: they are visited as cells.)
+func animations_animatable_impl_visit_edges(this: AnimationsAnimatableImpl*, visitor: gc.CellVisitor*):
+    for animation in ak.vector_span_const(&this.associated_animations):
+        gc.cell_visitor_visit_cell_2(visitor, (gc.Cell*)animation)
+    for css_animation in this.css_defined_animations:
+        if let animations = css_animation:
+            for entry in ak.hash_map_begin(animations):
+                gc.cell_visitor_visit_cell_2(visitor, (gc.Cell*)entry.value)
+
+    for transition in this.transitions:
+        if let found = transition:
+            for entry in ak.hash_map_begin(&found.associated_transitions):
+                gc.cell_visitor_visit_cell_2(visitor, (gc.Cell*)entry.value)
+
+## Ported from Libraries/LibWeb/Animations/Animatable.cpp:248 Web::Animations::Animatable::set_has_css_defined_animations.
+pub func animations_animatable_set_has_css_defined_animations(this: AnimationsAnimatable*):
+    animations_animatable_ensure_impl(this).has_css_defined_animations = true
+
+## Ported from Libraries/LibWeb/Animations/Animatable.cpp:253 Web::Animations::Animatable::has_css_defined_animations.
+pub func animations_animatable_has_css_defined_animations(this: AnimationsAnimatable*) -> bool:
+    let impl = this.m_impl else return false
+
+    return impl.has_css_defined_animations
+
+## Ported from Libraries/LibWeb/Animations/Animatable.cpp:261 Web::Animations::Animatable::css_defined_animations.
+pub func animations_animatable_css_defined_animations(this: AnimationsAnimatable*, pseudo_element: css_data.PseudoElement?) -> ak.HashMap[ak.FlyString, CssAnimation*, ak.FlyStringTraits]*?:
+    let impl = animations_animatable_ensure_impl(this)
+
+    var index: usize = 0
+    if let value = pseudo_element:
+        if not css_selector_pseudo_element_selector_is_known_pseudo_element_type(value):
+            return none
+        index = (usize)(u8)value + 1
+
+    if impl.css_defined_animations[index] == none:
+        impl.css_defined_animations[index] = (new ak.HashMap[ak.FlyString, CssAnimation*, ak.FlyStringTraits]) else trap("out of memory")
+
+    return impl.css_defined_animations[index]
+
+## Ported from Libraries/LibWeb/Animations/Animatable.cpp:277 Web::Animations::Animatable::ensure_impl.
+func animations_animatable_ensure_impl(this: AnimationsAnimatable*) -> AnimationsAnimatableImpl*:
+    if this.m_impl == none:
+        let impl = (new AnimationsAnimatableImpl) else trap("out of memory")
+        impl.is_sorted_by_composite_order = true
+        this.m_impl = impl
+    return this.m_impl else trap("unreachable: the impl was just made")
+
+## Ported from Libraries/LibWeb/Animations/Animatable.cpp:284 Web::Animations::Animatable::ensure_transition.
+func animations_animatable_ensure_transition(this: AnimationsAnimatable*, pseudo_element: css_data.PseudoElement?) -> AnimationsAnimatableTransition*?:
+    let impl = animations_animatable_ensure_impl(this)
+
+    var pseudo_element_index: usize = 0
+    if let value = pseudo_element:
+        if not css_selector_pseudo_element_selector_is_known_pseudo_element_type(value):
+            return none
+        pseudo_element_index = (usize)(u8)value + 1
+
+    if impl.transitions[pseudo_element_index] == none:
+        impl.transitions[pseudo_element_index] = (new AnimationsAnimatableTransition) else trap("out of memory")
+    return impl.transitions[pseudo_element_index]

@@ -1,0 +1,521 @@
+#==============================================================================================
+#
+#   node_1 - Layout::Node: construction, flow, containing blocks and stacking contexts
+#
+#   DESCRIPTION:
+#       Port of LibWeb/Layout/Node.cpp (lines 1-578): the constructor and visit_edges,
+#       is_out_of_flow, the absolute and fixed positioning containing-block predicates,
+#       recompute_containing_block, establishes_stacking_context, navigable, root and the
+#       positioning predicates.
+#
+#       Copyright (c) 2018-2023, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2021-2025, Sam Atkins <sam@ladybird.org>
+#       Copyright (c) 2025, Jelle Raaijmakers <jelle@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Construction and edges ===================================================================
+
+## Ported from Libraries/LibWeb/Layout/Node.cpp:48 Web::Layout::Node::Node.
+pub func layout_node_construct(this: LayoutNode*, document: DomDocument*, node: DomNode*?):
+    this.m_dom_node = node else document.dom_node()
+    this.m_anonymous = node == none
+    if let dom_node = node:
+        dom_node_set_layout_node(dom_node, this)
+
+## Ported from Libraries/LibWeb/Layout/Node.cpp:58 Web::Layout::Node::visit_edges (override).
+pub func layout_node_visit_edges_impl(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (LayoutNode*)base
+    gc.cell_visit_edges_impl(base, visitor)
+    gc.cell_visitor_visit_t_2(visitor, this.m_dom_node)
+    for paintable in ak.intrusive_list_begin(&this.m_paintable):
+        gc.cell_visitor_visit_t_2(visitor, paintable)
+    gc.cell_visitor_visit_t(visitor, this.m_containing_block)
+    gc.cell_visitor_visit_t(visitor, this.m_inline_containing_block_if_applicable)
+    gc.cell_visitor_visit_t(visitor, this.m_pseudo_element_generator)
+    tree_node_visit_edges(this, visitor)
+
+# mark: Flow =====================================================================================
+
+## Ported from Libraries/LibWeb/Layout/Node.cpp:72 Web::Layout::Node::is_out_of_flow.
+# https://www.w3.org/TR/css-display-3/#out-of-flow
+pub func layout_node_is_out_of_flow_layout_formatting_context(this: LayoutNode*, formatting_context: LayoutFormattingContext*) -> bool:
+    # A layout node is out of flow if either:
+
+    # 1. It is floated (which requires that floating is not inhibited).
+    let computed_values = layout_node_computed_values(this)
+    if not layout_formatting_context_inhibits_floating(formatting_context) and css_computed_values_float(&computed_values.computed_values) != css_data.Float.none_:
+        return true
+
+    # 2. It is "absolutely positioned".
+    if layout_node_is_absolutely_positioned(this):
+        return true
+
+    return false
+
+# mark: Containing blocks =======================================================================
+
+## `will_change_property(property_id)`: the will-change lambda of the containing-block and stacking-context
+## predicates.
+func layout_node_will_change_property(computed_values: const CssComputedValues*, property_id: css_data.PropertyId) -> bool:
+    let will_change = css_computed_values_will_change(computed_values)
+    return css_will_change_has_property(&will_change, property_id)
+
+## Ported from Libraries/LibWeb/Layout/Node.cpp:91 Web::Layout::Node::computed_values_establish_absolute_positioning_containing_block.
+# https://drafts.csswg.org/css-position-3/#absolute-positioning-containing-block
+# Checks if the computed values of this node would establish an absolute positioning
+# containing block. This is separate from establishes_an_absolute_positioning_containing_block()
+# because that function also checks is<Box>, but we need these checks for inline elements too.
+pub func layout_node_computed_values_establish_absolute_positioning_containing_block(this: LayoutNode*) -> bool:
+    let computed_values = &layout_node_computed_values(this).computed_values
+
+    # https://drafts.csswg.org/css-will-change/#will-change
+    # If any non-initial value of a property would cause the element to generate a containing block for absolutely
+    # positioned elements, specifying that property in will-change must cause the element to generate a containing
+    # block for absolutely positioned elements.
+
+    # https://drafts.csswg.org/css-position/#position-property
+    # Values other than 'static' make the box a positioned box, and cause it to establish an absolute positioning
+    # containing block for its descendants.
+    if css_computed_values_position(computed_values) != css_data.Positioning.static_ or layout_node_will_change_property(computed_values, css_data.PropertyId.position):
+        return true
+
+    # https://drafts.csswg.org/css-transforms-1/#propdef-transform
+    # Any computed value other than none for the transform affects containing block and stacking context
+    if layout_node_has_transformations_or_will_change(computed_values):
+        return true
+
+    # https://drafts.csswg.org/css-transforms-2/#propdef-perspective
+    # The use of this property with any value other than 'none' establishes a stacking context. It also establishes
+    # a containing block for all descendants, just like the 'transform' property does.
+    if css_computed_values_perspective(computed_values) != none or layout_node_will_change_property(computed_values, css_data.PropertyId.perspective):
+        return true
+
+    # https://drafts.csswg.org/filter-effects-1/#FilterProperty
+    # A value other than none for the filter property results in the creation of a containing block for absolute and
+    # fixed positioned descendants, unless the element it applies to is a document root element in the current
+    # browsing context.
+    let filter = css_computed_values_filter(computed_values)
+    if (css_filter_has_filters(&filter) or layout_node_will_change_property(computed_values, css_data.PropertyId.filter)) and not layout_node_is_root_element(this):
+        return true
+
+    # https://drafts.csswg.org/filter-effects-2/#BackdropFilterProperty
+    # A computed value of other than none results in the creation of both a stacking context and a containing block
+    # for absolute and fixed position descendants, unless the element it applies to is a document root element in the
+    # current browsing context.
+    let backdrop_filter = css_computed_values_backdrop_filter(computed_values)
+    if (css_filter_has_filters(&backdrop_filter) or layout_node_will_change_property(computed_values, css_data.PropertyId.backdrop_filter)) and not layout_node_is_root_element(this):
+        return true
+
+    # https://drafts.csswg.org/css-contain-2/#containment-types
+    # 4. The layout containment box establishes an absolute positioning containing block and a fixed positioning
+    #    containing block.
+    # 4. The paint containment box establishes an absolute positioning containing block and a fixed positioning
+    #    containing block.
+    if layout_node_has_layout_containment(this) or layout_node_has_paint_containment(this) or layout_node_will_change_property(computed_values, css_data.PropertyId.contain):
+        return true
+
+    # https://drafts.csswg.org/css-transforms-2/#transform-style-property
+    # A computed value of 'preserve-3d' for 'transform-style' on a transformable element establishes both a
+    # stacking context and a containing block for all descendants.
+    # FIXME: Check that the element is a transformable element.
+    if css_computed_values_transform_style(computed_values) == css_data.TransformStyle.preserve3_d or layout_node_will_change_property(computed_values, css_data.PropertyId.transform_style):
+        return true
+
+    # https://drafts.csswg.org/css-view-transitions-1/#snapshot-containing-block-concept
+    # FIXME: The snapshot containing block is considered to be an absolute positioning containing block and a fixed
+    #        positioning containing block for ::view-transition and its descendants.
+
+    return false
+
+## The four transform checks both containing-block predicates and establishes_stacking_context share:
+## `!transformations().is_empty()`, `translate()`, `rotate()`, `scale()`, each or its will-change.
+func layout_node_has_transformations_or_will_change(computed_values: const CssComputedValues*) -> bool:
+    let transformations = css_computed_values_transformations(computed_values)
+    if not ak.vector_is_empty(&transformations) or layout_node_will_change_property(computed_values, css_data.PropertyId.transform):
+        return true
+    if css_computed_values_translate(computed_values) != none or layout_node_will_change_property(computed_values, css_data.PropertyId.translate):
+        return true
+    if css_computed_values_rotate(computed_values) != none or layout_node_will_change_property(computed_values, css_data.PropertyId.rotate):
+        return true
+    if css_computed_values_scale(computed_values) != none or layout_node_will_change_property(computed_values, css_data.PropertyId.scale):
+        return true
+    return false
+
+## Ported from Libraries/LibWeb/Layout/Node.cpp:163 Web::Layout::Node::establishes_an_absolute_positioning_containing_block.
+# https://drafts.csswg.org/css-position-3/#absolute-positioning-containing-block
+pub func layout_node_establishes_an_absolute_positioning_containing_block(this: LayoutNode*) -> bool:
+    if not is_layout_box(this):
+        return false
+
+    if is_layout_viewport(this):
+        return true
+
+    # https://github.com/w3c/fxtf-drafts/issues/307#issuecomment-499612420
+    # foreignObject establishes a containing block for absolutely and fixed positioned elements.
+    if layout_node_is_svg_foreign_object_box(this):
+        return true
+
+    return layout_node_computed_values_establish_absolute_positioning_containing_block(this)
+
+## Ported from Libraries/LibWeb/Layout/Node.cpp:180 Web::Layout::Node::establishes_a_fixed_positioning_containing_block.
+# https://drafts.csswg.org/css-position-3/#fixed-positioning-containing-block
+pub func layout_node_establishes_a_fixed_positioning_containing_block(this: LayoutNode*) -> bool:
+    if not is_layout_box(this):
+        return false
+
+    let computed_values = &layout_node_computed_values(this).computed_values
+
+    # https://drafts.csswg.org/css-will-change/#will-change
+    # If any non-initial value of a property would cause the element to generate a containing block for fixed
+    # positioned elements, specifying that property in will-change must cause the element to generate a containing
+    # block for fixed positioned elements.
+
+    # https://drafts.csswg.org/css-transforms-1/#propdef-transform
+    # Any computed value other than none for the transform affects containing block and stacking context
+    if layout_node_has_transformations_or_will_change(computed_values):
+        return true
+
+    # https://drafts.csswg.org/css-transforms-2/#propdef-perspective
+    # The use of this property with any value other than 'none' establishes a stacking context. It also establishes
+    # a containing block for all descendants, just like the 'transform' property does.
+    if css_computed_values_perspective(computed_values) != none or layout_node_will_change_property(computed_values, css_data.PropertyId.perspective):
+        return true
+
+    # https://drafts.csswg.org/filter-effects-1/#FilterProperty
+    # A value other than none for the filter property results in the creation of a containing block for absolute and
+    # fixed positioned descendants, unless the element it applies to is a document root element in the current
+    # browsing context.
+    let filter = css_computed_values_filter(computed_values)
+    if (css_filter_has_filters(&filter) or layout_node_will_change_property(computed_values, css_data.PropertyId.filter)) and not layout_node_is_root_element(this):
+        return true
+
+    # https://drafts.csswg.org/filter-effects-2/#BackdropFilterProperty
+    # A computed value of other than none results in the creation of both a stacking context and a containing block
+    # for absolute and fixed position descendants, unless the element it applies to is a document root element in the
+    # current browsing context.
+    let backdrop_filter = css_computed_values_backdrop_filter(computed_values)
+    if (css_filter_has_filters(&backdrop_filter) or layout_node_will_change_property(computed_values, css_data.PropertyId.backdrop_filter)) and not layout_node_is_root_element(this):
+        return true
+
+    # https://drafts.csswg.org/css-contain-2/#containment-types
+    # 4. The layout containment box establishes an absolute positioning containing block and a fixed positioning
+    #    containing block.
+    # 4. The paint containment box establishes an absolute positioning containing block and a fixed positioning
+    #    containing block.
+    if layout_node_has_layout_containment(this) or layout_node_has_paint_containment(this) or layout_node_will_change_property(computed_values, css_data.PropertyId.contain):
+        return true
+
+    # https://drafts.csswg.org/css-transforms-2/#transform-style-property
+    # A computed value of 'preserve-3d' for 'transform-style' on a transformable element establishes both a
+    # stacking context and a containing block for all descendants.
+    # FIXME: Check that the element is a transformable element.
+    if css_computed_values_transform_style(computed_values) == css_data.TransformStyle.preserve3_d or layout_node_will_change_property(computed_values, css_data.PropertyId.transform_style):
+        return true
+
+    # https://drafts.csswg.org/css-view-transitions-1/#snapshot-containing-block-concept
+    # FIXME: The snapshot containing block is considered to be an absolute positioning containing block and a fixed
+    #        positioning containing block for ::view-transition and its descendants.
+
+    return false
+
+## Ported from Libraries/LibWeb/Layout/Node.cpp:248 Web::Layout::nearest_ancestor_capable_of_forming_a_containing_block.
+func layout_nearest_ancestor_capable_of_forming_a_containing_block(node: LayoutNode*) -> LayoutBox*?:
+    var ancestor = layout_node_parent(node)
+    while let current = ancestor:
+        let display = layout_node_display(current.layout_node())
+        if layout_node_is_block_container(current.layout_node()) or css_display_is_flex_inside(&display) or css_display_is_grid_inside(&display) or layout_node_is_replaced_box_with_children(current.layout_node()):
+            return as_layout_box(current)
+        ancestor = layout_node_parent(current.layout_node())
+    return none
+
+## Ported from Libraries/LibWeb/Layout/Node.cpp:261 Web::Layout::Node::recompute_containing_block.
+pub func layout_node_recompute_containing_block(this: LayoutNode*):
+    # Reset the inline containing block - we'll set it below if applicable.
+    this.m_inline_containing_block_if_applicable = none
+
+    if is_layout_text_node(this):
+        this.m_containing_block = layout_nearest_ancestor_capable_of_forming_a_containing_block(this)
+        return
+
+    let position = css_computed_values_position(&layout_node_computed_values(this).computed_values)
+
+    # https://drafts.csswg.org/css-position-3/#absolute-cb
+    if position == css_data.Positioning.absolute:
+        var ancestor = layout_node_parent(this)
+        while let current = ancestor:
+            if layout_node_establishes_an_absolute_positioning_containing_block(current.layout_node()):
+                break
+            ancestor = layout_node_parent(current.layout_node())
+        this.m_containing_block = (LayoutBox*?)ancestor
+
+        # FIXME: Containing block handling for absolutely positioned elements needs architectural improvements.
+        #
+        #        The CSS specification defines the containing block as a *rectangle*, not a box. For most cases,
+        #        this rectangle is derived from the padding box of the nearest positioned ancestor Box. However,
+        #        when the positioned ancestor is an *inline* element (e.g., a <span> with position: relative),
+        #        the containing block rectangle should be the bounding box of that inline's fragments.
+        #
+        #        Currently, m_containing_block is typed as Box*, which cannot represent inline elements.
+        #        The proper fix would be to:
+        #        1. Separate the concept of "the node that establishes the containing block" from "the containing
+        #           block rectangle".
+        #        2. Store a reference to the establishing node (which could be InlineNode or Box).
+        #        3. Compute the containing block rectangle on demand based on the establishing node's type.
+        #
+        #        For now, we use a workaround: check if there's an inline element with position:relative (or
+        #        other containing-block-establishing properties) between this node and its containing_block()
+        #        in the DOM tree. If found, store it in m_inline_containing_block_if_applicable.
+        #
+        #        We check the DOM tree here (rather than the layout tree) because when a block element is inside
+        #        an inline element, the layout tree restructures so the block becomes a sibling of the inline.
+        #        But the CSS containing block relationship is based on the DOM structure.
+        if let containing_block = this.m_containing_block:
+            let containing_block_dom_node = layout_node_dom_node(containing_block.layout_node())
+
+            # For pseudo-elements, we need to start from the generating element itself, since it may
+            # be the inline containing block. For regular elements, start from parent_element().
+            var first_ancestor_to_check: DomElement*? = none
+            if layout_node_is_generated_for_pseudo_element(this):
+                first_ancestor_to_check = this.m_pseudo_element_generator
+            elif let this_dom_node = layout_node_dom_node(this):
+                first_ancestor_to_check = dom_node_parent_element(this_dom_node)
+
+            var dom_ancestor = first_ancestor_to_check
+            while let current = dom_ancestor:
+                dom_ancestor = dom_node_parent_element(current.dom_node())
+
+                # Stop if we reach the DOM node of the containing block.
+                if (DomNode*?)current.dom_node() == containing_block_dom_node:
+                    break
+
+                # NB: Called during containing block recomputation as part of layout.
+                # Check if this DOM element has an InlineNode in the layout tree.
+                let layout_node = dom_element_unsafe_layout_node(current) else continue
+                if not is_layout_inline_node(layout_node):
+                    continue
+
+                # Restrict the per-property trigger set to those that actually apply to
+                # non-atomic inlines: `position` and filter/backdrop-filter. transform,
+                # contain, perspective and friends from
+                # computed_values_establish_absolute_positioning_containing_block()
+                # explicitly do not apply to non-atomic inlines per their respective specs.
+                let computed_values = &layout_node_computed_values(layout_node.layout_node()).computed_values
+                let will_change = css_computed_values_will_change(computed_values)
+                let filter = css_computed_values_filter(computed_values)
+                let backdrop_filter = css_computed_values_backdrop_filter(computed_values)
+                let inline_establishes_cb = layout_node_is_positioned(layout_node.layout_node()) or css_will_change_has_property(&will_change, css_data.PropertyId.position) or css_filter_has_filters(&filter) or css_will_change_has_property(&will_change, css_data.PropertyId.filter) or css_filter_has_filters(&backdrop_filter) or css_will_change_has_property(&will_change, css_data.PropertyId.backdrop_filter)
+                if inline_establishes_cb:
+                    this.m_inline_containing_block_if_applicable = (LayoutInlineNode*)layout_node
+                    break
+
+        return
+
+    # https://drafts.csswg.org/css-position-3/#fixed-cb
+    if position == css_data.Positioning.fixed:
+        # The containing block is established by the nearest ancestor box that establishes an fixed positioning
+        # containing block, with the bounds of the containing block determined identically to the absolute positioning
+        # containing block.
+        var ancestor = layout_node_parent(this)
+        while let current = ancestor:
+            if layout_node_establishes_a_fixed_positioning_containing_block(current.layout_node()):
+                break
+            ancestor = layout_node_parent(current.layout_node())
+        # If no ancestor establishes one, the box’s fixed positioning containing block is the initial fixed containing
+        # block:
+        if ancestor == none:
+            #  - in continuous media, the layout viewport (whose size matches the dynamic viewport size); as a result,
+            #    fixed boxes do not move when the document is scrolled.
+            ancestor = layout_node_root(this).layout_node_with_style()
+            # FIXME: - in paged media, the page area of each page; fixed positioned boxes are thus replicated on every
+            #   page. (They are fixed with respect to the page box only, and are not affected by being seen through a
+            #   viewport; as in the case of print preview, for example.)
+        this.m_containing_block = (LayoutBox*?)ancestor
+        return
+
+    this.m_containing_block = layout_nearest_ancestor_capable_of_forming_a_containing_block(this)
+
+## Ported from Libraries/LibWeb/Layout/Node.cpp:371 Web::Layout::Node::static_position_containing_block.
+# returns containing block this node would have had if its position was static
+pub func layout_node_static_position_containing_block_const(this: LayoutNode*) -> LayoutBox*?:
+    return layout_nearest_ancestor_capable_of_forming_a_containing_block(this)
+
+## Ported from Libraries/LibWeb/Layout/Node.h:163 Web::Layout::Node::static_position_containing_block.
+pub func layout_node_static_position_containing_block(this: LayoutNode*) -> LayoutBox*?:
+    return layout_node_static_position_containing_block_const(this)
+
+## Ported from Libraries/LibWeb/Layout/Node.cpp:376 Web::Layout::Node::non_anonymous_containing_block.
+pub func layout_node_non_anonymous_containing_block(this: LayoutNode*) -> LayoutBox*?:
+    var nearest_ancestor_box = layout_node_containing_block(this) else trap("VERIFY: nearest_ancestor_box")
+    while layout_node_is_anonymous(nearest_ancestor_box.layout_node()):
+        nearest_ancestor_box = layout_node_containing_block(nearest_ancestor_box.layout_node()) else trap("VERIFY: nearest_ancestor_box")
+    return nearest_ancestor_box
+
+# mark: Stacking contexts =======================================================================
+
+## Ported from Libraries/LibWeb/Layout/Node.cpp:388 Web::Layout::Node::establishes_stacking_context.
+# https://developer.mozilla.org/en-US/docs/Web/CSS/CSS_Positioning/Understanding_z_index/The_stacking_context
+pub func layout_node_establishes_stacking_context(this: LayoutNode*) -> bool:
+    # NOTE: While MDN is not authoritative, there isn't a single convenient location
+    #       in the CSS specifications where the rules for stacking contexts is described.
+    #       That's why the "spec link" here points to MDN.
+
+    if not layout_node_has_style(this):
+        return false
+
+    if layout_node_is_svg_box(this):
+        return false
+
+    # We make a stacking context for the viewport. Painting and hit testing starts from here.
+    if layout_node_is_viewport(this):
+        return true
+
+    # Root element of the document (<html>).
+    if layout_node_is_root_element(this):
+        return true
+
+    let computed_values = &layout_node_computed_values(this).computed_values
+
+    let position = css_computed_values_position(computed_values)
+
+    # https://drafts.csswg.org/css-will-change/#will-change
+    # If any non-initial value of a property would create a stacking context on the element, specifying that property
+    # in will-change must create a stacking context on the element.
+
+    let has_z_index = css_computed_values_z_index(computed_values) != none or layout_node_will_change_property(computed_values, css_data.PropertyId.z_index)
+
+    # Element with a position value absolute or relative and z-index value other than auto.
+    if position == css_data.Positioning.absolute or position == css_data.Positioning.relative:
+        if has_z_index:
+            return true
+
+    # Element with a position value fixed or sticky.
+    if position == css_data.Positioning.fixed or position == css_data.Positioning.sticky or layout_node_will_change_property(computed_values, css_data.PropertyId.position):
+        return true
+
+    if layout_node_has_transformations_or_will_change(computed_values):
+        return true
+
+    # Element that is a child of a flex container, with z-index value other than auto.
+    if let parent = layout_node_parent(this):
+        let parent_display = layout_node_display(parent.layout_node())
+        if css_display_is_flex_inside(&parent_display) and has_z_index:
+            return true
+
+    # Element that is a child of a grid container, with z-index value other than auto.
+    if let parent = layout_node_parent(this):
+        let parent_display = layout_node_display(parent.layout_node())
+        if css_display_is_grid_inside(&parent_display) and has_z_index:
+            return true
+
+    # https://drafts.fxtf.org/filter-effects/#FilterProperty
+    # https://drafts.fxtf.org/filter-effects-2/#backdrop-filter-operation
+    # A computed value of other than none results in the creation of both a stacking context
+    # [CSS21] and a Containing Block for absolute and fixed position descendants, unless the
+    # element it applies to is a document root element in the current browsing context.
+    # Spec Note: This rule works in the same way as for the filter property.
+    let backdrop_filter = css_computed_values_backdrop_filter(computed_values)
+    let filter = css_computed_values_filter(computed_values)
+    if css_filter_has_filters(&backdrop_filter) or css_filter_has_filters(&filter) or layout_node_will_change_property(computed_values, css_data.PropertyId.backdrop_filter) or layout_node_will_change_property(computed_values, css_data.PropertyId.filter):
+        return true
+
+    # Element with any of the following properties with value other than none:
+    # - transform
+    # - filter
+    # - backdrop-filter
+    # - perspective
+    # - clip-path
+    # - mask / mask-image / mask-border
+    if css_computed_values_mask(computed_values) != none or css_computed_values_clip_path(computed_values) != none or css_computed_values_mask_image(computed_values) != none or layout_node_will_change_property(computed_values, css_data.PropertyId.mask) or layout_node_will_change_property(computed_values, css_data.PropertyId.clip_path) or layout_node_will_change_property(computed_values, css_data.PropertyId.mask_image):
+        return true
+
+    if layout_node_is_svg_foreign_object_box(this):
+        return true
+
+    # https://drafts.fxtf.org/compositing/#propdef-isolation
+    # For CSS, setting isolation to isolate will turn the element into a stacking context.
+    if css_computed_values_isolation(computed_values) == css_data.Isolation.isolate or layout_node_will_change_property(computed_values, css_data.PropertyId.isolation):
+        return true
+
+    # https://drafts.csswg.org/css-contain-2/#containment-types
+    # 5. The layout containment box creates a stacking context.
+    # 3. The paint containment box creates a stacking context.
+    if layout_node_has_layout_containment(this) or layout_node_has_paint_containment(this) or layout_node_will_change_property(computed_values, css_data.PropertyId.contain):
+        return true
+
+    # https://drafts.fxtf.org/compositing/#mix-blend-mode
+    # Applying a blendmode other than normal to the element must establish a new stacking context.
+    if css_computed_values_mix_blend_mode(computed_values) != css_data.MixBlendMode.normal or layout_node_will_change_property(computed_values, css_data.PropertyId.mix_blend_mode):
+        return true
+
+    # https://drafts.csswg.org/css-view-transitions-1/#named-and-transitioning
+    # Elements captured in a view transition during a view transition or whose view-transition-name computed value is
+    # not 'none' (at any time):
+    # - Form a stacking context.
+    if css_computed_values_view_transition_name(computed_values) != none or layout_node_will_change_property(computed_values, css_data.PropertyId.view_transition_name):
+        return true
+
+    # https://drafts.csswg.org/css-transforms-2/#propdef-perspective
+    # The use of this property with any value other than 'none' establishes a stacking context.
+    if css_computed_values_perspective(computed_values) != none or layout_node_will_change_property(computed_values, css_data.PropertyId.perspective):
+        return true
+
+    # https://drafts.csswg.org/css-transforms-2/#transform-style-property
+    # A computed value of 'preserve-3d' for 'transform-style' on a transformable element establishes both a
+    # stacking context and a containing block for all descendants.
+    # FIXME: Check that the element is a transformable element.
+    if css_computed_values_transform_style(computed_values) == css_data.TransformStyle.preserve3_d or layout_node_will_change_property(computed_values, css_data.PropertyId.transform_style):
+        return true
+
+    return css_computed_values_opacity(computed_values) < 1.0f32 or layout_node_will_change_property(computed_values, css_data.PropertyId.opacity)
+
+# mark: Navigable, root and positioning ==========================================================
+
+## Ported from Libraries/LibWeb/Layout/Node.cpp:521 Web::Layout::Node::navigable.
+pub func layout_node_navigable(this: LayoutNode*) -> HtmlNavigable*?:
+    return dom_document_navigable(layout_node_document(this))
+
+## Ported from Libraries/LibWeb/Layout/Node.cpp:526 Web::Layout::Node::root.
+pub func layout_node_root_const(this: LayoutNode*) -> LayoutViewport*:
+    # NB: Called during layout, which is in progress.
+    return dom_document_unsafe_layout_node(layout_node_document(this)) else trap("VERIFY: document().unsafe_layout_node()")
+
+## Ported from Libraries/LibWeb/Layout/Node.cpp:533 Web::Layout::Node::root.
+pub func layout_node_root(this: LayoutNode*) -> LayoutViewport*:
+    # NB: Called during layout, which is in progress.
+    return dom_document_unsafe_layout_node(layout_node_document(this)) else trap("VERIFY: document().unsafe_layout_node()")
+
+## Ported from Libraries/LibWeb/Layout/Node.cpp:540 Web::Layout::Node::is_floating.
+pub func layout_node_is_floating(this: LayoutNode*) -> bool:
+    if not layout_node_has_style(this):
+        return false
+    # flex-items don't float.
+    if layout_node_is_flex_item(this):
+        return false
+    return css_computed_values_float(&layout_node_computed_values(this).computed_values) != css_data.Float.none_
+
+## Ported from Libraries/LibWeb/Layout/Node.cpp:550 Web::Layout::Node::is_positioned.
+pub func layout_node_is_positioned(this: LayoutNode*) -> bool:
+    return layout_node_has_style(this) and css_computed_values_position(&layout_node_computed_values(this).computed_values) != css_data.Positioning.static_
+
+## Ported from Libraries/LibWeb/Layout/Node.cpp:555 Web::Layout::Node::is_absolutely_positioned.
+pub func layout_node_is_absolutely_positioned(this: LayoutNode*) -> bool:
+    if not layout_node_has_style(this):
+        return false
+    let position = css_computed_values_position(&layout_node_computed_values(this).computed_values)
+    return position == css_data.Positioning.absolute or position == css_data.Positioning.fixed
+
+## Ported from Libraries/LibWeb/Layout/Node.cpp:563 Web::Layout::Node::is_fixed_position.
+pub func layout_node_is_fixed_position(this: LayoutNode*) -> bool:
+    if not layout_node_has_style(this):
+        return false
+    let position = css_computed_values_position(&layout_node_computed_values(this).computed_values)
+    return position == css_data.Positioning.fixed
+
+## Ported from Libraries/LibWeb/Layout/Node.cpp:571 Web::Layout::Node::is_sticky_position.
+pub func layout_node_is_sticky_position(this: LayoutNode*) -> bool:
+    if not layout_node_has_style(this):
+        return false
+    let position = css_computed_values_position(&layout_node_computed_values(this).computed_values)
+    return position == css_data.Positioning.sticky
