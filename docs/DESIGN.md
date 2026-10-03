@@ -825,6 +825,38 @@ The rules agents follow:
 6. **Threads** (`HTML/RenderingThread`, `CSS/FontLoading`, decoders) run on the main thread in
    P1. Later, a worker thread allocates from the C heap (its current allocator is `memory.heap`)
    and hands results to the main thread by copying.
+7. **What outlives every VM lives in the C heap, and refers only to the C heap.** A module
+   global (a C++ static or singleton) and everything it keeps outlive any VM: the VM that was
+   current when an entry was cached is collected and destroyed while the cache lives on, so a
+   cache entry in a VM's heap dangles (and a collection can free it at any time, since module
+   globals are not scanned). Such a structure allocates what it keeps from `memory.heap`
+   explicitly, whatever allocator is current, with ak's atomic allocator unset (atomic storage
+   goes through `ak.atomic_allocator`, which the gc module points at the newest heap), and
+   never stores a managed pointer. Managed memory may point at it: it is never freed, like
+   the donor's process-wide objects. Allocate only what is kept in such a scope: temporaries
+   made there are never freed. A single static object is made `with memory.heap:` (as
+   `KeywordStyleValue`'s static instances are); a cache filled later does the same around each
+   insertion.
+
+   Fonts follow this rule with one refinement (luce-browser-render
+   `web_fonts/font_allocators.lucb`). In Ladybird fonts are reference counted and the font
+   database, its system font provider, their typefaces and the fonts those cache live for the
+   process. Here `FontDatabase::the()`, `PathFontProvider` (with every font file it loads),
+   `Platform::FontPlugin` (its generic-family tables and fallback lists) and gfx's color-space
+   singletons live in the C heap whatever is current. A `Typeface` records the allocators that
+   were current when it was made (`m_allocators`), and everything it and its fonts keep later
+   (`Typeface::font`'s fonts and keys, the HarfBuzz face and fonts, the glyph pages, the
+   shaping cache) comes from those: a system typeface keeps its caches in the C heap, while a
+   web font's typeface, made by `FontLoader` under the VM's heap, keeps them in that heap and
+   is collected with its document. HarfBuzz shapes in the current allocator and the shaping
+   cache keeps a copy; an `SfntFace` is complete when it is made (its CFF INDEXes are parsed
+   then). Per-document font structures are managed and rightly so: `FontComputer`'s computed
+   font cache, `FontCascadeList`s and `FontLoader`s hold system fonts (C heap, never freed) and
+   their own web fonts (managed, kept by the conservative scan of their blobs). Fonts dropped
+   from a typeface's full cache are not freed (managed memory may still refer to them).
+   Tests compute fonts with their VM's heap current (`let allocator: memory.Allocator =
+   vm_heap(vm); with allocator:`), collect, and destroy VMs freely; `css/tests_fonts_2`'s
+   lifetime test and render's `web_fonts/tests_lifetimes` check this.
 
 Equality is protected by construction: `ak.String` contains a union, so `a == b` does not compile
 (verified) and the porter writes `a.equals(b)`; `ak.Vector` likewise.
@@ -871,8 +903,9 @@ backend is only used for comparison runs. A diagnostic mode collects on every al
 
 ### 3.5 External resources
 
-Almost nothing in the port owns memory outside the heap: fonts are parsed from managed bytes,
-bitmaps are atomic blobs, the rasterizer draws into managed buffers. What remains (open files
+Almost nothing in the port owns memory outside the heap: web fonts are parsed from managed
+bytes (system fonts live in the C heap for the process, §3.3 rule 7), bitmaps are atomic blobs,
+the rasterizer draws into managed buffers. What remains (open files
 during loading, GPU textures from P4, luce-js values held by cells, native font handles if a
 platform shaper is used) is released by `finalize` or a blob finalizer. Finalizers run before the
 sweep and must not allocate.

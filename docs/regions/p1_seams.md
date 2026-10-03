@@ -79,10 +79,9 @@ Types filled by hand: `types_promise` (`JsPromise`, `JsPromiseState`, `JsPromise
   (`test_html_forms_collectable_pages`, the test page/document vtables are gone); `test_html_forms_collect(vm)`
   is a plain full collection.
 - r42's oracle and scenario tests no longer run under DeferGC (`test_media_invalidation_end_defer_gc` is gone).
-- r41's font tests keep DeferGC for a different reason, now documented: fonts the font database makes during a
-  test (Typeface::font's cache) are managed memory referred to only from the database in the C heap.
-  `test_fonts_setup` now loads the font files with the C heap as ak's atomic allocator (they outlived only the
-  first test VM before).
+- r41's font tests kept DeferGC for a different reason: fonts the font database made during a test
+  (Typeface::font's cache) were managed memory referred to only from the database in the C heap. The font-cache
+  fix (DESIGN.md §3.3 rule 7) removed it, and `test_fonts_setup`'s C-heap atomic allocator with it.
 
 ### For region r28 (Page, Navigables, Window)
 
@@ -137,8 +136,8 @@ For an HTML document the caller is `HTMLDocument::create` — **r27** (ported).
 
 - Blobs are scanned conservatively (DESIGN.md §3.3), so a dequeued `AK::Queue` slot (the microtask queue's) keeps
   what it pointed to until it is overwritten: a test cannot expect a finished reaction's cells to be collected.
-- The font database in the C heap with fonts cached from a VM's heap is a hazard beyond tests: whoever makes the
-  embedder's font database should make it, and its fonts, managed memory the VM keeps (`vm_keep_alive`).
+- The font database in the C heap with fonts cached from a VM's heap was a hazard beyond tests; it is fixed the
+  other way round: the database keeps its fonts in the C heap too (DESIGN.md §3.3 rule 7).
 
 ## Compiler issues
 

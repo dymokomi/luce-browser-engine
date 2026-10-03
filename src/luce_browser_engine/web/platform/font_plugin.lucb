@@ -8,9 +8,10 @@
 #       generated/types_traits.lucb). In layout test mode every generic family is SerenitySans
 #       and the symbol font is Noto Emoji (DESIGN.md §6.1).
 #
-#       The plugin holds a managed Font, and FontDatabase::the() is a module global of
-#       web_fonts that the collector does not scan: the embedder keeps the plugin and the
-#       database reachable (a root, or its stack) for the life of the process.
+#       The plugin is process-wide and outlives every VM, as the font database does: it lives
+#       in the C heap (the embedder allocates it there) and so do its tables, whatever allocator
+#       is current, and the fonts it holds come from the database's C-heap typefaces
+#       (DESIGN.md §3.3 rule 7, luce-browser-render's web_fonts/font_allocators.lucb).
 #
 #       Copyright (c) 2022, Andreas Kling <andreas@ladybird.org>
 #       Copyright (c) 2023, Linus Groh <linusg@serenityos.org>
@@ -44,7 +45,16 @@ func platform_font_plugin_file_uri(path: const ak.String*) -> ak.String:
     return ak.string_builder_to_string(&builder) else trap("MUST: String::formatted")
 
 ## Ported from Libraries/LibWeb/Platform/FontPlugin.cpp:37 Web::Platform::FontPlugin::FontPlugin.
+## `this` is in the C heap; what the plugin keeps is allocated there too.
 pub func platform_font_plugin_construct(this: PlatformFontPlugin*, is_layout_test_mode: bool, font_provider: web_fonts.SystemFontProvider*? = none):
+    let c_heap = web_fonts.font_allocators_c_heap()
+    let previous = web_fonts.font_allocators_enter(&c_heap)
+    defer web_fonts.font_allocators_leave(previous)
+    with memory.heap:
+        platform_font_plugin_construct_impl(this, is_layout_test_mode, font_provider)
+
+## The body of FontPlugin::FontPlugin.
+func platform_font_plugin_construct_impl(this: PlatformFontPlugin*, is_layout_test_mode: bool, font_provider: web_fonts.SystemFontProvider*?):
     this.m_is_layout_test_mode = is_layout_test_mode
 
     var provider = font_provider
@@ -93,7 +103,16 @@ pub func platform_font_plugin_is_layout_test_mode(this: const PlatformFontPlugin
 # mark: Generic font families ===================================================================
 
 ## Ported from Libraries/LibWeb/Platform/FontPlugin.cpp:84 Web::Platform::FontPlugin::update_generic_fonts.
+## The fallback lists are kept in the C heap with the plugin.
 pub func platform_font_plugin_update_generic_fonts(this: PlatformFontPlugin*):
+    let c_heap = web_fonts.font_allocators_c_heap()
+    let previous = web_fonts.font_allocators_enter(&c_heap)
+    defer web_fonts.font_allocators_leave(previous)
+    with memory.heap:
+        platform_font_plugin_update_generic_fonts_impl(this)
+
+## The body of FontPlugin::update_generic_fonts.
+func platform_font_plugin_update_generic_fonts_impl(this: PlatformFontPlugin*):
     # Store fallback font lists for each generic font category.
     # The actual font selection happens in generic_font_name() based on the requested style.
 
@@ -120,25 +139,24 @@ pub func platform_font_plugin_update_generic_fonts(this: PlatformFontPlugin*):
     *ak.vector_at(fallbacks, (usize)PlatformGenericFont.ui_sans_serif) = ak.vector_clone(ak.vector_at(fallbacks, (usize)PlatformGenericFont.sans_serif))
     *ak.vector_at(fallbacks, (usize)PlatformGenericFont.ui_serif) = ak.vector_clone(ak.vector_at(fallbacks, (usize)PlatformGenericFont.serif))
 
-## The lambda FontPlugin::generic_font_name passes to HashMap::ensure.
-struct PlatformFontPluginGenericFontName:
-    var this: PlatformFontPlugin*
-    var generic_font: PlatformGenericFont
-    var weight: i32
-    var slope: i32
-
-    static func call(context: void*?) -> ak.FlyString:
-        let captures = (PlatformFontPluginGenericFontName*)(context else trap("generic_font_name: no captures"))
-        return platform_font_plugin_compute_generic_font_name(captures.this, captures.generic_font, captures.weight, captures.slope)
-
 ## Ported from Libraries/LibWeb/Platform/FontPlugin.cpp:115 Web::Platform::FontPlugin::generic_font_name.
+## `m_generic_font_cache.ensure(key, [&] { return compute_generic_font_name(...); })`, as a
+## lookup, the computation in the current allocator, then the insertion in the C heap with the
+## plugin (FlyStrings are valid anywhere).
 pub func platform_font_plugin_generic_font_name(this: PlatformFontPlugin*, generic_font: PlatformGenericFont, weight: i32, slope: i32) -> ak.FlyString:
     if this.m_is_layout_test_mode:
         return ak.fly_string_from_str("SerenitySans")
 
     let key = PlatformGenericFontKey(generic_font = generic_font, weight = weight, slope = slope)
-    var captures = PlatformFontPluginGenericFontName(this = this, generic_font = generic_font, weight = weight, slope = slope)
-    return *ak.hash_map_ensure_t_callback(&this.m_generic_font_cache, key, ak.Function0[ak.FlyString](call = PlatformFontPluginGenericFontName.call, context = &captures))
+    if let cached = ak.hash_map_get_k(&this.m_generic_font_cache, key):
+        return *cached
+    let name = platform_font_plugin_compute_generic_font_name(this, generic_font, weight, slope)
+    let c_heap = web_fonts.font_allocators_c_heap()
+    let previous = web_fonts.font_allocators_enter(&c_heap)
+    defer web_fonts.font_allocators_leave(previous)
+    with memory.heap:
+        discard(ak.hash_map_set(&this.m_generic_font_cache, key, name))
+    return name
 
 ## The lambda FontPlugin::compute_generic_font_name passes to
 ## FontDatabase::for_each_typeface_with_family_name: the style a family offers.
