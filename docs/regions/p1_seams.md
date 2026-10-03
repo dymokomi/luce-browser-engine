@@ -100,7 +100,7 @@ Types filled by hand: `types_promise` (`JsPromise`, `JsPromiseState`, `JsPromise
    (`html_list_of_available_images_construct`). After it, `initialize` completes (`page_did_create_new_document`,
    `ensure_cookie_version_index`, whose `HTTP::Cookie::canonicalize_domain` is ported here).
 
-For an HTML document the caller is `HTMLDocument::create` — **r27**.
+For an HTML document the caller is `HTMLDocument::create` — **r27** (ported).
 
 `Document::create_and_initialize(type, content_type, navigation_params)` needs, in order:
 
@@ -112,10 +112,10 @@ For an HTML document the caller is `HTMLDocument::create` — **r27**.
    closure stubs (Fetch).
 4. The realm's global: `Window::create`, `BrowsingContext::window_proxy` — **r28**;
    `WindowEnvironmentSettingsObject::setup` (r29, ported) then reaches r28's Window accessors.
-5. `HTMLDocument::create` — **r27**.
+5. `HTMLDocument::create` — **r27** (ported).
 6. `realm.create<CustomElementRegistry>` — **P3** closure stub; CSP initialization — **P2**.
 
-`page/tests_page` asserts stops 1 of Document::create and 1, 2, 4, 5 of create_and_initialize with
+`page/tests_page` asserts stops 1 of Document::create and 1, 2, 4, 6 of create_and_initialize with
 `test_page_still_unported`.
 
 ## Tests

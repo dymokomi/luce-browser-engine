@@ -1,0 +1,537 @@
+#==============================================================================================
+#
+#   html_media_element_1 - HTML::HTMLMediaElement: construction, attributes, the media
+#                          provider object, errors, time ranges and canPlayType
+#
+#   DESCRIPTION:
+#       Port of LibWeb/HTML/HTMLMediaElement.cpp lines 59-397 and the inline members of
+#       HTMLMediaElement.h: RemoteFetchData's destructor, the constructor (which moves the
+#       mixin tables to the concrete class's, as C++'s vptrs move), initialize (the track
+#       lists and the document observer), finalize, adjust_computed_style, queueing a media
+#       element task, visit_edges, attribute_changed, srcObject and the assigned media provider
+#       object, the removing steps, cancelling the fetching process, the fatal decode error
+#       steps, buffered / played / seekable, canPlayType, seeking and load().
+#
+#       Media playback is phase 4 and loading phase 2 (DESIGN.md §1.4): what C++ asks of
+#       AudioTrackList, VideoTrackList, TextTrackList, TimeRanges, MediaError and LibMedia goes
+#       to the closure stubs of stub_closure's "Region r27 media" sections.
+#
+#==============================================================================================
+
+# mark: Helpers =================================================================================
+
+## The media element's realm (`this->realm()`).
+func html_media_element_realm(this: HtmlMediaElement*) -> Realm*:
+    return html_element_realm(this.html_element())
+
+## The media element's node document (`document()`).
+func html_media_element_document(this: HtmlMediaElement*) -> DomDocument*:
+    return html_element_document(this.html_element())
+
+## `dispatch_event(DOM::Event::create(realm(), event_name))` at the media element.
+func html_media_element_fire_event(this: HtmlMediaElement*, event_name: ak.FlyString):
+    discard(dom_event_target_dispatch_event(this.dom_event_target(), dom_event_create(html_media_element_realm(this), event_name)))
+
+## The captures of the many `queue_a_media_element_task([this] { dispatch_event(DOM::Event::create(realm(),
+## HTML::EventNames::X)); })` lambdas: the element and the event's name.
+struct HtmlMediaElementFireEventTask:
+    var this: HtmlMediaElement*
+    var event_name: ak.FlyString
+
+    ## The task's steps: fire the event at the element.
+    static func run(context: void*?):
+        let captures = (HtmlMediaElementFireEventTask*)(context else trap("fire event task: no captures"))
+        html_media_element_fire_event(captures.this, captures.event_name)
+
+## `queue_a_media_element_task([this] { dispatch_event(DOM::Event::create(realm(), event_name)); })`.
+func html_media_element_queue_firing_an_event(this: HtmlMediaElement*, event_name: ak.FlyString):
+    let captures = new HtmlMediaElementFireEventTask(this = this, event_name = event_name) else trap("out of memory")
+    html_media_element_queue_a_media_element_task(this, ak.Function0[unit](call = HtmlMediaElementFireEventTask.run, context = captures))
+
+## `m_delaying_the_load_event.clear()`: destroys a held delayer (its destructor stops delaying the
+## document's load event).
+func html_media_element_clear_delaying_the_load_event(this: HtmlMediaElement*):
+    if let delayer = this.m_delaying_the_load_event:
+        var released = delayer
+        dom_document_load_event_delayer_destruct(&released)
+    this.m_delaying_the_load_event = none
+
+## `m_delaying_the_load_event.emplace(document)`: the previous delayer, if any, is destroyed first.
+func html_media_element_emplace_delaying_the_load_event(this: HtmlMediaElement*, document: DomDocument*):
+    html_media_element_clear_delaying_the_load_event(this)
+    var delayer: DomDocumentLoadEventDelayer = ---
+    dom_document_load_event_delayer_construct(&delayer, document)
+    this.m_delaying_the_load_event = delayer
+
+## `style.display().is_contents()` → `display: none` (https://drafts.csswg.org/css-display-3/#unbox), the
+## adjust_computed_style step every replaced-content element shares.
+func html_media_element_set_display(style: CssComputedProperties*, short_: CssDisplayShort):
+    css_computed_properties_set_property(style, css_data.PropertyId.display, css_display_style_value_create(css_display_from_short(short_)).css_style_value())
+
+# mark: RemoteFetchData and construction ========================================================
+
+## Ported from HTMLMediaElement.cpp:67 Web::HTML::HTMLMediaElement::RemoteFetchData::~RemoteFetchData.
+## `m_remote_fetch_data.clear()` and every reassignment of the OwnPtr run it.
+func html_media_element_remote_fetch_data_destruct(this: HtmlMediaElementRemoteFetchData*):
+    if let stream = this.stream:
+        media_incrementally_populated_stream_set_data_request_callback(stream, none)
+        media_incrementally_populated_stream_close(stream)
+
+    if let fetch_controller = (FetchController*?)gc.weak_ptr(&this.fetch_controller):
+        fetch_controller_stop_fetch(fetch_controller)
+
+## `m_remote_fetch_data.clear()`: the OwnPtr's destructor runs RemoteFetchData's.
+func html_media_element_clear_remote_fetch_data(this: HtmlMediaElement*):
+    if let fetch_data = this.m_remote_fetch_data:
+        this.m_remote_fetch_data = none
+        html_media_element_remote_fetch_data_destruct(fetch_data)
+
+## Ported from HTMLMediaElement.cpp:79 Web::HTML::HTMLMediaElement::HTMLMediaElement.
+pub func html_media_element_construct(this: HtmlMediaElement*, document: DomDocument*, qualified_name: DomQualifiedName):
+    html_element_construct(this.html_element(), document, qualified_name)
+    # The vptrs of the mixin bases move to HTMLMediaElement's tables.
+    let element = this.html_element()
+    element.element.slottable_mixin.vtable = &html_media_element_slottable_mixin_vtable
+    element.element.aria_mixin.vtable = &html_media_element_aria_mixin_vtable
+    element.element.animatable.vtable = &html_media_element_animatable_vtable
+    element.global_event_handlers.vtable = &html_media_element_global_event_handlers_vtable
+    element.form_associated_element.vtable = &html_media_element_form_associated_element_vtable
+    # The members' initializers: the unique media element event task source and the non-zero
+    # defaults (m_duration { NAN }).
+    html_unique_task_source_construct(&this.m_media_element_event_task_source)
+    html_media_element_init_fields(this)
+    this.m_duration = math.nan
+
+## The captures of initialize's document observer callbacks: the media element.
+struct HtmlMediaElementDocumentObserverCallback:
+    var this: HtmlMediaElement*
+
+    ## `set_document_became_inactive`'s callback.
+    static func became_inactive(context: void*?):
+        let this = ((HtmlMediaElementDocumentObserverCallback*)(context else trap("document observer: no captures"))).this
+
+        # If the media element's node document stops being a fully active document, then the playback will stop until
+        # the document is active again.
+        html_media_element_pause_element(this)
+
+        # AD-HOC: Stop the fetch here so that the element can be reclaimed by GC. The fetch callbacks hold a strong
+        #         reference to their media element to ensure that load/error events are fired as expected.
+        if let fetch_data = this.m_remote_fetch_data:
+            if let fetch_controller = (FetchController*?)gc.weak_ptr(&fetch_data.fetch_controller):
+                fetch_controller_stop_fetch(fetch_controller)
+                gc.weak_assign(&fetch_data.fetch_controller, none)
+
+    ## `set_document_became_active`'s callback.
+    static func became_active(context: void*?):
+        let this = ((HtmlMediaElementDocumentObserverCallback*)(context else trap("document observer: no captures"))).this
+
+        # AD-HOC: Restart the fetch from where the stream last received data so that playback can continue.
+        if let fetch_data = this.m_remote_fetch_data:
+            assert(gc.weak_ptr(&fetch_data.fetch_controller) == none)
+            let stream = fetch_data.stream else trap("RemoteFetchData: no stream")
+            if media_incrementally_populated_stream_next_chunk_start(stream) != media_incrementally_populated_stream_expected_size(stream):
+                html_media_element_load_remote_resource(this, .html_media_element_until_end(HtmlMediaElementUntilEnd(first = media_incrementally_populated_stream_next_chunk_start(stream))))
+
+## Ported from HTMLMediaElement.cpp:86 Web::HTML::HTMLMediaElement::initialize (override).
+pub func html_media_element_initialize_impl(base: JsCell*, realm: Realm*):
+    let this = (HtmlMediaElement*)base
+    web_set_prototype_for_interface(base, realm, BindInterfaceName.html_media_element)
+    html_element_initialize_impl(base, realm)
+
+    this.m_audio_tracks = realm_create_html_audio_track_list(realm, realm)
+    this.m_video_tracks = realm_create_html_video_track_list(realm, realm, this)
+    this.m_text_tracks = realm_create_html_text_track_list(realm, realm)
+    let document_observer = realm_create_dom_document_observer(realm, realm, html_media_element_document(this))
+    this.m_document_observer = document_observer
+
+    let captures = new HtmlMediaElementDocumentObserverCallback(this = this) else trap("out of memory")
+
+    # https://html.spec.whatwg.org/multipage/media.html#playing-the-media-resource:media-element-82
+    dom_document_observer_set_document_became_inactive(document_observer, ak.Function0[unit](call = HtmlMediaElementDocumentObserverCallback.became_inactive, context = captures))
+
+    dom_document_observer_set_document_became_active(document_observer, ak.Function0[unit](call = HtmlMediaElementDocumentObserverCallback.became_active, context = captures))
+
+    page_register_media_element(dom_document_page(html_media_element_document(this)), dom_node_unique_id(this.dom_node()))
+
+## Ported from HTMLMediaElement.cpp:122 Web::HTML::HTMLMediaElement::finalize (override).
+pub func html_media_element_finalize_impl(base: gc.Cell*):
+    let this = (HtmlMediaElement*)base
+    dom_node_finalize_impl(base)
+
+    page_unregister_media_element(dom_document_page(html_media_element_document(this)), dom_node_unique_id(this.dom_node()))
+
+## Ported from HTMLMediaElement.cpp:129 Web::HTML::HTMLMediaElement::adjust_computed_style (override).
+pub func html_media_element_adjust_computed_style_impl(base: DomElement*, style: CssComputedProperties*):
+    # https://drafts.csswg.org/css-display-3/#unbox
+    let contents_display = css_computed_properties_display(style)
+    if css_display_is_contents(&contents_display):
+        html_media_element_set_display(style, CssDisplayShort.none_)
+
+    # AD-HOC: We rewrite `display: inline` to `display: inline-block`.
+    #         This is required for the internal shadow tree to work correctly in layout.
+    let display = css_computed_properties_display(style)
+    if css_display_is_inline_outside(&display) and css_display_is_flow_inside(&display):
+        html_media_element_set_display(style, CssDisplayShort.inline_block)
+
+## Ported from HTMLMediaElement.cpp:142 Web::HTML::HTMLMediaElement::queue_a_media_element_task.
+# https://html.spec.whatwg.org/multipage/media.html#queue-a-media-element-task
+pub func html_media_element_queue_a_media_element_task(this: HtmlMediaElement*, steps: ak.Function0[unit]):
+    # To queue a media element task with a media element element and a series of steps steps, queue an element task on the media element's
+    # media element event task source given element and steps.
+    discard(dom_element_queue_an_element_task(this.dom_element(), html_media_element_media_element_event_task_source(this), steps))
+
+## Ported from HTMLMediaElement.cpp:149 Web::HTML::HTMLMediaElement::visit_edges (override).
+pub func html_media_element_visit_edges_impl(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (HtmlMediaElement*)base
+    html_element_visit_edges_impl(base, visitor)
+    gc.cell_visitor_visit_cell(visitor, (gc.Cell*?)this.m_error)  # opaque in phase 1
+    gc.cell_visitor_visit_cell(visitor, (gc.Cell*?)this.m_audio_tracks)  # opaque in phase 1
+    gc.cell_visitor_visit_cell(visitor, (gc.Cell*?)this.m_video_tracks)  # opaque in phase 1
+    gc.cell_visitor_visit_cell(visitor, (gc.Cell*?)this.m_text_tracks)  # opaque in phase 1
+    gc.cell_visitor_visit_t[DomDocumentObserver](visitor, this.m_document_observer)
+    gc.cell_visitor_visit_t[HtmlSourceElementSelector](visitor, this.m_source_element_selector)
+    for promise in ak.vector_span(&this.m_pending_play_promises):  # m_pending_play_promises (opaque in phase 1)
+        gc.cell_visitor_visit_cell(visitor, (gc.Cell*)promise)
+    gc.cell_visitor_visit_cell(visitor, (gc.Cell*?)this.m_selected_video_track)  # opaque in phase 1
+    match this.m_assigned_media_provider_object:
+        .empty:
+            return
+        .media_source_extensions_media_source(media_source):
+            gc.cell_visitor_visit_cell(visitor, (gc.Cell*)media_source)  # opaque in phase 1
+        .file_api_blob(blob):
+            gc.cell_visitor_visit_cell(visitor, (gc.Cell*)blob)  # opaque in phase 1
+
+# mark: Attributes and the media provider object ================================================
+
+## Ported from HTMLMediaElement.cpp:170 Web::HTML::HTMLMediaElement::attribute_changed (override).
+pub func html_media_element_attribute_changed_impl(base: DomElement*, name: ak.FlyString, old_value: ak.String?, value: ak.String?, namespace_: ak.FlyString?):
+    let this = (HtmlMediaElement*)base
+    html_element_attribute_changed_impl(base, name, old_value, value, namespace_)
+
+    if ak.fly_string_eq_fly_string(&name, &html_attribute_names_src):
+        # https://html.spec.whatwg.org/multipage/media.html#attr-media-src
+        # If a src attribute of a media element is set or changed, the user agent must invoke the
+        # media element's media element load algorithm. (Removing the src attribute does not do
+        # this, even if there are source elements present.)
+        if value == none:
+            return
+        html_media_element_load_element(this) else trap("FIXME: should propagate errors")
+    elif ak.fly_string_eq_fly_string(&name, &html_attribute_names_crossorigin):
+        this.m_crossorigin = html_cors_setting_attribute_from_keyword(value)
+    elif ak.fly_string_eq_fly_string(&name, &html_attribute_names_controls):
+        if value != none or dom_node_is_scripting_disabled(this.dom_node()):
+            html_media_element_create_controls(this)
+        else:
+            html_media_element_destroy_controls(this)
+
+## Ported from HTMLMediaElement.cpp:193 Web::HTML::HTMLMediaElement::src_object.
+# https://html.spec.whatwg.org/multipage/media.html#dom-media-srcobject
+pub func html_media_element_src_object(this: HtmlMediaElement*) -> HtmlOptionalMediaProvider:
+    # The srcObject IDL attribute, on getting, must return the element's assigned media provider
+    # object, if any, or null otherwise.
+    match html_media_element_assigned_media_provider_object_const(this):
+        .empty:
+            return .empty
+        .file_api_blob(blob):
+            return .file_api_blob(blob)
+        .media_source_extensions_media_source(media_source):
+            return .media_source_extensions_media_source(media_source)
+
+## Ported from HTMLMediaElement.cpp:210 Web::HTML::HTMLMediaElement::set_src_object.
+# https://html.spec.whatwg.org/multipage/media.html#dom-media-srcobject
+pub func html_media_element_set_src_object(this: HtmlMediaElement*, src_object: HtmlOptionalMediaProvider) -> !:
+    # On setting, it must set the element's assigned media provider object to the new value,
+    var provider: HtmlMediaElementMediaProviderObject = .empty
+    match src_object:
+        .empty:
+            provider = .empty
+        .file_api_blob(blob):
+            provider = .file_api_blob(blob else trap("GC::Ref of a null Blob root"))
+        .media_source_extensions_media_source(media_source):
+            provider = .media_source_extensions_media_source(media_source else trap("GC::Ref of a null MediaSource root"))
+    html_media_element_set_assigned_media_provider_object(this, provider)
+
+    # and then invoke the element's media element load algorithm.
+    try html_media_element_load_element(this)
+
+## Ported from HTMLMediaElement.cpp:228 Web::HTML::HTMLMediaElement::assigned_media_provider_object.
+pub func html_media_element_assigned_media_provider_object(this: HtmlMediaElement*) -> HtmlMediaElementMediaProviderObject*:
+    return &this.m_assigned_media_provider_object
+
+## Ported from HTMLMediaElement.cpp:233 Web::HTML::HTMLMediaElement::assigned_media_provider_object.
+pub func html_media_element_assigned_media_provider_object_const(this: HtmlMediaElement*) -> HtmlMediaElementMediaProviderObject:
+    return this.m_assigned_media_provider_object
+
+## Ported from HTMLMediaElement.cpp:238 Web::HTML::HTMLMediaElement::set_assigned_media_provider_object.
+pub func html_media_element_set_assigned_media_provider_object(this: HtmlMediaElement*, provider: HtmlMediaElementMediaProviderObject):
+    this.m_assigned_media_provider_object = provider
+
+## Ported from HTMLMediaElement.cpp:244 Web::HTML::HTMLMediaElement::removed_from (override).
+# https://html.spec.whatwg.org/multipage/media.html#playing-the-media-resource:media-element-83
+pub func html_media_element_removed_from_impl(base: DomNode*, is_subtree_root: DomNodeIsSubtreeRoot, old_ancestor: DomNode*?, old_root: DomNode*):
+    let this = (HtmlMediaElement*)base
+    html_element_removed_from_impl(base, is_subtree_root, old_ancestor, old_root)
+
+    # When a media element is removed from a Document, the user agent must run the following steps:
+
+    # FIXME: 1. Await a stable state, allowing the task that removed the media element from the Document to continue. The
+    #           synchronous section consists of all the remaining steps of this algorithm. (Steps in the synchronous section
+    #           are marked with ⌛.)
+
+    # 2. ⌛ If the media element is in a document, return.
+    if dom_node_in_a_document_tree(base):
+        return
+
+    # 3. ⌛ Run the internal pause steps for the media element.
+    html_media_element_pause_element(this)
+
+# mark: Fetching and errors =====================================================================
+
+## Ported from HTMLMediaElement.cpp:262 Web::HTML::HTMLMediaElement::cancel_the_fetching_process.
+pub func html_media_element_cancel_the_fetching_process(this: HtmlMediaElement*):
+    this.m_current_fetch_generation +%= 1
+    if let fetch_data = this.m_remote_fetch_data:
+        if let stream = fetch_data.stream:
+            media_incrementally_populated_stream_close(stream)
+    html_media_element_clear_remote_fetch_data(this)
+
+## Ported from HTMLMediaElement.cpp:271 Web::HTML::HTMLMediaElement::set_decoder_error.
+# https://html.spec.whatwg.org/multipage/media.html#fatal-decode-error
+pub func html_media_element_set_decoder_error(this: HtmlMediaElement*, error_message: ak.String):
+    let realm = html_media_element_realm(this)
+
+    if this.m_error != none:
+        return
+
+    # -> If the media data is corrupted
+
+    # Fatal errors in decoding the media data that occur after the user agent has established whether the current media
+    # resource is usable (i.e. once the media element's readyState attribute is no longer HAVE_NOTHING) must cause the
+    # user agent to execute the following steps:
+
+    # NB: This is only invoked by PlaybackManager after the metadata has been retrieved, so we should be sure that
+    #     the ready state indicates we have that metadata.
+    assert(this.m_ready_state != HtmlMediaElementReadyState.have_nothing)
+
+    # 1. The user agent should cancel the fetching process.
+    html_media_element_cancel_the_fetching_process(this)
+
+    # 2. Set the error attribute to the result of creating a MediaError with MEDIA_ERR_DECODE.
+    this.m_error = realm_create_html_media_error(realm, realm, HtmlMediaErrorCode.decode, error_message)
+
+    # 3. Set the element's networkState attribute to the NETWORK_IDLE value.
+    this.m_network_state = HtmlMediaElementNetworkState.idle
+
+    # 4. Set the element's delaying-the-load-event flag to false. This stops delaying the load event.
+    html_media_element_clear_delaying_the_load_event(this)
+
+    # 5. Fire an event named error at the media element.
+    html_media_element_fire_event(this, html_event_names_error)
+
+    # 6. Abort the overall resource selection algorithm.
+    # NB: Cancelling the fetching process stops the resource selection algorithm when the error is set.
+
+# mark: Time ranges and canPlayType =============================================================
+
+## Ported from HTMLMediaElement.cpp:308 Web::HTML::HTMLMediaElement::buffered.
+# https://html.spec.whatwg.org/multipage/media.html#dom-media-buffered
+pub func html_media_element_buffered(this: HtmlMediaElement*) -> HtmlTimeRanges*:
+    let realm = html_media_element_realm(this)
+
+    # https://html.spec.whatwg.org/multipage/media.html#dom-media-buffered
+    # The buffered attribute must return a new static normalized TimeRanges object that represents the ranges of the
+    # media resource, if any, that the user agent has buffered, at the time the attribute is evaluated.
+    let time_ranges = realm_create_html_time_ranges(realm, realm)
+    if let playback_manager = this.m_playback_manager:
+        let ranges = media_playback_manager_buffered_time_ranges(playback_manager)
+        for range in ak.vector_span_const(&ranges.ranges):
+            html_time_ranges_add_range(time_ranges, ak.duration_to_seconds_f64(&range.start), ak.duration_to_seconds_f64(&range.end))
+    return time_ranges
+
+## Ported from HTMLMediaElement.cpp:324 Web::HTML::HTMLMediaElement::played.
+# https://html.spec.whatwg.org/multipage/media.html#dom-media-played
+pub func html_media_element_played(this: HtmlMediaElement*) -> HtmlTimeRanges*:
+    let realm = html_media_element_realm(this)
+
+    # The played attribute must return a new static normalized TimeRanges object that represents the ranges of points on the media timeline of the media resource reached through the
+    # usual monotonic increase of the current playback position during normal playback, if any, at the time the attribute is evaluated.
+    let time_ranges = realm_create_html_time_ranges(realm, realm)
+    # FIXME: Actually add the correct ranges
+    return time_ranges
+
+## Ported from HTMLMediaElement.cpp:336 Web::HTML::HTMLMediaElement::seekable.
+# https://html.spec.whatwg.org/multipage/media.html#dom-media-seekable
+pub func html_media_element_seekable(this: HtmlMediaElement*) -> HtmlTimeRanges*:
+    let realm = html_media_element_realm(this)
+
+    # The seekable attribute must return a new static normalized TimeRanges object that represents the ranges of the media resource, if any, that the
+    # user agent is able to seek to, at the time the attribute is evaluated.
+    let time_ranges = realm_create_html_time_ranges(realm, realm)
+    html_time_ranges_add_range(time_ranges, 0.0, this.m_duration)
+    return time_ranges
+
+## Whether one of `subtypes` is `subtype` (`Array::contains_slow`).
+func html_media_element_subtypes_contain(subtypes: const str[], subtype: ak.String) -> bool:
+    for candidate in subtypes:
+        if ak.string_eq_string_view(&subtype, ak.sv(candidate)):
+            return true
+    return false
+
+## Ported from HTMLMediaElement.cpp:348 Web::HTML::HTMLMediaElement::can_play_type.
+# https://html.spec.whatwg.org/multipage/media.html#dom-navigator-canplaytype
+pub func html_media_element_can_play_type(this: HtmlMediaElement*, type_: ak.StringView) -> BindCanPlayTypeResult:
+    # The canPlayType(type) method must:
+    # - return the empty string if type is a type that the user agent knows it cannot render or is the type "application/octet-stream"
+    # - return "probably" if the user agent is confident that the type represents a media resource that it can render if used in with this audio or video element
+    # - return "maybe" otherwise. Implementers are encouraged to return "maybe" unless the type can be confidently established as being supported or not
+    # Generally, a user agent should never return "probably" for a type that allows the codecs parameter if that parameter is not present.
+    let type_view = type_
+    if ak.string_view_eq_string_view(&type_view, ak.sv("application/octet-stream")):
+        return BindCanPlayTypeResult.empty
+
+    let mime_type = mime_type_parse(type_)
+
+    if let parsed = mime_type:
+        let parsed_type = mime_type_type(&parsed)
+        if ak.string_eq_string_view(&parsed_type, ak.sv("video")):
+            if html_media_element_subtypes_contain(html_media_element_supported_video_subtypes, mime_type_subtype(&parsed)):
+                return BindCanPlayTypeResult.probably
+            return BindCanPlayTypeResult.maybe
+
+    if let parsed = mime_type:
+        let parsed_type = mime_type_type(&parsed)
+        if ak.string_eq_string_view(&parsed_type, ak.sv("audio")):
+            var result = BindCanPlayTypeResult.maybe
+            if html_media_element_subtypes_contain(html_media_element_supported_audio_subtypes, mime_type_subtype(&parsed)):
+                result = BindCanPlayTypeResult.probably
+
+            # "Maybe" because we support mp3, but "mpeg" can also refer to MP1 and MP2.
+            let parsed_subtype = mime_type_subtype(&parsed)
+            if ak.string_eq_string_view(&parsed_subtype, ak.sv("mpeg")):
+                result = BindCanPlayTypeResult.maybe
+
+            return result
+
+    return BindCanPlayTypeResult.empty
+
+## Ported from HTMLMediaElement.cpp:381 Web::HTML::HTMLMediaElement::set_seeking.
+pub func html_media_element_set_seeking(this: HtmlMediaElement*, seeking: bool):
+    if this.m_seeking == seeking:
+        return
+    this.m_seeking = seeking
+    dom_node_set_needs_style_update(this.dom_node(), true)
+
+## Ported from HTMLMediaElement.cpp:390 Web::HTML::HTMLMediaElement::load.
+# https://html.spec.whatwg.org/multipage/media.html#dom-media-load
+pub func html_media_element_load(this: HtmlMediaElement*) -> !:
+    # When the load() method on a media element is invoked, the user agent must run the media element load algorithm.
+    try html_media_element_load_element(this)
+    return
+
+# mark: Inline members of HTMLMediaElement.h ====================================================
+
+## Ported from HTMLMediaElement.h:47 Web::HTML::HTMLMediaElement::is_focusable (override).
+pub func html_media_element_is_focusable_impl(base: DomEventTarget*) -> bool:
+    return true
+
+## Ported from HTMLMediaElement.h:56 Web::HTML::HTMLMediaElement::error.
+pub func html_media_element_error(this: HtmlMediaElement*) -> HtmlMediaError*?:
+    return this.m_error
+
+## Ported from HTMLMediaElement.h:59 Web::HTML::HTMLMediaElement::current_src.
+pub func html_media_element_current_src(this: HtmlMediaElement*) -> ak.String:
+    return this.m_current_src
+
+## Ported from HTMLMediaElement.h:71 Web::HTML::HTMLMediaElement::network_state.
+pub func html_media_element_network_state(this: HtmlMediaElement*) -> HtmlMediaElementNetworkState:
+    return this.m_network_state
+
+## Ported from HTMLMediaElement.h:100 Web::HTML::HTMLMediaElement::ready_state.
+pub func html_media_element_ready_state(this: HtmlMediaElement*) -> HtmlMediaElementReadyState:
+    return this.m_ready_state
+
+## Ported from HTMLMediaElement.h:104 Web::HTML::HTMLMediaElement::seeking.
+pub func html_media_element_seeking(this: HtmlMediaElement*) -> bool:
+    return this.m_seeking
+
+## Ported from HTMLMediaElement.h:113 Web::HTML::HTMLMediaElement::current_playback_position.
+pub func html_media_element_current_playback_position(this: HtmlMediaElement*) -> f64:
+    return this.m_current_playback_position
+
+## Ported from HTMLMediaElement.h:117 Web::HTML::HTMLMediaElement::show_poster.
+pub func html_media_element_show_poster(this: HtmlMediaElement*) -> bool:
+    return this.m_show_poster
+
+## Ported from HTMLMediaElement.h:118 Web::HTML::HTMLMediaElement::paused.
+pub func html_media_element_paused(this: HtmlMediaElement*) -> bool:
+    return this.m_paused
+
+## Ported from HTMLMediaElement.h:125 Web::HTML::HTMLMediaElement::volume.
+pub func html_media_element_volume(this: HtmlMediaElement*) -> f64:
+    return this.m_volume
+
+## Ported from HTMLMediaElement.h:128 Web::HTML::HTMLMediaElement::default_playback_rate.
+pub func html_media_element_default_playback_rate(this: HtmlMediaElement*) -> f64:
+    return this.m_default_playback_rate
+
+## Ported from HTMLMediaElement.h:131 Web::HTML::HTMLMediaElement::playback_rate.
+pub func html_media_element_playback_rate(this: HtmlMediaElement*) -> f64:
+    return this.m_playback_rate
+
+## Ported from HTMLMediaElement.h:134 Web::HTML::HTMLMediaElement::muted.
+pub func html_media_element_muted(this: HtmlMediaElement*) -> bool:
+    return this.m_muted
+
+## Ported from HTMLMediaElement.h:143 Web::HTML::HTMLMediaElement::audio_tracks.
+pub func html_media_element_audio_tracks(this: HtmlMediaElement*) -> HtmlAudioTrackList*:
+    return this.m_audio_tracks else trap("HTMLMediaElement::audio_tracks before initialize")
+
+## Ported from HTMLMediaElement.h:144 Web::HTML::HTMLMediaElement::video_tracks.
+pub func html_media_element_video_tracks(this: HtmlMediaElement*) -> HtmlVideoTrackList*:
+    return this.m_video_tracks else trap("HTMLMediaElement::video_tracks before initialize")
+
+## Ported from HTMLMediaElement.h:145 Web::HTML::HTMLMediaElement::text_tracks.
+pub func html_media_element_text_tracks(this: HtmlMediaElement*) -> HtmlTextTrackList*:
+    return this.m_text_tracks else trap("HTMLMediaElement::text_tracks before initialize")
+
+## Ported from HTMLMediaElement.h:157 Web::HTML::HTMLMediaElement::set_duration (Badge<MediaSource>).
+pub func html_media_element_set_duration_media_source(this: HtmlMediaElement*, duration: f64):
+    html_media_element_set_duration_f64(this, duration)
+
+## Ported from HTMLMediaElement.h:159 Web::HTML::HTMLMediaElement::playback_manager.
+pub func html_media_element_playback_manager(this: HtmlMediaElement*) -> MediaPlaybackManager*:
+    return this.m_playback_manager else trap("VERIFY: m_playback_manager")
+
+## Ported from HTMLMediaElement.h:168 Web::HTML::HTMLMediaElement::crossorigin.
+pub func html_media_element_crossorigin(this: HtmlMediaElement*) -> HtmlCorsSettingAttribute:
+    return this.m_crossorigin
+
+## Ported from HTMLMediaElement.h:170 Web::HTML::HTMLMediaElement::selected_video_track_sink.
+pub func html_media_element_selected_video_track_sink(this: HtmlMediaElement*) -> MediaDisplayingVideoSink*?:
+    return this.m_selected_video_track_sink
+
+## Ported from HTMLMediaElement.h:174 Web::HTML::HTMLMediaElement::update_intrinsic_video_dimensions (virtual).
+pub func html_media_element_update_intrinsic_video_dimensions_impl(this: HtmlMediaElement*):
+    return
+
+## Ported from HTMLMediaElement.h:175 Web::HTML::HTMLMediaElement::update_natural_dimensions (virtual).
+pub func html_media_element_update_natural_dimensions_impl(this: HtmlMediaElement*):
+    return
+
+## Ported from HTMLMediaElement.h:193 Web::HTML::HTMLMediaElement::is_html_media_element (override).
+pub func html_media_element_is_html_media_element_impl(base: DomNode*) -> bool:
+    return true
+
+## Ported from HTMLMediaElement.h:201 Web::HTML::HTMLMediaElement::media_element_event_task_source.
+pub func html_media_element_media_element_event_task_source(this: HtmlMediaElement*) -> HtmlTaskSource:
+    return this.m_media_element_event_task_source.source
+
+## Ported from HTMLMediaElement.h:274 Web::HTML::HTMLMediaElement::reject_pending_play_promises<ErrorType>.
+# https://html.spec.whatwg.org/multipage/media.html#reject-pending-play-promises
+# The C++ template parameter ErrorType (WebIDL::AbortError, WebIDL::NotSupportedError) is the
+# function `create_error`, the type's create.
+pub func html_media_element_reject_pending_play_promises_utf16_string(this: HtmlMediaElement*, promises: const (JsPromiseCapability*)[], message: ak.Utf16String, create_error: func(Realm*, ak.Utf16String) -> IdlDomException*):
+    let realm = html_media_element_realm(this)
+
+    let error_ = create_error(realm, message)
+    html_media_element_reject_pending_play_promises_idl_dom_exception(this, promises, error_)

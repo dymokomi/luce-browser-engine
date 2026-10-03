@@ -1,0 +1,386 @@
+#==============================================================================================
+#
+#   html_media_element_2 - HTML::HTMLMediaElement: currentTime, duration, play / pause,
+#                          volume, text tracks and the media element load algorithm
+#
+#   DESCRIPTION:
+#       Port of LibWeb/HTML/HTMLMediaElement.cpp lines 398-773: currentTime and fastSeek, the
+#       current playback position, duration and ended, the durationchange steps, play(),
+#       pause(), toggling playback, volume and muted, fullscreen, the effective media volume,
+#       addTextTrack() and the media element load algorithm.
+#
+#==============================================================================================
+
+# mark: currentTime and the playback position ===================================================
+
+## Ported from HTMLMediaElement.cpp:398 Web::HTML::HTMLMediaElement::current_time.
+# https://html.spec.whatwg.org/multipage/media.html#dom-media-currenttime
+pub func html_media_element_current_time(this: HtmlMediaElement*) -> f64:
+    # The currentTime attribute must, on getting, return the media element's default playback start position, unless that is zero,
+    # in which case it must return the element's official playback position. The returned value must be expressed in seconds.
+    if this.m_default_playback_start_position != 0.0:
+        return this.m_default_playback_start_position
+    return this.m_official_playback_position
+
+## Ported from HTMLMediaElement.cpp:408 Web::HTML::HTMLMediaElement::set_current_time.
+# https://html.spec.whatwg.org/multipage/media.html#dom-media-currenttime
+pub func html_media_element_set_current_time(this: HtmlMediaElement*, current_time: f64):
+    # On setting, if the media element's readyState is HAVE_NOTHING, then it must set the media element's default playback start
+    # position to the new value; otherwise, it must set the official playback position to the new value and then seek to the new
+    # value. The new value must be interpreted as being in seconds.
+    if this.m_ready_state == HtmlMediaElementReadyState.have_nothing:
+        this.m_default_playback_start_position = current_time
+    else:
+        # AD-HOC: Don't set the official playback position here, as seek_element() will set it according to the seekable
+        #         ranges. We return the value passed to the setter to ensure that chained assignments like
+        #             videoA.currentTime = videoB.currentTime = Number.MAX_VALUE;
+        #         will seek both videoA and videoB to their corresponding ending positions.
+        #         See https://github.com/whatwg/html/issues/11773
+
+        html_media_element_seek_element(this, current_time)
+
+## Ported from HTMLMediaElement.cpp:427 Web::HTML::HTMLMediaElement::fast_seek.
+# https://html.spec.whatwg.org/multipage/media.html#dom-media-fastseek
+pub func html_media_element_fast_seek(this: HtmlMediaElement*, time: f64):
+    # The fastSeek(time) method must seek to the time given by time, with the approximate-for-speed flag set.
+    html_media_element_seek_element(this, time, HtmlMediaSeekMode.approximate_for_speed)
+
+## Ported from HTMLMediaElement.cpp:434 Web::HTML::HTMLMediaElement::set_current_playback_position.
+# https://html.spec.whatwg.org/multipage/media.html#playing-the-media-resource:current-playback-position-13
+pub func html_media_element_set_current_playback_position(this: HtmlMediaElement*, playback_position: f64):
+    # When the current playback position of a media element changes (e.g. due to playback or seeking), the user agent must
+    # run the time marches on steps. To support use cases that depend on the timing accuracy of cue event firing, such as
+    # synchronizing captions with shot changes in a video, user agents should fire cue events as close as possible to their
+    # position on the media timeline, and ideally within 20 milliseconds. If the current playback position changes while the
+    # steps are running, then the user agent must wait for the steps to complete, and then must immediately rerun the steps.
+    # These steps are thus run as often as possible or needed.
+    # FIXME: Detect "the current playback position changes while the steps are running".
+    this.m_current_playback_position = playback_position
+
+    # FIXME: Regarding the official playback position, the spec states:
+    #
+    #        Any time the user agent provides a stable state, the official playback position must be set to the current playback position.
+    #        https://html.spec.whatwg.org/multipage/media.html#playing-the-media-resource:official-playback-position-2
+    #
+    #        We do not currently have a means to track a "stable state", so for now, keep the official playback position
+    #        in sync with the current playback position.
+    this.m_official_playback_position = this.m_current_playback_position
+
+    html_media_element_time_marches_on(this)
+
+    # NOTE: Invoking the following steps is not listed in the spec. Rather, the spec just describes the scenario in
+    #       which these steps should be invoked, which is when we've reached the end of the media playback.
+    if this.m_current_playback_position == this.m_duration:
+        html_media_element_reached_end_of_media_playback(this)
+
+    html_media_element_upon_has_ended_playback_possibly_changed(this)
+    html_media_element_update_natural_dimensions(this)
+
+## Ported from HTMLMediaElement.cpp:466 Web::HTML::HTMLMediaElement::duration.
+# https://html.spec.whatwg.org/multipage/media.html#dom-media-duration
+pub func html_media_element_duration(this: HtmlMediaElement*) -> f64:
+    # The duration attribute must return the time of the end of the media resource, in seconds, on the media timeline. If no media data is available,
+    # then the attributes must return the Not-a-Number (NaN) value. If the media resource is not known to be bounded (e.g. streaming radio, or a live
+    # event with no announced end time), then the attribute must return the positive Infinity value.
+
+    # FIXME: Handle unbounded media resources.
+    return this.m_duration
+
+## Ported from HTMLMediaElement.cpp:477 Web::HTML::HTMLMediaElement::ended.
+# https://html.spec.whatwg.org/multipage/media.html#dom-media-ended
+pub func html_media_element_ended(this: HtmlMediaElement*) -> bool:
+    # The ended attribute must return true if, the last time the event loop reached step 1, the media element had ended
+    # playback and the direction of playback was forwards, and false otherwise.
+    # NOTE: We queue a task to set this at event loop step 1 whenever something happens that may affect the resulting value.
+    #       Currently, that is when the ready state changes, when the current playback position changes, or the duration
+    #       changes.
+    return this.m_ended
+
+## Ported from HTMLMediaElement.cpp:488 Web::HTML::HTMLMediaElement::set_duration.
+# https://html.spec.whatwg.org/multipage/media.html#durationChange
+pub func html_media_element_set_duration_f64(this: HtmlMediaElement*, duration: f64):
+    # When the length of the media resource changes to a known value (e.g. from being unknown to known, or from a previously established length to a new
+    # length), the user agent must queue a media element task given the media element to fire an event named durationchange at the media element. (The event
+    # is not fired when the duration is reset as part of loading a new media resource.) If the duration is changed such that the current playback position
+    # ends up being greater than the time of the end of the media resource, then the user agent must also seek to the time of the end of the media resource.
+    if not math.is_nan(duration):
+        html_media_element_queue_firing_an_event(this, html_event_names_durationchange)
+
+        if this.m_current_playback_position > duration:
+            html_media_element_seek_element(this, duration)
+
+    this.m_duration = duration
+
+    html_media_element_upon_has_ended_playback_possibly_changed(this)
+
+    dom_node_set_needs_repaint(this.dom_node())
+
+# mark: play() and pause() ======================================================================
+
+## Ported from HTMLMediaElement.cpp:510 Web::HTML::HTMLMediaElement::play.
+pub func html_media_element_play(this: HtmlMediaElement*) -> JsPromiseCapability*:
+    let realm = html_media_element_realm(this)
+
+    # FIXME: 1. If the media element is not allowed to play, then return a promise rejected with a "NotAllowedError" DOMException.
+
+    # 2. If the media element's error attribute is not null and its code is MEDIA_ERR_SRC_NOT_SUPPORTED, then return a promise
+    #    rejected with a "NotSupportedError" DOMException.
+    if let error_ = this.m_error:
+        if html_media_error_code(error_) == HtmlMediaErrorCode.src_not_supported:
+            let message = html_media_error_message(error_)
+            let exception = idl_not_supported_error_create(realm, ak.utf16_string_from_utf8_string(&message))
+            return idl_create_rejected_promise_from_exception(realm, .idl_dom_exception(exception))
+
+    # 3. Let promise be a new promise and append promise to the list of pending play promises.
+    let promise = idl_create_promise(realm)
+    ak.vector_append_t(&this.m_pending_play_promises, promise)
+
+    # 4. Run the internal play steps for the media element.
+    html_media_element_play_element(this)
+
+    # 5. Return promise.
+    return promise
+
+## Ported from HTMLMediaElement.cpp:535 Web::HTML::HTMLMediaElement::pause.
+# https://html.spec.whatwg.org/multipage/media.html#dom-media-pause
+pub func html_media_element_pause(this: HtmlMediaElement*):
+    # 1. If the media element's networkState attribute has the value NETWORK_EMPTY, invoke the media element's resource
+    #    selection algorithm.
+    if this.m_network_state == HtmlMediaElementNetworkState.empty:
+        html_media_element_select_resource(this)
+
+    # 2. Run the internal pause steps for the media element.
+    html_media_element_pause_element(this)
+
+## Ported from HTMLMediaElement.cpp:546 Web::HTML::HTMLMediaElement::toggle_playback.
+pub func html_media_element_toggle_playback(this: HtmlMediaElement*):
+    # AD-HOC: An execution context is required for Promise creation hooks.
+    var execution_context: HtmlTemporaryExecutionContext = ---
+    html_temporary_execution_context_construct_realm(&execution_context, html_media_element_realm(this))
+    defer html_temporary_execution_context_destruct(&execution_context)
+
+    if html_media_element_potentially_playing(this):
+        html_media_element_pause(this)
+    else:
+        discard(html_media_element_play(this))
+
+# mark: Volume, muted and fullscreen ============================================================
+
+## Ported from HTMLMediaElement.cpp:558 Web::HTML::HTMLMediaElement::set_volume.
+# https://html.spec.whatwg.org/multipage/media.html#dom-media-volume
+pub func html_media_element_set_volume(this: HtmlMediaElement*, volume: f64) -> !:
+    if this.m_volume == volume:
+        return
+
+    # On setting, if the new value is in the range 0.0 to 1.0 inclusive, the media element's playback volume must be
+    # set to the new value. If the new value is outside the range 0.0 to 1.0 inclusive, then, on setting, an
+    # "IndexSizeError" DOMException must be thrown instead.
+    if volume < 0.0 or volume > 1.0:
+        try idl_throw(.idl_dom_exception(idl_index_size_error_create(html_media_element_realm(this), ak.utf16_string_from_str("Volume must be in the range 0.0 to 1.0, inclusive"))))
+
+    this.m_volume = volume
+    html_media_element_volume_or_muted_attribute_changed(this)
+
+    return
+
+## Ported from HTMLMediaElement.cpp:576 Web::HTML::HTMLMediaElement::set_muted.
+# https://html.spec.whatwg.org/multipage/media.html#dom-media-muted
+pub func html_media_element_set_muted(this: HtmlMediaElement*, muted: bool):
+    if this.m_muted == muted:
+        return
+
+    this.m_muted = muted
+    html_media_element_volume_or_muted_attribute_changed(this)
+    dom_node_set_needs_style_update(this.dom_node(), true)
+
+## Ported from HTMLMediaElement.cpp:586 Web::HTML::HTMLMediaElement::toggle_fullscreen.
+pub func html_media_element_toggle_fullscreen(this: HtmlMediaElement*):
+    let document = html_media_element_document(this)
+
+    if dom_document_fullscreen_element(document) == (DomElement*?)this.dom_element():
+        discard(dom_document_exit_fullscreen(document))
+    else:
+        discard(dom_element_request_fullscreen(this.dom_element()))
+
+## Ported from HTMLMediaElement.cpp:597 Web::HTML::HTMLMediaElement::volume_or_muted_attribute_changed.
+# https://html.spec.whatwg.org/multipage/media.html#user-interface:dom-media-volume-3
+pub func html_media_element_volume_or_muted_attribute_changed(this: HtmlMediaElement*):
+    # Whenever either of the values that would be returned by the volume and muted IDL attributes change, the user
+    # agent must queue a media element task given the media element to fire an event named volumechange at the media
+    # element.
+    html_media_element_queue_firing_an_event(this, html_event_names_volumechange)
+
+    # FIXME: Then, if the media element is not allowed to play, the user agent must run the internal pause steps for the media element.
+
+    html_media_element_update_volume(this)
+
+## Ported from HTMLMediaElement.cpp:611 Web::HTML::HTMLMediaElement::page_mute_state_changed.
+pub func html_media_element_page_mute_state_changed(this: HtmlMediaElement*):
+    html_media_element_update_volume(this)
+
+## Ported from HTMLMediaElement.cpp:617 Web::HTML::HTMLMediaElement::effective_media_volume.
+# https://html.spec.whatwg.org/multipage/media.html#effective-media-volume
+pub func html_media_element_effective_media_volume(this: HtmlMediaElement*) -> f64:
+    # 1. If the user has indicated that the user agent is to override the volume of the element, then return the
+    #    volume desired by the user.
+    if page_page_mute_state(dom_document_page(html_media_element_document(this))) == HtmlMuteState.muted:
+        return 0.0
+
+    # 2. If the element's audio output is muted, then return zero.
+    if this.m_muted:
+        return 0.0
+
+    # 3. Let volume be the playback volume of the audio portions of the media element, in range 0.0 (silent) to
+    #    1.0 (loudest).
+    let volume = ak.clamp_f64(this.m_volume, 0.0, 1.0)
+
+    # 4. Return volume, interpreted relative to the range 0.0 to 1.0, with 0.0 being silent, and 1.0 being the loudest
+    #    setting, values in between increasing in loudness. The range need not be linear. The loudest setting may be
+    #    lower than the system's loudest possible setting; for example the user could have set a maximum volume.
+    return volume
+
+## Ported from HTMLMediaElement.cpp:638 Web::HTML::HTMLMediaElement::update_volume.
+pub func html_media_element_update_volume(this: HtmlMediaElement*):
+    if let playback_manager = this.m_playback_manager:
+        media_playback_manager_set_volume(playback_manager, html_media_element_effective_media_volume(this))
+
+# mark: Text tracks =============================================================================
+
+## The captures of add_text_track's addtrack task: `[this, text_track]`.
+struct HtmlMediaElementAddTextTrackTask:
+    var this: HtmlMediaElement*
+    var text_track: HtmlTextTrack*
+
+    ## The task's steps: fire addtrack at the element's TextTrackList with the new track.
+    static func run(context: void*?):
+        let captures = (HtmlMediaElementAddTextTrackTask*)(context else trap("addtrack task: no captures"))
+        let this = captures.this
+        var event_init = HtmlTrackEventInit()
+        event_init.track = .text_track(captures.text_track)
+
+        let event = html_track_event_create(html_media_element_realm(this), html_event_names_addtrack, event_init)
+        # TextTrackList derives from DOM::EventTarget first (opaque in phase 1).
+        discard(dom_event_target_dispatch_event((DomEventTarget*)html_media_element_text_tracks(this), event))
+
+## Ported from HTMLMediaElement.cpp:645 Web::HTML::HTMLMediaElement::add_text_track.
+# https://html.spec.whatwg.org/multipage/media.html#dom-media-addtexttrack
+pub func html_media_element_add_text_track(this: HtmlMediaElement*, kind: BindTextTrackKind, label: ak.String, language: ak.String) -> HtmlTextTrack*:
+    # 1. Create a new TextTrack object.
+    let text_track = html_text_track_create(html_media_element_realm(this))
+
+    # 2. Create a new text track corresponding to the new object, and set its text track kind to kind, its text track
+    #    label to label, its text track language to language, its text track readiness state to the text track loaded
+    #    state, its text track mode to the text track hidden mode, and its text track list of cues to an empty list.
+    html_text_track_set_kind(text_track, kind)
+    html_text_track_set_label(text_track, label)
+    html_text_track_set_language(text_track, language)
+    html_text_track_set_readiness_state(text_track, HtmlTextTrackReadinessState.loaded)
+    html_text_track_set_mode(text_track, BindTextTrackMode.hidden)
+    # FIXME: set text track list of cues to an empty list
+
+    # FIXME: 3. Initially, the text track list of cues is not associated with any rules for updating the text track rendering.
+    #    When a text track cue is added to it, the text track list of cues has its rules permanently set accordingly.
+
+    # FIXME: 4. Add the new text track to the media element's list of text tracks.
+
+    # 5. Queue a media element task given the media element to fire an event named addtrack at the media element's
+    #    textTracks attribute's TextTrackList object, using TrackEvent, with the track attribute initialized to the new
+    #    text track's TextTrack object.
+    let captures = new HtmlMediaElementAddTextTrackTask(this = this, text_track = text_track) else trap("out of memory")
+    html_media_element_queue_a_media_element_task(this, ak.Function0[unit](call = HtmlMediaElementAddTextTrackTask.run, context = captures))
+
+    # 6. Return the new TextTrack object.
+    return text_track
+
+# mark: The media element load algorithm ========================================================
+
+## load_element's `remove_tasks_matching` filter: `task.source() == media_element_event_task_source()`.
+func html_media_element_load_element_is_media_element_task(context: void*?, task: HtmlTask*) -> bool:
+    let this = (HtmlMediaElement*)(context else trap("remove_tasks_matching: no element"))
+    return html_task_source(task) == html_media_element_media_element_event_task_source(this)
+
+## load_element's timeupdate task: `[this] { dispatch_time_update_event(); }`.
+func html_media_element_dispatch_time_update_event_task(context: void*?):
+    html_media_element_dispatch_time_update_event((HtmlMediaElement*)(context else trap("timeupdate task: no element")))
+
+## Ported from HTMLMediaElement.cpp:681 Web::HTML::HTMLMediaElement::load_element.
+# https://html.spec.whatwg.org/multipage/media.html#media-element-load-algorithm
+pub func html_media_element_load_element(this: HtmlMediaElement*) -> !:
+    this.m_first_data_load_event_since_load_start = true
+
+    # 1. Abort any already-running instance of the resource selection algorithm for this element.
+    #    NOTE: All deferred subroutines of the resource selection algorithm will be queued under the media element task
+    #          source, or run as part of the fetch. Step 2 will remove any subroutine from the queue. Step 6.2 will stop
+    #          any ongoing fetch operation. Therefore, all resource selection algorithms will be cancelled before a new
+    #          one begins.
+
+    # 2. Let pending tasks be a list of all tasks from the media element's media element event task source in one of
+    #    the task queues.
+    # FIXME: 3. For each task in pending tasks that would resolve pending play promises or reject pending play promises,
+    #    immediately resolve or reject those promises in the order the corresponding tasks were queued.
+    # 4. Remove each task in pending tasks from its task queue
+    html_task_queue_remove_tasks_matching(html_event_loop_task_queue(html_main_thread_event_loop()), ak.Function1[HtmlTask*, bool](call = html_media_element_load_element_is_media_element_task, context = this))
+
+    # 5. If the media element's networkState is set to NETWORK_LOADING or NETWORK_IDLE, queue a media element task given the media element to
+    #    fire an event named abort at the media element.
+    if this.m_network_state == HtmlMediaElementNetworkState.loading or this.m_network_state == HtmlMediaElementNetworkState.idle:
+        html_media_element_queue_firing_an_event(this, html_event_names_abort)
+
+    # 6. If the media element's networkState is not set to NETWORK_EMPTY, then:
+    if this.m_network_state != HtmlMediaElementNetworkState.empty:
+        # 1. Queue a media element task given the media element to fire an event named emptied at the media element.
+        html_media_element_queue_firing_an_event(this, html_event_names_emptied)
+
+        # 2. If a fetching process is in progress for the media element, the user agent should stop it.
+        html_media_element_cancel_the_fetching_process(this)
+
+        # FIXME: 3. If the media element's assigned media provider object is a MediaSource object, then detach it.
+
+        # 4. Forget the media element's media-resource-specific tracks.
+        html_media_element_forget_media_resource_specific_tracks(this)
+
+        # 5. If readyState is not set to HAVE_NOTHING, then set it to that state.
+        if this.m_ready_state != HtmlMediaElementReadyState.have_nothing:
+            html_media_element_set_ready_state(this, HtmlMediaElementReadyState.have_nothing)
+
+        # 6. If the paused attribute is false, then:
+        if not html_media_element_paused(this):
+            # 1. Set the paused attribute to true.
+            html_media_element_set_paused(this, true)
+
+            # 2. Take pending play promises and reject pending play promises with the result and an "AbortError" DOMException.
+            var promises = html_media_element_take_pending_play_promises(this)
+            html_media_element_reject_pending_play_promises_utf16_string(this, ak.vector_span(&promises), ak.utf16_string_from_str("Media playback was aborted"), idl_abort_error_create)
+
+        # 7. If seeking is true, set it to false.
+        if html_media_element_seeking(this):
+            html_media_element_set_seeking(this, false)
+
+        # 8. Set the current playback position to 0.
+        this.m_current_playback_position = 0.0
+
+        if this.m_official_playback_position != 0.0:
+            # Set the official playback position to 0.
+            this.m_official_playback_position = 0.0
+
+            # If this changed the official playback position, then queue a media element task given the media element to fire an
+            # event named timeupdate at the media element.
+            html_media_element_queue_a_media_element_task(this, ak.Function0[unit](call = html_media_element_dispatch_time_update_event_task, context = this))
+
+        # FIXME: 9. Set the timeline offset to Not-a-Number (NaN).
+
+        # 10. Update the duration attribute to Not-a-Number (NaN).
+        html_media_element_set_duration_f64(this, math.nan)
+
+    # 7. Set the playbackRate attribute to the value of the defaultPlaybackRate attribute.
+    try html_media_element_set_playback_rate(this, this.m_default_playback_rate)
+
+    # 8. Set the error attribute to null and the can autoplay flag to true.
+    this.m_error = none
+    this.m_can_autoplay = true
+
+    # 9. Invoke the media element's resource selection algorithm.
+    html_media_element_select_resource(this)
+
+    # 10. NOTE: Playback of any previously playing media resource for this element stops.
+    return

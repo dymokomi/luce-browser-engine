@@ -1,0 +1,460 @@
+#==============================================================================================
+#
+#   html_object_element_2 - HTML::HTMLObjectElement: the object representation steps
+#
+#   DESCRIPTION:
+#       Port of LibWeb/HTML/HTMLObjectElement.cpp (lines 233-621) and the inlines of
+#       HTMLObjectElement.h: the element task that (re)determines what the element represents
+#       (with its fetch of the data resource), the load and failure of the resource, the handler,
+#       completed and fallback steps, loading an image, updating the layout and nested objects,
+#       the tab index, the Layout::ImageProvider overrides and the reflected type.
+#
+#==============================================================================================
+
+# mark: The load event delayers ==================================================================
+
+## `vector.empend(document())` of a Vector<DocumentLoadEventDelayer>: a new delayer appended.
+func html_object_element_append_delayer(delayers: ak.Vector[DomDocumentLoadEventDelayer]*, document: DomDocument*):
+    var delayer: DomDocumentLoadEventDelayer = ---
+    dom_document_load_event_delayer_construct(&delayer, document)
+    ak.vector_append_t(delayers, delayer)
+
+## `vector.take_last()` of a Vector<DocumentLoadEventDelayer> whose result is dropped: the last delayer
+## removed and destroyed, which releases its hold on the load event.
+func html_object_element_take_last_delayer(delayers: ak.Vector[DomDocumentLoadEventDelayer]*):
+    var delayer = ak.vector_take_last(delayers)
+    dom_document_load_event_delayer_destruct(&delayer)
+
+# mark: The object representation task ===========================================================
+
+## Ported from HTMLObjectElement.cpp:234 Web::HTML::HTMLObjectElement::queue_element_task_to_run_object_representation_steps.
+# https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-object-element:queue-an-element-task
+pub func html_object_element_queue_element_task_to_run_object_representation_steps(this: HtmlObjectElement*):
+    let document = dom_node_document(this.dom_node())
+
+    # AD-HOC: If the document isn't fully active, this task will never run, and we will indefinitely delay the load event.
+    if not dom_document_is_fully_active(document):
+        return
+
+    # This task being queued or actively running must delay the load event of the element's node document.
+    html_object_element_append_delayer(&this.m_document_load_event_delayer_for_object_representation_task, document)
+
+    discard(dom_element_queue_an_element_task(this.dom_element(), HtmlTaskSource.dom_manipulation, ak.Function0[unit](call = html_object_element_run_object_representation_task, context = this)))
+
+## The response of the representation task's fetch: `fetch_algorithms_input.process_response = [this](GC::Ref<Response> response) { ... }`;
+## the context is the object element.
+func html_object_element_process_response(context: void*?, fetched_response: FetchResponse*):
+    let this = (HtmlObjectElement*)(context else trap("process_response: no object element"))
+    let realm = dom_element_realm(this.dom_element())
+    let global = realm_global_object(bind_platform_object_realm(dom_node_document(this.dom_node()).bind_platform_object()))
+    var response = fetched_response
+
+    if fetch_response_is_network_error(response) or not fetch_is_ok_status(fetch_response_status(response)):
+        html_object_element_resource_did_fail(this)
+        return
+
+    let response_type = fetch_response_type(response)
+    if response_type == FetchResponseType.opaque or response_type == FetchResponseType.opaque_redirect:
+        response = fetch_filtered_response_internal_response(response)
+
+    let captures = new HtmlObjectElementProcessResponseDataRead(this = this, response = response) else trap("out of memory")
+    let heap = realm_heap(realm)
+    let on_data_read = gc.create_function1(heap, ak.Function1[ak.ByteBuffer, unit](call = html_object_element_on_data_read, context = captures))
+    let on_error = gc.create_function1(heap, ak.Function1[JsValue, unit](call = html_object_element_on_error, context = this))
+
+    let body = fetch_response_body(response) else trap("VERIFY: response->body()")
+    fetch_body_fully_read(body, realm, on_data_read, on_error, global)
+
+## The captures of the response's on_data_read: `[this, response]`.
+struct HtmlObjectElementProcessResponseDataRead:
+    var this: HtmlObjectElement*
+    var response: FetchResponse*
+
+## The response body's on_data_read: `[this, response](ByteBuffer data) { resource_did_load(response, data); }`.
+func html_object_element_on_data_read(context: void*?, data: ak.ByteBuffer):
+    let captures = (HtmlObjectElementProcessResponseDataRead*)(context else trap("on_data_read: no captures"))
+    var bytes = data
+    html_object_element_resource_did_load(captures.this, captures.response, ak.byte_buffer_bytes(&bytes))
+
+## The response body's on_error: `[this](JS::Value) { resource_did_fail(); }`; the context is the object element.
+func html_object_element_on_error(context: void*?, value: JsValue):
+    let this = (HtmlObjectElement*)(context else trap("on_error: no object element"))
+    html_object_element_resource_did_fail(this)
+
+## The element task queue_element_task_to_run_object_representation_steps queues (`[this]() { ... }`);
+## the context is the object element.
+func html_object_element_run_object_representation_task(context: void*?):
+    let this = (HtmlObjectElement*)(context else trap("object representation task: no object element"))
+    # ScopeGuard guard { [&]() { m_document_load_event_delayer_for_object_representation_task.take_last(); } };
+    defer html_object_element_take_last_delayer(&this.m_document_load_event_delayer_for_object_representation_task)
+
+    let realm = dom_element_realm(this.dom_element())
+    let vm = realm_vm(realm)
+    let document = dom_node_document(this.dom_node())
+
+    # FIXME: 1. If the user has indicated a preference that this object element's fallback content be shown instead of the
+    #           element's usual behavior, then jump to the step below labeled fallback.
+
+    # 2. If the element has an ancestor media element, or has an ancestor object element that is not showing its
+    #    fallback content, or if the element is not in a document whose browsing context is non-null, or if the
+    #    element's node document is not fully active, or if the element is still in the stack of open elements of
+    #    an HTML parser or XML parser, or if the element is not being rendered, then jump to the step below labeled
+    #    fallback.
+    # FIXME: Handle the element being in the stack of open elements.
+    # FIXME: Handle the element not being rendered.
+    if dom_document_browsing_context(document) == none or not dom_document_is_fully_active(document):
+        html_object_element_run_object_representation_fallback_steps(this)
+        return
+    if html_object_element_has_ancestor_media_element_or_object_element_not_showing_fallback_content(this):
+        html_object_element_run_object_representation_fallback_steps(this)
+        return
+
+    # 3. If the data attribute is present and its value is not the empty string, then:
+    let data = dom_element_get_attribute(this.dom_element(), html_attribute_names_data) else return
+    if ak.string_is_empty(&data):
+        return
+
+    # 1. If the type attribute is present and its value is not a type that the user agent supports, then the user
+    #    agent may jump to the step below labeled fallback without fetching the content to examine its real type.
+
+    # 2. Let url be the result of encoding-parsing a URL given the data attribute's value, relative to the element's node document.
+    let url = dom_document_encoding_parse_url(document, ak.string_bytes_as_string_view(&data))
+
+    # 3. If url is failure, then fire an event named error at the element and jump to the step below labeled fallback.
+    if url == none:
+        discard(dom_event_target_dispatch_event(this.dom_event_target(), dom_event_create(realm, html_event_names_error)))
+        html_object_element_run_object_representation_fallback_steps(this)
+        return
+
+    # 4. Let request be a new request whose URL is url, client is the element's node document's relevant settings
+    #    object, destination is "object", credentials mode is "include", mode is "navigate", initiator type is
+    #    "object", and whose use-URL-credentials flag is set.
+    let request = fetch_request_create(vm)
+    fetch_request_set_url(request, url else trap("unreachable"))
+    fetch_request_set_client(request, dom_document_relevant_settings_object(document))
+    fetch_request_set_destination(request, FetchRequestDestination.object)
+    fetch_request_set_credentials_mode(request, FetchRequestCredentialsMode.include)
+    fetch_request_set_mode(request, FetchRequestMode.navigate)
+    fetch_request_set_initiator_type(request, FetchRequestInitiatorType.object)
+    fetch_request_set_use_url_credentials(request, true)
+
+    # Fetch::Infrastructure::FetchAlgorithms::Input fetch_algorithms_input {}; fetch_algorithms_input.process_response = [this](...) { ... };
+    let process_response = ak.Function1[FetchResponse*, unit](call = html_object_element_process_response, context = this)
+
+    # 5. Fetch request.
+    discard(fetch_fetching_fetch(realm, request, fetch_algorithms_create_with_process_response(vm, process_response)))
+
+    #    Fetching the resource must delay the load event of the element's node document until the task that is
+    #    queued by the networking task source once the resource has been fetched (defined next) has been run.
+    html_object_element_append_delayer(&this.m_document_load_event_delayer_for_resource_load, document)
+
+    # 6. If the resource is not yet available (e.g. because the resource was not available in the cache, so that
+    #    loading the resource required making a request over the network), then jump to the step below labeled
+    #    fallback. The task that is queued by the networking task source once the resource is available must
+    #    restart this algorithm from this step. Resources can load incrementally; user agents may opt to consider
+    #    a resource "available" whenever enough data has been obtained to begin processing the resource.
+
+    # NOTE: The request is always asynchronous, even if it is cached or succeeded/failed immediately. Allow the
+    #       response callback to invoke the fallback steps. This prevents the fallback layout from flashing very
+    #       briefly between here and the resource loading.
+
+# mark: The resource's load and failure ==========================================================
+
+## Ported from HTMLObjectElement.cpp:342 Web::HTML::HTMLObjectElement::resource_did_fail.
+# https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-object-element:concept-event-fire-2
+pub func html_object_element_resource_did_fail(this: HtmlObjectElement*):
+    # ScopeGuard guard { [&]() { m_document_load_event_delayer_for_resource_load.take_last(); } };
+    defer html_object_element_take_last_delayer(&this.m_document_load_event_delayer_for_resource_load)
+
+    # 3.7. If the load failed (e.g. there was an HTTP 404 error, there was a DNS error), fire an event named error at
+    #      the element, then jump to the step below labeled fallback.
+    discard(dom_event_target_dispatch_event(this.dom_event_target(), dom_event_create(dom_element_realm(this.dom_element()), html_event_names_error)))
+    html_object_element_run_object_representation_fallback_steps(this)
+
+## Ported from HTMLObjectElement.cpp:353 Web::HTML::HTMLObjectElement::resource_did_load.
+# https://html.spec.whatwg.org/multipage/iframe-embed-object.html#object-type-detection
+pub func html_object_element_resource_did_load(this: HtmlObjectElement*, response: FetchResponse*, data: const u8[]):
+    # ScopeGuard guard { [&]() { m_document_load_event_delayer_for_resource_load.take_last(); } };
+    defer html_object_element_take_last_delayer(&this.m_document_load_event_delayer_for_resource_load)
+
+    # 3.8. Determine the resource type, as follows:
+
+    # 1. Let the resource type be unknown.
+    var resource_type: MimeType? = none
+
+    # FIXME: 2. If the user agent is configured to strictly obey Content-Type headers for this resource, and the resource has
+    #           associated Content-Type metadata, then let the resource type be the type specified in the resource's Content-Type
+    #           metadata, and jump to the step below labeled handler.
+
+    # 3. Run the appropriate set of steps from the following list:
+    # -> If the resource has associated Content-Type metadata
+    if let content_type = fetch_extract_mime_type(fetch_response_header_list(response)):
+        # 1. Let binary be false.
+        var binary = false
+
+        # 2. If the type specified in the resource's Content-Type metadata is "text/plain", and the result of applying
+        #    the rules for distinguishing if a resource is text or binary to the resource is that the resource is not
+        #    text/plain, then set binary to true.
+        let content_essence = mime_type_essence(&content_type)
+        if ak.string_eq_string_view(&content_essence, ak.sv("text/plain")):
+            let computed_type = mime_resource_sniff(data, MimeSniffingConfiguration(sniffing_context = MimeSniffingContext.text_or_binary, supplied_type = content_type))
+
+            let computed_essence = mime_type_essence(&computed_type)
+            if not ak.string_eq_string_view(&computed_essence, ak.sv("text/plain")):
+                binary = true
+
+        # 3. If the type specified in the resource's Content-Type metadata is "application/octet-stream", then set binary to true.
+        elif ak.string_eq_string_view(&content_essence, ak.sv("application/octet-stream")):
+            binary = true
+
+        # 4. If binary is false, then let the resource type be the type specified in the resource's Content-Type metadata,
+        #    and jump to the step below labeled handler.
+        if not binary:
+            resource_type = content_type
+        else:
+            # 5. If there is a type attribute present on the object element, and its value is not application/octet-stream,
+            #    then run the following steps:
+            let type_ = html_object_element_type(this)
+            if not ak.string_is_empty(&type_) and not ak.string_eq_string_view(&type_, ak.sv("application/octet-stream")):
+                # 1. If the attribute's value is a type that starts with "image/" that is not also an XML MIME type, then
+                #    let the resource type be the type specified in that type attribute.
+                if ak.string_starts_with_bytes(&type_, ak.sv("image/")):
+                    if let parsed_type = mime_type_parse(ak.string_bytes_as_string_view(&type_)):
+                        if not mime_type_is_xml(&parsed_type):
+                            resource_type = parsed_type
+
+                # 2. Jump to the step below labeled handler.
+    # -> Otherwise, if the resource does not have associated Content-Type metadata
+    else:
+        var tentative_type: MimeType? = none
+
+        # 1. If there is a type attribute present on the object element, then let the tentative type be the type specified in that type attribute.
+        #    Otherwise, let tentative type be the computed type of the resource.
+        let type_ = html_object_element_type(this)
+        if not ak.string_is_empty(&type_):
+            tentative_type = mime_type_parse(ak.string_bytes_as_string_view(&type_))
+        else:
+            tentative_type = mime_resource_sniff(data)
+
+        # 2. If tentative type is not application/octet-stream, then let resource type be tentative type and jump to the
+        #    step below labeled handler.
+        if let tentative = tentative_type:
+            let tentative_essence = mime_type_essence(&tentative)
+            if not ak.string_eq_string_view(&tentative_essence, ak.sv("application/octet-stream")):
+                resource_type = tentative
+
+    if let handled_type = resource_type:
+        html_object_element_run_object_representation_handler_steps(this, response, handled_type, data)
+    else:
+        html_object_element_run_object_representation_fallback_steps(this)
+
+# mark: Handler, completed and fallback steps ====================================================
+
+## Ported from HTMLObjectElement.cpp:437 Web::HTML::HTMLObjectElement::run_object_representation_handler_steps.
+# https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-object-element:plugin-11
+pub func html_object_element_run_object_representation_handler_steps(this: HtmlObjectElement*, response: FetchResponse*, resource_type: MimeType, data: const u8[]):
+    # 3.9. Handler: Handle the content as given by the first of the following cases that matches:
+
+    # -> If the resource type is an XML MIME type, or if the resource type does not start with "image/"
+    if can_load_document_with_type(&resource_type) and (mime_type_is_xml(&resource_type) or not mime_type_is_image(&resource_type)):
+        # If the object element's content navigable is null, then create a new child navigable for the element.
+        if this.navigable_container.m_content_navigable == none and dom_node_in_a_document_tree(this.dom_node()):
+            html_navigable_container_create_new_child_navigable(&this.navigable_container)
+
+        # NOTE: Creating a new nested browsing context can fail if the document is not attached to a browsing context
+        let content_navigable = this.navigable_container.m_content_navigable else return
+
+        # Let response be the response from fetch.
+
+        # If response's URL does not match about:blank, then navigate the element's content navigable to response's URL
+        # using the element's node document, with historyHandling set to "replace".
+        if let response_url = fetch_response_url(response):
+            if not html_url_matches_about_blank(response_url):
+                html_navigable_navigate(content_navigable, HtmlNavigableNavigateParams(url = response_url, source_document = dom_node_document(this.dom_node()), history_handling = BindNavigationHistoryBehavior.replace)) else trap("MUST: Navigable::navigate")
+
+        # The object element represents its content navigable.
+        html_object_element_run_object_representation_completed_steps(this, HtmlObjectElementRepresentation.content_navigable)
+
+    # -> If the resource type starts with "image/", and support for images has not been disabled
+    # FIXME: Handle disabling image support.
+    elif mime_type_is_image(&resource_type):
+        # Destroy a child navigable given the object element.
+        html_navigable_container_destroy_the_child_navigable(&this.navigable_container)
+
+        # Apply the image sniffing rules to determine the type of the image.
+        # The object element represents the specified image.
+        # If the image cannot be rendered, e.g. because it is malformed or in an unsupported format, jump to the step
+        # below labeled fallback.
+        if data.length == 0:
+            html_object_element_run_object_representation_fallback_steps(this)
+            return
+
+        html_object_element_load_image(this)
+
+    # -> Otherwise
+    else:
+        # The given resource type is not supported. Jump to the step below labeled fallback.
+        html_object_element_run_object_representation_fallback_steps(this)
+
+## The load event task of the completed steps (`[&]() { dispatch_event(...); }`); the context is the object element.
+func html_object_element_fire_load_event(context: void*?):
+    let this = (HtmlObjectElement*)(context else trap("load event task: no object element"))
+    discard(dom_event_target_dispatch_event(this.dom_event_target(), dom_event_create(dom_element_realm(this.dom_element()), html_event_names_load)))
+
+## Ported from HTMLObjectElement.cpp:494 Web::HTML::HTMLObjectElement::run_object_representation_completed_steps.
+# https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-object-element:the-object-element-19
+pub func html_object_element_run_object_representation_completed_steps(this: HtmlObjectElement*, representation: HtmlObjectElementRepresentation):
+    # 3.10. The element's contents are not part of what the object element represents.
+
+    # 3.11. If the object element does not represent its content navigable, then once the resource is completely loaded,
+    #       queue an element task on the DOM manipulation task source given the object element to fire an event named
+    #       load at the element.
+    if representation != HtmlObjectElementRepresentation.content_navigable:
+        discard(dom_element_queue_an_element_task(this.dom_element(), HtmlTaskSource.dom_manipulation, ak.Function0[unit](call = html_object_element_fire_load_event, context = this)))
+
+    html_object_element_update_layout_and_child_objects(this, representation)
+
+    # 3.12. Return.
+
+## Ported from HTMLObjectElement.cpp:513 Web::HTML::HTMLObjectElement::run_object_representation_fallback_steps.
+# https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-object-element:the-object-element-23
+pub func html_object_element_run_object_representation_fallback_steps(this: HtmlObjectElement*):
+    # 4. Fallback: The object element represents the element's children. This is the element's fallback content.
+    #    Destroy a child navigable given the element.
+    html_navigable_container_destroy_the_child_navigable(&this.navigable_container)
+
+    html_object_element_update_layout_and_child_objects(this, HtmlObjectElementRepresentation.children)
+
+# mark: Loading an image and updating the layout =================================================
+
+## load_image's on-finish callback: `[this] { run_object_representation_completed_steps(Representation::Image); ...take_last(); }`.
+func html_object_element_image_did_load(context: void*?):
+    let this = (HtmlObjectElement*)(context else trap("image callback: no object element"))
+    html_object_element_run_object_representation_completed_steps(this, HtmlObjectElementRepresentation.image)
+    html_object_element_take_last_delayer(&this.m_document_load_event_delayer_for_resource_load)
+
+## load_image's on-fail callback: `[this] { run_object_representation_fallback_steps(); ...take_last(); }`.
+func html_object_element_image_did_fail(context: void*?):
+    let this = (HtmlObjectElement*)(context else trap("image callback: no object element"))
+    html_object_element_run_object_representation_fallback_steps(this)
+    html_object_element_take_last_delayer(&this.m_document_load_event_delayer_for_resource_load)
+
+## Ported from HTMLObjectElement.cpp:522 Web::HTML::HTMLObjectElement::load_image.
+pub func html_object_element_load_image(this: HtmlObjectElement*):
+    let document = dom_node_document(this.dom_node())
+    let realm = dom_element_realm(this.dom_element())
+
+    # FIXME: This currently reloads the image instead of reusing the resource we've already downloaded.
+    let data = dom_element_get_attribute_value(this.dom_element(), html_attribute_names_data)
+    let maybe_url = dom_document_encoding_parse_url(document, ak.string_bytes_as_string_view(&data))
+
+    if maybe_url == none:
+        html_object_element_run_object_representation_fallback_steps(this)
+        return
+    let url = maybe_url else trap("unreachable")
+
+    html_object_element_append_delayer(&this.m_document_load_event_delayer_for_resource_load, document)
+
+    let resource_request = html_shared_resource_request_get_or_create(realm, dom_document_page(document), url)
+    this.m_resource_request = resource_request
+    html_shared_resource_request_add_callbacks(resource_request, ak.Function0[unit](call = html_object_element_image_did_load, context = this), ak.Function0[unit](call = html_object_element_image_did_fail, context = this))
+
+    if html_shared_resource_request_needs_fetching(resource_request):
+        let request = html_create_potential_cors_request(realm_vm(realm), url, FetchRequestDestination.image, HtmlCorsSettingAttribute.no_cors)
+        fetch_request_set_client(request, dom_document_relevant_settings_object(document))
+        html_shared_resource_request_fetch_resource(resource_request, realm, request)
+
+## Ported from HTMLObjectElement.cpp:553 Web::HTML::HTMLObjectElement::update_layout_and_child_objects.
+pub func html_object_element_update_layout_and_child_objects(this: HtmlObjectElement*, representation: HtmlObjectElementRepresentation):
+    if representation == HtmlObjectElementRepresentation.children:
+        # for_each_child_of_type<HTMLObjectElement>([](auto& object) { object.queue_element_task_to_run_object_representation_steps(); ... });
+        for child in dom_node_children(this.dom_node()):
+            if let object = as_if_html_object_element(child):
+                html_object_element_queue_element_task_to_run_object_representation_steps(object)
+
+    this.m_representation = representation
+    css_invalidation_invalidate_style_after_object_representation_change(this.dom_element())
+
+    if let parent_element = dom_node_parent_element(this.dom_node()):
+        dom_node_set_needs_layout_tree_update(parent_element.dom_node(), true, DomSetNeedsLayoutTreeUpdateReason.html_object_element_update_layout_and_child_objects)
+
+## Ported from HTMLObjectElement.cpp:570 Web::HTML::HTMLObjectElement::default_tab_index_value (override).
+# https://html.spec.whatwg.org/multipage/interaction.html#dom-tabindex
+pub func html_object_element_default_tab_index_value_impl(base: DomElement*) -> i32:
+    # See the base function for the spec comments.
+    return 0
+
+# mark: Layout::ImageProvider ====================================================================
+
+## The object element a Layout::ImageProvider mixin belongs to.
+func html_object_element_from_image_provider(base: LayoutImageProvider*) -> HtmlObjectElement*:
+    return (HtmlObjectElement*)((u8*)base - offsetof(HtmlObjectElement, image_provider))
+
+## Ported from HTMLObjectElement.cpp:576 Web::HTML::HTMLObjectElement::image_data.
+pub func html_object_element_image_data(this: HtmlObjectElement*) -> HtmlDecodedImageData*?:
+    let resource_request = this.m_resource_request else return none
+    return html_shared_resource_request_image_data(resource_request)
+
+## Ported from HTMLObjectElement.cpp:583 Web::HTML::HTMLObjectElement::is_image_available (override).
+pub func html_object_element_is_image_available_impl(base: LayoutImageProvider*) -> bool:
+    return html_object_element_image_data(html_object_element_from_image_provider(base)) != none
+
+## Ported from HTMLObjectElement.cpp:588 Web::HTML::HTMLObjectElement::intrinsic_width (override).
+pub func html_object_element_intrinsic_width_impl(base: LayoutImageProvider*) -> gfx.CssPixels?:
+    if let image_data = html_object_element_image_data(html_object_element_from_image_provider(base)):
+        return html_decoded_image_data_intrinsic_width(image_data)
+    return none
+
+## Ported from HTMLObjectElement.cpp:595 Web::HTML::HTMLObjectElement::intrinsic_height (override).
+pub func html_object_element_intrinsic_height_impl(base: LayoutImageProvider*) -> gfx.CssPixels?:
+    if let image_data = html_object_element_image_data(html_object_element_from_image_provider(base)):
+        return html_decoded_image_data_intrinsic_height(image_data)
+    return none
+
+## Ported from HTMLObjectElement.cpp:602 Web::HTML::HTMLObjectElement::intrinsic_aspect_ratio (override).
+pub func html_object_element_intrinsic_aspect_ratio_impl(base: LayoutImageProvider*) -> gfx.CssPixelFraction?:
+    if let image_data = html_object_element_image_data(html_object_element_from_image_provider(base)):
+        return html_decoded_image_data_intrinsic_aspect_ratio(image_data)
+    return none
+
+## Ported from HTMLObjectElement.cpp:609 Web::HTML::HTMLObjectElement::current_image_bitmap_sized (override).
+pub func html_object_element_current_image_bitmap_sized_impl(base: LayoutImageProvider*, size: gfx.IntSize) -> gfx.ImmutableBitmap*?:
+    if let image_data = html_object_element_image_data(html_object_element_from_image_provider(base)):
+        return html_decoded_image_data_bitmap(image_data, 0, size)
+    return none
+
+## Ported from HTMLObjectElement.cpp:616 Web::HTML::HTMLObjectElement::set_visible_in_viewport (override).
+pub func html_object_element_set_visible_in_viewport_impl(base: LayoutImageProvider*, arg0: bool):
+    # FIXME: Loosen grip on image data when it's not visible, e.g via volatile memory.
+    return
+
+# mark: Inline members of HTMLObjectElement.h ====================================================
+
+## Ported from HTMLObjectElement.h:38 Web::HTML::HTMLObjectElement::type.
+pub func html_object_element_type(this: HtmlObjectElement*) -> ak.String:
+    return dom_element_get_attribute_value(this.dom_element(), html_attribute_names_type)
+
+## Ported from HTMLObjectElement.h:41 Web::HTML::HTMLObjectElement::is_form_associated_element (override).
+pub func html_object_element_is_form_associated_element_impl(base: HtmlFormAssociatedElement*) -> bool:
+    return true
+
+## Ported from HTMLObjectElement.h:45 Web::HTML::HTMLObjectElement::is_listed (override).
+# https://html.spec.whatwg.org/multipage/forms.html#category-listed
+pub func html_object_element_is_listed_impl(base: HtmlFormAssociatedElement*) -> bool:
+    return true
+
+## Ported from HTMLObjectElement.h:52 Web::HTML::HTMLObjectElement::is_html_object_element (override).
+pub func html_object_element_is_html_object_element_impl(base: DomNode*) -> bool:
+    return true
+
+## Ported from HTMLObjectElement.h:85 Web::HTML::HTMLObjectElement::to_html_element (override).
+pub func html_object_element_to_html_element_impl(base: LayoutImageProvider*) -> DomElement*?:
+    return html_object_element_from_image_provider(base).dom_element()
+
+## Ported from HTMLObjectElement.h:86 Web::HTML::HTMLObjectElement::current_frame_index (override).
+pub func html_object_element_current_frame_index_impl(base: LayoutImageProvider*) -> usize:
+    return 0
+
+## Ported from HTMLObjectElement.h:87 Web::HTML::HTMLObjectElement::decoded_image_data (override).
+pub func html_object_element_decoded_image_data_impl(base: LayoutImageProvider*) -> HtmlDecodedImageData*?:
+    return html_object_element_image_data(html_object_element_from_image_provider(base))
