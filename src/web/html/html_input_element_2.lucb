@@ -1,0 +1,549 @@
+#==============================================================================================
+#
+#   html_input_element_2 - HTML::HTMLInputElement: activation, value, placeholder, styles
+#
+#   DESCRIPTION:
+#       Port of LibWeb/HTML/HTMLInputElement.cpp (lines 482-1050): the input activation
+#       behavior, edits of the text node, picked colors and selected files, the value IDL
+#       attribute in its four modes and the optional value, committing pending changes, the
+#       inline styles of the inner text, stepper buttons and placeholder (C++'s function-local
+#       static GC::Roots are module roots here, made in the internal CSS realm as the C++
+#       makes them), the button label, updating the button and text shadow trees, readonly
+#       and maxlength applicability, and the placeholder.
+#
+#==============================================================================================
+
+# mark: Input activation behavior ===============================================================
+
+## Ported from HTMLInputElement.cpp:483 Web::HTML::HTMLInputElement::run_input_activation_behavior.
+# https://html.spec.whatwg.org/multipage/input.html#input-activation-behavior
+func html_input_element_run_input_activation_behavior(this: HtmlInputElement*, event: DomEvent*) -> !:
+    let realm = html_input_element_realm(this)
+    let document = html_input_element_document(this)
+    let type_state = html_input_element_type_state(this)
+    if type_state == HtmlInputElementTypeAttributeState.checkbox or type_state == HtmlInputElementTypeAttributeState.radio_button:
+        # 1. If the element is not connected, then return.
+        if not dom_node_is_connected(this.dom_node()):
+            return
+
+        # 2. Fire an event named input at the element with the bubbles and composed attributes initialized to true.
+        let input_event = dom_event_create(realm, html_event_names_input)
+        dom_event_set_bubbles(input_event, true)
+        dom_event_set_composed(input_event, true)
+        discard(html_input_element_dispatch_event(this, input_event))
+
+        # 3. Fire an event named change at the element with the bubbles attribute initialized to true.
+        let change_event = dom_event_create(realm, html_event_names_change)
+        dom_event_set_bubbles(change_event, true)
+        discard(html_input_element_dispatch_event(this, change_event))
+    # https://html.spec.whatwg.org/multipage/input.html#submit-button-state-(type=submit)
+    elif type_state == HtmlInputElementTypeAttributeState.submit_button:
+        # The input element represents a button that, when activated, submits the form.
+        if dom_element_is_actually_disabled(this.dom_element()):
+            return
+
+        # 1. If the element does not have a form owner, then return.
+        let form = html_input_element_form(this) else return
+
+        # 2. If the element's node document is not fully active, then return.
+        if not dom_document_is_fully_active(document):
+            return
+
+        # 3. Submit the element's form owner from the element with userInvolvement set to event's user navigation involvement.
+        try html_form_element_submit_form(form, this.html_element(), HtmlFormElementSubmitFormOptions(user_involvement = html_user_navigation_involvement(event)))
+    elif type_state == HtmlInputElementTypeAttributeState.file_upload or type_state == HtmlInputElementTypeAttributeState.color:
+        html_show_the_picker_if_applicable(this)
+    # https://html.spec.whatwg.org/multipage/input.html#image-button-state-(type=image):input-activation-behavior
+    elif type_state == HtmlInputElementTypeAttributeState.image_button:
+        # 1. If the element does not have a form owner, then return.
+        let form = html_input_element_form(this) else return
+
+        # 2. If the element's node document is not fully active, then return.
+        if not dom_document_is_fully_active(document):
+            return
+
+        # 3. If the user activated the control while explicitly selecting a coordinate, then set the element's selected
+        #    coordinate to that coordinate.
+        if let mouse_event = as_if_ui_events_mouse_event(event):
+            if dom_event_is_trusted(event):
+                let x = gfx.CssPixels.from_f64(ui_events_mouse_event_offset_x(mouse_event))
+                let y = gfx.CssPixels.from_f64(ui_events_mouse_event_offset_y(mouse_event))
+
+                this.m_selected_coordinate = HtmlInputElementSelectedCoordinate(x = x.to_int(), y = y.to_int())
+
+        # 4. Submit the element's form owner from the element with userInvolvement set to event's user navigation involvement.
+        try html_form_element_submit_form(form, this.html_element(), HtmlFormElementSubmitFormOptions(user_involvement = html_user_navigation_involvement(event)))
+    # https://html.spec.whatwg.org/multipage/input.html#reset-button-state-(type=reset)
+    elif type_state == HtmlInputElementTypeAttributeState.reset_button:
+        # The input element represents a button that, when activated, resets the form.
+        if dom_element_is_actually_disabled(this.dom_element()):
+            return
+
+        # 1. If the element does not have a form owner, then return.
+        let form = html_input_element_form(this) else return
+
+        # 2. If the element's node document is not fully active, then return.
+        if not dom_document_is_fully_active(document):
+            return
+
+        # 3. Reset the form owner from the element.
+        html_form_element_reset_form(form)
+
+# mark: User interaction ========================================================================
+
+## Ported from HTMLInputElement.cpp:567 Web::HTML::HTMLInputElement::did_edit_text_node (override).
+pub func html_input_element_did_edit_text_node_impl(base: HtmlFormAssociatedTextControlElement*, input_type: ak.FlyString, data: ak.Utf16String?):
+    let this = html_input_element_from_text_control(base)
+    # An input element's dirty value flag must be set to true whenever the user interacts with the control in a way that changes the value.
+    let old_value = this.m_value
+    let text_node = this.m_text_node else trap("VERIFY: GC::Ptr<Text>::operator-> on null")
+    this.m_value = html_input_element_value_sanitization_algorithm(this, dom_character_data_data(text_node.dom_character_data()))
+    this.m_dirty_value = true
+
+    this.m_has_uncommitted_changes = true
+
+    if not html_utf16_equals(&this.m_value, &old_value):
+        html_form_associated_text_control_element_relevant_value_was_changed(html_input_element_text_control(this))
+
+    html_input_element_update_placeholder_visibility(this)
+
+    html_input_element_user_interaction_did_change_input_value(this, input_type, data)
+
+## The captures of did_pick_color's element task: `[this]`.
+struct HtmlInputElementDidPickColorTask:
+    var this: HtmlInputElement*
+
+## did_pick_color's element task.
+func html_input_element_did_pick_color_task(context: void*?):
+    let captures = (HtmlInputElementDidPickColorTask*)(context else trap("no captures"))
+    let this = captures.this
+    # set its user validity to true
+    this.m_user_validity = true
+    # and fire an event named change at the input element, with the bubbles attribute initialized to true.
+    let change_event = dom_event_create(html_input_element_realm(this), html_event_names_change)
+    dom_event_set_bubbles(change_event, true)
+    discard(html_input_element_dispatch_event(this, change_event))
+
+## Ported from HTMLInputElement.cpp:584 Web::HTML::HTMLInputElement::did_pick_color.
+pub func html_input_element_did_pick_color(this: HtmlInputElement*, picked_color: gfx.Color?, state: HtmlColorPickerUpdateState):
+    if html_input_element_type_state(this) == HtmlInputElementTypeAttributeState.color and picked_color != none:
+        let color = picked_color else trap("unreachable")
+        # then when the user changes the element's value
+        this.m_value = html_input_element_value_sanitization_algorithm(this, gfx.color_to_utf16_string_without_alpha(&color))
+        this.m_dirty_value = true
+
+        html_input_element_update_color_well_element(this)
+
+        # the user agent must queue an element task on the user interaction task source
+        html_input_element_user_interaction_did_change_input_value(this)
+
+        if state == HtmlColorPickerUpdateState.closed:
+            html_input_element_set_is_open(this, false)
+
+            # https://html.spec.whatwg.org/multipage/input.html#common-input-element-events
+            # [...] any time the user commits the change, the user agent must queue an element task on the user interaction task source given the input element to
+            let captures = new HtmlInputElementDidPickColorTask(this = this) else trap("out of memory")
+            discard(dom_element_queue_an_element_task(this.dom_element(), HtmlTaskSource.user_interaction, ak.Function0[unit](call = html_input_element_did_pick_color_task, context = captures)))
+
+## The captures of did_select_files' cancel task: `[this]`.
+struct HtmlInputElementDidSelectFilesCancelTask:
+    var this: HtmlInputElement*
+
+## did_select_files' cancel task.
+func html_input_element_did_select_files_cancel_task(context: void*?):
+    let captures = (HtmlInputElementDidSelectFilesCancelTask*)(context else trap("no captures"))
+    let this = captures.this
+    discard(html_input_element_dispatch_event(this, dom_event_create(html_input_element_realm(this), html_event_names_cancel, DomEventInit(bubbles = true))))
+
+## The captures of did_select_files' update task: `[this, files, multiple_handling]`.
+struct HtmlInputElementDidSelectFilesUpdateTask:
+    var this: HtmlInputElement*
+    var files: FileApiFileList*
+    var multiple_handling: HtmlInputElementMultipleHandling
+
+## did_select_files' update task: "update the file selection".
+func html_input_element_did_select_files_update_task(context: void*?):
+    let captures = (HtmlInputElementDidSelectFilesUpdateTask*)(context else trap("no captures"))
+    let this = captures.this
+    let files = captures.files
+    let multiple = html_input_element_has_attribute(this, html_attribute_names_multiple)
+
+    # 1. Update element's selected files so that it represents the user's selection.
+    if this.m_selected_files != none and multiple and captures.multiple_handling == HtmlInputElementMultipleHandling.append:
+        let selected_files = this.m_selected_files else trap("unreachable")
+        for i in 0..<(usize)file_api_file_list_length(files):
+            file_api_file_list_add_file(selected_files, file_api_file_list_item(files, i) else trap("VERIFY: FileList::item"))
+    else:
+        this.m_selected_files = files
+
+    html_input_element_update_file_input_shadow_tree(this)
+
+    let realm = html_input_element_realm(this)
+    # 2. Fire an event named input at the input element, with the bubbles and composed attributes initialized to true.
+    discard(html_input_element_dispatch_event(this, dom_event_create(realm, html_event_names_input, DomEventInit(bubbles = true, composed = true))))
+
+    # 3. Fire an event named change at the input element, with the bubbles attribute initialized to true.
+    discard(html_input_element_dispatch_event(this, dom_event_create(realm, html_event_names_change, DomEventInit(bubbles = true))))
+
+## Ported from HTMLInputElement.cpp:613 Web::HTML::HTMLInputElement::did_select_files.
+pub func html_input_element_did_select_files(this: HtmlInputElement*, selected_files: HtmlSelectedFile[], multiple_handling: HtmlInputElementMultipleHandling = HtmlInputElementMultipleHandling.replace):
+    let realm = html_input_element_realm(this)
+    html_input_element_set_is_open(this, false)
+
+    # https://html.spec.whatwg.org/multipage/input.html#show-the-picker,-if-applicable
+    # 4. If the user dismissed the prompt without changing their selection, then queue an element task on the user
+    #    interaction task source given element to fire an event named cancel at element, with the bubbles attribute
+    #    initialized to true.
+    if selected_files.length == 0:
+        let captures = new HtmlInputElementDidSelectFilesCancelTask(this = this) else trap("out of memory")
+        discard(dom_element_queue_an_element_task(this.dom_element(), HtmlTaskSource.user_interaction, ak.Function0[unit](call = html_input_element_did_select_files_cancel_task, context = captures)))
+
+        return
+
+    let files = file_api_file_list_create(realm)
+
+    for selected_file in &selected_files:
+        var contents = html_selected_file_take_contents(selected_file)
+
+        let mime_type = mime_resource_sniff(ak.byte_buffer_bytes(&contents))
+        let blob = file_api_blob_create(realm, contents, mime_type_essence(&mime_type))
+
+        # FIXME: The FileAPI should use ByteString for file names.
+        let file_name = ak.string_from_byte_string(html_selected_file_name(selected_file)) else trap("MUST: String::from_byte_string")
+
+        # FIXME: Fill in other fields (e.g. last_modified).
+        let options = FileApiFilePropertyBag(type_ = mime_type_essence(&mime_type), last_modified = none)
+
+        var blob_parts = ak.Vector[FileApiBlob*]()
+        ak.vector_append_t(&blob_parts, blob)
+        let file = file_api_file_create(realm, blob_parts, file_name, options) else trap("MUST: File::create")
+        file_api_file_list_add_file(files, file)
+
+    # https://html.spec.whatwg.org/multipage/input.html#update-the-file-selection
+    # 1. Queue an element task on the user interaction task source given element and the following steps:
+    let captures = new HtmlInputElementDidSelectFilesUpdateTask(this = this, files = files, multiple_handling = multiple_handling) else trap("out of memory")
+    discard(dom_element_queue_an_element_task(this.dom_element(), HtmlTaskSource.user_interaction, ak.Function0[unit](call = html_input_element_did_select_files_update_task, context = captures)))
+
+# mark: The value ===============================================================================
+
+## Ported from HTMLInputElement.cpp:671 Web::HTML::HTMLInputElement::value.
+pub func html_input_element_value(this: HtmlInputElement*) -> ak.Utf16String:
+    match html_input_element_value_attribute_mode(this):
+        # https://html.spec.whatwg.org/multipage/input.html#dom-input-value-value
+        .value:
+            # Return the current value of the element.
+            return this.m_value
+
+        # https://html.spec.whatwg.org/multipage/input.html#dom-input-value-default
+        .default:
+            # On getting, if the element has a value content attribute, return that attribute's value; otherwise, return
+            # the empty string.
+            let value = dom_element_get_attribute_value(this.dom_element(), html_attribute_names_value)
+            return ak.utf16_string_from_utf8_string(&value)
+
+        # https://html.spec.whatwg.org/multipage/input.html#dom-input-value-default-on
+        .default_on:
+            # On getting, if the element has a value content attribute, return that attribute's value; otherwise, return
+            # the string "on".
+            if let value = html_input_element_get_attribute(this, html_attribute_names_value):
+                return ak.utf16_string_from_utf8_string(&value)
+            return ak.utf16_string_from_str("on")
+
+        # https://html.spec.whatwg.org/multipage/input.html#dom-input-value-filename
+        .filename:
+            # On getting, return the string "C:\fakepath\" followed by the name of the first file in the list of selected
+            # files, if any, or the empty string if the list is empty.
+            if let selected_files = this.m_selected_files:
+                if let first_file = file_api_file_list_item(selected_files, 0):
+                    var builder = ak.string_builder_new_mode(ak.StringBuilderMode.utf16)
+                    ak.string_builder_append_string_view(&builder, ak.sv("C:\\fakepath\\"))
+                    let name = file_api_file_name(first_file)
+                    ak.string_builder_append_string_view(&builder, ak.string_bytes_as_string_view(&name))
+                    return ak.string_builder_to_utf16_string(&builder)
+            return ak.utf16_string_new()
+        _:
+            trap("VERIFY_NOT_REACHED")
+
+## Ported from HTMLInputElement.cpp:705 Web::HTML::HTMLInputElement::optional_value (override).
+pub func html_input_element_optional_value_impl(base: HtmlFormAssociatedElement*) -> ak.String?:
+    let this = html_input_element_from_form_associated_element(base)
+    match this.m_type:
+        # https://html.spec.whatwg.org/multipage/input.html#submit-button-state-(type=submit):concept-fe-optional-value
+        .submit_button:
+            # The element's optional value is the value of the element's value attribute, if there is one; otherwise null.
+            return html_input_element_get_attribute(this, html_attribute_names_value)
+        _:
+            trap("VERIFY_NOT_REACHED")
+
+## Ported from HTMLInputElement.cpp:717 Web::HTML::HTMLInputElement::set_value.
+pub func html_input_element_set_value(this: HtmlInputElement*, value: ak.Utf16String) -> !:
+    let realm = html_input_element_realm(this)
+
+    match html_input_element_value_attribute_mode(this):
+        # https://html.spec.whatwg.org/multipage/input.html#dom-input-value-value
+        .value:
+            # 1. Let oldValue be the element's value.
+            let old_value = this.m_value
+
+            # 2. Set the element's value to the new value.
+            # NOTE: For the TextNode this is done as part of step 4 below.
+
+            # 3. Set the element's dirty value flag to true.
+            this.m_dirty_value = true
+
+            # 4. Invoke the value sanitization algorithm, if the element's type attribute's current state defines one.
+            this.m_value = html_input_element_value_sanitization_algorithm(this, value)
+
+            # 5. If the element's value (after applying the value sanitization algorithm) is different from oldValue,
+            #    and the element has a text entry cursor position, move the text entry cursor position to the end of the
+            #    text control, unselecting any selected text and resetting the selection direction to "none".
+            if not html_utf16_equals(&this.m_value, &old_value):
+                html_form_associated_text_control_element_relevant_value_was_changed(html_input_element_text_control(this))
+
+                if let text_node = this.m_text_node:
+                    dom_character_data_set_data(text_node.dom_character_data(), this.m_value)
+                    html_input_element_update_placeholder_visibility(this)
+
+                    let length = (u32)dom_node_length(text_node.dom_node())
+                    html_form_associated_text_control_element_set_the_selection_range(html_input_element_text_control(this), length, length)
+
+                html_input_element_update_shadow_tree(this)
+
+        # https://html.spec.whatwg.org/multipage/input.html#dom-input-value-default
+        # https://html.spec.whatwg.org/multipage/input.html#dom-input-value-default-on
+        .default, .default_on:
+            # On setting, set the value of the element's value content attribute to the new value.
+            dom_element_set_attribute_value(this.dom_element(), html_attribute_names_value, ak.utf16_string_base_to_utf8_but_should_be_ported_to_utf16(&value.utf16_string_base))
+
+        # https://html.spec.whatwg.org/multipage/input.html#dom-input-value-filename
+        .filename:
+            # On setting, if the new value is the empty string, empty the list of selected files; otherwise, throw an "InvalidStateError" DOMException.
+            if not html_utf16_is_empty(&value):
+                try idl_throw(.idl_dom_exception(idl_invalid_state_error_create(realm, ak.utf16_string_from_str("Setting value of input type file to non-empty string"))))
+
+            this.m_selected_files = none
+        _:
+            trap("VERIFY_NOT_REACHED")
+
+## Ported from HTMLInputElement.cpp:776 Web::HTML::HTMLInputElement::commit_pending_changes.
+pub func html_input_element_commit_pending_changes(this: HtmlInputElement*):
+    # The change event fires when the value is committed, if that makes sense for the control,
+    # or else when the control loses focus
+    match html_input_element_type_state(this):
+        .email, .password, .search, .telephone, .text, .url, .checkbox, .radio_button:
+            if not this.m_has_uncommitted_changes:
+                return
+        _:
+            discard(this.m_has_uncommitted_changes)
+
+    this.m_has_uncommitted_changes = false
+
+    let change_event = dom_event_create(html_input_element_realm(this), html_event_names_change, DomEventInit(bubbles = true))
+    discard(html_input_element_dispatch_event(this, change_event))
+
+# mark: Inline styles of the shadow tree ========================================================
+
+## A `static GC::Root<CSS::CSSStyleProperties> style` made on first use: a style declaration in the
+## internal CSS realm holding `text`.
+func html_input_element_static_style(root: gc.Root[CssStyleProperties]*, text: str) -> CssStyleProperties*:
+    if gc.root_is_null(root):
+        let style = css_style_properties_create(internal_css_realm(), ak.Vector[CssStyleProperty](), ak.OrderedHashMap[ak.FlyString, CssStyleProperty, ak.FlyStringTraits]())
+        *root = gc.root_create(style)
+        css_style_properties_set_declarations_from_text(style, ak.sv(text))
+    return gc.root_cell(root) else trap("VERIFY: the static style")
+
+## `static GC::Root<CSS::CSSStyleProperties> style` of inner_text_style_when_visible().
+var html_inner_text_style_when_visible_s_style: gc.Root[CssStyleProperties]
+
+## Ported from HTMLInputElement.cpp:804 Web::HTML::inner_text_style_when_visible.
+# https://www.w3.org/TR/css-ui-4/#input-rules
+func html_inner_text_style_when_visible() -> CssStyleProperties*:
+    return html_input_element_static_style(&html_inner_text_style_when_visible_s_style, """
+                width: 100%;
+                height: 1lh;
+                align-items: center;
+                overflow: auto;
+                scrollbar-width: none;
+                text-overflow: clip;
+                white-space: nowrap;
+            """)
+
+## `static GC::Root<CSS::CSSStyleProperties> style` of inner_text_style_when_hidden().
+var html_inner_text_style_when_hidden_s_style: gc.Root[CssStyleProperties]
+
+## Ported from HTMLInputElement.cpp:822 Web::HTML::inner_text_style_when_hidden.
+func html_inner_text_style_when_hidden() -> CssStyleProperties*:
+    return html_input_element_static_style(&html_inner_text_style_when_hidden_s_style, """
+                width: 0;
+                display: inline;
+            """)
+
+## `static GC::Root<CSS::CSSStyleProperties> style` of stepper_button_style_when_visible().
+var html_stepper_button_style_when_visible_s_style: gc.Root[CssStyleProperties]
+
+## Ported from HTMLInputElement.cpp:835 Web::HTML::stepper_button_style_when_visible.
+func html_stepper_button_style_when_visible() -> CssStyleProperties*:
+    return html_input_element_static_style(&html_stepper_button_style_when_visible_s_style, """
+                padding: 0;
+                cursor: default;
+            """)
+
+## `static GC::Root<CSS::CSSStyleProperties> style` of stepper_button_style_when_hidden().
+var html_stepper_button_style_when_hidden_s_style: gc.Root[CssStyleProperties]
+
+## Ported from HTMLInputElement.cpp:848 Web::HTML::stepper_button_style_when_hidden.
+func html_stepper_button_style_when_hidden() -> CssStyleProperties*:
+    return html_input_element_static_style(&html_stepper_button_style_when_hidden_s_style, """
+                display: none;
+            """)
+
+## `static GC::Root<CSS::CSSStyleProperties> style` of placeholder_style_when_visible().
+var html_placeholder_style_when_visible_s_style: gc.Root[CssStyleProperties]
+
+## Ported from HTMLInputElement.cpp:860 Web::HTML::placeholder_style_when_visible.
+func html_placeholder_style_when_visible() -> CssStyleProperties*:
+    return html_input_element_static_style(&html_placeholder_style_when_visible_s_style, """
+                width: 100%;
+                height: 1lh;
+                align-items: center;
+                overflow: hidden;
+                scrollbar-width: none;
+                text-overflow: clip;
+                white-space: nowrap;
+            """)
+
+## `static GC::Root<CSS::CSSStyleProperties> style` of placeholder_style_when_hidden().
+var html_placeholder_style_when_hidden_s_style: gc.Root[CssStyleProperties]
+
+## Ported from HTMLInputElement.cpp:878 Web::HTML::placeholder_style_when_hidden.
+func html_placeholder_style_when_hidden() -> CssStyleProperties*:
+    return html_input_element_static_style(&html_placeholder_style_when_hidden_s_style, "display: none;")
+
+## Ported from HTMLInputElement.cpp:888 Web::HTML::HTMLInputElement::update_placeholder_visibility.
+func html_input_element_update_placeholder_visibility(this: HtmlInputElement*):
+    let placeholder_element = this.m_placeholder_element else return
+    let inner_text_element = this.m_inner_text_element else trap("VERIFY: GC::Ptr<Element>::operator-> on null")
+    if html_input_element_placeholder_value(this) != none:
+        dom_element_set_inline_style(inner_text_element, html_inner_text_style_when_hidden())
+        dom_element_set_inline_style(placeholder_element, html_placeholder_style_when_visible())
+    else:
+        dom_element_set_inline_style(inner_text_element, html_inner_text_style_when_visible())
+        dom_element_set_inline_style(placeholder_element, html_placeholder_style_when_hidden())
+
+# mark: Button and text shadow trees ============================================================
+
+## Ported from HTMLInputElement.cpp:901 Web::HTML::HTMLInputElement::button_label.
+func html_input_element_button_label(this: HtmlInputElement*) -> ak.Utf16String:
+    var label: ak.Utf16String? = none
+    if let value = html_input_element_get_attribute(this, html_attribute_names_value):
+        label = ak.utf16_string_from_utf8_string(&value)
+
+    if label == none:
+        if html_input_element_type_state(this) == HtmlInputElementTypeAttributeState.reset_button:
+            # https://html.spec.whatwg.org/multipage/input.html#reset-button-state-(type=reset)
+            # If the element has a value attribute, the button's label must be the value of that attribute;
+            # otherwise, it must be an implementation-defined string that means "Reset" or some such.
+            label = ak.utf16_string_from_str("Reset")
+        elif html_input_element_type_state(this) == HtmlInputElementTypeAttributeState.submit_button:
+            # https://html.spec.whatwg.org/multipage/input.html#submit-button-state-(type=submit)
+            # If the element has a value attribute, the button's label must be the value of that attribute;
+            # otherwise, it must be an implementation-defined string that means "Submit" or some such.
+            label = ak.utf16_string_from_str("Submit")
+        else:
+            # https://html.spec.whatwg.org/multipage/input.html#button-state-(type=button)
+            # If the element has a value attribute, the button's label must be the value of that attribute;
+            # otherwise, it must be the empty string.
+            label = html_input_element_value(this)
+
+    return label else trap("unreachable")
+
+## Ported from HTMLInputElement.cpp:927 Web::HTML::HTMLInputElement::update_button_input_shadow_tree.
+func html_input_element_update_button_input_shadow_tree(this: HtmlInputElement*):
+    if let text_node = this.m_text_node:
+        dom_character_data_set_data(text_node.dom_character_data(), html_input_element_button_label(this))
+        html_input_element_update_placeholder_visibility(this)
+
+## Ported from HTMLInputElement.cpp:935 Web::HTML::HTMLInputElement::update_text_input_shadow_tree.
+func html_input_element_update_text_input_shadow_tree(this: HtmlInputElement*):
+    if let text_node = this.m_text_node:
+        dom_character_data_set_data(text_node.dom_character_data(), this.m_value)
+        html_input_element_update_placeholder_visibility(this)
+
+    if this.m_type == HtmlInputElementTypeAttributeState.number:
+        let up_button_element = this.m_up_button_element else trap("VERIFY: GC::Ptr<Element>::operator-> on null")
+        let down_button_element = this.m_down_button_element else trap("VERIFY: GC::Ptr<Element>::operator-> on null")
+        # The `textfield` appearance is used to hide the stepper buttons.
+        let style = dom_element_computed_properties(this.dom_element())
+        if style != none and css_computed_properties_appearance(style else trap("unreachable")) == css_data.Appearance.textfield:
+            dom_element_set_inline_style(up_button_element, html_stepper_button_style_when_hidden())
+            dom_element_set_inline_style(down_button_element, html_stepper_button_style_when_hidden())
+        else:
+            dom_element_set_inline_style(up_button_element, html_stepper_button_style_when_visible())
+            dom_element_set_inline_style(down_button_element, html_stepper_button_style_when_visible())
+
+# mark: readonly, maxlength and the placeholder =================================================
+
+## Ported from HTMLInputElement.cpp:955 Web::HTML::HTMLInputElement::is_allowed_to_be_readonly.
+# https://html.spec.whatwg.org/multipage/input.html#the-input-element:attr-input-readonly-3
+pub func html_input_element_is_allowed_to_be_readonly(this: HtmlInputElement*) -> bool:
+    match this.m_type:
+        .text, .search, .telephone, .url, .email, .password, .date, .month, .week, .time, .local_date_and_time, .number:
+            return true
+        _:
+            return false
+
+## Ported from HTMLInputElement.cpp:977 Web::HTML::is_applicable_for_maxlength_attribute.
+# https://html.spec.whatwg.org/multipage/input.html#the-input-element:attr-input-maxlength-3
+func html_is_applicable_for_maxlength_attribute(state: HtmlInputElementTypeAttributeState) -> bool:
+    match state:
+        .text, .search, .telephone, .url, .email, .password:
+            return true
+        _:
+            return false
+
+## Ported from HTMLInputElement.cpp:993 Web::HTML::HTMLInputElement::handle_maxlength_attribute.
+# https://html.spec.whatwg.org/multipage/input.html#attr-input-maxlength
+func html_input_element_handle_maxlength_attribute(this: HtmlInputElement*):
+    # The maxlength attribute, when it applies, is a form control maxlength attribute.
+    if let text_node = this.m_text_node:
+        if html_is_applicable_for_maxlength_attribute(html_input_element_type_state(this)):
+            let max_length = html_input_element_max_length(this)
+            if max_length >= 0:
+                dom_text_set_max_length(text_node, (u64)max_length)
+            else:
+                dom_text_set_max_length(text_node, none)
+
+## Ported from HTMLInputElement.cpp:1007 Web::HTML::is_allowed_to_have_placeholder.
+# https://html.spec.whatwg.org/multipage/input.html#the-input-element:attr-input-placeholder-3
+func html_is_allowed_to_have_placeholder(state: HtmlInputElementTypeAttributeState) -> bool:
+    match state:
+        .text, .search, .url, .telephone, .email, .password, .number:
+            return true
+        _:
+            return false
+
+## Ported from HTMLInputElement.cpp:1024 Web::HTML::HTMLInputElement::placeholder.
+# https://html.spec.whatwg.org/multipage/input.html#attr-input-placeholder
+pub func html_input_element_placeholder(this: HtmlInputElement*) -> ak.String:
+    let placeholder = html_input_element_get_attribute(this, html_attribute_names_placeholder) else return ak.string_new()
+
+    # The attribute, if specified, must have a value that contains no U+000A LINE FEED (LF) or U+000D CARRIAGE RETURN (CR) characters.
+    var builder = ak.string_builder_new()
+    let view = ak.string_bytes_as_string_view(&placeholder)
+    for c in ak.string_view_bytes(&view):
+        if c != '\r' and c != '\n':
+            ak.string_builder_append_u8(&builder, c)
+    return ak.string_from_string_builder(&builder) else trap("MUST: StringBuilder::to_string")
+
+## Ported from HTMLInputElement.cpp:1041 Web::HTML::HTMLInputElement::placeholder_value.
+# https://html.spec.whatwg.org/multipage/input.html#attr-input-placeholder
+pub func html_input_element_placeholder_value(this: HtmlInputElement*) -> ak.String?:
+    let text_node = this.m_text_node else return none
+    let data = dom_character_data_data(text_node.dom_character_data())
+    if not html_utf16_is_empty(&data):
+        return none
+    if not html_is_allowed_to_have_placeholder(html_input_element_type_state(this)):
+        return none
+    if not html_input_element_has_attribute(this, html_attribute_names_placeholder):
+        return none
+    return html_input_element_placeholder(this)
