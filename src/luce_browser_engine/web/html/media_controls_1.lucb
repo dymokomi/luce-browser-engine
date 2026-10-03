@@ -1,0 +1,531 @@
+#==============================================================================================
+#
+#   media_controls_1 - HTML::MediaControls: the user agent shadow tree of <video controls> and
+#                      <audio controls>, and its event listeners
+#
+#   DESCRIPTION:
+#       Port of LibWeb/HTML/MediaControls.cpp lines 1-428: the constructor and destructor,
+#       creating the shadow tree (the generated MediaControlsDOM), the add_event_listener
+#       overloads (a native function wrapping a handler, registered as an IDL event listener
+#       and remembered for removal) and setting up the listeners of the media element, the
+#       document, the controls' elements and the window.
+#
+#       The C++ handler templates become one handler shape: `ak.Function1[DomEvent*, bool]`
+#       answering whether to prevent the event's default, with the event type the C++ template
+#       parameter T selects (`vm.argument(0).as_if<T>()`) passed as HtmlMediaControlsEventType.
+#       MouseEvent and KeyboardEvent are phase 4 (closure stubs); listeners for them are created
+#       and trap only if such an event is dispatched.
+#
+#==============================================================================================
+
+# mark: Helpers =================================================================================
+
+## The media element of the controls (`*m_media_element`; the controls never outlive it while used).
+func html_media_controls_media_element(this: const HtmlMediaControls*) -> HtmlMediaElement*:
+    return gc.weak_ptr(&this.m_media_element) else trap("VERIFY: m_media_element")
+
+## The generated DOM of the controls (`*m_dom`).
+func html_media_controls_dom(this: const HtmlMediaControls*) -> HtmlMediaControlsDom:
+    return this.m_dom else trap("MediaControls: no DOM")
+
+## One of the DOM's elements (`m_dom->name`), which must exist.
+func html_media_controls_element(element: gc.Weak[DomElement]) -> DomElement*:
+    return html_media_controls_optional_element(element) else trap("MediaControls: no such element")
+
+## One of the DOM's elements (`m_dom->name`), if the template made it (an option's element may be absent).
+func html_media_controls_optional_element(element: gc.Weak[DomElement]) -> DomElement*?:
+    let weak = element
+    return gc.weak_ptr(&weak)
+
+## A Vector<String> of one class name (the C++ function-local `static Vector<String> s_..._class = { "name"_string }`;
+## a module global would not be scanned by the collector, so each use builds its own).
+func html_media_controls_class_list_of(name: str) -> ak.Vector[ak.String]:
+    var classes = ak.Vector[ak.String]()
+    ak.vector_append_t(&classes, ak.string_from_str(name))
+    return classes
+
+## Ported from MediaControls.cpp:607 the `static Vector<String> s_visible_class = { "visible"_string }` of show_controls / hide_controls.
+func html_s_visible_class() -> ak.Vector[ak.String]:
+    return html_media_controls_class_list_of("visible")
+
+## The window of the media element's realm (`as<HTML::Window>(realm.global_object())`).
+func html_media_controls_window(realm: Realm*) -> HtmlWindow*:
+    return as_html_window((gc.Cell*)realm_global_object(realm))
+
+# mark: Construction ============================================================================
+
+## Ported from MediaControls.cpp:29 Web::HTML::MediaControls::MediaControls.
+pub func html_media_controls_construct(this: HtmlMediaControls*, media_element: HtmlMediaElement*):
+    html_media_controls_init_fields(this)
+    this.m_media_element = gc.make_weak(media_element)
+    html_media_controls_create_shadow_tree(this)
+    html_media_controls_set_up_event_listeners(this)
+
+## Ported from MediaControls.cpp:36 Web::HTML::MediaControls::~MediaControls (`m_controls.clear()`
+## runs it).
+pub func html_media_controls_destruct(this: HtmlMediaControls*):
+    html_media_controls_remove_event_listeners(this)
+    if let media_element = gc.weak_ptr(&this.m_media_element):
+        dom_element_set_shadow_root(media_element.dom_element(), none)
+    # RefPtr<Core::Timer>'s destructor stops a pending hover timer.
+    if let hover_timer = this.m_hover_timer:
+        core_timer_stop(hover_timer)
+
+## Ported from MediaControls.cpp:43 Web::HTML::MediaControls::create_shadow_tree.
+pub func html_media_controls_create_shadow_tree(this: HtmlMediaControls*):
+    let media_element = html_media_controls_media_element(this)
+    let document = dom_node_document(media_element.dom_node())
+    let realm = html_element_realm(media_element.html_element())
+
+    let is_video = is_html_video_element(media_element)
+
+    let shadow_root = realm_create_dom_shadow_root(realm, document, media_element.dom_element(), BindShadowRootMode.closed)
+    dom_shadow_root_set_user_agent_internal(shadow_root, true)
+    dom_element_set_shadow_root(media_element.dom_element(), shadow_root)
+
+    var dom: HtmlMediaControlsDom = ---
+    html_media_controls_dom_construct(&dom, document, shadow_root.dom_node(), HtmlMediaControlsDomOptions.video if is_video else HtmlMediaControlsDomOptions.none_)
+    this.m_dom = dom
+
+    let container = html_media_controls_element(dom.container)
+    if is_video:
+        dom_token_list_add(dom_element_class_list(container), html_media_controls_class_list_of("video")) else trap("MUST: add the video class")
+    else:
+        dom_token_list_add(dom_element_class_list(container), html_media_controls_class_list_of("audio")) else trap("MUST: add the audio class")
+
+    # Initialize state
+    html_media_controls_update_play_pause_icon(this)
+    html_media_controls_update_timestamp(this)
+    html_media_controls_update_volume_and_mute_indicator(this)
+    html_media_controls_update_fullscreen_icon(this)
+    html_media_controls_update_placeholder_visibility(this)
+
+    html_media_controls_show_controls(this)
+
+# mark: add_event_listener ======================================================================
+
+## The C++ template parameter T of add_event_listener: the type `vm.argument(0).as_if<T>()` asks for.
+pub enum HtmlMediaControlsEventType as u8:
+    event = 0
+    mouse_event = 1
+    keyboard_event = 2
+
+## The captures of add_event_listener's native function: `[handler = move(handler)](JS::VM& vm) { ... }`.
+struct HtmlMediaControlsListener:
+    var event_type: HtmlMediaControlsEventType
+    var handler: ak.Function1[DomEvent*, bool]
+
+    ## The native function's behaviour: run the handler for an event of the type, preventing the
+    ## event's default when it answers true.
+    static func call(context: void*?, vm: Vm*) -> JsValue!:
+        let captures = (HtmlMediaControlsListener*)(context else trap("MediaControls listener: no captures"))
+        let argument = vm_argument(vm, 0)
+        if js_value_is_object(argument):
+            if let event = html_media_controls_event_as_if(captures.event_type, (gc.Cell*)js_value_as_object(argument)):
+                if ak.function1_call(&captures.handler, event):
+                    dom_event_prevent_default(event)
+        return js_undefined()
+
+## `vm.argument(0).as_if<T>()` for the template parameter T.
+func html_media_controls_event_as_if(event_type: HtmlMediaControlsEventType, object: gc.Cell*) -> DomEvent*?:
+    let event = as_if_dom_event(object) else return none
+    match event_type:
+        .event:
+            return event
+        .mouse_event:
+            if as_if_ui_events_mouse_event(event) == none:
+                return none
+            return event
+        .keyboard_event:
+            if as_if_ui_events_keyboard_event(event) == none:
+                return none
+            return event
+        _:
+            trap("VERIFY_NOT_REACHED: HtmlMediaControlsEventType")
+
+## Ported from MediaControls.cpp:75 Web::HTML::MediaControls::add_event_listener<T, Handler>(JS::Realm&,
+## DOM::EventTarget&, FlyString const&, ListenOnce, Handler). The template parameter T is `event_type`.
+pub func html_media_controls_add_event_listener_html_media_controls_listen_onc_t_handler(this: HtmlMediaControls*, realm: Realm*, target: DomEventTarget*, event_name: ak.FlyString, listen_once: HtmlMediaControlsListenOnce, event_type: HtmlMediaControlsEventType, handler: ak.Function1[DomEvent*, bool]) -> DomIdlEventListener*:
+    let captures = new HtmlMediaControlsListener(event_type = event_type, handler = handler) else trap("out of memory")
+    let callback_function = js_native_function_create(realm, JsNativeFunctionBehaviour(call = HtmlMediaControlsListener.call, context = captures), 0, ak.utf16_fly_string_new(), realm)
+    # realm.heap().allocate<WebIDL::CallbackType>(*callback_function, realm)
+    let callback = realm_create_idl_callback_type_realm(realm, (JsObject*)callback_function, realm, IdlOperationReturnsPromise.no)
+    let listener = dom_idl_event_listener_create(realm, callback)
+
+    var options = DomAddEventListenerOptions()
+    options.once = listen_once == HtmlMediaControlsListenOnce.yes
+    dom_event_target_add_event_listener(target, event_name, listener, .dom_add_event_listener_options(options))
+
+    ak.vector_append_t(&this.m_registered_event_listeners, HtmlMediaControlsRegisteredEventListener(target = gc.make_weak(target), event_name = event_name, listener = gc.make_weak(listener)))
+    return listener
+
+## The captures of the `CallableAs<bool>` overload's adapter: `[handler = move(handler)](DOM::Event&) { return handler(); }`.
+struct HtmlMediaControlsPlainHandler:
+    var handler: ak.Function0[bool]
+
+    ## The adapter: call the handler without the event.
+    static func call(context: void*?, event: DomEvent*) -> bool:
+        let captures = (HtmlMediaControlsPlainHandler*)(context else trap("MediaControls handler: no captures"))
+        return ak.function0_call(&captures.handler)
+
+## Ported from MediaControls.cpp:98 Web::HTML::MediaControls::add_event_listener<CallableAs<bool> Handler>.
+pub func html_media_controls_add_event_listener_t_handler(this: HtmlMediaControls*, realm: Realm*, target: DomEventTarget*, event_name: ak.FlyString, handler: ak.Function0[bool]) -> DomIdlEventListener*:
+    let adapter = new HtmlMediaControlsPlainHandler(handler = handler) else trap("out of memory")
+    return html_media_controls_add_event_listener_html_media_controls_listen_onc_t_handler(this, realm, target, event_name, HtmlMediaControlsListenOnce.no, HtmlMediaControlsEventType.event, ak.Function1[DomEvent*, bool](call = HtmlMediaControlsPlainHandler.call, context = adapter))
+
+## Ported from MediaControls.cpp:106 Web::HTML::MediaControls::add_event_listener<CallableAs<bool, UIEvents::MouseEvent const&> Handler>.
+pub func html_media_controls_add_event_listener_mouse_event(this: HtmlMediaControls*, realm: Realm*, target: DomEventTarget*, event_name: ak.FlyString, handler: ak.Function1[DomEvent*, bool]) -> DomIdlEventListener*:
+    return html_media_controls_add_event_listener_html_media_controls_listen_onc_t_handler(this, realm, target, event_name, HtmlMediaControlsListenOnce.no, HtmlMediaControlsEventType.mouse_event, handler)
+
+## Ported from MediaControls.cpp:112 Web::HTML::MediaControls::add_event_listener<CallableAs<bool, UIEvents::MouseEvent const&> Handler>
+## (with ListenOnce).
+pub func html_media_controls_add_event_listener_html_media_controls_listen_onc_t_handler_2(this: HtmlMediaControls*, realm: Realm*, target: DomEventTarget*, event_name: ak.FlyString, listen_once: HtmlMediaControlsListenOnce, handler: ak.Function1[DomEvent*, bool]) -> DomIdlEventListener*:
+    return html_media_controls_add_event_listener_html_media_controls_listen_onc_t_handler(this, realm, target, event_name, listen_once, HtmlMediaControlsEventType.mouse_event, handler)
+
+## Ported from MediaControls.cpp:118 Web::HTML::MediaControls::add_event_listener<CallableAs<bool, UIEvents::KeyboardEvent const&> Handler>.
+pub func html_media_controls_add_event_listener_keyboard_event(this: HtmlMediaControls*, realm: Realm*, target: DomEventTarget*, event_name: ak.FlyString, handler: ak.Function1[DomEvent*, bool]) -> DomIdlEventListener*:
+    return html_media_controls_add_event_listener_html_media_controls_listen_onc_t_handler(this, realm, target, event_name, HtmlMediaControlsListenOnce.no, HtmlMediaControlsEventType.keyboard_event, handler)
+
+## Ported from MediaControls.cpp:123 Web::HTML::MediaControls::remove_event_listeners.
+pub func html_media_controls_remove_event_listeners(this: HtmlMediaControls*):
+    for registered in ak.vector_span(&this.m_registered_event_listeners):
+        let target = gc.weak_ptr(&registered.target) else continue
+        let listener = gc.weak_ptr(&registered.listener) else continue
+        dom_event_target_remove_event_listener_without_options(target, registered.event_name, listener)
+    ak.vector_clear(&this.m_registered_event_listeners)
+
+    if let media_element = gc.weak_ptr(&this.m_media_element):
+        let window = html_media_controls_window(html_element_realm(media_element.html_element()))
+        html_window_cancel_animation_frame(window, this.m_request_animation_frame_id)
+
+# mark: The listeners ===========================================================================
+
+## A `[this] { ...; return true; }` handler: its steps, by name.
+enum HtmlMediaControlsPlainSteps as u8:
+    update_play_state = 0
+    update_placeholder = 1
+    update_time = 2
+    update_volume = 3
+    update_metadata = 4
+    update_emptied = 5
+    update_fullscreen = 6
+    toggle_playback = 7
+    toggle_mute_button = 8
+    toggle_fullscreen = 9
+    show = 10
+    hide = 11
+    enter_controls = 12
+    leave_controls = 13
+
+## The captures of the `[this] { ... }` handlers: the controls and which steps they run.
+struct HtmlMediaControlsPlainListener:
+    var this: HtmlMediaControls*
+    var steps: HtmlMediaControlsPlainSteps
+
+    ## The handler's steps (each C++ lambda returns true).
+    static func call(context: void*?) -> bool:
+        let captures = (HtmlMediaControlsPlainListener*)(context else trap("MediaControls handler: no captures"))
+        let this = captures.this
+        match captures.steps:
+            .update_play_state:
+                # play, pause, playing
+                html_media_controls_update_play_pause_icon(this)
+                html_media_controls_update_placeholder_visibility(this)
+            .update_placeholder:
+                # seeked
+                html_media_controls_update_placeholder_visibility(this)
+            .update_time:
+                # timeupdate, durationchange
+                html_media_controls_update_timeline(this)
+                html_media_controls_update_timestamp(this)
+            .update_volume:
+                # volumechange, addtrack
+                html_media_controls_update_volume_and_mute_indicator(this)
+            .update_metadata:
+                # loadedmetadata
+                html_media_controls_update_timestamp(this)
+                html_media_controls_update_volume_and_mute_indicator(this)
+            .update_emptied:
+                # emptied
+                html_media_controls_update_placeholder_visibility(this)
+                html_media_controls_update_timeline(this)
+                html_media_controls_update_timestamp(this)
+            .update_fullscreen:
+                # fullscreenchange
+                html_media_controls_update_fullscreen_icon(this)
+            .toggle_playback:
+                html_media_controls_toggle_playback(this)
+            .toggle_mute_button:
+                # Speaker button
+                let media_element = html_media_controls_media_element(this)
+                html_media_element_set_muted(media_element, not html_media_element_muted(media_element))
+            .toggle_fullscreen:
+                html_media_controls_toggle_fullscreen(this)
+            .show:
+                html_media_controls_show_controls(this)
+            .hide:
+                html_media_controls_hide_controls(this)
+            .enter_controls:
+                this.m_hovering_controls = true
+                html_media_controls_show_controls(this)
+            .leave_controls:
+                this.m_hovering_controls = false
+                html_media_controls_show_controls(this)
+            _:
+                trap("VERIFY_NOT_REACHED: HtmlMediaControlsPlainSteps")
+        return true
+
+## `add_event_listener(realm, target, event_name, [this] { steps; return true; })`.
+func html_media_controls_listen(this: HtmlMediaControls*, realm: Realm*, target: DomEventTarget*, event_name: ak.FlyString, steps: HtmlMediaControlsPlainSteps):
+    let captures = new HtmlMediaControlsPlainListener(this = this, steps = steps) else trap("out of memory")
+    discard(html_media_controls_add_event_listener_t_handler(this, realm, target, event_name, ak.Function0[bool](call = HtmlMediaControlsPlainListener.call, context = captures)))
+
+## set_up_event_listeners' `static constexpr auto compute_timeline_position = [](UIEvents::MouseEvent const& event,
+## DOM::Element& timeline_element, double duration) -> Optional<double> { ... }`.
+func html_media_controls_compute_timeline_position(event: DomEvent*, timeline_element: DomElement*, duration: f64) -> f64?:
+    if math.is_nan(duration) or duration == 0.0:
+        return none
+    let rect = dom_element_get_bounding_client_rect(timeline_element)
+    let left = gfx.css_pixel_rect_left(&rect)
+    let width = gfx.css_pixel_rect_width(&rect)
+    let fraction = ak.clamp_f64((ui_events_mouse_event_client_x(as_ui_events_mouse_event(event)) - gfx.css_pixels_to_double_const(&left)) / gfx.css_pixels_to_double_const(&width), 0.0, 1.0)
+    return fraction * duration
+
+## set_up_event_listeners' `static constexpr auto compute_volume = [](UIEvents::MouseEvent const& event,
+## DOM::Element& volume_element) -> Optional<double> { ... }`.
+func html_media_controls_compute_volume(event: DomEvent*, volume_element: DomElement*) -> f64?:
+    let rect = dom_element_get_bounding_client_rect(volume_element)
+    let left = gfx.css_pixel_rect_left(&rect)
+    let width = gfx.css_pixel_rect_width(&rect)
+    return ak.clamp_f64((ui_events_mouse_event_client_x(as_ui_events_mouse_event(event)) - gfx.css_pixels_to_double_const(&left)) / gfx.css_pixels_to_double_const(&width), 0.0, 1.0)
+
+## The captures of the scrubbing listeners: the controls and, for mouseup, the mousemove listener
+## to remove (`[this, mousemove_listener]`).
+struct HtmlMediaControlsScrubListener:
+    var this: HtmlMediaControls*
+    var mousemove_listener: DomIdlEventListener*?
+
+    ## The timeline's mousedown handler.
+    static func timeline_mousedown(context: void*?, event: DomEvent*) -> bool:
+        let captures = (HtmlMediaControlsScrubListener*)(context else trap("timeline mousedown: no captures"))
+        let this = captures.this
+        let media_element = html_media_controls_media_element(this)
+        let timeline_element = html_media_controls_element(html_media_controls_dom(this).timeline_element)
+
+        let position = html_media_controls_compute_timeline_position(event, timeline_element, html_media_element_duration(media_element)) else return false
+
+        this.m_scrubbing_timeline = HtmlMediaControlsScrubbing.while_paused
+        if not html_media_element_paused(media_element):
+            html_media_element_pause(media_element)
+            this.m_scrubbing_timeline = HtmlMediaControlsScrubbing.while_playing
+
+        html_media_controls_set_current_time(this, position)
+
+        let realm = html_element_realm(media_element.html_element())
+        let window = html_media_controls_window(realm)
+
+        let move_captures = new HtmlMediaControlsScrubListener(this = this, mousemove_listener = none) else trap("out of memory")
+        let mousemove_listener = html_media_controls_add_event_listener_mouse_event(this, realm, window.dom_event_target(), ui_events_event_names_mousemove, ak.Function1[DomEvent*, bool](call = HtmlMediaControlsScrubListener.timeline_mousemove, context = move_captures))
+
+        let up_captures = new HtmlMediaControlsScrubListener(this = this, mousemove_listener = mousemove_listener) else trap("out of memory")
+        discard(html_media_controls_add_event_listener_html_media_controls_listen_onc_t_handler_2(this, realm, window.dom_event_target(), ui_events_event_names_mouseup, HtmlMediaControlsListenOnce.yes, ak.Function1[DomEvent*, bool](call = HtmlMediaControlsScrubListener.timeline_mouseup, context = up_captures)))
+
+        return true
+
+    ## The window's mousemove handler while scrubbing the timeline.
+    static func timeline_mousemove(context: void*?, event: DomEvent*) -> bool:
+        let captures = (HtmlMediaControlsScrubListener*)(context else trap("timeline mousemove: no captures"))
+        let this = captures.this
+        let media_element = html_media_controls_media_element(this)
+        let timeline_element = html_media_controls_element(html_media_controls_dom(this).timeline_element)
+
+        let position = html_media_controls_compute_timeline_position(event, timeline_element, html_media_element_duration(media_element)) else return false
+
+        html_media_controls_set_current_time(this, position)
+        return true
+
+    ## The window's mouseup handler ending a timeline scrub.
+    static func timeline_mouseup(context: void*?, event: DomEvent*) -> bool:
+        let captures = (HtmlMediaControlsScrubListener*)(context else trap("timeline mouseup: no captures"))
+        let this = captures.this
+        let media_element = html_media_controls_media_element(this)
+        let timeline_element = html_media_controls_element(html_media_controls_dom(this).timeline_element)
+
+        let was_playing = this.m_scrubbing_timeline == HtmlMediaControlsScrubbing.while_playing
+        this.m_scrubbing_timeline = HtmlMediaControlsScrubbing.no
+
+        if let position = html_media_controls_compute_timeline_position(event, timeline_element, html_media_element_duration(media_element)):
+            html_media_controls_set_current_time(this, position)
+
+        if was_playing:
+            if html_media_element_ended(media_element):
+                let loop = dom_element_has_attribute(media_element.dom_element(), html_attribute_names_loop)
+                if loop:
+                    discard(html_media_element_play(media_element))
+            else:
+                discard(html_media_element_play(media_element))
+
+        html_media_controls_update_play_pause_icon(this)
+
+        let window_inner = as_html_window((gc.Cell*)html_relevant_global_object((JsObject*)media_element))
+        dom_event_target_remove_event_listener_without_options(window_inner.dom_event_target(), ui_events_event_names_mousemove, captures.mousemove_listener else trap("timeline mouseup: no mousemove listener"))
+        return true
+
+    ## The volume area's mousedown handler.
+    static func volume_mousedown(context: void*?, event: DomEvent*) -> bool:
+        let captures = (HtmlMediaControlsScrubListener*)(context else trap("volume mousedown: no captures"))
+        let this = captures.this
+        let media_element = html_media_controls_media_element(this)
+        let volume_element = html_media_controls_element(html_media_controls_dom(this).volume_element)
+
+        let volume = html_media_controls_compute_volume(event, volume_element) else return false
+
+        this.m_scrubbing_volume = true
+
+        html_media_controls_set_volume(this, volume)
+
+        let realm = html_element_realm(media_element.html_element())
+        let window = html_media_controls_window(realm)
+
+        let move_captures = new HtmlMediaControlsScrubListener(this = this, mousemove_listener = none) else trap("out of memory")
+        let mousemove_listener = html_media_controls_add_event_listener_mouse_event(this, realm, window.dom_event_target(), ui_events_event_names_mousemove, ak.Function1[DomEvent*, bool](call = HtmlMediaControlsScrubListener.volume_mousemove, context = move_captures))
+
+        let up_captures = new HtmlMediaControlsScrubListener(this = this, mousemove_listener = mousemove_listener) else trap("out of memory")
+        discard(html_media_controls_add_event_listener_html_media_controls_listen_onc_t_handler_2(this, realm, window.dom_event_target(), ui_events_event_names_mouseup, HtmlMediaControlsListenOnce.yes, ak.Function1[DomEvent*, bool](call = HtmlMediaControlsScrubListener.volume_mouseup, context = up_captures)))
+
+        return true
+
+    ## The window's mousemove handler while scrubbing the volume.
+    static func volume_mousemove(context: void*?, event: DomEvent*) -> bool:
+        let captures = (HtmlMediaControlsScrubListener*)(context else trap("volume mousemove: no captures"))
+        let this = captures.this
+        let volume_element = html_media_controls_element(html_media_controls_dom(this).volume_element)
+
+        let volume = html_media_controls_compute_volume(event, volume_element) else return false
+
+        html_media_controls_set_volume(this, volume)
+        return true
+
+    ## The window's mouseup handler ending a volume scrub.
+    static func volume_mouseup(context: void*?, event: DomEvent*) -> bool:
+        let captures = (HtmlMediaControlsScrubListener*)(context else trap("volume mouseup: no captures"))
+        let this = captures.this
+        let media_element = html_media_controls_media_element(this)
+        let volume_element = html_media_controls_element(html_media_controls_dom(this).volume_element)
+
+        this.m_scrubbing_volume = false
+
+        if let volume = html_media_controls_compute_volume(event, volume_element):
+            html_media_controls_set_volume(this, volume)
+
+        let window_inner = as_html_window((gc.Cell*)html_relevant_global_object((JsObject*)media_element))
+        dom_event_target_remove_event_listener_without_options(window_inner.dom_event_target(), ui_events_event_names_mousemove, captures.mousemove_listener else trap("volume mouseup: no mousemove listener"))
+        return true
+
+## The keydown handler: `[this](UIEvents::KeyboardEvent const& event) { ... }`.
+func html_media_controls_keydown(context: void*?, event: DomEvent*) -> bool:
+    let this = (HtmlMediaControls*)(context else trap("keydown: no controls"))
+    let media_element = html_media_controls_media_element(this)
+
+    let arrow_time_step = 5.0
+    let arrow_volume_step = 0.1
+
+    let key = ui_events_keyboard_event_key(as_if_ui_events_keyboard_event(event) else trap("keydown: not a KeyboardEvent"))
+
+    if ak.string_eq_string_view(&key, ak.sv(" ")):
+        html_media_controls_toggle_playback(this)
+    elif ak.string_eq_string_view(&key, ak.sv("Home")):
+        html_media_controls_set_current_time(this, 0.0)
+    elif ak.string_eq_string_view(&key, ak.sv("End")):
+        html_media_controls_set_current_time(this, html_media_element_duration(media_element))
+    elif ak.string_eq_string_view(&key, ak.sv("ArrowLeft")):
+        html_media_controls_set_current_time(this, html_media_element_current_time(media_element) - arrow_time_step)
+    elif ak.string_eq_string_view(&key, ak.sv("ArrowRight")):
+        html_media_controls_set_current_time(this, html_media_element_current_time(media_element) + arrow_time_step)
+    elif ak.string_eq_string_view(&key, ak.sv("ArrowUp")):
+        html_media_controls_set_volume(this, html_media_element_volume(media_element) + arrow_volume_step)
+    elif ak.string_eq_string_view(&key, ak.sv("ArrowDown")):
+        html_media_controls_set_volume(this, html_media_element_volume(media_element) - arrow_volume_step)
+    elif ak.string_eq_string_view(&key, ak.sv("m")) or ak.string_eq_string_view(&key, ak.sv("M")):
+        html_media_controls_toggle_mute(this)
+    else:
+        return false
+
+    return true
+
+## The requestAnimationFrame callback: `[this](JS::VM&) { update_timeline(); ...; return js_undefined(); }`.
+func html_media_controls_animation_frame(context: void*?, vm: Vm*) -> JsValue!:
+    let this = (HtmlMediaControls*)(context else trap("animation frame: no controls"))
+    html_media_controls_update_timeline(this)
+
+    let media_element = html_media_controls_media_element(this)
+    let realm = html_element_realm(media_element.html_element())
+    let window = html_media_controls_window(realm)
+    this.m_request_animation_frame_id = html_window_request_animation_frame(window, gc.weak_ptr(&this.m_request_animation_frame_callback) else trap("animation frame: no callback"))
+
+    return js_undefined()
+
+## Ported from MediaControls.cpp:140 Web::HTML::MediaControls::set_up_event_listeners.
+pub func html_media_controls_set_up_event_listeners(this: HtmlMediaControls*):
+    let media_element = html_media_controls_media_element(this)
+    let realm = html_element_realm(media_element.html_element())
+    let window = html_media_controls_window(realm)
+    let dom = html_media_controls_dom(this)
+    let target = media_element.dom_event_target()
+
+    # Media element state events
+    html_media_controls_listen(this, realm, target, html_event_names_play, HtmlMediaControlsPlainSteps.update_play_state)
+    html_media_controls_listen(this, realm, target, html_event_names_pause, HtmlMediaControlsPlainSteps.update_play_state)
+    html_media_controls_listen(this, realm, target, html_event_names_playing, HtmlMediaControlsPlainSteps.update_play_state)
+    html_media_controls_listen(this, realm, target, html_event_names_seeked, HtmlMediaControlsPlainSteps.update_placeholder)
+    html_media_controls_listen(this, realm, target, html_event_names_timeupdate, HtmlMediaControlsPlainSteps.update_time)
+    html_media_controls_listen(this, realm, target, html_event_names_durationchange, HtmlMediaControlsPlainSteps.update_time)
+    html_media_controls_listen(this, realm, target, html_event_names_volumechange, HtmlMediaControlsPlainSteps.update_volume)
+    html_media_controls_listen(this, realm, target, html_event_names_loadedmetadata, HtmlMediaControlsPlainSteps.update_metadata)
+    html_media_controls_listen(this, realm, target, html_event_names_addtrack, HtmlMediaControlsPlainSteps.update_volume)
+    html_media_controls_listen(this, realm, target, html_event_names_emptied, HtmlMediaControlsPlainSteps.update_emptied)
+
+    if html_media_controls_optional_element(dom.fullscreen_button) != none:
+        html_media_controls_listen(this, realm, dom_node_document(media_element.dom_node()).dom_event_target(), html_event_names_fullscreenchange, HtmlMediaControlsPlainSteps.update_fullscreen)
+
+    # Play/pause button
+    html_media_controls_listen(this, realm, html_media_controls_element(dom.play_button).dom_event_target(), ui_events_event_names_click, HtmlMediaControlsPlainSteps.toggle_playback)
+
+    # Video overlay click — toggle playback when clicking outside the controls
+    if let video_overlay = html_media_controls_optional_element(dom.video_overlay):
+        html_media_controls_listen(this, realm, video_overlay.dom_event_target(), ui_events_event_names_click, HtmlMediaControlsPlainSteps.toggle_playback)
+
+    # Timeline scrubbing
+    let timeline_captures = new HtmlMediaControlsScrubListener(this = this, mousemove_listener = none) else trap("out of memory")
+    discard(html_media_controls_add_event_listener_mouse_event(this, realm, html_media_controls_element(dom.timeline_element).dom_event_target(), ui_events_event_names_mousedown, ak.Function1[DomEvent*, bool](call = HtmlMediaControlsScrubListener.timeline_mousedown, context = timeline_captures)))
+
+    # Speaker button
+    html_media_controls_listen(this, realm, html_media_controls_element(dom.mute_button).dom_event_target(), ui_events_event_names_click, HtmlMediaControlsPlainSteps.toggle_mute_button)
+
+    # Volume scrubbing
+    let volume_captures = new HtmlMediaControlsScrubListener(this = this, mousemove_listener = none) else trap("out of memory")
+    discard(html_media_controls_add_event_listener_mouse_event(this, realm, html_media_controls_element(dom.volume_area).dom_event_target(), ui_events_event_names_mousedown, ak.Function1[DomEvent*, bool](call = HtmlMediaControlsScrubListener.volume_mousedown, context = volume_captures)))
+
+    # Fullscreen button
+    if let fullscreen_button = html_media_controls_optional_element(dom.fullscreen_button):
+        html_media_controls_listen(this, realm, fullscreen_button.dom_event_target(), ui_events_event_names_click, HtmlMediaControlsPlainSteps.toggle_fullscreen)
+
+        let video_overlay = html_media_controls_optional_element(dom.video_overlay) else trap("VERIFY: m_dom->video_overlay")
+        html_media_controls_listen(this, realm, video_overlay.dom_event_target(), ui_events_event_names_dblclick, HtmlMediaControlsPlainSteps.toggle_fullscreen)
+
+    # Hover detection for video controls visibility
+    if is_html_video_element(media_element):
+        html_media_controls_listen(this, realm, target, ui_events_event_names_mouseenter, HtmlMediaControlsPlainSteps.show)
+        html_media_controls_listen(this, realm, target, ui_events_event_names_mousemove, HtmlMediaControlsPlainSteps.show)
+        html_media_controls_listen(this, realm, target, ui_events_event_names_mouseleave, HtmlMediaControlsPlainSteps.hide)
+        html_media_controls_listen(this, realm, html_media_controls_element(dom.control_bar).dom_event_target(), ui_events_event_names_mouseenter, HtmlMediaControlsPlainSteps.enter_controls)
+        html_media_controls_listen(this, realm, html_media_controls_element(dom.control_bar).dom_event_target(), ui_events_event_names_mouseleave, HtmlMediaControlsPlainSteps.leave_controls)
+
+    # Keyboard handling
+    discard(html_media_controls_add_event_listener_keyboard_event(this, realm, target, ui_events_event_names_keydown, ak.Function1[DomEvent*, bool](call = html_media_controls_keydown, context = this)))
+
+    # Use requestAnimationFrame to update the timeline, since timeupdate only fires every 250ms.
+    let request_animation_frame_callback_function = js_native_function_create(realm, JsNativeFunctionBehaviour(call = html_media_controls_animation_frame, context = this), 0, ak.utf16_fly_string_new(), realm)
+    let request_animation_frame_callback = realm_create_idl_callback_type_realm(realm, (JsObject*)request_animation_frame_callback_function, realm, IdlOperationReturnsPromise.no)
+    this.m_request_animation_frame_callback = gc.make_weak(request_animation_frame_callback)
+    this.m_request_animation_frame_id = html_window_request_animation_frame(window, request_animation_frame_callback)

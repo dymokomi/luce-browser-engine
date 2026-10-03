@@ -11,7 +11,7 @@ for file in $(git ls-files '*.lucb' | grep -v -e '/types_' -e '/stubs/' -e '/gen
     luce-base fmt "$file" --check > /dev/null || { echo "$file is not formatted (luce-base fmt $file --write)"; exit 1; }
 done
 
-for module in src/luce_browser_engine/web tools/gen_css_values tools/embed_css; do
+for module in src/luce_browser_engine/web tools/gen_css_values tools/embed_css tools/gen_dom_tree; do
     echo "== luce-base check $module -W"
     # -W reports warnings without failing, so any output at all fails the run.
     output=$(luce-base check "$module" -W 2>&1) || { echo "$output"; exit 1; }
@@ -41,3 +41,11 @@ build/embed_css data/css "$generated"
 for file in "$generated"/*.lucb; do
     cmp "$file" "src/luce_browser_engine/web/generated/$(basename "$file")"
 done
+
+# The DOM of the media controls (web/generated/html/media_controls_dom.lucb) is written by
+# tools/gen_dom_tree from data/html/MediaControls.html and the engine's tag and attribute names.
+echo "== tools/gen_dom_tree: regenerate web/generated/html/media_controls_dom.lucb and compare"
+mkdir -p "$generated/html"
+luce-base build tools/gen_dom_tree -o build/gen_dom_tree
+build/gen_dom_tree data/html src/luce_browser_engine/web "$generated/html"
+cmp "$generated/html/media_controls_dom.lucb" src/luce_browser_engine/web/generated/html/media_controls_dom.lucb

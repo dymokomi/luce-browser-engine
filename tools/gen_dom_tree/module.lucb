@@ -1,0 +1,517 @@
+#==============================================================================================
+#
+#   gen_dom_tree - the generator of the engine's HTML-template DOM trees (MediaControlsDOM)
+#
+#   DESCRIPTION:
+#       Port of Meta/Generators/generate_dom_tree.py, which turns an HTML template into the
+#       C++ constructor of a struct that builds that DOM under a parent node. It reads
+#       data/html/MediaControls.html (and the style sheet its <link rel=stylesheet> names) and
+#       writes src/luce_browser_engine/web/generated/html/media_controls_dom.lucb, the Luce
+#       constructor of HTML::MediaControlsDOM (the struct and its Options enum are in
+#       generated/html/types_media_controls_dom.lucb).
+#
+#       As the Python generator does:
+#         - `data-name` names an element: it becomes a field (a GC::Weak) of the struct;
+#           other elements are `element_N` locals;
+#         - `data-option="video"` wraps the element and its subtree in
+#           `if (has_flag(options, Options::Video))`;
+#         - inside <svg>, tag and attribute names resolve to SVG::TagNames / SVG::AttributeNames
+#           when those declare them, else to the HTML tables;
+#         - `<link rel=stylesheet href=...>` becomes a <style> element whose text is the
+#           stripped style sheet, embedded as a constant;
+#         - non-blank text sets the parent's text content; comments are dropped.
+#       The Python generator reads the C++ TagNames.h / AttributeNames.h tables; this one reads
+#       the engine's own declarations of them (html/types_tag_names.lucb, html/types_attribute_names.lucb,
+#       svg/types_tag_names.lucb, svg/types_attribute_names.lucb) and answers Luce names. The
+#       template is tokenized by a small scanner covering what Python's html.parser.HTMLParser
+#       reports for it (start, end and self-closing tags, quoted attributes, text, comments).
+#
+#       Usage: gen_dom_tree DATA_DIRECTORY WEB_SOURCE_DIRECTORY OUTPUT_DIRECTORY, e.g.
+#       gen_dom_tree data/html src/luce_browser_engine/web src/luce_browser_engine/web/generated/html.
+#       test.sh regenerates into a temporary directory and compares with the committed fragment.
+#
+#       Copyright (c) 2026, the Ladybird developers.
+#       Copyright (c) 2026 the luce-browser authors.
+#       SPDX-License-Identifier: BSD-2-Clause (see data/html/LICENSE)
+#
+#==============================================================================================
+
+import c
+import files
+import strings
+
+## The HTML void elements, which cannot have children (HTML_VOID_ELEMENTS).
+let html_void_elements: str[14] = ["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"]
+
+## The most open elements the template may nest.
+let max_depth: usize = 64
+
+## An open element (DOMElement): its variable, tag and option.
+struct OpenElement:
+    var var_name: str
+    var tag: str
+    var option: str
+
+## The generator's state (DOMTreeParser).
+struct Generator:
+    var output: strings.Builder
+    var tables: Tables
+    var data_directory: str
+    var indentation: usize
+    var svg_depth: usize
+    var unnamed_element_counter: usize
+    var stack: OpenElement[64]
+    var stack_size: usize
+    var stylesheet_sources: strings.Builder
+    var stylesheet_count: usize
+    ## The default member initializers of the named fields (`GC::Weak<DOM::Element> name;` starts null).
+    var field_initializers: strings.Builder
+    ## The output's length before the last line, if that line was blank (`not self.lines[-1]`).
+    var blank_line_start: usize?
+
+## The four name tables, as the text of their Luce declarations.
+struct Tables:
+    var html_tags: str
+    var html_attributes: str
+    var svg_tags: str
+    var svg_attributes: str
+
+## Generate the MediaControlsDOM constructor from `arguments[1]` into `arguments[3]`.
+pub func main(arguments: c.str[]) -> i32!:
+    if arguments.length != 4:
+        print("usage: gen_dom_tree DATA_DIRECTORY WEB_SOURCE_DIRECTORY OUTPUT_DIRECTORY")
+        return 2
+    let data_directory = try str(arguments[1])
+    let web_directory = try str(arguments[2])
+    let output_directory = try str(arguments[3])
+
+    let tables = Tables(
+        html_tags = try read_text(try cat([web_directory, "/html/types_tag_names.lucb"])),
+        html_attributes = try read_text(try cat([web_directory, "/html/types_attribute_names.lucb"])),
+        svg_tags = try read_text(try cat([web_directory, "/svg/types_tag_names.lucb"])),
+        svg_attributes = try read_text(try cat([web_directory, "/svg/types_attribute_names.lucb"])),
+    )
+    let html = try read_text(try cat([data_directory, "/MediaControls.html"]))
+
+    var generator: Generator = ---
+    generator.output = try strings.Builder.create(16384)
+    generator.tables = tables
+    generator.data_directory = data_directory
+    generator.indentation = 0
+    generator.svg_depth = 0
+    generator.unnamed_element_counter = 0
+    generator.stack_size = 0
+    generator.stylesheet_sources = try strings.Builder.create(8192)
+    generator.stylesheet_count = 0
+    generator.field_initializers = try strings.Builder.create(1024)
+    generator.blank_line_start = none
+    try feed(&generator, html)
+
+    # `if not parser.lines[-1]: parser.lines.pop()`
+    if let start = generator.blank_line_start:
+        try generator.output.truncate(start)
+
+    let fragment = try render(&generator)
+    try files.write((c.str)try cat([output_directory, "/media_controls_dom.lucb"]), fragment.bytes)
+    return 0
+
+## The text of the file at `path`.
+func read_text(path: str) -> str!:
+    let bytes = try files.read((c.str)path)
+    return try str(bytes)
+
+# mark: Output lines ============================================================================
+
+## `_add_line(line)`: a line at the current indentation (one level is the function body's).
+func add_line(this: Generator*, line: str) -> !:
+    this.blank_line_start = none
+    for _ in 0..<(this.indentation + 1):
+        try this.output.put("    ")
+    try this.output.put(line)
+    try this.output.put("\n")
+
+## `_add_line("")`: a blank line.
+func add_blank_line(this: Generator*) -> !:
+    this.blank_line_start = this.output.length()
+    try this.output.put("\n")
+
+## `_add_line(...)` of a formatted line.
+func add_line_parts(this: Generator*, parts: const str[]) -> !:
+    try add_line(this, try cat(parts))
+
+# mark: Names ===================================================================================
+
+## The Luce identifier of a template name: `-` and other non-identifier characters become `_`
+## (to_snake_case) and an uppercase letter starts a new lowercase word (`viewBox` → `view_box`),
+## which is how the engine's name tables spell the C++ identifiers.
+func luce_identifier(name: str) -> str!:
+    var builder = try strings.Builder.create()
+    for byte in name.bytes:
+        if byte >= 'A' and byte <= 'Z':
+            try builder.put("_")
+            let lower: u8[1] = [byte + 32]
+            discard(try builder.write(lower))
+        elif (byte >= 'a' and byte <= 'z') or (byte >= '0' and byte <= '9') or byte == '_':
+            let one: u8[1] = [byte]
+            discard(try builder.write(one))
+        else:
+            try builder.put("_")
+    return builder.view()
+
+## Whether `table` declares `pub var <name>: ak.FlyString`.
+func declares(table: str, name: str) -> bool!:
+    let declaration = try cat(["\npub var ", name, ": ak.FlyString\n"])
+    return strings.contains(table, declaration)
+
+## resolve_tag: (namespace, tag name) of `tag`.
+func resolve_tag(this: Generator*, tag: str, in_svg: bool) -> (str, str)!:
+    let identifier = try luce_identifier(tag)
+    let svg_name = try cat(["svg_tag_names_", identifier])
+    if in_svg and try declares(this.tables.svg_tags, svg_name):
+        return ("namespace_svg", svg_name)
+
+    let html_name = try cat(["html_tag_names_", identifier])
+    if not try declares(this.tables.html_tags, html_name):
+        print(f"gen_dom_tree: unknown HTML tag {tag}")
+        return error(error_unknown_name, "unknown HTML tag")
+    return ("namespace_html", html_name)
+
+## resolve_attribute: the attribute name of `attribute`.
+func resolve_attribute(this: Generator*, attribute: str, in_svg: bool) -> str!:
+    let identifier = try luce_identifier(attribute)
+    let svg_name = try cat(["svg_attribute_names_", identifier])
+    if in_svg and try declares(this.tables.svg_attributes, svg_name):
+        return svg_name
+
+    let html_name = try cat(["html_attribute_names_", identifier])
+    if not try declares(this.tables.html_attributes, html_name):
+        print(f"gen_dom_tree: unknown HTML attribute {attribute}")
+        return error(error_unknown_name, "unknown HTML attribute")
+    return html_name
+
+## The error of a template name the tables do not declare.
+let error_unknown_name: ErrorCode = ErrorCode.package(101)
+
+## The error of a template the scanner cannot read.
+let error_bad_template: ErrorCode = ErrorCode.package(102)
+
+## A Luce string literal of `text` (`"..."` with `\\`, `\"`, `\n`, `\t` and `\r` escaped).
+func quoted(text: str) -> str!:
+    var builder = try strings.Builder.create(text.length + 2)
+    try builder.put("\"")
+    for byte in text.bytes:
+        if byte == '\\':
+            try builder.put("\\\\")
+        elif byte == '"':
+            try builder.put("\\\"")
+        elif byte == '\n':
+            try builder.put("\\n")
+        elif byte == '\t':
+            try builder.put("\\t")
+        elif byte == '\r':
+            try builder.put("\\r")
+        else:
+            let one: u8[1] = [byte]
+            discard(try builder.write(one))
+    try builder.put("\"")
+    return builder.view()
+
+# mark: Tags ====================================================================================
+
+## `_current_parent()` as a DomNode* expression: `parent`, or the innermost open element's node.
+func parent_node(this: Generator*) -> str!:
+    if this.stack_size == 0:
+        return "parent"
+    return try cat([this.stack[this.stack_size - 1].var_name, ".dom_node()"])
+
+## One attribute of a start tag.
+struct Attribute:
+    var name: str
+    var value: str
+
+## `_handle_tag(tag, attrs, self_closing)`.
+func handle_tag(this: Generator*, tag: str, attributes: const Attribute[], self_closing: bool) -> !:
+    # Wrap optional nodes in if statements
+    var option = ""
+    var data_name = ""
+    for attribute in attributes:
+        if attribute.name == "data-option":
+            option = attribute.value
+        elif attribute.name == "data-name":
+            data_name = attribute.value
+    if option != "":
+        let option_case = try luce_identifier(option)
+        try add_line_parts(this, ["if ((u8)options & (u8)HtmlMediaControlsDomOptions.", option_case, ") != 0:"])
+        this.indentation += 1
+
+    # Handle SVG contexts
+    var in_svg = this.svg_depth > 0
+    if tag == "svg":
+        this.svg_depth += 1
+        in_svg = true
+
+    # Handle <link rel="stylesheet"> specially
+    if tag == "link":
+        try handle_stylesheet_link(this, attributes)
+        return
+
+    # Determine variable name
+    var var_name = ""
+    var is_named = false
+    if data_name != "":
+        var_name = try luce_identifier(data_name)
+        is_named = true
+        discard(try this.field_initializers.write(f"    this.{var_name} = gc.make_weak(no_element)\n"))
+    else:
+        this.unnamed_element_counter += 1
+        var_name = try cat(["element_", try decimal(this.unnamed_element_counter)])
+
+    let (namespace_expression, tag_expression) = try resolve_tag(this, tag, in_svg)
+    let parent = try parent_node(this)
+
+    try add_line_parts(this, ["let ", var_name, " = dom_create_element(document, ", tag_expression, ", ", namespace_expression, ") else trap(\"MUST: DOM::create_element\")"])
+    if is_named:
+        try add_line_parts(this, ["this.", var_name, " = gc.make_weak(", var_name, ")"])
+
+    # Set attributes (skip data-name)
+    for attribute in attributes:
+        if attribute.name == "data-option" or attribute.name == "data-name":
+            continue
+        let attribute_expression = try resolve_attribute(this, attribute.name, in_svg)
+        try add_line_parts(this, ["dom_element_set_attribute_value(", var_name, ", ", attribute_expression, ", ak.string_from_str(", try quoted(attribute.value), "))"])
+
+    try add_line_parts(this, ["discard(dom_node_append_child(", parent, ", ", var_name, ".dom_node()) else trap(\"MUST: append_child\"))"])
+
+    try add_blank_line(this)
+
+    if this.stack_size == max_depth:
+        return error(error_bad_template, "the template nests too deeply")
+    this.stack[this.stack_size] = OpenElement(var_name = var_name, tag = tag, option = option)
+    this.stack_size += 1
+
+    if self_closing or (is_void_element(tag) and not in_svg):
+        try handle_endtag(this, tag)
+
+## Whether `tag` is an HTML void element.
+func is_void_element(tag: str) -> bool:
+    for name in html_void_elements:
+        if name == tag:
+            return true
+    return false
+
+## `handle_endtag(tag)`.
+func handle_endtag(this: Generator*, tag: str) -> !:
+    if this.stack_size == 0 or this.stack[this.stack_size - 1].tag != tag:
+        return
+    this.stack_size -= 1
+    let node = this.stack[this.stack_size]
+
+    if tag == "svg":
+        this.svg_depth -= 1
+    if node.option != "":
+        this.indentation -= 1
+        if let start = this.blank_line_start:
+            try this.output.truncate(start)
+            this.blank_line_start = none
+        let option_case = try pascal_case(node.option)
+        try add_line_parts(this, ["# Options::", option_case])
+        try add_blank_line(this)
+
+## to_pascal_case: `video` → `Video` (the C++ enumerator's name, for the closing comment).
+func pascal_case(text: str) -> str!:
+    var builder = try strings.Builder.create()
+    var start_of_word = true
+    for byte in text.bytes:
+        let is_letter_or_digit = (byte >= 'a' and byte <= 'z') or (byte >= 'A' and byte <= 'Z') or (byte >= '0' and byte <= '9')
+        if not is_letter_or_digit:
+            start_of_word = true
+            continue
+        var out = byte
+        if start_of_word and byte >= 'a' and byte <= 'z':
+            out = byte - 32
+        elif not start_of_word and byte >= 'A' and byte <= 'Z':
+            out = byte + 32
+        let one: u8[1] = [out]
+        discard(try builder.write(one))
+        start_of_word = false
+    return builder.view()
+
+## `handle_data(data)`: non-blank text sets the current parent's text content.
+func handle_data(this: Generator*, data: str) -> !:
+    if strings.trim(data) == "":
+        return
+    let parent = try parent_node(this)
+    try add_line_parts(this, ["dom_node_set_text_content(", parent, ", ak.utf16_string_from_str(", try quoted(data), ")) else trap(\"MUST: set_text_content\")"])
+    try add_blank_line(this)
+
+## `_handle_stylesheet_link(attrs)`: a <style> element holding the linked style sheet.
+func handle_stylesheet_link(this: Generator*, attributes: const Attribute[]) -> !:
+    var href = ""
+    for attribute in attributes:
+        if attribute.name == "href":
+            href = attribute.value
+    if href == "":
+        return error(error_bad_template, "a <link> without href")
+    let css_content = try read_text(try cat([this.data_directory, "/", href]))
+
+    this.unnamed_element_counter += 1
+    let var_name = try cat(["element_", try decimal(this.unnamed_element_counter)])
+
+    this.stylesheet_count += 1
+    let source_var = try cat(["html_media_controls_dom_stylesheet_source_", try decimal(this.stylesheet_count)])
+    try add_stylesheet_source(this, source_var, href, css_content)
+
+    let parent = try parent_node(this)
+
+    try add_line_parts(this, ["let ", var_name, " = dom_create_element(document, html_tag_names_style, namespace_html) else trap(\"MUST: DOM::create_element\")"])
+    try add_line_parts(this, ["dom_node_set_text_content(", var_name, ".dom_node(), ak.utf16_string_from_str(", source_var, ")) else trap(\"MUST: set_text_content\")"])
+    try add_line_parts(this, ["discard(dom_node_append_child(", parent, ", ", var_name, ".dom_node()) else trap(\"MUST: append_child\"))"])
+
+    try add_blank_line(this)
+
+## A style sheet source constant: `static String s_stylesheet_source_N = R"~~~(\n<stripped css>\n)~~~"_string;`.
+func add_stylesheet_source(this: Generator*, source_var: str, href: str, css_content: str) -> !:
+    let stripped = strings.trim(css_content)
+    discard(try this.stylesheet_sources.write(f"## The style sheet {href}, stripped (MediaControlsDOM.cpp's `{source_var}`).\n"))
+    discard(try this.stylesheet_sources.write(f"let {source_var}: str = \"\"\"\n\n"))
+    for byte in stripped.bytes:
+        if byte == '\\':
+            try this.stylesheet_sources.put("\\\\")
+        elif byte == '\t':
+            try this.stylesheet_sources.put("\\t")
+        elif byte == '\r':
+            try this.stylesheet_sources.put("\\r")
+        else:
+            let one: u8[1] = [byte]
+            discard(try this.stylesheet_sources.write(one))
+    try this.stylesheet_sources.put("\n\"\"\"\n\n")
+
+# mark: The template scanner ====================================================================
+
+## Whether `byte` is HTML whitespace.
+func is_space(byte: u8) -> bool:
+    return byte == ' ' or byte == '\n' or byte == '\t' or byte == '\r' or byte == 0x0c
+
+## Tokenize `html` and feed each start tag, end tag and text to the generator (HTMLParser.feed).
+func feed(this: Generator*, html: str) -> !:
+    let bytes = html.bytes
+    var position: usize = 0
+    while position < bytes.length:
+        if bytes[position] != '<':
+            # Text up to the next tag.
+            let start = position
+            while position < bytes.length and bytes[position] != '<':
+                position += 1
+            try handle_data(this, (str)bytes[start..<position])
+            continue
+
+        # A comment: dropped (handle_comment).
+        if strings.starts_with((str)bytes[position..<bytes.length], "<!--"):
+            let end = strings.find_from(html, "-->", position + 4) else return error(error_bad_template, "an unterminated comment")
+            position = end + 3
+            continue
+
+        # An end tag.
+        if position + 1 < bytes.length and bytes[position + 1] == '/':
+            let name_start = position + 2
+            var name_end = name_start
+            while name_end < bytes.length and bytes[name_end] != '>' and not is_space(bytes[name_end]):
+                name_end += 1
+            let close = strings.find_from(html, ">", name_end) else return error(error_bad_template, "an unterminated end tag")
+            try handle_endtag(this, (str)bytes[name_start..<name_end])
+            position = close + 1
+            continue
+
+        # A start tag: its name, then its attributes.
+        let name_start = position + 1
+        var cursor = name_start
+        while cursor < bytes.length and bytes[cursor] != '>' and bytes[cursor] != '/' and not is_space(bytes[cursor]):
+            cursor += 1
+        let tag = (str)bytes[name_start..<cursor]
+
+        var attributes: Attribute[16] = ---
+        var attribute_count: usize = 0
+        var self_closing = false
+        while true:
+            while cursor < bytes.length and is_space(bytes[cursor]):
+                cursor += 1
+            if cursor >= bytes.length:
+                return error(error_bad_template, "an unterminated start tag")
+            if bytes[cursor] == '>':
+                cursor += 1
+                break
+            if bytes[cursor] == '/':
+                self_closing = true
+                cursor += 1
+                continue
+            let attribute_start = cursor
+            while cursor < bytes.length and bytes[cursor] != '=' and bytes[cursor] != '>' and bytes[cursor] != '/' and not is_space(bytes[cursor]):
+                cursor += 1
+            let attribute_name = (str)bytes[attribute_start..<cursor]
+            var attribute_value = ""
+            if cursor < bytes.length and bytes[cursor] == '=':
+                cursor += 1
+                if cursor < bytes.length and (bytes[cursor] == '"' or bytes[cursor] == '\''):
+                    let quote = bytes[cursor]
+                    let value_start = cursor + 1
+                    cursor = value_start
+                    while cursor < bytes.length and bytes[cursor] != quote:
+                        cursor += 1
+                    attribute_value = (str)bytes[value_start..<cursor]
+                    cursor += 1
+                else:
+                    let value_start = cursor
+                    while cursor < bytes.length and bytes[cursor] != '>' and not is_space(bytes[cursor]):
+                        cursor += 1
+                    attribute_value = (str)bytes[value_start..<cursor]
+            if attribute_count == 16:
+                return error(error_bad_template, "too many attributes")
+            attributes[attribute_count] = Attribute(name = attribute_name, value = attribute_value)
+            attribute_count += 1
+        position = cursor
+
+        try handle_tag(this, tag, attributes[0..<attribute_count], self_closing)
+
+# mark: The fragment ============================================================================
+
+## The generated fragment: header, style sheet sources and the constructor.
+func render(this: Generator*) -> str!:
+    let rule = "#=============================================================================================="
+    var builder = try strings.Builder.create(this.output.length() + this.stylesheet_sources.length() + 4096)
+    try builder.put(rule)
+    try builder.put("\n#\n")
+    try builder.put("#   media_controls_dom - HTML::MediaControlsDOM: the DOM of MediaControls.html\n")
+    try builder.put("#\n#   DESCRIPTION:\n")
+    try builder.put("#       Generated by tools/gen_dom_tree from data/html/MediaControls.html; do not edit.\n")
+    try builder.put("#       The C++ it stands for, at Ladybird 47c82b38d0, is\n")
+    try builder.put("#       Build/Libraries/LibWeb/HTML/MediaControlsDOM.cpp,\n")
+    try builder.put("#       written by Meta/Generators/generate_dom_tree.py.\n")
+    try builder.put("#\n#       Copyright (c) 2026, the Ladybird developers.\n")
+    try builder.put("#       SPDX-License-Identifier: BSD-2-Clause (see data/html/LICENSE)\n#\n")
+    try builder.put(rule)
+    try builder.put("\n\n")
+    try builder.put(this.stylesheet_sources.view())
+    try builder.put("## Web::HTML::MediaControlsDOM::MediaControlsDOM(DOM::Document&, DOM::Node& parent, Options): builds the\n")
+    try builder.put("## template's DOM under `parent`, naming its data-name elements in `this`.\n")
+    try builder.put("pub func html_media_controls_dom_construct(this: HtmlMediaControlsDom*, document: DomDocument*, parent: DomNode*, options: HtmlMediaControlsDomOptions = HtmlMediaControlsDomOptions.none_):\n")
+    try builder.put("    # The fields' default member initializers: every GC::Weak starts null.\n")
+    try builder.put("    let no_element: DomElement*? = none\n")
+    try builder.put(this.field_initializers.view())
+    try builder.put("\n")
+    try builder.put(this.output.view())
+    return builder.view()
+
+# mark: Text helpers ============================================================================
+
+## The decimal digits of `value`.
+func decimal(value: usize) -> str!:
+    var buffer: u8[24] = ---
+    let text = try format(buffer, f"{value}")
+    return try strings.copy(text)
+
+## The concatenation of `parts`.
+func cat(parts: const str[]) -> str!:
+    var builder = try strings.Builder.create()
+    for part in parts:
+        try builder.put(part)
+    return builder.view()
