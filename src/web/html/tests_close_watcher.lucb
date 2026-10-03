@@ -1,0 +1,143 @@
+#==============================================================================================
+#
+#   tests_close_watcher - CloseWatcher and CloseWatcherManager (P1 polish)
+#
+#   DESCRIPTION:
+#       Ladybird tests close watchers through Tests/LibWeb/Text and WPT (script), so these pin
+#       the C++ in the window of a fully active document (a test page's top-level
+#       traversable and its initial about:blank document, tests_html_browsing's helpers):
+#       establishing watchers into groups (a new group only after user activation), requesting
+#       to close one (cancel, then close, at native listeners; a cancel listener preventing the
+#       close; a disabled or destroyed watcher), and processing the last group in reverse
+#       order, as the Escape key does. Layout/input/dialog-open-non-modal.html establishes one
+#       through <dialog open>.
+#
+#==============================================================================================
+
+# mark: Helpers =================================================================================
+
+## A close watcher's recorded events: 1 for cancel, 2 for close, in order.
+struct TestCloseWatcherLog:
+    var entries: i32[8]
+    var count: usize
+    var prevent_cancel: bool
+
+## A native listener behaviour: logs the event (cancel 1, close 2), and prevents a cancelable
+## cancel when the log asks for it.
+func test_close_watcher_listener_call(context: void*?, vm: Vm*) -> JsValue!:
+    let log = (TestCloseWatcherLog*)(context else trap("no captures"))
+    let event = as_dom_event((gc.Cell*)js_value_as_object(vm_argument(vm, 0)))
+    let type_ = dom_event_type(event)
+    log.entries[log.count] = 1 if ak.fly_string_eq_fly_string(&type_, &html_event_names_cancel) else 2
+    log.count += 1
+    if log.prevent_cancel and dom_event_cancelable(event):
+        dom_event_prevent_default(event)
+    return js_undefined()
+
+## Adds a recording listener for cancel and close to `close_watcher`.
+func test_close_watcher_listen(realm: Realm*, close_watcher: HtmlCloseWatcher*, log: TestCloseWatcherLog*):
+    let function = js_native_function_create(realm, JsNativeFunctionBehaviour(call = test_close_watcher_listener_call, context = log), 1, ak.utf16_fly_string_new(), realm)
+    let callback = realm_create_idl_callback_type_realm(realm, (JsObject*)function, realm, IdlOperationReturnsPromise.no)
+    let listener = dom_idl_event_listener_create(realm, callback)
+    dom_event_target_add_event_listener_without_options(close_watcher.dom_event_target(), html_event_names_cancel, listener)
+    dom_event_target_add_event_listener_without_options(close_watcher.dom_event_target(), html_event_names_close, listener)
+
+## Whether the log holds exactly `expected`.
+func test_close_watcher_log_is(log: const TestCloseWatcherLog*, expected: const i32[]) -> bool:
+    if log.count != expected.length:
+        return false
+    for i in 0..<expected.length:
+        if log.entries[i] != expected[i]:
+            return false
+    return true
+
+## A getEnabledState whose answer is the bool its context points at.
+func test_close_watcher_enabled(context: void*?) -> bool:
+    return *(bool*)(context else trap("no captures"))
+
+## The sizes of a manager's groups, last group last.
+func test_close_watcher_group_sizes_are(manager: HtmlCloseWatcherManager*, expected: const usize[]) -> bool:
+    if ak.vector_size(&manager.m_groups) != expected.length:
+        return false
+    for i in 0..<expected.length:
+        if ak.vector_size(ak.vector_at(&manager.m_groups, i)) != expected[i]:
+            return false
+    return true
+
+# mark: CloseWatcher ============================================================================
+
+test "close watchers: groups, request close (cancel then close), prevention, destroy and processing":
+    web_initialize_strings()
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    discard(web_test_install_agent(vm))
+    web_test_install_event_loop_plugin()
+    defer web_test_remove_event_loop_plugin()
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        let (page, traversable) = test_browsing_page_with_traversable(vm)
+        discard(page)
+        let window = html_navigable_active_window(traversable.html_navigable()) else trap("no active window")
+        assert(dom_document_is_fully_active(html_window_associated_document(window)))
+        let realm = bind_platform_object_realm(window.bind_platform_object())
+        var enabled = true
+        let get_enabled_state = gc.create_function0(vm_heap(vm), ak.Function0[bool](call = test_close_watcher_enabled, context = &enabled))
+
+        # The first watcher makes a group; the next joins it until a user activation allows another.
+        let manager = html_window_close_watcher_manager(window)
+        assert(html_window_close_watcher_manager(window) == manager)
+        assert(manager.m_allowed_number_of_groups == 1 and html_close_watcher_manager_can_prevent_close(manager))
+        let first = html_close_watcher_establish(window, get_enabled_state)
+        let second = html_close_watcher_establish(window, get_enabled_state)
+        assert(is_dom_event_target(first) and is_html_close_watcher(first) and not is_dom_node(first))
+        assert(test_close_watcher_group_sizes_are(manager, [2]))
+        assert(not html_close_watcher_manager_can_prevent_close(manager))
+        html_close_watcher_manager_notify_about_user_activation(manager)
+        html_close_watcher_manager_notify_about_user_activation(manager)
+        assert(manager.m_allowed_number_of_groups == 2 and not manager.m_next_user_interaction_allows_a_new_group)
+        let third = html_close_watcher_establish(window, get_enabled_state)
+        assert(test_close_watcher_group_sizes_are(manager, [2, 1]) and manager.m_next_user_interaction_allows_a_new_group)
+
+        # Requesting to close fires cancel (cancelable), then close, and destroys the watcher.
+        var log = TestCloseWatcherLog()
+        test_close_watcher_listen(realm, third, &log)
+        assert(html_close_watcher_request_close(third, false))
+        assert(test_close_watcher_log_is(&log, [1, 2]))
+        assert(not third.m_is_active and not third.m_is_running_cancel_action)
+        assert(test_close_watcher_group_sizes_are(manager, [2]))
+        # A destroyed watcher closes at once, without events.
+        assert(html_close_watcher_request_close(third, false))
+        assert(log.count == 2)
+
+        # A disabled watcher neither cancels nor closes.
+        var second_log = TestCloseWatcherLog(prevent_cancel = true)
+        test_close_watcher_listen(realm, second, &second_log)
+        enabled = false
+        assert(html_close_watcher_request_close(second, false))
+        html_close_watcher_close(second)
+        assert(second_log.count == 0 and second.m_is_active)
+        enabled = true
+
+        # A cancel listener that prevents the default keeps it open (canPreventClose holds
+        # without history-action activation when it is not required).
+        assert(not html_close_watcher_request_close(second, false))
+        assert(test_close_watcher_log_is(&second_log, [1]) and second.m_is_active)
+
+        # Processing the last group requests to close its watchers in reverse order, requiring
+        # history-action activation: the window has none, so cancel cannot prevent the close.
+        var first_log = TestCloseWatcherLog()
+        test_close_watcher_listen(realm, first, &first_log)
+        assert(html_close_watcher_manager_process_close_watchers(manager))
+        assert(test_close_watcher_log_is(&second_log, [1, 1, 2]))
+        assert(test_close_watcher_log_is(&first_log, [1, 2]))
+        assert(not first.m_is_active and not second.m_is_active)
+        assert(ak.vector_is_empty(&manager.m_groups))
+        assert(manager.m_allowed_number_of_groups == 1)
+        # Nothing left to process.
+        assert(not html_close_watcher_manager_process_close_watchers(manager))
+
+        # destroy() removes a watcher from its group and empties groups away.
+        let fourth = html_close_watcher_establish(window, get_enabled_state)
+        assert(test_close_watcher_group_sizes_are(manager, [1]))
+        html_close_watcher_destroy(fourth)
+        assert(ak.vector_is_empty(&manager.m_groups) and not fourth.m_is_active)
