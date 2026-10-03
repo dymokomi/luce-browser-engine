@@ -1,0 +1,253 @@
+#==============================================================================================
+#
+#   set - JS::Map and JS::Set before luce-js
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibJS/Runtime/Map.cpp (lines 1-93) and Map.h, Set.cpp (lines 1-105) and
+#       Set.h, with ValueTraits.h and SameValue (Value.cpp), as the phase-1 stand-ins of
+#       DESIGN.md §3.6: LibWeb keeps JS::Set and JS::Map objects of its own (FontFaceSet's set
+#       entries, CSSFontFeatureValuesMap's entries) and fills them natively. A Map keeps its keys
+#       in insertion order (a red-black tree of insertion ids) and its entries in a hash map, as
+#       LibJS does; iterating yields the entries in insertion order. GetSetRecord, Set::copy and
+#       the Map iterators need JS (phase 3); iteration here answers the keys or entries as a list.
+#
+#       Copyright (c) 2021, Idan Horowitz <idan.horowitz@serenityos.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: SameValue and ValueTraits ===============================================================
+
+## Ported from Libraries/LibJS/Runtime/Value.cpp:46 same_type_for_equality (static).
+func js_same_type_for_equality(lhs: JsValue, rhs: JsValue) -> bool:
+    # If the top two bytes are identical then either:
+    # both are NaN boxed Values with the same type
+    # or they are doubles which happen to have the same top bytes.
+    if (lhs.nan_boxed_value.m_value.encoded & gc.tag_extraction) == (rhs.nan_boxed_value.m_value.encoded & gc.tag_extraction):
+        return true
+
+    if js_value_is_number(lhs) and js_value_is_number(rhs):
+        return true
+
+    # One of the Values is not a number and they do not have the same tag
+    return false
+
+## Value::is_nan (Value.h): a number that is NaN.
+func js_value_is_nan(this: JsValue) -> bool:
+    return js_value_is_number(this) and math.is_nan(js_value_as_double(this))
+
+## Value::is_positive_zero / is_negative_zero (Value.h).
+func js_value_is_zero_with_sign(this: JsValue, negative: bool) -> bool:
+    if not js_value_is_number(this):
+        return false
+    let value = js_value_as_double(this)
+    return value == 0.0 and math.signbit(value) == negative
+
+## Ported from Libraries/LibJS/Runtime/Value.cpp:2225 JS::same_value:
+## 7.2.10 SameValue ( x, y ), https://tc39.es/ecma262/#sec-samevalue
+pub func js_same_value(lhs: JsValue, rhs: JsValue) -> bool:
+    # 1. If Type(x) is different from Type(y), return false.
+    if not js_same_type_for_equality(lhs, rhs):
+        return false
+
+    # 2. If x is a Number, then
+    if js_value_is_number(lhs):
+        # a. Return Number::sameValue(x, y).
+
+        # 6.1.6.1.14 Number::sameValue ( x, y ), https://tc39.es/ecma262/#sec-numeric-types-number-sameValue
+        # 1. If x is NaN and y is NaN, return true.
+        if js_value_is_nan(lhs) and js_value_is_nan(rhs):
+            return true
+        # 2. If x is +0𝔽 and y is -0𝔽, return false.
+        if js_value_is_zero_with_sign(lhs, false) and js_value_is_zero_with_sign(rhs, true):
+            return false
+        # 3. If x is -0𝔽 and y is +0𝔽, return false.
+        if js_value_is_zero_with_sign(lhs, true) and js_value_is_zero_with_sign(rhs, false):
+            return false
+        # 4. If x is the same Number value as y, return true.
+        # 5. Return false.
+        return js_value_as_double(lhs) == js_value_as_double(rhs)
+
+    # 3. Return SameValueNonNumber(x, y).
+    return js_same_value_non_number(lhs, rhs)
+
+## Ported from Libraries/LibJS/Runtime/Value.cpp:2274 JS::same_value_non_number:
+## 7.2.12 SameValueNonNumber ( x, y ), https://tc39.es/ecma262/#sec-samevaluenonnumeric.
+## BigInts and strings are JS cells (phase 3).
+pub func js_same_value_non_number(lhs: JsValue, rhs: JsValue) -> bool:
+    # 1. Assert: Type(x) is the same as Type(y).
+    assert(js_same_type_for_equality(lhs, rhs))
+    assert(not js_value_is_number(lhs))
+
+    # 3. If x is undefined, return true.
+    # 4. If x is null, return true.
+    # 6. If x is a Boolean, then
+    #    a. If x and y are both true or both false, return true; otherwise, return false.
+    # 7. If x is a Symbol, then
+    #    a. If x and y are both the same Symbol value, return true; otherwise, return false.
+    # 8. If x and y are the same Object value, return true. Otherwise, return false.
+    # NOTE: All the options above will have the exact same bit representation in Value, so we can directly compare the bits.
+    return lhs.nan_boxed_value.m_value.encoded == rhs.nan_boxed_value.m_value.encoded
+
+## Ported from Libraries/LibJS/Runtime/ValueTraits.h:18 JS::ValueTraits::hash. Strings and
+## BigInts are JS cells (phase 3).
+pub func js_value_traits_hash(value: JsValue) -> u32:
+    # In the IEEE 754 standard a NaN value is encoded as any value from 0x7ff0000000000001 to 0x7fffffffffffffff,
+    # with the least significant bits (referred to as the 'payload') carrying some kind of diagnostic information
+    # indicating the source of the NaN. Since ECMA262 does not differentiate between different kinds of NaN values,
+    # Sets and Maps must not differentiate between them either.
+    # This is achieved by replacing any NaN value by a canonical qNaN.
+    var encoded = value.nan_boxed_value.m_value.encoded
+    if js_value_is_nan(value):
+        encoded = gc.canon_nan_bits
+
+    return ak.u64_hash(encoded)  # FIXME: Is this the best way to hash pointers, doubles & ints?
+
+# mark: Map =====================================================================================
+
+## Ported from Libraries/LibJS/Runtime/Map.cpp:15 JS::Map::create (its prototype,
+## %Map.prototype%, is a JS object: phase 3).
+pub func js_map_create(realm: Realm*) -> JsMap*:
+    let this = (JsMap*)web_allocate_cell(realm, &js_map_class)
+    this.m_realm = realm
+    web_initialize_cell(this.cell(), realm)
+    return this
+
+## JS_OBJECT(Map, Object)'s class_name.
+func js_map_class_name_impl(this: gc.Cell*) -> ak.StringView:
+    return ak.sv("Map")
+
+## Ported from Libraries/LibJS/Runtime/Map.cpp:25 JS::Map::map_clear:
+## 24.1.3.1 Map.prototype.clear ( ), https://tc39.es/ecma262/#sec-map.prototype.clear
+pub func js_map_map_clear(this: JsMap*):
+    ak.red_black_tree_clear(&this.m_keys)
+    ak.hash_map_clear(&this.m_entries)
+
+## Ported from Libraries/LibJS/Runtime/Map.cpp:32 JS::Map::map_remove:
+## 24.1.3.3 Map.prototype.delete ( key ), https://tc39.es/ecma262/#sec-map.prototype.delete
+pub func js_map_map_remove(this: JsMap*, key: JsValue) -> bool:
+    var index: usize? = none
+
+    var it = ak.red_black_tree_begin(&this.m_keys)
+    while not ak.red_black_tree_iterator_is_end(&it):
+        if js_same_value(*ak.red_black_tree_iterator_deref(&it), key):
+            index = ak.red_black_tree_iterator_key(&it)
+            break
+        discard(ak.red_black_tree_iterator_inc(&it))
+
+    let found = index else return false
+
+    discard(ak.red_black_tree_remove(&this.m_keys, found))
+    discard(ak.hash_map_remove_k(&this.m_entries, key))
+    return true
+
+## Ported from Libraries/LibJS/Runtime/Map.cpp:52 JS::Map::map_get:
+## 24.1.3.6 Map.prototype.get ( key ), https://tc39.es/ecma262/#sec-map.prototype.get
+pub func js_map_map_get(this: JsMap*, key: JsValue) -> JsValue?:
+    if let value = ak.hash_map_get_k(&this.m_entries, key):
+        return *value
+    return none
+
+## Ported from Libraries/LibJS/Runtime/Map.cpp:60 JS::Map::map_has:
+## 24.1.3.7 Map.prototype.has ( key ), https://tc39.es/ecma262/#sec-map.prototype.has
+pub func js_map_map_has(this: JsMap*, key: JsValue) -> bool:
+    return ak.hash_map_contains_k(&this.m_entries, key)
+
+## Ported from Libraries/LibJS/Runtime/Map.cpp:66 JS::Map::map_set:
+## 24.1.3.9 Map.prototype.set ( key, value ), https://tc39.es/ecma262/#sec-map.prototype.set
+pub func js_map_map_set(this: JsMap*, key: JsValue, value: JsValue):
+    if let existing = ak.hash_map_get_k(&this.m_entries, key):
+        *existing = value
+    else:
+        let index = this.m_next_insertion_id
+        this.m_next_insertion_id += 1
+        ak.red_black_tree_insert(&this.m_keys, index, key)
+        discard(ak.hash_map_set(&this.m_entries, key, value))
+
+## Ported from Libraries/LibJS/Runtime/Map.cpp:78 JS::Map::map_size.
+pub func js_map_map_size(this: JsMap*) -> usize:
+    return ak.base_red_black_tree_size(&this.m_keys.base)
+
+## Ported from Libraries/LibJS/Runtime/Map.cpp:83 JS::Map::visit_edges (override).
+pub func js_map_visit_edges_impl(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (JsMap*)base
+    gc.cell_visit_edges_impl(base, visitor)
+    # Object's shape: its realm.
+    gc.cell_visitor_visit_t_2(visitor, this.m_realm)
+    for entry in ak.hash_map_begin(&this.m_entries):
+        js_visit_value(visitor, entry.key)
+        js_visit_value(visitor, entry.value)
+    # NOTE: The entries in m_keys are already visited by the walk over m_entries above.
+
+## JS::Map's iteration (`for (auto const& entry : map)`, Map::IteratorImpl): its entries in
+## insertion order.
+pub func js_map_entries(this: JsMap*) -> ak.Vector[JsMapEntry]:
+    var entries: ak.Vector[JsMapEntry]
+    var it = ak.red_black_tree_begin(&this.m_keys)
+    while not ak.red_black_tree_iterator_is_end(&it):
+        let key = *ak.red_black_tree_iterator_deref(&it)
+        let value = ak.hash_map_get_k(&this.m_entries, key) else trap("VERIFY: a Map key has an entry")
+        ak.vector_append_t(&entries, JsMapEntry(key = key, value = *value))
+        discard(ak.red_black_tree_iterator_inc(&it))
+    return entries
+
+# mark: Set =====================================================================================
+
+## Ported from Libraries/LibJS/Runtime/Set.cpp:16 JS::Set::create (its prototype,
+## %Set.prototype%, is a JS object: phase 3).
+pub func js_set_create(realm: Realm*) -> JsSet*:
+    let this = (JsSet*)web_allocate_cell(realm, &js_set_class)
+    this.m_realm = realm
+    web_initialize_cell(this.cell(), realm)
+    return this
+
+## JS_OBJECT(Set, Object)'s class_name.
+func js_set_class_name_impl(this: gc.Cell*) -> ak.StringView:
+    return ak.sv("Set")
+
+## Ported from Libraries/LibJS/Runtime/Set.cpp:26 JS::Set::initialize (override).
+pub func js_set_initialize_impl(base: JsCell*, realm: Realm*):
+    let this = (JsSet*)base
+    js_cell_initialize_impl(base, realm)
+    this.m_values = js_map_create(realm)
+
+## Ported from Libraries/LibJS/Runtime/Set.cpp:44 JS::Set::visit_edges (override).
+pub func js_set_visit_edges_impl(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (JsSet*)base
+    gc.cell_visit_edges_impl(base, visitor)
+    # Object's shape: its realm.
+    gc.cell_visitor_visit_t_2(visitor, this.m_realm)
+    gc.cell_visitor_visit_t(visitor, this.m_values)
+
+## The Set's Map (`m_values`, made by initialize).
+func js_set_values_map(this: JsSet*) -> JsMap*:
+    return this.m_values else trap("VERIFY: the Set is initialized")
+
+## Ported from Libraries/LibJS/Runtime/Set.h:32 JS::Set::set_clear.
+pub func js_set_set_clear(this: JsSet*):
+    js_map_map_clear(js_set_values_map(this))
+
+## Ported from Libraries/LibJS/Runtime/Set.h:33 JS::Set::set_remove.
+pub func js_set_set_remove(this: JsSet*, value: JsValue) -> bool:
+    return js_map_map_remove(js_set_values_map(this), value)
+
+## Ported from Libraries/LibJS/Runtime/Set.h:34 JS::Set::set_has.
+pub func js_set_set_has(this: JsSet*, key: JsValue) -> bool:
+    return js_map_map_has(js_set_values_map(this), key)
+
+## Ported from Libraries/LibJS/Runtime/Set.h:35 JS::Set::set_add.
+pub func js_set_set_add(this: JsSet*, key: JsValue):
+    js_map_map_set(js_set_values_map(this), key, js_undefined())
+
+## Ported from Libraries/LibJS/Runtime/Set.h:36 JS::Set::set_size.
+pub func js_set_set_size(this: JsSet*) -> usize:
+    return js_map_map_size(js_set_values_map(this))
+
+## JS::Set's iteration (`for (auto value : set)`, Set::begin/end over its Map): its keys in
+## insertion order.
+pub func js_set_values(this: JsSet*) -> ak.Vector[JsValue]:
+    var values: ak.Vector[JsValue]
+    let entries = js_map_entries(js_set_values_map(this))
+    for entry in ak.vector_span_const(&entries):
+        ak.vector_append_t(&values, entry.key)
+    return values

@@ -919,6 +919,39 @@ What P1 must already have so P3 is not a redesign: `PlatformObject` with `m_real
 split into gather-roots / mark / finalize / sweep functions with embedder hooks; `Realm` and `Vm`
 as cells reachable from `Window` and the main thread.
 
+**P1 stand-ins for the JS objects LibWeb makes natively.** Some phase-1 paths make JS objects
+themselves, faithfully to the donor: `FontFaceSet`'s set entries are a `JS::Set` and its ready
+promise a WebIDL promise, every `FontFace` holds a status promise, `CSSFontFeatureValuesMap` keeps
+a `JS::Map`. Before luce-js these are **cells of the engine** (`external/lib_js/promise`,
+`promise_jobs`, `set`), ported from LibJS with LibJS's steps and order:
+
+- `JS::Promise` (the 27.2.6 slots; `fulfill`, `reject`, `perform_then`, the resolve/reject
+  function steps), `JS::PromiseCapability`, `JS::PromiseReaction`, `JS::JobCallback`, the
+  reaction and resolve-thenable jobs, `NewPromiseCapability` and `Promise.prototype.then`;
+  `JS::Map` (insertion ids in a red-black tree, entries hashed by `ValueTraits`/SameValue) and
+  `JS::Set` over it. They are JS objects in the donor, so before P3 a `js.Value` of one holds the
+  cell (r19's `js_value_from_object`), as for platform objects and native functions; their
+  classes share JS::Cell's class id and are recognized by their `ClassInfo`; each visits its
+  values in `visit_edges` and keeps its shape's realm (`js_object_shape_realm`).
+- Resolve/reject functions, executors and WebIDL's reaction steps are `JsNativeFunction`s whose
+  captures hold their slots. `%Promise%` is named by its realm (`js_new_promise_capability(vm,
+  realm)`): `Construct(%Promise%, « executor »)` runs `PromiseConstructor::construct`'s steps.
+- Jobs go through the VM's host hooks (`Vm.host_enqueue_promise_job`, `host_make_job_callback`,
+  `host_call_job_callback`, `host_promise_rejection_tracker`, `host_promise_job_queue_is_empty`;
+  LibJS's defaults set by `vm_create`). `bind_initialize_main_thread_vm` installs LibWeb's
+  (`bind_install_main_thread_vm_host_hooks`): a promise job is a microtask on the main thread
+  event loop, run prepared to run script and a callback in its realm, and rejections are tracked
+  on the global's about-to-be-notified list, which every microtask checkpoint notifies about.
+- The WebIDL operations (`web_idl/promise`) are ported in full over them; their signatures are
+  the ones the port already calls, so **P3 swaps the implementation for luce-js objects without
+  touching callers**: `JsPromiseCapability*`, `JsSet*`, `JsMap*` become wrappers of QuickJS
+  objects (or cells holding them) and the `js_*` functions their operations.
+- Anything that needs JS keeps trapping `unported (P3)`: `Get(x, "then")` of an object that is not
+  one of these promises answers undefined (no JS properties exist), the self-resolution TypeError,
+  `JS::Array` (`get_promise_for_wait_for_all`'s results), PromiseRejectionEvent (firing
+  `unhandledrejection` / `rejectionhandled`), GetFunctionRealm of bound functions and proxies.
+  WebIDL `ReactionSteps` cannot throw before P3 (a GC::Function's result cannot be fallible).
+
 ### 3.7 Weak references
 
 In LibGC a `Weak<T>` holds a reference-counted `WeakImpl` from a weak block. The impl points to

@@ -1,0 +1,481 @@
+#==============================================================================================
+#
+#   promise - JS::Promise before luce-js: settling promises and queueing their reactions
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibJS/Runtime/Promise.cpp (lines 1-409) and Promise.h, with
+#       PromiseResolvingFunction.cpp/.h, as the phase-1 stand-in of DESIGN.md §3.6: a promise is
+#       a cell with the slots of 27.2.6, its resolve and reject functions are native functions,
+#       and its reactions become jobs given to the VM's HostEnqueuePromiseJob (LibWeb's queues
+#       them as microtasks). The steps are LibJS's, in its order. What needs JS objects that
+#       phase 1 does not have stays a phase-3 trap: Get(resolution, "then") of an object that is
+#       not a promise of this file answers undefined (no JS properties exist before luce-js),
+#       the TypeError of a self-resolution, and the prototypes. Construct(%Promise%, « executor »)
+#       runs PromiseConstructor::construct's steps (there is no %Promise% function object yet);
+#       %Promise.prototype.then% is a native function made where `then` is read.
+#
+#       Copyright (c) 2021-2023, Linus Groh <linusg@serenityos.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Promise =================================================================================
+
+## Ported from Libraries/LibJS/Runtime/Promise.cpp:52 JS::Promise::create: a pending promise in
+## `realm` (its prototype, %Promise.prototype%, is a JS object: phase 3).
+pub func js_promise_create(realm: Realm*) -> JsPromise*:
+    let this = (JsPromise*)web_allocate_cell(realm, &js_promise_class)
+    js_promise_construct(this, realm)
+    web_initialize_cell(this.cell(), realm)
+    return this
+
+## Ported from Libraries/LibJS/Runtime/Promise.cpp:58 JS::Promise::Promise: 27.2 Promise Objects,
+## https://tc39.es/ecma262/#sec-promise-objects, with the default member initializers.
+pub func js_promise_construct(this: JsPromise*, realm: Realm*):
+    this.m_realm = realm
+    this.m_state = JsPromiseState.pending
+    this.m_is_handled = false
+    this.m_result = js_undefined()
+
+## JS_OBJECT(Promise, Object)'s class_name.
+func js_promise_class_name_impl(this: gc.Cell*) -> ak.StringView:
+    return ak.sv("Promise")
+
+## Ported from Libraries/LibJS/Runtime/Promise.h:43 JS::Promise::state.
+pub func js_promise_state(this: JsPromise*) -> JsPromiseState:
+    return this.m_state
+
+## Ported from Libraries/LibJS/Runtime/Promise.h:44 JS::Promise::result.
+pub func js_promise_result(this: JsPromise*) -> JsValue:
+    return this.m_result
+
+## Ported from Libraries/LibJS/Runtime/Promise.h:58 JS::Promise::is_handled.
+pub func js_promise_is_handled(this: JsPromise*) -> bool:
+    return this.m_is_handled
+
+## Ported from Libraries/LibJS/Runtime/Promise.h:59 JS::Promise::set_is_handled.
+pub func js_promise_set_is_handled(this: JsPromise*):
+    this.m_is_handled = true
+
+## Ported from Libraries/LibJS/Runtime/Promise.h:66 JS::Promise::is_settled.
+func js_promise_is_settled(this: JsPromise*) -> bool:
+    return this.m_state == JsPromiseState.fulfilled or this.m_state == JsPromiseState.rejected
+
+## Ported from Libraries/LibJS/Runtime/Promise.cpp:64 JS::Promise::create_resolving_functions:
+## 27.2.1.3 CreateResolvingFunctions ( promise ), https://tc39.es/ecma262/#sec-createresolvingfunctions
+pub func js_promise_create_resolving_functions(this: JsPromise*) -> JsPromiseResolvingFunctions:
+    let vm = js_cell_vm(this.js_cell())
+    let realm = vm_current_realm(vm) else trap("VERIFY: a current realm")
+
+    # 1. Let alreadyResolved be the Record { [[Value]]: false }.
+    # NOTE: This is stored directly on the resolve function. The reject function keeps the resolve function alive and
+    #       uses the same bit.
+
+    # 2. Let stepsResolve be the algorithm steps defined in Promise Resolve Functions.
+    # 3. Let lengthResolve be the number of non-optional parameters of the function definition in Promise Resolve Functions.
+    # 4. Let resolve be CreateBuiltinFunction(stepsResolve, lengthResolve, "", « [[Promise]], [[AlreadyResolved]] »).
+    # 5. Set resolve.[[Promise]] to promise.
+    # 6. Set resolve.[[AlreadyResolved]] to alreadyResolved.
+
+    # 27.2.1.3.2 Promise Resolve Functions, https://tc39.es/ecma262/#sec-promise-resolve-functions
+    let resolve_function = js_promise_resolving_function_create_resolve(realm, this)
+    # (The `name` property is a JS property: phase 3.)
+
+    # 7. Let stepsReject be the algorithm steps defined in Promise Reject Functions.
+    # 8. Let lengthReject be the number of non-optional parameters of the function definition in Promise Reject Functions.
+    # 9. Let reject be CreateBuiltinFunction(stepsReject, lengthReject, "", « [[Promise]], [[AlreadyResolved]] »).
+    # 10. Set reject.[[Promise]] to promise.
+    # 11. Set reject.[[AlreadyResolved]] to alreadyResolved.
+
+    # 27.2.1.3.1 Promise Reject Functions, https://tc39.es/ecma262/#sec-promise-reject-functions
+    let reject_function = js_promise_resolving_function_create_reject(realm, this, resolve_function)
+
+    # 12. Return the Record { [[Resolve]]: resolve, [[Reject]]: reject }.
+    let resolve = resolve_function.function else trap("the resolve function")
+    let reject = reject_function.function else trap("the reject function")
+    return JsPromiseResolvingFunctions(resolve = (JsFunctionObject*)resolve, reject = (JsFunctionObject*)reject)
+
+## Ported from Libraries/LibJS/Runtime/Promise.cpp:107 JS::Promise::resolve_function_steps:
+## 27.2.1.3.2 Promise Resolve Functions, https://tc39.es/ecma262/#sec-promise-resolve-functions
+pub func js_promise_resolve_function_steps(vm: Vm*, promise: JsPromise*, already_resolved: bool*) -> JsValue:
+    let realm = vm_current_realm(vm) else trap("VERIFY: a current realm")
+
+    let resolution = vm_argument(vm, 0)
+
+    # 1. Let F be the active function object.
+    # 2. Assert: F has a [[Promise]] internal slot whose value is an Object.
+    # 3. Let promise be F.[[Promise]].
+
+    # 4. Let alreadyResolved be F.[[AlreadyResolved]].
+    # 5. If alreadyResolved.[[Value]] is true, return undefined.
+    if *already_resolved:
+        return js_undefined()
+
+    # 6. Set alreadyResolved.[[Value]] to true.
+    *already_resolved = true
+
+    # 7. If SameValue(resolution, promise) is true, then
+    if js_value_is_object(resolution) and js_value_as_object(resolution) == (JsObject*)promise:
+        # a. Let selfResolutionError be a newly created TypeError object.
+        let self_resolution_error = js_type_error_create(realm, ak.string_from_str("Cannot resolve promise with itself"))
+
+        # b. Perform RejectPromise(promise, selfResolutionError).
+        js_promise_reject(promise, self_resolution_error)
+
+        # c. Return undefined.
+        return js_undefined()
+
+    # 8. If Type(resolution) is not Object, then
+    if not js_value_is_object(resolution):
+        # a. Perform FulfillPromise(promise, resolution).
+        js_promise_fulfill(promise, resolution)
+
+        # b. Return undefined.
+        return js_undefined()
+
+    # 9. Let then be Completion(Get(resolution, "then")).
+    # 10. If then is an abrupt completion, then
+    #     a. Perform RejectPromise(promise, then.[[Value]]).
+    #     b. Return undefined.
+    # (A phase-1 Get has no getters, so it cannot throw.)
+    # 11. Let thenAction be then.[[Value]].
+    let then_action = js_promise_get_then(realm, js_value_as_object(resolution))
+
+    # 12. If IsCallable(thenAction) is false, then
+    if not js_value_is_function(then_action):
+        # a. Perform FulfillPromise(promise, resolution).
+        js_promise_fulfill(promise, resolution)
+
+        # b. Return undefined.
+        return js_undefined()
+
+    # 13. Let thenJobCallback be HostMakeJobCallback(thenAction).
+    let then_job_callback = vm_host_make_job_callback(vm, js_value_as_function(then_action))
+
+    # 14. Let job be NewPromiseResolveThenableJob(promise, resolution, thenJobCallback).
+    let job = js_create_promise_resolve_thenable_job(vm, promise, resolution, then_job_callback)
+
+    # 15. Perform HostEnqueuePromiseJob(job.[[Job]], job.[[Realm]]).
+    vm_host_enqueue_promise_job(vm, job.job, job.realm)
+
+    # 16. Return undefined.
+    return js_undefined()
+
+## Ported from Libraries/LibJS/Runtime/Promise.cpp:196 JS::Promise::reject_function_steps:
+## 27.2.1.3.1 Promise Reject Functions, https://tc39.es/ecma262/#sec-promise-reject-functions
+pub func js_promise_reject_function_steps(vm: Vm*, promise: JsPromise*, already_resolved: bool*) -> JsValue:
+    let reason = vm_argument(vm, 0)
+
+    # 1. Let F be the active function object.
+    # 2. Assert: F has a [[Promise]] internal slot whose value is an Object.
+    # 3. Let promise be F.[[Promise]].
+
+    # 4. Let alreadyResolved be F.[[AlreadyResolved]].
+    # 5. If alreadyResolved.[[Value]] is true, return undefined.
+    if *already_resolved:
+        return js_undefined()
+
+    # 6. Set alreadyResolved.[[Value]] to true.
+    *already_resolved = true
+
+    # 7. Perform RejectPromise(promise, reason).
+    js_promise_reject(promise, reason)
+
+    # 8. Return undefined.
+    return js_undefined()
+
+## Ported from Libraries/LibJS/Runtime/Promise.cpp:222 JS::Promise::fulfill:
+## 27.2.1.4 FulfillPromise ( promise, value ), https://tc39.es/ecma262/#sec-fulfillpromise
+pub func js_promise_fulfill(this: JsPromise*, value: JsValue):
+    # 1. Assert: The value of promise.[[PromiseState]] is pending.
+    assert(this.m_state == JsPromiseState.pending)
+
+    # 2. Let reactions be promise.[[PromiseFulfillReactions]].
+    # NOTE: This is a noop, we do these steps in a slightly different order.
+
+    # 3. Set promise.[[PromiseResult]] to value.
+    this.m_result = value
+
+    # 4. Set promise.[[PromiseFulfillReactions]] to undefined.
+    # 5. Set promise.[[PromiseRejectReactions]] to undefined.
+
+    # 6. Set promise.[[PromiseState]] to fulfilled.
+    this.m_state = JsPromiseState.fulfilled
+
+    # 7. Perform TriggerPromiseReactions(reactions, value).
+    js_promise_trigger_reactions(this)
+    ak.vector_clear(&this.m_fulfill_reactions)
+    ak.vector_clear(&this.m_reject_reactions)
+
+    # 8. Return unused.
+
+## Ported from Libraries/LibJS/Runtime/Promise.cpp:250 JS::Promise::reject:
+## 27.2.1.7 RejectPromise ( promise, reason ), https://tc39.es/ecma262/#sec-rejectpromise
+pub func js_promise_reject(this: JsPromise*, reason: JsValue):
+    let vm = js_cell_vm(this.js_cell())
+
+    # 1. Assert: The value of promise.[[PromiseState]] is pending.
+    assert(this.m_state == JsPromiseState.pending)
+
+    # 2. Let reactions be promise.[[PromiseRejectReactions]].
+    # NOTE: This is a noop, we do these steps in a slightly different order.
+
+    # 3. Set promise.[[PromiseResult]] to reason.
+    this.m_result = reason
+
+    # 4. Set promise.[[PromiseFulfillReactions]] to undefined.
+    # 5. Set promise.[[PromiseRejectReactions]] to undefined.
+
+    # 6. Set promise.[[PromiseState]] to rejected.
+    this.m_state = JsPromiseState.rejected
+
+    # 7. If promise.[[PromiseIsHandled]] is false, perform HostPromiseRejectionTracker(promise, "reject").
+    if not this.m_is_handled:
+        vm_host_promise_rejection_tracker(vm, this, JsPromiseRejectionOperation.reject)
+
+    # 8. Perform TriggerPromiseReactions(reactions, reason).
+    js_promise_trigger_reactions(this)
+    ak.vector_clear(&this.m_fulfill_reactions)
+    ak.vector_clear(&this.m_reject_reactions)
+
+    # 9. Return unused.
+
+## Ported from Libraries/LibJS/Runtime/Promise.cpp:283 JS::Promise::trigger_reactions:
+## 27.2.1.8 TriggerPromiseReactions ( reactions, argument ), https://tc39.es/ecma262/#sec-triggerpromisereactions
+func js_promise_trigger_reactions(this: JsPromise*):
+    assert(js_promise_is_settled(this))
+    let vm = js_cell_vm(this.js_cell())
+    let reactions = &this.m_fulfill_reactions if this.m_state == JsPromiseState.fulfilled else &this.m_reject_reactions
+
+    # 1. For each element reaction of reactions, do
+    for reaction in ak.vector_span(reactions):
+        # a. Let job be NewPromiseReactionJob(reaction, argument).
+        let job = js_create_promise_reaction_job(vm, reaction else trap("VERIFY: a reaction"), this.m_result)
+
+        # b. Perform HostEnqueuePromiseJob(job.[[Job]], job.[[Realm]]).
+        vm_host_enqueue_promise_job(vm, job.job, job.realm)
+
+    # 2. Return unused.
+
+## Ported from Libraries/LibJS/Runtime/Promise.cpp:310 JS::Promise::perform_then:
+## 27.2.5.4.1 PerformPromiseThen ( promise, onFulfilled, onRejected [ , resultCapability ] ),
+## https://tc39.es/ecma262/#sec-performpromisethen
+pub func js_promise_perform_then(this: JsPromise*, on_fulfilled: JsValue, on_rejected: JsValue, result_capability: JsPromiseCapability*?) -> JsValue:
+    let vm = js_cell_vm(this.js_cell())
+
+    # 1. Assert: IsPromise(promise) is true.
+    # 2. If resultCapability is not present, then
+    #     a. Set resultCapability to undefined.
+
+    # 3. If IsCallable(onFulfilled) is false, then
+    #     a. Let onFulfilledJobCallback be empty.
+    var on_fulfilled_job_callback: JsJobCallback*? = none
+
+    # 4. Else,
+    if js_value_is_function(on_fulfilled):
+        # a. Let onFulfilledJobCallback be HostMakeJobCallback(onFulfilled).
+        on_fulfilled_job_callback = vm_host_make_job_callback(vm, js_value_as_function(on_fulfilled))
+
+    # 5. If IsCallable(onRejected) is false, then
+    #     a. Let onRejectedJobCallback be empty.
+    var on_rejected_job_callback: JsJobCallback*? = none
+
+    # 6. Else,
+    if js_value_is_function(on_rejected):
+        # a. Let onRejectedJobCallback be HostMakeJobCallback(onRejected).
+        on_rejected_job_callback = vm_host_make_job_callback(vm, js_value_as_function(on_rejected))
+
+    # 7. Let fulfillReaction be the PromiseReaction { [[Capability]]: resultCapability, [[Type]]: Fulfill, [[Handler]]: onFulfilledJobCallback }.
+    let fulfill_reaction = js_promise_reaction_create(vm, JsPromiseReactionType.fulfill, result_capability, on_fulfilled_job_callback)
+
+    # 8. Let rejectReaction be the PromiseReaction { [[Capability]]: resultCapability, [[Type]]: Reject, [[Handler]]: onRejectedJobCallback }.
+    let reject_reaction = js_promise_reaction_create(vm, JsPromiseReactionType.reject, result_capability, on_rejected_job_callback)
+
+    match this.m_state:
+        # 9. If promise.[[PromiseState]] is pending, then
+        .pending:
+            # a. Append fulfillReaction as the last element of the List that is promise.[[PromiseFulfillReactions]].
+            ak.vector_append_t(&this.m_fulfill_reactions, fulfill_reaction)
+
+            # b. Append rejectReaction as the last element of the List that is promise.[[PromiseRejectReactions]].
+            ak.vector_append_t(&this.m_reject_reactions, reject_reaction)
+        # 10. Else if promise.[[PromiseState]] is fulfilled, then
+        .fulfilled:
+            # a. Let value be promise.[[PromiseResult]].
+            let value = this.m_result
+
+            # b. Let fulfillJob be NewPromiseReactionJob(fulfillReaction, value).
+            let fulfill_job = js_create_promise_reaction_job(vm, fulfill_reaction, value)
+
+            # c. Perform HostEnqueuePromiseJob(fulfillJob.[[Job]], fulfillJob.[[Realm]]).
+            vm_host_enqueue_promise_job(vm, fulfill_job.job, fulfill_job.realm)
+        # 11. Else,
+        .rejected:
+            # a. Assert: The value of promise.[[PromiseState]] is rejected.
+
+            # b. Let reason be promise.[[PromiseResult]].
+            let reason = this.m_result
+
+            # c. If promise.[[PromiseIsHandled]] is false, perform HostPromiseRejectionTracker(promise, "handle").
+            if not this.m_is_handled:
+                vm_host_promise_rejection_tracker(vm, this, JsPromiseRejectionOperation.handle)
+
+            # d. Let rejectJob be NewPromiseReactionJob(rejectReaction, reason).
+            let reject_job = js_create_promise_reaction_job(vm, reject_reaction, reason)
+
+            # e. Perform HostEnqueuePromiseJob(rejectJob.[[Job]], rejectJob.[[Realm]]).
+            vm_host_enqueue_promise_job(vm, reject_job.job, reject_job.realm)
+        _:
+            trap("VERIFY_NOT_REACHED")
+
+    # 12. Set promise.[[PromiseIsHandled]] to true.
+    this.m_is_handled = true
+
+    # 13. If resultCapability is undefined, then
+    let capability = result_capability else return js_undefined()
+    # a. Return undefined.
+
+    # 14. Else,
+    #     a. Return resultCapability.[[Promise]].
+    return js_value_from_object(capability.m_promise)
+
+## Ported from Libraries/LibJS/Runtime/Promise.cpp:401 JS::Promise::visit_edges (override).
+pub func js_promise_visit_edges_impl(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (JsPromise*)base
+    gc.cell_visit_edges_impl(base, visitor)
+    # Object's shape: its realm.
+    gc.cell_visitor_visit_t_2(visitor, this.m_realm)
+    js_visit_value(visitor, this.m_result)
+    gc.cell_visitor_visit_vector_nullable(visitor, &this.m_fulfill_reactions)
+    gc.cell_visitor_visit_vector_nullable(visitor, &this.m_reject_reactions)
+
+# mark: PromiseResolvingFunction ================================================================
+
+## JS::PromiseResolvingFunction::Kind (Libraries/LibJS/Runtime/PromiseResolvingFunction.h:19).
+enum JsPromiseResolvingFunctionKind as u8:
+    resolve = 0
+    reject = 1
+
+## JS::PromiseResolvingFunction (Libraries/LibJS/Runtime/PromiseResolvingFunction.h:15): a
+## NativeFunction subclass with the [[Promise]] and [[AlreadyResolved]] slots. Before phase 3 it
+## is a JS::NativeFunction whose captures are these slots (the native function's visit_edges
+## scans them, so the promise and the resolve function stay alive).
+struct JsPromiseResolvingFunction:
+    var function: JsNativeFunction*?  # the function object these slots belong to (set once made)
+    var m_promise: JsPromise*
+    var m_resolve_function: JsPromiseResolvingFunction*?
+    var m_already_resolved: bool  # C++ default: { false }
+    var m_kind: JsPromiseResolvingFunctionKind
+
+## Ported from Libraries/LibJS/Runtime/PromiseResolvingFunction.cpp:16 JS::PromiseResolvingFunction::create_resolve.
+func js_promise_resolving_function_create_resolve(realm: Realm*, promise: JsPromise*) -> JsPromiseResolvingFunction*:
+    return js_promise_resolving_function_create(realm, promise, JsPromiseResolvingFunctionKind.resolve, none)
+
+## Ported from Libraries/LibJS/Runtime/PromiseResolvingFunction.cpp:21 JS::PromiseResolvingFunction::create_reject.
+func js_promise_resolving_function_create_reject(realm: Realm*, promise: JsPromise*, resolve_function: JsPromiseResolvingFunction*) -> JsPromiseResolvingFunction*:
+    return js_promise_resolving_function_create(realm, promise, JsPromiseResolvingFunctionKind.reject, resolve_function)
+
+## Ported from Libraries/LibJS/Runtime/PromiseResolvingFunction.cpp:26
+## JS::PromiseResolvingFunction::PromiseResolvingFunction and :34 initialize (`length` 1 is a JS
+## property: phase 3): realm.create<PromiseResolvingFunction>(promise, kind, resolve_function,
+## %Function.prototype%), a native function in `realm` whose captures are the slots.
+func js_promise_resolving_function_create(realm: Realm*, promise: JsPromise*, kind: JsPromiseResolvingFunctionKind, resolve_function: JsPromiseResolvingFunction*?) -> JsPromiseResolvingFunction*:
+    let slots = new JsPromiseResolvingFunction(function = none, m_promise = promise, m_resolve_function = resolve_function, m_already_resolved = false, m_kind = kind) else trap("out of memory")
+    slots.function = js_native_function_create(realm, JsNativeFunctionBehaviour(call = js_promise_resolving_function_call, context = slots), 1, ak.utf16_fly_string_new(), realm)
+    return slots
+
+## Ported from Libraries/LibJS/Runtime/PromiseResolvingFunction.cpp:40 JS::PromiseResolvingFunction::call (override).
+func js_promise_resolving_function_call(context: void*?, vm: Vm*) -> JsValue!:
+    let this = (JsPromiseResolvingFunction*)(context else trap("no slots"))
+    match this.m_kind:
+        .resolve:
+            return js_promise_resolve_function_steps(vm, this.m_promise, js_promise_resolving_function_already_resolved(this))
+        .reject:
+            return js_promise_reject_function_steps(vm, this.m_promise, js_promise_resolving_function_already_resolved(this))
+        _:
+            trap("VERIFY_NOT_REACHED")
+
+## Ported from Libraries/LibJS/Runtime/PromiseResolvingFunction.cpp:58 JS::PromiseResolvingFunction::already_resolved.
+func js_promise_resolving_function_already_resolved(this: JsPromiseResolvingFunction*) -> bool*:
+    if this.m_kind == JsPromiseResolvingFunctionKind.resolve:
+        return &this.m_already_resolved
+
+    let resolve_function = this.m_resolve_function else trap("VERIFY: m_resolve_function")
+    return &resolve_function.m_already_resolved
+
+# mark: Phase-1 stand-ins for the JS objects promises meet ======================================
+
+## IsCallable(value) (Value::is_function): an object that is a function. Before phase 3 the
+## callable objects are native functions.
+pub func js_value_is_function(this: JsValue) -> bool:
+    return js_value_is_object(this) and js_object_is_function(js_value_as_object(this))
+
+## Value::as_function.
+pub func js_value_as_function(this: JsValue) -> JsFunctionObject*:
+    assert(js_value_is_function(this))
+    return (JsFunctionObject*)js_value_as_object(this)
+
+## Get(object, "then") before phase 3, which has no JS properties: a promise's `then` is
+## %Promise.prototype.then% (made here as a native function, see js_promise_prototype_then);
+## every other object has none.
+func js_promise_get_then(realm: Realm*, object: JsObject*) -> JsValue:
+    if not is_js_promise((gc.Cell*)object):
+        return js_undefined()
+    let then = js_native_function_create(realm, JsNativeFunctionBehaviour(call = js_promise_prototype_then, context = none), 2, ak.utf16_fly_string_new(), realm)
+    return js_value_from_object((JsObject*)then)
+
+## Ported from Libraries/LibJS/Runtime/PromisePrototype.cpp:40 JS::PromisePrototype::then:
+## 27.2.5.4 Promise.prototype.then ( onFulfilled, onRejected ),
+## https://tc39.es/ecma262/#sec-promise.prototype.then.
+func js_promise_prototype_then(context: void*?, vm: Vm*) -> JsValue!:
+    let on_fulfilled = vm_argument(vm, 0)
+    let on_rejected = vm_argument(vm, 1)
+
+    # 1. Let promise be the this value.
+    # 2. If IsPromise(promise) is false, throw a TypeError exception.
+    let this_value = vm_this_value(vm)
+    if not js_value_is_object(this_value) or not is_js_promise((gc.Cell*)js_value_as_object(this_value)):
+        return try vm_throw_completion(vm, IdlSimpleExceptionType.type_error, .string_view(ak.sv("Not an object of type Promise")))
+    let promise = (JsPromise*)js_value_as_object(this_value)
+
+    # 3. Let C be ? SpeciesConstructor(promise, %Promise%).
+    # (Before phase 3 a promise's constructor is the %Promise% of its realm.)
+    # 4. Let resultCapability be ? NewPromiseCapability(C).
+    let result_capability = try js_new_promise_capability(vm, promise.m_realm)
+
+    # 5. Return PerformPromiseThen(promise, onFulfilled, onRejected, resultCapability).
+    return js_promise_perform_then(promise, on_fulfilled, on_rejected, result_capability)
+
+## Ported from Libraries/LibJS/Runtime/PromiseConstructor.cpp:261 JS::PromiseConstructor::construct:
+## 27.2.3.1 Promise ( executor ), https://tc39.es/ecma262/#sec-promise-executor, for
+## Construct(%Promise%, « executor ») with the %Promise% of `constructor_realm` (NewTarget is that
+## constructor, so the promise is made in its realm).
+pub func js_promise_constructor_construct(vm: Vm*, constructor_realm: Realm*, executor: JsValue) -> JsPromise*!:
+
+    # 2. If IsCallable(executor) is false, throw a TypeError exception.
+    if not js_value_is_function(executor):
+        return try vm_throw_completion(vm, IdlSimpleExceptionType.type_error, .string_view(ak.sv("Promise executor must be a function")))
+
+    # 3. Let promise be ? OrdinaryCreateFromConstructor(NewTarget, "%Promise.prototype%", « [[PromiseState]], [[PromiseResult]], [[PromiseFulfillReactions]], [[PromiseRejectReactions]], [[PromiseIsHandled]] »).
+    # 4. Set promise.[[PromiseState]] to pending.
+    # 5. Set promise.[[PromiseFulfillReactions]] to a new empty List.
+    # 6. Set promise.[[PromiseRejectReactions]] to a new empty List.
+    # 7. Set promise.[[PromiseIsHandled]] to false.
+    let promise = js_promise_create(constructor_realm)
+
+    # 8. Let resolvingFunctions be CreateResolvingFunctions(promise).
+    let resolving_functions = js_promise_create_resolving_functions(promise)
+
+    # 9. Let completion be Completion(Call(executor, undefined, « resolvingFunctions.[[Resolve]], resolvingFunctions.[[Reject]] »)).
+    let arguments: JsValue[2] = [js_value_from_object((JsObject*)resolving_functions.resolve), js_value_from_object((JsObject*)resolving_functions.reject)]
+    let completion = js_call(vm, js_value_as_function(executor), js_undefined(), arguments) catch:
+        # 10. If completion is an abrupt completion, then
+        let abrupt = vm_take_throw_completion(vm)
+        # a. Perform ? Call(resolvingFunctions.[[Reject]], undefined, « completion.[[Value]] »).
+        let reject_arguments: JsValue[1] = [js_completion_value(&abrupt)]
+        discard(try js_call(vm, resolving_functions.reject, js_undefined(), reject_arguments))
+        recover js_undefined()
+    discard(completion)
+
+    # 11. Return promise.
+    return promise
