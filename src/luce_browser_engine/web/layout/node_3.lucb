@@ -1,0 +1,444 @@
+#==============================================================================================
+#
+#   node_3 - Layout::NodeWithStyle::apply_style: computed properties into computed values
+#
+#   DESCRIPTION:
+#       Port of LibWeb/Layout/Node.cpp (lines 675-1070): NodeWithStyle::apply_style, which
+#       reads every property a layout node keeps from the element's ComputedProperties into its
+#       ComputedValues, in the donor's order (fonts and colors first: later lengths and colors
+#       resolve against them).
+#
+#       Copyright (c) 2018-2023, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2021-2025, Sam Atkins <sam@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Helpers of apply_style ==================================================================
+
+## `border_radius_data_from_style_value`: the lambda of apply_style.
+func layout_node_with_style_border_radius_data_from_style_value(value: CssStyleValue*) -> CssBorderRadiusData:
+    let border_radius = css_style_value_as_border_radius(value)
+    return CssBorderRadiusData(horizontal_radius = css_length_percentage_from_style_value(css_border_radius_style_value_horizontal_radius(border_radius)), vertical_radius = css_length_percentage_from_style_value(css_border_radius_style_value_vertical_radius(border_radius)))
+
+## `CSS::LengthPercentageOrAuto(CSS::Length::make_px(0))`: the default of length_box for margins and paddings.
+func layout_node_with_style_zero_px_or_auto() -> CssLengthPercentageOrAuto:
+    return css_length_percentage_or_auto_new(css_length_percentage_new_css_length(css_length_make_px_f64(0.0)))
+
+## `do_border_style`: the lambda of apply_style.
+func layout_node_with_style_do_border_style(computed_style: CssComputedProperties*, color_resolution_context: CssColorResolutionContext, border: display_list.BorderData*, width_property: css_data.PropertyId, color_property: css_data.PropertyId, style_property: css_data.PropertyId):
+    # FIXME: Support <image-1d>
+    border.color = css_computed_properties_color(computed_style, color_property, color_resolution_context)
+    border.line_style = css_computed_properties_line_style(computed_style, style_property)
+
+    # If the border-style corresponding to a given border-width is none or hidden, then the used width is 0.
+    # https://drafts.csswg.org/css-backgrounds/#border-width
+    if border.line_style == css_data.LineStyle.none_ or border.line_style == css_data.LineStyle.hidden:
+        border.width = gfx.CssPixels.from_int(0)
+    else:
+        # FIXME: Interpolation can cause negative values - we clamp here but should instead clamp as part of interpolation
+        let length = css_computed_properties_length(computed_style, width_property)
+        border.width = ak.max(gfx.CssPixels.from_int(0), css_length_absolute_length_to_px(&length))
+
+## `extract_paint_fallback_color`: the lambda of apply_style.
+func layout_node_with_style_extract_paint_fallback_color(url_value: CssUrlStyleValue*, color_resolution_context: CssColorResolutionContext) -> gfx.Color?:
+    if let fallback = css_url_style_value_paint_fallback(url_value):
+        if css_style_value_has_color(fallback):
+            return css_style_value_to_color(fallback, color_resolution_context)
+    return none
+
+## The first value of mask-image (the lambda of apply_style that picks it).
+func layout_node_with_style_first_mask_image(computed_style: CssComputedProperties*) -> CssStyleValue*:
+    let value = css_computed_properties_property(computed_style, css_data.PropertyId.mask_image)
+
+    if css_style_value_is_value_list(value):
+        let values = css_style_value_list_values(css_style_value_as_value_list(value))
+        return *ak.vector_at_const(&values, 0)
+
+    return value
+
+# mark: apply_style =============================================================================
+
+## Ported from Libraries/LibWeb/Layout/Node.cpp:675 Web::Layout::NodeWithStyle::apply_style.
+pub func layout_node_with_style_apply_style(this: LayoutNodeWithStyle*, computed_style: CssComputedProperties*):
+    let computed_values = layout_node_with_style_mutable_computed_values(this)
+    let document = layout_node_document(this.layout_node())
+
+    # NOTE: color-scheme must be set first to ensure system colors can be resolved correctly.
+    let preferred_color_scheme = page_preferred_color_scheme(dom_document_page(document))
+    var color_scheme: CssPreferredColorScheme = ---
+    if let supported_color_schemes = dom_document_supported_color_schemes(document):
+        color_scheme = css_computed_properties_color_scheme(computed_style, preferred_color_scheme, &supported_color_schemes)
+    else:
+        color_scheme = css_computed_properties_color_scheme(computed_style, preferred_color_scheme, none)
+    css_mutable_computed_values_set_color_scheme(computed_values, color_scheme)
+
+    # NOTE: We have to be careful that font-related properties get set in the right order.
+    #       m_font is used by Length::to_px() when resolving sizes against this layout node.
+    #       That's why it has to be set before everything else.
+    css_mutable_computed_values_set_font_list(computed_values, css_computed_properties_computed_font_list(computed_style, dom_document_font_computer(document)))
+    css_mutable_computed_values_set_font_size(computed_values, css_computed_properties_font_size(computed_style))
+    css_mutable_computed_values_set_font_weight(computed_values, css_computed_properties_font_weight(computed_style))
+    css_mutable_computed_values_set_line_height(computed_values, css_computed_properties_line_height(computed_style))
+
+    # NOTE: color must be set after color-scheme to ensure currentColor can be resolved in other properties (e.g. background-color).
+    # NOTE: color must be set after font_size as `CalculatedStyleValue`s can rely on it being set for resolving lengths.
+    css_mutable_computed_values_set_color(computed_values, css_computed_properties_color(computed_style, css_data.PropertyId.color, css_color_resolution_context_for_layout_node_with_style(this)))
+    # NOTE: Currently there are still discussions about `accentColor` and `currentColor` interactions, so the line below might need changing in the future
+    css_mutable_computed_values_set_accent_color(computed_values, css_computed_properties_accent_color(computed_style, css_color_resolution_context_for_layout_node_with_style(this)))
+    # NOTE: This color resolution context must be created after we set color above so that currentColor resolves correctly
+    # FIXME: We should resolve colors to their absolute forms at compute time (i.e. by implementing the relevant absolutized methods)
+    let color_resolution_context = css_color_resolution_context_for_layout_node_with_style(this)
+
+    css_mutable_computed_values_set_vertical_align(computed_values, css_computed_properties_vertical_align(computed_style))
+
+    let background_layers = css_computed_properties_background_layers(computed_style)
+
+    for layer in ak.vector_span_const(&background_layers):
+        css_abstract_image_style_value_load_any_resources_layout_node_with_style(layer.background_image, this)
+
+    css_mutable_computed_values_set_background_layers(computed_values, background_layers)
+
+    css_mutable_computed_values_set_background_color(computed_values, css_computed_properties_color(computed_style, css_data.PropertyId.background_color, color_resolution_context))
+    css_mutable_computed_values_set_background_color_clip(computed_values, css_computed_properties_background_color_clip(computed_style))
+
+    css_mutable_computed_values_set_box_sizing(computed_values, css_computed_properties_box_sizing(computed_style))
+
+    if let font_language_override = css_computed_properties_font_language_override(computed_style):
+        css_mutable_computed_values_set_font_language_override(computed_values, font_language_override)
+    css_mutable_computed_values_set_font_variation_settings(computed_values, css_computed_properties_font_variation_settings(computed_style))
+
+    css_mutable_computed_values_set_border_bottom_left_radius(computed_values, layout_node_with_style_border_radius_data_from_style_value(css_computed_properties_property(computed_style, css_data.PropertyId.border_bottom_left_radius)))
+    css_mutable_computed_values_set_border_bottom_right_radius(computed_values, layout_node_with_style_border_radius_data_from_style_value(css_computed_properties_property(computed_style, css_data.PropertyId.border_bottom_right_radius)))
+    css_mutable_computed_values_set_border_top_left_radius(computed_values, layout_node_with_style_border_radius_data_from_style_value(css_computed_properties_property(computed_style, css_data.PropertyId.border_top_left_radius)))
+    css_mutable_computed_values_set_border_top_right_radius(computed_values, layout_node_with_style_border_radius_data_from_style_value(css_computed_properties_property(computed_style, css_data.PropertyId.border_top_right_radius)))
+    css_mutable_computed_values_set_display(computed_values, css_computed_properties_display(computed_style))
+    css_mutable_computed_values_set_display_before_box_type_transformation(computed_values, css_computed_properties_display_before_box_type_transformation(computed_style))
+
+    css_mutable_computed_values_set_flex_direction(computed_values, css_computed_properties_flex_direction(computed_style))
+    css_mutable_computed_values_set_flex_wrap(computed_values, css_computed_properties_flex_wrap(computed_style))
+    css_mutable_computed_values_set_flex_basis(computed_values, css_computed_properties_flex_basis(computed_style))
+    css_mutable_computed_values_set_flex_grow(computed_values, css_computed_properties_flex_grow(computed_style))
+    css_mutable_computed_values_set_flex_shrink(computed_values, css_computed_properties_flex_shrink(computed_style))
+    css_mutable_computed_values_set_order(computed_values, css_computed_properties_order(computed_style))
+    css_mutable_computed_values_set_clip(computed_values, css_computed_properties_clip(computed_style))
+
+    css_mutable_computed_values_set_backdrop_filter(computed_values, css_computed_properties_backdrop_filter(computed_style))
+    css_mutable_computed_values_set_filter(computed_values, css_computed_properties_filter(computed_style))
+
+    css_mutable_computed_values_set_flood_color(computed_values, css_computed_properties_color(computed_style, css_data.PropertyId.flood_color, color_resolution_context))
+    css_mutable_computed_values_set_flood_opacity(computed_values, css_computed_properties_flood_opacity(computed_style))
+
+    css_mutable_computed_values_set_justify_content(computed_values, css_computed_properties_justify_content(computed_style))
+    css_mutable_computed_values_set_justify_items(computed_values, css_computed_properties_justify_items(computed_style))
+    css_mutable_computed_values_set_justify_self(computed_values, css_computed_properties_justify_self(computed_style))
+
+    css_mutable_computed_values_set_align_content(computed_values, css_computed_properties_align_content(computed_style))
+    css_mutable_computed_values_set_align_items(computed_values, css_computed_properties_align_items(computed_style))
+    css_mutable_computed_values_set_align_self(computed_values, css_computed_properties_align_self(computed_style))
+
+    css_mutable_computed_values_set_appearance(computed_values, css_computed_properties_appearance(computed_style))
+
+    css_mutable_computed_values_set_position(computed_values, css_computed_properties_position(computed_style))
+
+    # https://drafts.csswg.org/css-anchor-position-1/#position-anchor
+    let position_anchor_value = css_computed_properties_property(computed_style, css_data.PropertyId.position_anchor)
+    if css_style_value_is_custom_ident(position_anchor_value):
+        css_mutable_computed_values_set_position_anchor(computed_values, css_custom_ident_style_value_custom_ident(css_style_value_as_custom_ident(position_anchor_value)))
+
+    css_mutable_computed_values_set_text_align(computed_values, css_computed_properties_text_align(computed_style))
+    css_mutable_computed_values_set_text_justify(computed_values, css_computed_properties_text_justify(computed_style))
+    css_mutable_computed_values_set_text_overflow(computed_values, css_computed_properties_text_overflow(computed_style))
+    css_mutable_computed_values_set_text_underline_offset(computed_values, css_computed_properties_text_underline_offset(computed_style))
+    css_mutable_computed_values_set_text_underline_position(computed_values, css_computed_properties_text_underline_position(computed_style))
+
+    css_mutable_computed_values_set_text_indent(computed_values, css_computed_properties_text_indent(computed_style))
+    css_mutable_computed_values_set_text_wrap_mode(computed_values, css_computed_properties_text_wrap_mode(computed_style))
+    css_mutable_computed_values_set_tab_size(computed_values, css_computed_properties_tab_size(computed_style))
+
+    css_mutable_computed_values_set_white_space_collapse(computed_values, css_computed_properties_white_space_collapse(computed_style))
+    css_mutable_computed_values_set_word_break(computed_values, css_computed_properties_word_break(computed_style))
+
+    css_mutable_computed_values_set_word_spacing(computed_values, css_computed_properties_word_spacing(computed_style))
+    css_mutable_computed_values_set_letter_spacing(computed_values, css_computed_properties_letter_spacing(computed_style))
+
+    css_mutable_computed_values_set_float(computed_values, css_computed_properties_float(computed_style))
+
+    css_mutable_computed_values_set_border_spacing_horizontal(computed_values, css_computed_properties_border_spacing_horizontal(computed_style))
+    css_mutable_computed_values_set_border_spacing_vertical(computed_values, css_computed_properties_border_spacing_vertical(computed_style))
+
+    css_mutable_computed_values_set_caption_side(computed_values, css_computed_properties_caption_side(computed_style))
+    css_mutable_computed_values_set_clear(computed_values, css_computed_properties_clear(computed_style))
+    css_mutable_computed_values_set_overflow_x(computed_values, css_computed_properties_overflow_x(computed_style))
+    css_mutable_computed_values_set_overflow_y(computed_values, css_computed_properties_overflow_y(computed_style))
+    css_mutable_computed_values_set_content_visibility(computed_values, css_computed_properties_content_visibility(computed_style))
+    css_mutable_computed_values_set_cursor(computed_values, css_computed_properties_cursor(computed_style))
+    css_mutable_computed_values_set_image_rendering(computed_values, css_computed_properties_image_rendering(computed_style))
+    css_mutable_computed_values_set_pointer_events(computed_values, css_computed_properties_pointer_events(computed_style))
+    css_mutable_computed_values_set_text_decoration_line(computed_values, css_computed_properties_text_decoration_line(computed_style))
+    css_mutable_computed_values_set_text_decoration_skip_ink(computed_values, css_computed_properties_text_decoration_skip_ink(computed_style))
+    css_mutable_computed_values_set_text_decoration_style(computed_values, css_computed_properties_text_decoration_style(computed_style))
+    css_mutable_computed_values_set_text_transform(computed_values, css_computed_properties_text_transform(computed_style))
+
+    css_mutable_computed_values_set_list_style_type(computed_values, css_computed_properties_list_style_type(computed_style, layout_node_with_style_style_scope(this)))
+    css_mutable_computed_values_set_list_style_position(computed_values, css_computed_properties_list_style_position(computed_style))
+    let list_style_image = css_computed_properties_property(computed_style, css_data.PropertyId.list_style_image)
+    if css_style_value_is_abstract_image(list_style_image):
+        let image = css_style_value_as_abstract_image(list_style_image)
+        this.m_list_style_image = image
+        css_abstract_image_style_value_load_any_resources_layout_node_with_style(image, this)
+
+    css_mutable_computed_values_set_text_decoration_color(computed_values, css_computed_properties_color(computed_style, css_data.PropertyId.text_decoration_color, color_resolution_context))
+    css_mutable_computed_values_set_text_decoration_thickness(computed_values, css_computed_properties_text_decoration_thickness(computed_style))
+
+    css_mutable_computed_values_set_webkit_text_fill_color(computed_values, css_computed_properties_color(computed_style, css_data.PropertyId.webkit_text_fill_color, color_resolution_context))
+
+    css_mutable_computed_values_set_text_shadow(computed_values, css_computed_properties_text_shadow(computed_style, this.layout_node()))
+
+    css_mutable_computed_values_set_z_index(computed_values, css_computed_properties_z_index(computed_style))
+    css_mutable_computed_values_set_opacity(computed_values, css_computed_properties_opacity(computed_style))
+
+    css_mutable_computed_values_set_visibility(computed_values, css_computed_properties_visibility(computed_style))
+
+    css_mutable_computed_values_set_width(computed_values, css_computed_properties_size_value(computed_style, css_data.PropertyId.width))
+    css_mutable_computed_values_set_min_width(computed_values, css_computed_properties_size_value(computed_style, css_data.PropertyId.min_width))
+    css_mutable_computed_values_set_max_width(computed_values, css_computed_properties_size_value(computed_style, css_data.PropertyId.max_width))
+
+    css_mutable_computed_values_set_height(computed_values, css_computed_properties_size_value(computed_style, css_data.PropertyId.height))
+    css_mutable_computed_values_set_min_height(computed_values, css_computed_properties_size_value(computed_style, css_data.PropertyId.min_height))
+    css_mutable_computed_values_set_max_height(computed_values, css_computed_properties_size_value(computed_style, css_data.PropertyId.max_height))
+
+    css_mutable_computed_values_set_inset(computed_values, css_computed_properties_length_box(computed_style, css_data.PropertyId.left, css_data.PropertyId.top, css_data.PropertyId.right, css_data.PropertyId.bottom, css_length_percentage_or_auto_make_auto()))
+    css_mutable_computed_values_set_margin(computed_values, css_computed_properties_length_box(computed_style, css_data.PropertyId.margin_left, css_data.PropertyId.margin_top, css_data.PropertyId.margin_right, css_data.PropertyId.margin_bottom, layout_node_with_style_zero_px_or_auto()))
+    css_mutable_computed_values_set_padding(computed_values, css_computed_properties_length_box(computed_style, css_data.PropertyId.padding_left, css_data.PropertyId.padding_top, css_data.PropertyId.padding_right, css_data.PropertyId.padding_bottom, layout_node_with_style_zero_px_or_auto()))
+    css_mutable_computed_values_set_overflow_clip_margin(computed_values, css_computed_properties_length_box(computed_style, css_data.PropertyId.overflow_clip_margin_left, css_data.PropertyId.overflow_clip_margin_top, css_data.PropertyId.overflow_clip_margin_right, css_data.PropertyId.overflow_clip_margin_bottom, layout_node_with_style_zero_px_or_auto()))
+
+    css_mutable_computed_values_set_box_shadow(computed_values, css_computed_properties_box_shadow(computed_style, this.layout_node()))
+
+    if let rotate_value = css_computed_properties_rotate(computed_style):
+        css_mutable_computed_values_set_rotate(computed_values, rotate_value)
+
+    if let translate_value = css_computed_properties_translate(computed_style):
+        css_mutable_computed_values_set_translate(computed_values, translate_value)
+
+    if let scale_value = css_computed_properties_scale(computed_style):
+        css_mutable_computed_values_set_scale(computed_values, scale_value)
+
+    css_mutable_computed_values_set_transformations(computed_values, css_computed_properties_transformations(computed_style))
+    css_mutable_computed_values_set_transform_box(computed_values, css_computed_properties_transform_box(computed_style))
+    css_mutable_computed_values_set_transform_origin(computed_values, css_computed_properties_transform_origin(computed_style))
+    css_mutable_computed_values_set_transform_style(computed_values, css_computed_properties_transform_style(computed_style))
+    css_mutable_computed_values_set_perspective(computed_values, css_computed_properties_perspective(computed_style))
+    css_mutable_computed_values_set_perspective_origin(computed_values, css_computed_properties_perspective_origin(computed_style))
+
+    let transition_delay_property = css_computed_properties_property(computed_style, css_data.PropertyId.transition_delay)
+    if css_style_value_is_time(transition_delay_property):
+        let transition_delay = css_style_value_as_time(transition_delay_property)
+        css_mutable_computed_values_set_transition_delay(computed_values, css_time_style_value_time(transition_delay))
+    elif css_style_value_is_calculated(transition_delay_property):
+        let transition_delay = css_style_value_as_calculated(transition_delay_property)
+        let context = CssCalculationResolutionContext(length_resolution_context = css_length_resolution_context_for_layout_node(this.layout_node()))
+        css_mutable_computed_values_set_transition_delay(computed_values, css_calculated_style_value_resolve_time(transition_delay, context) else trap("Optional::value: a resolved time"))
+
+    layout_node_with_style_do_border_style(computed_style, color_resolution_context, css_mutable_computed_values_border_left(computed_values), css_data.PropertyId.border_left_width, css_data.PropertyId.border_left_color, css_data.PropertyId.border_left_style)
+    layout_node_with_style_do_border_style(computed_style, color_resolution_context, css_mutable_computed_values_border_top(computed_values), css_data.PropertyId.border_top_width, css_data.PropertyId.border_top_color, css_data.PropertyId.border_top_style)
+    layout_node_with_style_do_border_style(computed_style, color_resolution_context, css_mutable_computed_values_border_right(computed_values), css_data.PropertyId.border_right_width, css_data.PropertyId.border_right_color, css_data.PropertyId.border_right_style)
+    layout_node_with_style_do_border_style(computed_style, color_resolution_context, css_mutable_computed_values_border_bottom(computed_values), css_data.PropertyId.border_bottom_width, css_data.PropertyId.border_bottom_color, css_data.PropertyId.border_bottom_style)
+
+    let outline_color = css_computed_properties_property(computed_style, css_data.PropertyId.outline_color)
+    if css_style_value_has_color(outline_color):
+        css_mutable_computed_values_set_outline_color(computed_values, css_style_value_to_color(outline_color, color_resolution_context) else trap("Optional::value: a resolved outline color"))
+    # FIXME: Support calc()
+    let outline_offset = css_computed_properties_property(computed_style, css_data.PropertyId.outline_offset)
+    if css_style_value_is_length(outline_offset):
+        css_mutable_computed_values_set_outline_offset(computed_values, css_length_style_value_length(css_style_value_as_length(outline_offset)))
+    css_mutable_computed_values_set_outline_style(computed_values, css_computed_properties_outline_style(computed_style))
+
+    # FIXME: Interpolation can cause negative values - we clamp here but should instead clamp as part of interpolation.
+    let outline_width = css_computed_properties_length(computed_style, css_data.PropertyId.outline_width)
+    css_mutable_computed_values_set_outline_width(computed_values, ak.max(gfx.CssPixels.from_int(0), css_length_absolute_length_to_px(&outline_width)))
+
+    css_mutable_computed_values_set_grid_auto_columns(computed_values, css_computed_properties_grid_auto_columns(computed_style))
+    css_mutable_computed_values_set_grid_auto_rows(computed_values, css_computed_properties_grid_auto_rows(computed_style))
+    css_mutable_computed_values_set_grid_template_columns(computed_values, css_computed_properties_grid_template_columns(computed_style))
+    css_mutable_computed_values_set_grid_template_rows(computed_values, css_computed_properties_grid_template_rows(computed_style))
+    css_mutable_computed_values_set_grid_column_end(computed_values, css_computed_properties_grid_column_end(computed_style))
+    css_mutable_computed_values_set_grid_column_start(computed_values, css_computed_properties_grid_column_start(computed_style))
+    css_mutable_computed_values_set_grid_row_end(computed_values, css_computed_properties_grid_row_end(computed_style))
+    css_mutable_computed_values_set_grid_row_start(computed_values, css_computed_properties_grid_row_start(computed_style))
+    css_mutable_computed_values_set_grid_template_areas(computed_values, css_computed_properties_grid_template_areas(computed_style))
+    css_mutable_computed_values_set_grid_auto_flow(computed_values, css_computed_properties_grid_auto_flow(computed_style))
+
+    css_mutable_computed_values_set_cx(computed_values, css_length_percentage_from_style_value(css_computed_properties_property(computed_style, css_data.PropertyId.cx)))
+    css_mutable_computed_values_set_cy(computed_values, css_length_percentage_from_style_value(css_computed_properties_property(computed_style, css_data.PropertyId.cy)))
+    css_mutable_computed_values_set_r(computed_values, css_length_percentage_from_style_value(css_computed_properties_property(computed_style, css_data.PropertyId.r)))
+    css_mutable_computed_values_set_rx(computed_values, css_length_percentage_or_auto_from_style_value(css_computed_properties_property(computed_style, css_data.PropertyId.rx)))
+    css_mutable_computed_values_set_ry(computed_values, css_length_percentage_or_auto_from_style_value(css_computed_properties_property(computed_style, css_data.PropertyId.ry)))
+    css_mutable_computed_values_set_x(computed_values, css_length_percentage_from_style_value(css_computed_properties_property(computed_style, css_data.PropertyId.x)))
+    css_mutable_computed_values_set_y(computed_values, css_length_percentage_from_style_value(css_computed_properties_property(computed_style, css_data.PropertyId.y)))
+
+    let fill = css_computed_properties_property(computed_style, css_data.PropertyId.fill)
+    if css_style_value_has_color(fill):
+        var paint: CssSvgPaint = ---
+        css_svg_paint_construct_color(&paint, css_style_value_to_color(fill, color_resolution_context) else trap("Optional::value: a resolved fill color"))
+        css_mutable_computed_values_set_fill(computed_values, paint)
+    elif css_style_value_is_url(fill):
+        let url_value = css_style_value_as_url(fill)
+        var paint: CssSvgPaint = ---
+        css_svg_paint_construct_css_url(&paint, css_url_style_value_url(url_value), layout_node_with_style_extract_paint_fallback_color(url_value, color_resolution_context))
+        css_mutable_computed_values_set_fill(computed_values, paint)
+    let stroke = css_computed_properties_property(computed_style, css_data.PropertyId.stroke)
+    if css_style_value_has_color(stroke):
+        var paint: CssSvgPaint = ---
+        css_svg_paint_construct_color(&paint, css_style_value_to_color(stroke, color_resolution_context) else trap("Optional::value: a resolved stroke color"))
+        css_mutable_computed_values_set_stroke(computed_values, paint)
+    elif css_style_value_is_url(stroke):
+        let url_value = css_style_value_as_url(stroke)
+        var paint: CssSvgPaint = ---
+        css_svg_paint_construct_css_url(&paint, css_url_style_value_url(url_value), layout_node_with_style_extract_paint_fallback_color(url_value, color_resolution_context))
+        css_mutable_computed_values_set_stroke(computed_values, paint)
+
+    css_mutable_computed_values_set_stop_color(computed_values, css_computed_properties_color(computed_style, css_data.PropertyId.stop_color, color_resolution_context))
+
+    let stroke_width = css_computed_properties_property(computed_style, css_data.PropertyId.stroke_width)
+    # FIXME: Converting to pixels isn't really correct - values should be in "user units"
+    #        https://svgwg.org/svg2-draft/coords.html#TermUserUnits
+    # FIXME: Support calc()
+    if css_style_value_is_number(stroke_width):
+        css_mutable_computed_values_set_stroke_width(computed_values, css_length_percentage_new_css_length(css_length_make_px_css_pixels(gfx.css_pixels_nearest_value_for_f64(css_number_style_value_number(css_style_value_as_number(stroke_width))))))
+    elif css_style_value_is_length(stroke_width):
+        css_mutable_computed_values_set_stroke_width(computed_values, css_length_percentage_new_css_length(css_length_style_value_length(css_style_value_as_length(stroke_width))))
+    elif css_style_value_is_percentage(stroke_width):
+        css_mutable_computed_values_set_stroke_width(computed_values, css_length_percentage_new_css_percentage(css_percentage_style_value_percentage(css_style_value_as_percentage(stroke_width))))
+    css_mutable_computed_values_set_shape_rendering(computed_values, css_computed_properties_shape_rendering(computed_style))
+    css_mutable_computed_values_set_paint_order(computed_values, css_computed_properties_paint_order(computed_style))
+
+    # FIXME: We should actually support more than one mask image rather than just using the first
+    let mask_image = layout_node_with_style_first_mask_image(computed_style)
+    if css_style_value_is_url(mask_image):
+        var mask: CssMaskReference = ---
+        css_mask_reference_construct(&mask, css_url_style_value_url(css_style_value_as_url(mask_image)))
+        css_mutable_computed_values_set_mask(computed_values, mask)
+    elif css_style_value_is_abstract_image(mask_image):
+        let abstract_image = css_style_value_as_abstract_image(mask_image)
+        css_mutable_computed_values_set_mask_image(computed_values, abstract_image)
+        css_abstract_image_style_value_load_any_resources_layout_node_with_style(abstract_image, this)
+
+    css_mutable_computed_values_set_mask_type(computed_values, css_computed_properties_mask_type(computed_style))
+
+    let clip_path = css_computed_properties_property(computed_style, css_data.PropertyId.clip_path)
+    if css_style_value_is_url(clip_path):
+        var reference: CssClipPathReference = ---
+        css_clip_path_reference_construct_css_url(&reference, css_url_style_value_url(css_style_value_as_url(clip_path)))
+        css_mutable_computed_values_set_clip_path(computed_values, reference)
+    elif css_style_value_is_basic_shape(clip_path):
+        var reference: CssClipPathReference = ---
+        css_clip_path_reference_construct_css_basic_shape_style_value(&reference, css_style_value_as_basic_shape(clip_path))
+        css_mutable_computed_values_set_clip_path(computed_values, reference)
+    css_mutable_computed_values_set_clip_rule(computed_values, css_computed_properties_clip_rule(computed_style))
+    css_mutable_computed_values_set_fill_rule(computed_values, css_computed_properties_fill_rule(computed_style))
+
+    css_mutable_computed_values_set_fill_opacity(computed_values, css_computed_properties_fill_opacity(computed_style))
+    css_mutable_computed_values_set_stroke_dasharray(computed_values, css_computed_properties_stroke_dasharray(computed_style))
+
+    let stroke_dashoffset = css_computed_properties_property(computed_style, css_data.PropertyId.stroke_dashoffset)
+    # FIXME: Converting to pixels isn't really correct - values should be in "user units"
+    #        https://svgwg.org/svg2-draft/coords.html#TermUserUnits
+    # FIXME: Support calc()
+    if css_style_value_is_number(stroke_dashoffset):
+        css_mutable_computed_values_set_stroke_dashoffset(computed_values, css_length_percentage_new_css_length(css_length_make_px_css_pixels(gfx.css_pixels_nearest_value_for_f64(css_number_style_value_number(css_style_value_as_number(stroke_dashoffset))))))
+    elif css_style_value_is_length(stroke_dashoffset):
+        css_mutable_computed_values_set_stroke_dashoffset(computed_values, css_length_percentage_new_css_length(css_length_style_value_length(css_style_value_as_length(stroke_dashoffset))))
+    elif css_style_value_is_percentage(stroke_dashoffset):
+        css_mutable_computed_values_set_stroke_dashoffset(computed_values, css_length_percentage_new_css_percentage(css_percentage_style_value_percentage(css_style_value_as_percentage(stroke_dashoffset))))
+
+    css_mutable_computed_values_set_stroke_linecap(computed_values, css_computed_properties_stroke_linecap(computed_style))
+    css_mutable_computed_values_set_stroke_linejoin(computed_values, css_computed_properties_stroke_linejoin(computed_style))
+    css_mutable_computed_values_set_stroke_miterlimit(computed_values, css_computed_properties_stroke_miterlimit(computed_style))
+
+    css_mutable_computed_values_set_stroke_opacity(computed_values, css_computed_properties_stroke_opacity(computed_style))
+    css_mutable_computed_values_set_stop_opacity(computed_values, css_computed_properties_stop_opacity(computed_style))
+
+    css_mutable_computed_values_set_text_anchor(computed_values, css_computed_properties_text_anchor(computed_style))
+    css_mutable_computed_values_set_dominant_baseline(computed_values, css_computed_properties_dominant_baseline(computed_style))
+
+    # FIXME: Support calc()
+    let column_count = css_computed_properties_property(computed_style, css_data.PropertyId.column_count)
+    if css_style_value_is_integer(column_count):
+        css_mutable_computed_values_set_column_count(computed_values, css_column_count_make_integer(css_integer_style_value_integer(css_style_value_as_integer(column_count))))
+
+    css_mutable_computed_values_set_column_span(computed_values, css_computed_properties_column_span(computed_style))
+
+    css_mutable_computed_values_set_column_width(computed_values, css_computed_properties_size_value(computed_style, css_data.PropertyId.column_width))
+    css_mutable_computed_values_set_column_height(computed_values, css_computed_properties_size_value(computed_style, css_data.PropertyId.column_height))
+
+    css_mutable_computed_values_set_column_gap(computed_values, css_computed_properties_gap_value(computed_style, css_data.PropertyId.column_gap))
+    css_mutable_computed_values_set_row_gap(computed_values, css_computed_properties_gap_value(computed_style, css_data.PropertyId.row_gap))
+
+    css_mutable_computed_values_set_border_collapse(computed_values, css_computed_properties_border_collapse(computed_style))
+
+    css_mutable_computed_values_set_empty_cells(computed_values, css_computed_properties_empty_cells(computed_style))
+
+    css_mutable_computed_values_set_table_layout(computed_values, css_computed_properties_table_layout(computed_style))
+
+    let aspect_ratio = css_computed_properties_property(computed_style, css_data.PropertyId.aspect_ratio)
+    if css_style_value_is_value_list(aspect_ratio):
+        let values_list = css_style_value_list_values(css_style_value_as_value_list(aspect_ratio))
+        if ak.vector_size(&values_list) == 2:
+            let first = *ak.vector_at_const(&values_list, 0)
+            let second = *ak.vector_at_const(&values_list, 1)
+            if css_style_value_is_keyword(first) and css_keyword_style_value_keyword(css_style_value_as_keyword(first)) == css_data.Keyword.auto and css_style_value_is_ratio(second):
+                css_mutable_computed_values_set_aspect_ratio(computed_values, CssAspectRatio(use_natural_aspect_ratio_if_available = true, preferred_ratio = css_ratio_style_value_resolved(css_style_value_as_ratio(second))))
+    elif css_style_value_is_keyword(aspect_ratio) and css_keyword_style_value_keyword(css_style_value_as_keyword(aspect_ratio)) == css_data.Keyword.auto:
+        css_mutable_computed_values_set_aspect_ratio(computed_values, CssAspectRatio(use_natural_aspect_ratio_if_available = true, preferred_ratio = none))
+    elif css_style_value_is_ratio(aspect_ratio):
+        # https://drafts.csswg.org/css-sizing-4/#aspect-ratio
+        # If the <ratio> is degenerate, the property instead behaves as auto.
+        let resolved = css_ratio_style_value_resolved(css_style_value_as_ratio(aspect_ratio))
+        if css_ratio_is_degenerate(&resolved):
+            css_mutable_computed_values_set_aspect_ratio(computed_values, CssAspectRatio(use_natural_aspect_ratio_if_available = true, preferred_ratio = none))
+        else:
+            css_mutable_computed_values_set_aspect_ratio(computed_values, CssAspectRatio(use_natural_aspect_ratio_if_available = false, preferred_ratio = resolved))
+
+    css_mutable_computed_values_set_touch_action(computed_values, css_computed_properties_touch_action(computed_style))
+
+    let math_shift_value = css_computed_properties_property(computed_style, css_data.PropertyId.math_shift)
+    if let math_shift = css_data.keyword_to_math_shift(css_style_value_to_keyword(math_shift_value)):
+        css_mutable_computed_values_set_math_shift(computed_values, math_shift)
+
+    let math_style_value = css_computed_properties_property(computed_style, css_data.PropertyId.math_style)
+    if let math_style = css_data.keyword_to_math_style(css_style_value_to_keyword(math_style_value)):
+        css_mutable_computed_values_set_math_style(computed_values, math_style)
+
+    css_mutable_computed_values_set_math_depth(computed_values, css_computed_properties_math_depth(computed_style))
+    css_mutable_computed_values_set_quotes(computed_values, css_computed_properties_quotes(computed_style))
+    css_mutable_computed_values_set_counter_increment(computed_values, css_computed_properties_counter_data(computed_style, css_data.PropertyId.counter_increment))
+    css_mutable_computed_values_set_counter_reset(computed_values, css_computed_properties_counter_data(computed_style, css_data.PropertyId.counter_reset))
+    css_mutable_computed_values_set_counter_set(computed_values, css_computed_properties_counter_data(computed_style, css_data.PropertyId.counter_set))
+
+    css_mutable_computed_values_set_object_fit(computed_values, css_computed_properties_object_fit(computed_style))
+    css_mutable_computed_values_set_object_position(computed_values, css_computed_properties_object_position(computed_style))
+    css_mutable_computed_values_set_direction(computed_values, css_computed_properties_direction(computed_style))
+    css_mutable_computed_values_set_unicode_bidi(computed_values, css_computed_properties_unicode_bidi(computed_style))
+    css_mutable_computed_values_set_scrollbar_color(computed_values, css_computed_properties_scrollbar_color(computed_style, this))
+    css_mutable_computed_values_set_scrollbar_width(computed_values, css_computed_properties_scrollbar_width(computed_style))
+    css_mutable_computed_values_set_writing_mode(computed_values, css_computed_properties_writing_mode(computed_style))
+    css_mutable_computed_values_set_user_select(computed_values, css_computed_properties_user_select(computed_style))
+    css_mutable_computed_values_set_isolation(computed_values, css_computed_properties_isolation(computed_style))
+    css_mutable_computed_values_set_mix_blend_mode(computed_values, css_computed_properties_mix_blend_mode(computed_style))
+    css_mutable_computed_values_set_view_transition_name(computed_values, css_computed_properties_view_transition_name(computed_style))
+    css_mutable_computed_values_set_contain(computed_values, css_computed_properties_contain(computed_style))
+    css_mutable_computed_values_set_container_type(computed_values, css_computed_properties_container_type(computed_style))
+    css_mutable_computed_values_set_shape_rendering(computed_values, css_computed_values_shape_rendering(&computed_values.computed_values))
+    css_mutable_computed_values_set_will_change(computed_values, css_computed_properties_will_change(computed_style))
+
+    css_mutable_computed_values_set_caret_color(computed_values, css_computed_properties_caret_color(computed_style, this))
+    css_mutable_computed_values_set_color_interpolation(computed_values, css_computed_properties_color_interpolation(computed_style))
+    css_mutable_computed_values_set_resize(computed_values, css_computed_properties_resize(computed_style))
+
+    layout_node_with_style_propagate_style_to_anonymous_wrappers(this)
+
+    if let box_node = as_if_layout_node_with_style_and_box_model_metrics(this):
+        layout_node_with_style_and_box_model_metrics_propagate_style_along_continuation(box_node, computed_style)
+
+    layout_node_with_style_rebuild_image_observers(this)

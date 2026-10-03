@@ -1,0 +1,330 @@
+#==============================================================================================
+#
+#   tests_layout_tree - layout trees built from parsed documents, pinned to the reference build
+#
+#   DESCRIPTION:
+#       Runs the cases of tests_layout_tree_cases (a local oracle over the reference build's
+#       LibWeb, luce-browser-tools/oracles/luce-browser-engine/layout_tree) through the port: a
+#       document is parsed with scripting disabled, gets the case's author style sheet, its
+#       style is computed, and Layout::TreeBuilder builds its layout tree, before any layout.
+#       Modes: `tree` (Dump's dump_tree, the first part of a Layout test's expectation, every box
+#       "(not painted)"), `nodes` (the Node / NodeWithStyle predicates and containing blocks),
+#       `chunks` (each text node's text for rendering and ChunkIterator chunks) and `markers`
+#       (each list item marker's string).
+#
+#       The documents have no browsing context or navigable until region r28: the harness gives
+#       each a stand-in navigable (800x600, what the oracle's top-level traversable has) once it
+#       is parsed, runs Document::update_style's steps past its browsing-context check (the
+#       oracle's document has the traversable's browsing context). The stand-in has its own class:
+#       Navigable's visit_edges and finalize are r28's.
+#
+#==============================================================================================
+
+# mark: Building a document's layout tree =======================================================
+
+## Document::update_style's steps after its checks (invalidation, the viewport rect, media rules, the caches and
+## update_style_recursively), for a document whose browsing context region r28 cannot make yet.
+func test_layout_tree_update_style(document: DomDocument*):
+    let style_computer = dom_document_style_computer(document)
+    css_style_invalidator_invalidate(document.m_style_invalidator, document.dom_node())
+    css_style_computer_set_viewport_rect(style_computer, dom_document_viewport_rect(document))
+    dom_document_evaluate_media_rules(document)
+    css_style_computer_reset_has_result_cache(style_computer)
+    css_style_computer_reset_ancestor_filter(style_computer)
+    dom_document_build_registered_properties_cache(document)
+    discard(dom_update_style_recursively(document.dom_node(), style_computer, false, false, false))
+    document.m_needs_full_style_update = false
+
+## The stand-in navigable's visit_edges: its page and active document (Navigable::visit_edges is region r28's).
+func test_layout_tree_navigable_visit_edges(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (HtmlNavigable*)base
+    gc.cell_visit_edges_impl(base, visitor)
+    gc.cell_visitor_visit_t_2(visitor, this.m_page)
+    gc.cell_visitor_visit_t(visitor, this.m_active_document)
+
+## The stand-in navigable's class: Navigable's, with the visit above and no finalize (both region r28's).
+let test_layout_tree_navigable_vtable: HtmlNavigableVTable = HtmlNavigableVTable(cell_vtable = JsCellVTable(cell_vtable = gc.CellVTable(class_info = &test_layout_tree_navigable_class, visit_edges = test_layout_tree_navigable_visit_edges)))
+
+## Class information of the stand-in navigable (Navigable's class id, 268).
+let test_layout_tree_navigable_class: ak.ClassInfo = ak.ClassInfo(name = "Navigable", first_id = 268, last_id = 268, size = sizeof(HtmlNavigable), vtable = (const void*)&test_layout_tree_navigable_vtable)
+
+## A navigable for `document` as the oracle's top-level traversable is to it: 800x600, the document active.
+func test_layout_tree_stand_in_navigable(heap: gc.Heap*, document: DomDocument*) -> HtmlNavigable*:
+    let navigable = (HtmlNavigable*)web_heap_allocate_cell(heap, &test_layout_tree_navigable_class)
+    navigable.m_page = dom_document_page(document)
+    gfx.css_pixel_size_construct_int(&navigable.m_viewport_size, 800, 600)
+    navigable.m_active_document = document
+    return navigable
+
+## The oracle's `build`: the document of `html` with `css` as its author style sheet, its style computed, its
+## layout tree built and each layout node's containing block computed (as Document::update_layout does). The
+## document refers to its navigable weakly (as C++): the caller keeps the answered root of the stand-in until it
+## is done with the document.
+noinline func test_layout_tree_build(heap: gc.Heap*, realm: Realm*, html: str, css: str) -> (DomDocument*, gc.Root[HtmlNavigable]):
+    let document = web_test_create_document(realm, DocumentDomDocumentType.html)
+    let parser = html_parser_create(document, ak.sv(html), HtmlParserScriptingMode.disabled, ak.sv("UTF-8"))
+    html_parser_run_url(parser, dom_document_url(document))
+    if css.length > 0:
+        var params: CssParsingParams = ---
+        css_parsing_params_construct_dom_document(&params, document)
+        let sheet = parse_css_stylesheet(params, ak.sv(css))
+        ak.vector_append_t(&dom_document_style_sheets(document).m_sheets, sheet)
+        discard(ak.hash_table_set(&sheet.m_owning_documents_or_shadow_roots, document.dom_node()))
+        css_style_scope_invalidate_rule_cache(dom_document_style_scope(document))
+    let navigable = gc.root_create(test_layout_tree_stand_in_navigable(heap, document))
+    dom_document_set_navigable(document, gc.root_cell(&navigable))
+    test_layout_tree_update_style(document)
+    var tree_builder: LayoutTreeBuilder = ---
+    layout_tree_builder_construct(&tree_builder)
+    let root = layout_tree_builder_build(&tree_builder, document.dom_node()) else trap("the tree builder built nothing")
+    document.m_layout_root = as_layout_viewport(root)
+    for node in layout_node_inclusive_subtree(root):
+        layout_node_recompute_containing_block(node)
+    return (document, navigable)
+
+# mark: The modes ===============================================================================
+
+## Appends `text`'s lines, each indented by two spaces (the oracle's put_lines of a right-trimmed text).
+func test_layout_tree_put_lines(out: ak.StringBuilder*, text: ak.StringView):
+    let bytes = ak.string_view_bytes(&text)
+    var end = bytes.length
+    while end > 0 and (bytes[end - 1] == ' ' or bytes[end - 1] == '\n' or bytes[end - 1] == '\t' or bytes[end - 1] == '\r'):
+        end -= 1
+    var start: usize = 0
+    for i in 0..<end + 1:
+        if i == end or bytes[i] == '\n':
+            ak.string_builder_append(out, "  ")
+            ak.string_builder_append_string_view(out, ak.sv((str)bytes[start..<i]))
+            ak.string_builder_append(out, "\n")
+            start = i + 1
+
+## `flag(value)`.
+func test_layout_tree_flag(value: bool) -> str:
+    return "1" if value else "0"
+
+## Appends " <name>=<0|1>".
+func test_layout_tree_put_flag(out: ak.StringBuilder*, name: str, value: bool):
+    ak.string_builder_append(out, " ")
+    ak.string_builder_append(out, name)
+    ak.string_builder_append(out, "=")
+    ak.string_builder_append(out, test_layout_tree_flag(value))
+
+## Appends a String.
+func test_layout_tree_put_string(out: ak.StringBuilder*, value: ak.String):
+    ak.string_builder_append_string_view(out, ak.string_bytes_as_string_view(&value))
+
+## Appends a decimal integer.
+func test_layout_tree_put_number(out: ak.StringBuilder*, value: i64):
+    let text = ak.string_number_i64(value)
+    test_layout_tree_put_string(out, text)
+
+## Appends `<name>=<debug description>` of a node or `-`.
+func test_layout_tree_put_node(out: ak.StringBuilder*, name: str, node: LayoutNode*?):
+    ak.string_builder_append(out, " ")
+    ak.string_builder_append(out, name)
+    ak.string_builder_append(out, "=")
+    if let found = node:
+        test_layout_tree_put_string(out, layout_node_debug_description(found))
+    else:
+        ak.string_builder_append(out, "-")
+
+## Appends a CSSPixels' raw value, or `-`.
+func test_layout_tree_put_px(out: ak.StringBuilder*, value: gfx.CssPixels?):
+    if let px = value:
+        test_layout_tree_put_number(out, (i64)px.raw_value())
+    else:
+        ak.string_builder_append(out, "-")
+
+## The oracle's `run_nodes`.
+func test_layout_tree_nodes(out: ak.StringBuilder*, document: DomDocument*):
+    let root = dom_document_unsafe_layout_node(document) else trap("no layout tree")
+    for node in layout_node_inclusive_subtree(root.layout_node()):
+        ak.string_builder_append(out, "  ")
+        test_layout_tree_put_string(out, layout_node_debug_description(node))
+        let display = layout_node_display(node)
+        ak.string_builder_append(out, " display=")
+        test_layout_tree_put_string(out, css_display_to_string(&display))
+        test_layout_tree_put_flag(out, "inline", layout_node_is_inline(node))
+        test_layout_tree_put_flag(out, "inline_block", layout_node_is_inline_block(node))
+        test_layout_tree_put_flag(out, "atomic", layout_node_is_atomic_inline(node))
+        test_layout_tree_put_flag(out, "floating", layout_node_is_floating(node))
+        test_layout_tree_put_flag(out, "positioned", layout_node_is_positioned(node))
+        test_layout_tree_put_flag(out, "abspos", layout_node_is_absolutely_positioned(node))
+        test_layout_tree_put_flag(out, "out_of_flow", layout_node_is_out_of_flow(node))
+        test_layout_tree_put_flag(out, "root", layout_node_is_root_element(node))
+        test_layout_tree_put_flag(out, "generated", layout_node_is_generated_for_pseudo_element(node))
+        test_layout_tree_put_flag(out, "anonymous", layout_node_is_anonymous(node))
+        if layout_node_has_style_or_parent_with_style(node):
+            test_layout_tree_put_flag(out, "stacking", layout_node_establishes_stacking_context(node))
+            test_layout_tree_put_flag(out, "abs_cb", layout_node_establishes_an_absolute_positioning_containing_block(node))
+            test_layout_tree_put_flag(out, "fixed_cb", layout_node_establishes_a_fixed_positioning_containing_block(node))
+            test_layout_tree_put_flag(out, "size_contain", layout_node_has_size_containment(node))
+            test_layout_tree_put_flag(out, "layout_contain", layout_node_has_layout_containment(node))
+            test_layout_tree_put_flag(out, "style_contain", layout_node_has_style_containment(node))
+            test_layout_tree_put_flag(out, "paint_contain", layout_node_has_paint_containment(node))
+            ak.string_builder_append(out, " user_select=")
+            test_layout_tree_put_number(out, (i64)(u8)layout_node_user_select_used_value(node))
+            test_layout_tree_put_flag(out, "transform", layout_node_has_css_transform(node))
+        if let with_style = as_if_layout_node_with_style(node):
+            test_layout_tree_put_flag(out, "scroll", layout_node_with_style_is_scroll_container(with_style))
+        if let metrics = as_if_layout_node_with_style_and_box_model_metrics(node):
+            test_layout_tree_put_node(out, "continuation", (LayoutNode*?)layout_node_with_style_and_box_model_metrics_continuation_of_node(metrics))
+            test_layout_tree_put_flag(out, "inline_continuation", layout_node_with_style_and_box_model_metrics_should_create_inline_continuation(metrics))
+        test_layout_tree_put_node(out, "cb", (LayoutNode*?)layout_node_containing_block(node))
+        test_layout_tree_put_node(out, "inline_cb", (LayoutNode*?)layout_node_inline_containing_block_if_applicable(node))
+        if let box = as_if_layout_box(node):
+            let size = layout_box_auto_content_box_size(box)
+            ak.string_builder_append(out, " auto_size=")
+            test_layout_tree_put_px(out, size.width)
+            ak.string_builder_append(out, "x")
+            test_layout_tree_put_px(out, size.height)
+            test_layout_tree_put_flag(out, "has_auto_size", layout_box_has_auto_content_box_size(box))
+            ak.string_builder_append(out, " ratio=")
+            if let ratio = layout_box_preferred_aspect_ratio(box):
+                test_layout_tree_put_number(out, (i64)gfx.css_pixel_fraction_numerator(&ratio).raw_value())
+                ak.string_builder_append(out, "/")
+                test_layout_tree_put_number(out, (i64)gfx.css_pixel_fraction_denominator(&ratio).raw_value())
+            else:
+                ak.string_builder_append(out, "-")
+        ak.string_builder_append(out, "\n")
+
+## The oracle's `escape`: a view's UTF-8 with \n, \t and \\ escaped.
+func test_layout_tree_put_escaped(out: ak.StringBuilder*, view: ak.Utf16View):
+    let utf8 = ak.utf16_view_to_utf8(&view) else trap("MUST: to_utf8")
+    let text = ak.string_bytes_as_string_view(&utf8)
+    for byte in ak.string_view_bytes(&text):
+        if byte == '\n':
+            ak.string_builder_append(out, "\\n")
+        elif byte == '\t':
+            ak.string_builder_append(out, "\\t")
+        elif byte == '\\':
+            ak.string_builder_append(out, "\\\\")
+        else:
+            ak.string_builder_append_u8(out, byte)
+
+## The oracle's `run_chunks`.
+func test_layout_tree_chunks(out: ak.StringBuilder*, document: DomDocument*):
+    let root = dom_document_unsafe_layout_node(document) else trap("no layout tree")
+    for node in layout_node_inclusive_subtree(root.layout_node()):
+        let text_node = as_if_layout_text_node(node) else continue
+        ak.string_builder_append(out, "  text \"")
+        let text = layout_text_node_text_for_rendering(text_node)
+        test_layout_tree_put_escaped(out, ak.utf16_string_base_utf16_view(&text.utf16_string_base))
+        ak.string_builder_append(out, "\"\n")
+        for mode in 0..<3:
+            let wrap = mode != 0
+            let respect = mode == 2
+            var iterator: LayoutTextNodeChunkIterator = ---
+            layout_text_node_chunk_iterator_construct(&iterator, text_node, wrap, respect)
+            ak.string_builder_append(out, "    wrap=")
+            ak.string_builder_append(out, test_layout_tree_flag(wrap))
+            ak.string_builder_append(out, " linebreaks=")
+            ak.string_builder_append(out, test_layout_tree_flag(respect))
+            ak.string_builder_append(out, " collapse=")
+            ak.string_builder_append(out, test_layout_tree_flag(layout_text_node_chunk_iterator_should_collapse_whitespace(&iterator)))
+            ak.string_builder_append(out, "\n")
+            while let chunk = layout_text_node_chunk_iterator_next(&iterator):
+                ak.string_builder_append(out, "      ")
+                test_layout_tree_put_number(out, (i64)chunk.start)
+                ak.string_builder_append(out, "+")
+                test_layout_tree_put_number(out, (i64)chunk.length)
+                ak.string_builder_append(out, " \"")
+                test_layout_tree_put_escaped(out, chunk.view)
+                ak.string_builder_append(out, "\"")
+                test_layout_tree_put_flag(out, "newline", chunk.has_breaking_newline)
+                test_layout_tree_put_flag(out, "tab", chunk.has_breaking_tab)
+                test_layout_tree_put_flag(out, "ws", chunk.is_all_whitespace)
+                test_layout_tree_put_flag(out, "break", chunk.can_break_after)
+                ak.string_builder_append(out, " type=")
+                test_layout_tree_put_number(out, (i64)(i32)chunk.text_type)
+                ak.string_builder_append(out, "\n")
+
+## The oracle's `run_markers`.
+func test_layout_tree_markers(out: ak.StringBuilder*, document: DomDocument*):
+    let root = dom_document_unsafe_layout_node(document) else trap("no layout tree")
+    for node in layout_node_inclusive_subtree(root.layout_node()):
+        let marker = as_if_layout_list_item_marker_box(node) else continue
+        ak.string_builder_append(out, "  marker ")
+        if let text = layout_list_item_marker_box_text(marker):
+            ak.string_builder_append(out, "\"")
+            test_layout_tree_put_string(out, text)
+            ak.string_builder_append(out, "\"")
+        else:
+            ak.string_builder_append(out, "-")
+        ak.string_builder_append(out, " position=")
+        test_layout_tree_put_number(out, (i64)(u8)layout_list_item_marker_box_list_style_position(marker))
+        ak.string_builder_append(out, "\n")
+
+## Runs one case and answers its output.
+func test_layout_tree_run_case(heap: gc.Heap*, realm: Realm*, test_case: const TestLayoutTreeCase*) -> ak.String:
+    var out = ak.string_builder_new()
+    var (document, navigable) = test_layout_tree_build(heap, realm, test_case.html, test_case.css)
+    defer gc.root_release(&navigable)
+    if test_case.mode == "tree":
+        var builder = ak.string_builder_new()
+        let root = dom_document_unsafe_layout_node(document) else trap("no layout tree")
+        dump_tree_string_builder_layout_node(&builder, root.layout_node(), false, false)
+        test_layout_tree_put_lines(&out, ak.string_builder_string_view(&builder))
+    elif test_case.mode == "nodes":
+        test_layout_tree_nodes(&out, document)
+    elif test_case.mode == "chunks":
+        test_layout_tree_chunks(&out, document)
+    elif test_case.mode == "markers":
+        test_layout_tree_markers(&out, document)
+    else:
+        ak.string_builder_append(&out, "  unknown mode\n")
+    return ak.string_builder_to_string_without_validation(&out)
+
+## Runs every case of `mode` (a VM and realm for all of them, the user-agent sheets installed, the test client
+## preferring light, the cases in the C heap with collection deferred), printing each mismatch, and answers how many matched and failed.
+func test_layout_tree_run_mode(mode: str) -> (usize, usize):
+    web_initialize_strings()
+    test_fonts_setup()
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    let heap = vm_heap(vm)
+    var passed: usize = 0
+    var failed: usize = 0
+    # As css/tests_fonts: Typeface::font caches fonts in the C-heap font database, which outlives
+    # the VM, so the cases allocate in the C heap and no collection runs while they do.
+    test_fonts_defer_collections(realm)
+    defer test_fonts_end_deferral(realm)
+    with memory.heap:
+        test_page_client_color_scheme = CssPreferredColorScheme.light
+        defer test_page_client_color_scheme = CssPreferredColorScheme.auto
+        test_media_invalidation_install_user_agent_sheets(realm)
+        defer test_style_computer_release_user_agent_sheets()
+        for test_case in &test_layout_tree_cases:
+            if test_case.mode != mode:
+                continue
+            let actual = test_layout_tree_run_case(heap, realm, test_case)
+            let actual_view = ak.string_bytes_as_string_view(&actual)
+            if ak.string_view_equals(&actual_view, test_case.expected):
+                passed += 1
+            else:
+                failed += 1
+                print(f"layout tree case mismatch ({mode}): {test_case.html}")
+                print(f"expected:\n{test_case.expected}actual:\n{ak.string_view_text(ak.string_bytes_as_string_view(&actual))}")
+    return (passed, failed)
+
+# mark: Tests ===================================================================================
+
+test "layout trees of parsed documents (anonymous wrappers, continuations, pseudo-elements, markers, fieldsets) match the reference build":
+    let (passed, failed) = test_layout_tree_run_mode("tree")
+    assert(failed == 0)
+    assert(passed > 0)
+
+test "layout node predicates and containing blocks match the reference build":
+    let (passed, failed) = test_layout_tree_run_mode("nodes")
+    assert(failed == 0)
+    assert(passed > 0)
+
+test "text for rendering and TextNode::ChunkIterator chunks match the reference build":
+    let (passed, failed) = test_layout_tree_run_mode("chunks")
+    assert(failed == 0)
+    assert(passed > 0)
+
+test "list item marker strings match the reference build":
+    let (passed, failed) = test_layout_tree_run_mode("markers")
+    assert(failed == 0)
+    assert(passed > 0)

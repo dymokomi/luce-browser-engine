@@ -1,0 +1,339 @@
+#==============================================================================================
+#
+#   text_node_2 - Layout::TextNode::ChunkIterator: a text node's text, chunk by chunk
+#
+#   DESCRIPTION:
+#       Port of LibWeb/Layout/TextNode.cpp (lines 426-800) and the ChunkIterator members of
+#       TextNode.h: the chunks inline layout places one by one (runs of one font and one bidi
+#       text type that end at soft wrap opportunities, white space, tabs and preserved line
+#       breaks), with the peek queue, the line break opportunities of word-break, and the font
+#       a space is drawn in.
+#
+#       Copyright (c) 2018-2021, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2025, Jelle Raaijmakers <jelle@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Helpers =================================================================================
+
+## Ported from Libraries/LibWeb/Layout/TextNode.cpp:426 Web::Layout::is_interword_space.
+func layout_is_interword_space(code_point: u32) -> bool:
+    return code_point == 0x0020 or code_point == 0x00A0
+
+## `Gfx::GlyphRun::TextType` of each ASCII code point: the fast path of text_type_for_code_point. Each ASCII
+## character has a statically known bidi class (L = Ltr, C = Common, X = ContextDependent).
+let layout_ascii_text_types: u8[128] = [
+    # 0x00-0x0F: Control characters (BN=Common, S/B/WS=ContextDependent)
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0,
+    # 0x10-0x1F: Control characters
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1,
+    # 0x20-0x2F: Space and punctuation
+    1, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1,
+    # 0x30-0x3F: Digits and punctuation
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0,
+    # 0x40-0x4F: @ and uppercase letters
+    0, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+    # 0x50-0x5F: Uppercase letters and punctuation
+    3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0,
+    # 0x60-0x6F: ` and lowercase letters
+    0, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+    # 0x70-0x7F: Lowercase letters and punctuation
+    3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 0, 0, 0, 0, 0,
+]
+
+## Ported from Libraries/LibWeb/Layout/TextNode.cpp:450 Web::Layout::text_type_for_code_point.
+func layout_text_type_for_code_point(code_point: u32) -> web_fonts.GlyphRunTextType:
+    # Fast path for ASCII using a lookup table.
+    # Each ASCII character has a statically known bidi class.
+    if code_point < 0x80:
+        return (web_fonts.GlyphRunTextType)(i32)layout_ascii_text_types[code_point]
+
+    match web_unicode.bidirectional_class(code_point):
+        .white_space_neutral, .block_separator, .segment_separator, .common_number_separator, .dir_non_spacing_mark, .arabic_number, .european_number, .european_number_separator, .european_number_terminator:
+            return web_fonts.GlyphRunTextType.context_dependent
+        .boundary_neutral, .other_neutral, .first_strong_isolate, .pop_directional_format, .pop_directional_isolate:
+            return web_fonts.GlyphRunTextType.common
+        .left_to_right, .left_to_right_embedding, .left_to_right_isolate, .left_to_right_override:
+            return web_fonts.GlyphRunTextType.ltr
+        .right_to_left, .right_to_left_arabic, .right_to_left_embedding, .right_to_left_isolate, .right_to_left_override:
+            return web_fonts.GlyphRunTextType.rtl
+        _:
+            trap("VERIFY_NOT_REACHED")
+
+# mark: Construction ============================================================================
+
+## Ported from Libraries/LibWeb/Layout/TextNode.cpp:431 Web::Layout::TextNode::ChunkIterator::ChunkIterator(TextNode const&, bool, bool).
+pub func layout_text_node_chunk_iterator_construct(this: LayoutTextNodeChunkIterator*, text_node: LayoutTextNode*, should_wrap_lines: bool, should_respect_linebreaks: bool):
+    let text = layout_text_node_text_for_rendering(text_node)
+    let word_break = css_computed_values_word_break(&layout_node_computed_values(text_node.layout_node()).computed_values)
+    layout_text_node_chunk_iterator_construct_utf16_view(this, text_node, ak.utf16_string_base_utf16_view(&text.utf16_string_base), layout_text_node_grapheme_segmenter(text_node), layout_text_node_line_segmenter(text_node), word_break, should_wrap_lines, should_respect_linebreaks)
+
+## Ported from Libraries/LibWeb/Layout/TextNode.cpp:436 Web::Layout::TextNode::ChunkIterator::ChunkIterator(TextNode const&, Utf16View const&, ...).
+pub func layout_text_node_chunk_iterator_construct_utf16_view(this: LayoutTextNodeChunkIterator*, text_node: LayoutTextNode*, text: ak.Utf16View, grapheme_segmenter: web_unicode.Segmenter*, line_segmenter: web_unicode.Segmenter*, word_break: css_data.WordBreak, should_wrap_lines: bool, should_respect_linebreaks: bool):
+    let computed_values = &layout_node_computed_values(text_node.layout_node()).computed_values
+    this.m_should_wrap_lines = should_wrap_lines
+    this.m_should_respect_linebreaks = should_respect_linebreaks
+    this.m_view = text
+    this.m_font_cascade_list = css_computed_values_font_list(computed_values)
+    this.m_grapheme_segmenter = grapheme_segmenter
+    this.m_line_segmenter = line_segmenter
+    this.m_word_break = word_break
+    this.m_current_index = 0
+    this.m_peek_queue = ak.Vector[LayoutTextNodeChunk]()
+    this.m_last_non_whitespace_font = none
+    let white_space_collapse = css_computed_values_white_space_collapse(computed_values)
+    this.m_should_collapse_whitespace = white_space_collapse == css_data.WhiteSpaceCollapse.collapse or white_space_collapse == css_data.WhiteSpaceCollapse.preserve_breaks
+
+## Ported from Libraries/LibWeb/Layout/TextNode.h:50 Web::Layout::TextNode::ChunkIterator::should_wrap_lines.
+pub func layout_text_node_chunk_iterator_should_wrap_lines(this: LayoutTextNodeChunkIterator*) -> bool:
+    return this.m_should_wrap_lines
+
+## Ported from Libraries/LibWeb/Layout/TextNode.h:51 Web::Layout::TextNode::ChunkIterator::should_respect_linebreaks.
+pub func layout_text_node_chunk_iterator_should_respect_linebreaks(this: LayoutTextNodeChunkIterator*) -> bool:
+    return this.m_should_respect_linebreaks
+
+## Ported from Libraries/LibWeb/Layout/TextNode.h:52 Web::Layout::TextNode::ChunkIterator::should_collapse_whitespace.
+pub func layout_text_node_chunk_iterator_should_collapse_whitespace(this: LayoutTextNodeChunkIterator*) -> bool:
+    return this.m_should_collapse_whitespace
+
+# mark: Iteration ===============================================================================
+
+## Ported from Libraries/LibWeb/Layout/TextNode.cpp:521 Web::Layout::TextNode::ChunkIterator::next.
+pub func layout_text_node_chunk_iterator_next(this: LayoutTextNodeChunkIterator*) -> LayoutTextNodeChunk?:
+    if not ak.vector_is_empty(&this.m_peek_queue):
+        return ak.vector_take_first(&this.m_peek_queue)
+    return layout_text_node_chunk_iterator_next_without_peek(this)
+
+## Ported from Libraries/LibWeb/Layout/TextNode.cpp:528 Web::Layout::TextNode::ChunkIterator::peek.
+pub func layout_text_node_chunk_iterator_peek(this: LayoutTextNodeChunkIterator*, count: usize) -> LayoutTextNodeChunk?:
+    while ak.vector_size(&this.m_peek_queue) <= count:
+        let next = layout_text_node_chunk_iterator_next_without_peek(this) else return none
+        ak.vector_append_t(&this.m_peek_queue, next)
+
+    return *ak.vector_at(&this.m_peek_queue, count)
+
+## Ported from Libraries/LibWeb/Layout/TextNode.cpp:540 Web::Layout::TextNode::ChunkIterator::create_empty_chunk.
+pub func layout_text_node_chunk_iterator_create_empty_chunk(this: LayoutTextNodeChunkIterator*) -> LayoutTextNodeChunk:
+    return LayoutTextNodeChunk(view = ak.Utf16View(), font = web_fonts.font_cascade_list_first(this.m_font_cascade_list), is_all_whitespace = true, text_type = web_fonts.GlyphRunTextType.common)
+
+## `has_break_all_class`: a lambda of is_at_line_break_opportunity.
+func layout_has_break_all_class(code_point: u32) -> bool:
+    let line_break_class = web_unicode.line_break_class(code_point)
+    return line_break_class == web_unicode.LineBreakClass.alphabetic or line_break_class == web_unicode.LineBreakClass.numeric or line_break_class == web_unicode.LineBreakClass.complex_context or line_break_class == web_unicode.LineBreakClass.ideographic
+
+## `has_keep_all_class`: a lambda of is_at_line_break_opportunity.
+func layout_has_keep_all_class(code_point: u32) -> bool:
+    let line_break_class = web_unicode.line_break_class(code_point)
+    return line_break_class == web_unicode.LineBreakClass.alphabetic or line_break_class == web_unicode.LineBreakClass.numeric or line_break_class == web_unicode.LineBreakClass.ambiguous or line_break_class == web_unicode.LineBreakClass.ideographic
+
+## `get_previous_code_point`: a lambda of is_at_line_break_opportunity.
+func layout_text_node_chunk_iterator_previous_code_point(this: LayoutTextNodeChunkIterator*) -> u32?:
+    if this.m_current_index == 0:
+        return none
+    var current_index = this.m_current_index
+    var previous_code_point = ak.utf16_view_previous_code_point_at(&this.m_view, &current_index)
+    while web_unicode.line_break_class(previous_code_point) == web_unicode.LineBreakClass.combining_mark and current_index > 0:
+        previous_code_point = ak.utf16_view_previous_code_point_at(&this.m_view, &current_index)
+    return previous_code_point
+
+## `is_at_line_segmenter_boundary`: a lambda of is_at_line_break_opportunity.
+func layout_text_node_chunk_iterator_is_at_line_segmenter_boundary(this: LayoutTextNodeChunkIterator*) -> bool:
+    let boundary = web_unicode.segmenter_next_boundary(this.m_line_segmenter, this.m_current_index, web_unicode.SegmenterInclusive.yes) else return false
+    return boundary == (u64)this.m_current_index
+
+## Ported from Libraries/LibWeb/Layout/TextNode.cpp:550 Web::Layout::TextNode::ChunkIterator::is_at_line_break_opportunity.
+func layout_text_node_chunk_iterator_is_at_line_break_opportunity(this: LayoutTextNodeChunkIterator*) -> bool:
+    if not this.m_should_wrap_lines:
+        return false
+
+    # https://drafts.csswg.org/css-text-4/#word-break-property
+    # This property specifies soft wrap opportunities between and within “words”, i.e. where it is “normal” and
+    # permissible to break lines of text. It focuses on breaks between letters, and does not define whether and how
+    # soft wrap opportunities are created by white space and other space separators (though auto-phrase may suppress
+    # some), nor around punctuation.
+    match this.m_word_break:
+        .normal, .break_word:
+            # https://drafts.csswg.org/css-text-4/#valdef-word-break-normal
+            # Words break according to their customary rules, as described above. Korean, which commonly exhibits two
+            # different behaviors, allows breaks between any two consecutive Hangul/Hanja. For Ethiopic, which also
+            # exhibits two different behaviors, such breaks within words are not allowed.
+            # https://drafts.csswg.org/css-text-4/#valdef-word-break-break-word
+            # For compatibility with legacy content, the word-break property also supports a deprecated break-word
+            # keyword. When specified, this has the same effect as word-break: normal and overflow-wrap: anywhere,
+            # regardless of the actual value of the overflow-wrap property.
+            return layout_text_node_chunk_iterator_is_at_line_segmenter_boundary(this)
+        .break_all:
+            # https://drafts.csswg.org/css-text-4/#valdef-word-break-break-all
+            # Breaking is allowed within “words”: specifically, in addition to soft wrap opportunities allowed for normal,
+            # any typographic letter units (and any typographic character units resolving to the NU (“numeric”),
+            # AL (“alphabetic”), or SA (“Southeast Asian”) line breaking classes [UAX14]) are instead treated as ID
+            # (“ideographic characters”) for the purpose of line-breaking. Hyphenation is not applied.
+            if this.m_current_index >= ak.utf16_view_length_in_code_units(&this.m_view):
+                return false
+            if let previous_code_point = layout_text_node_chunk_iterator_previous_code_point(this):
+                if layout_has_break_all_class(previous_code_point) and layout_has_break_all_class(ak.utf16_view_code_point_at(&this.m_view, this.m_current_index)):
+                    return true
+            return layout_text_node_chunk_iterator_is_at_line_segmenter_boundary(this)
+        .keep_all:
+            # https://drafts.csswg.org/css-text-4/#valdef-word-break-keep-all
+            # Breaking is forbidden within “words”: implicit soft wrap opportunities between typographic letter units
+            # (or other typographic character units belonging to the NU, AL, AI, or ID Unicode line breaking classes [UAX14])
+            # are suppressed, i.e. breaks are prohibited between pairs of such characters (regardless of line-break
+            # settings other than anywhere) except where opportunities exist due to §6.1.1.1 Lexical Word Breaking.
+            # Otherwise this option is equivalent to normal. In this style, sequences of CJK characters do not break.
+            if this.m_current_index >= ak.utf16_view_length_in_code_units(&this.m_view):
+                return false
+            if let previous_code_point = layout_text_node_chunk_iterator_previous_code_point(this):
+                if layout_has_keep_all_class(previous_code_point) and layout_has_keep_all_class(ak.utf16_view_code_point_at(&this.m_view, this.m_current_index)):
+                    return false
+            return layout_text_node_chunk_iterator_is_at_line_segmenter_boundary(this)
+        _:
+            trap("VERIFY_NOT_REACHED")
+
+## The grapheme boundary after `index`, or the end of the text (`next_boundary(index).value_or(length)`).
+func layout_text_node_chunk_iterator_next_grapheme_boundary_after(this: LayoutTextNodeChunkIterator*, index: usize) -> usize:
+    let length = ak.utf16_view_length_in_code_units(&this.m_view)
+    let boundary = web_unicode.segmenter_next_boundary(this.m_grapheme_segmenter, index, web_unicode.SegmenterInclusive.no) else return length
+    return (usize)boundary
+
+## Ported from Libraries/LibWeb/Layout/TextNode.cpp:627 Web::Layout::TextNode::ChunkIterator::font_for_space.
+func layout_text_node_chunk_iterator_font_for_space(this: LayoutTextNodeChunkIterator*, at_index: usize, space_code_point: u32) -> const web_fonts.Font*:
+    # has_glyph(font): font.contains_glyph(space_code_point)
+
+    # 1. Prefer the last non-whitespace font in this node/run.
+    if let last_non_whitespace_font = this.m_last_non_whitespace_font:
+        if not web_fonts.font_is_emoji_font(last_non_whitespace_font) and web_fonts.font_contains_glyph(last_non_whitespace_font, space_code_point):
+            return last_non_whitespace_font
+
+    # 2. Look ahead to the next non-space to infer the base font of this run.
+    var i = at_index
+    while i < ak.utf16_view_length_in_code_units(&this.m_view):
+        let cp = ak.utf16_view_code_point_at(&this.m_view, i)
+        if not layout_is_interword_space(cp) and cp != (u32)'\t' and cp != (u32)'\n':
+            let font = web_fonts.font_cascade_list_font_for_code_point(this.m_font_cascade_list, cp, web_fonts.FontCascadeListTriggerPendingLoads.yes)
+            if not web_fonts.font_is_emoji_font(font) and web_fonts.font_contains_glyph(font, space_code_point):
+                return font
+            # Text is coming from an emoji face; we'll fall back to (3).
+            break
+        i = layout_text_node_chunk_iterator_next_grapheme_boundary_after(this, i)
+
+    # 3. No text around (leading/trailing/all spaces) — pick a font with the glyph from the cascade.
+    return web_fonts.font_cascade_list_font_for_code_point(this.m_font_cascade_list, space_code_point, web_fonts.FontCascadeListTriggerPendingLoads.yes)
+
+## `expected_font_for(cp)`: a lambda of next_without_peek.
+func layout_text_node_chunk_iterator_expected_font_for(this: LayoutTextNodeChunkIterator*, cp: u32) -> const web_fonts.Font*:
+    if layout_is_interword_space(cp):
+        return layout_text_node_chunk_iterator_font_for_space(this, this.m_current_index, cp)
+    return web_fonts.font_cascade_list_font_for_code_point(this.m_font_cascade_list, cp, web_fonts.FontCascadeListTriggerPendingLoads.yes)
+
+## `is_collapsible(code_point)`: a lambda of next_without_peek.
+# https://drafts.csswg.org/css-text-4/#collapsible-white-space
+func layout_text_node_chunk_iterator_is_collapsible(this: LayoutTextNodeChunkIterator*, code_point: u32) -> bool:
+    return this.m_should_collapse_whitespace and ak.is_ascii_space(code_point)
+
+## Ported from Libraries/LibWeb/Layout/TextNode.cpp:653 Web::Layout::TextNode::ChunkIterator::next_without_peek.
+func layout_text_node_chunk_iterator_next_without_peek(this: LayoutTextNodeChunkIterator*) -> LayoutTextNodeChunk?:
+    let length = ak.utf16_view_length_in_code_units(&this.m_view)
+    if this.m_current_index >= length:
+        return none
+
+    # current_code_point(): m_view.code_point_at(m_current_index)
+    # next_grapheme_boundary(): m_grapheme_segmenter.next_boundary(m_current_index).value_or(m_view.length_in_code_units())
+
+    var code_point = ak.utf16_view_code_point_at(&this.m_view, this.m_current_index)
+    var can_break_at_current_position = layout_text_node_chunk_iterator_is_at_line_break_opportunity(this)
+    let start_of_chunk = this.m_current_index
+
+    let font = layout_text_node_chunk_iterator_expected_font_for(this, ak.utf16_view_code_point_at(&this.m_view, this.m_current_index))
+    let text_type = layout_text_type_for_code_point(code_point)
+
+    var broken_on_tab = false
+
+    while this.m_current_index < length:
+        code_point = ak.utf16_view_code_point_at(&this.m_view, this.m_current_index)
+
+        if code_point == (u32)'\t':
+            if let result = layout_text_node_chunk_iterator_try_commit_chunk(this, start_of_chunk, this.m_current_index, false, broken_on_tab, false, font, text_type):
+                return result
+
+            broken_on_tab = true
+            # consume any consecutive tabs
+            while this.m_current_index < length and ak.utf16_view_code_point_at(&this.m_view, this.m_current_index) == (u32)'\t':
+                this.m_current_index = layout_text_node_chunk_iterator_next_grapheme_boundary_after(this, this.m_current_index)
+            can_break_at_current_position = layout_text_node_chunk_iterator_is_at_line_break_opportunity(this)
+
+        let expected_font = layout_text_node_chunk_iterator_expected_font_for(this, code_point)
+
+        if font != expected_font:
+            if let result = layout_text_node_chunk_iterator_try_commit_chunk(this, start_of_chunk, this.m_current_index, false, broken_on_tab, can_break_at_current_position, font, text_type):
+                return result
+
+        if this.m_should_respect_linebreaks and code_point == (u32)'\n':
+            # Newline encountered, and we're supposed to preserve them.
+            # If we have accumulated some code points in the current chunk, commit them now and continue with the newline next time.
+            if let result = layout_text_node_chunk_iterator_try_commit_chunk(this, start_of_chunk, this.m_current_index, false, broken_on_tab, false, font, text_type):
+                return result
+
+            # Otherwise, commit the newline!
+            this.m_current_index = layout_text_node_chunk_iterator_next_grapheme_boundary_after(this, this.m_current_index)
+            let result = layout_text_node_chunk_iterator_try_commit_chunk(this, start_of_chunk, this.m_current_index, true, broken_on_tab, false, font, text_type) else trap("VERIFY: result.has_value()")
+            return result
+
+        # If both this code point and the previous code point are collapsible, skip code points until we're at a non-
+        # collapsible code point.
+        if layout_text_node_chunk_iterator_is_collapsible(this, code_point) and this.m_current_index > 0 and layout_text_node_chunk_iterator_is_collapsible(this, ak.utf16_view_code_point_at(&this.m_view, this.m_current_index - 1)):
+            let result = layout_text_node_chunk_iterator_try_commit_chunk(this, start_of_chunk, this.m_current_index, false, broken_on_tab, false, font, text_type)
+
+            while this.m_current_index < length and layout_text_node_chunk_iterator_is_collapsible(this, ak.utf16_view_code_point_at(&this.m_view, this.m_current_index)):
+                this.m_current_index = layout_text_node_chunk_iterator_next_grapheme_boundary_after(this, this.m_current_index)
+
+            if let committed = result:
+                return committed
+
+            return layout_text_node_chunk_iterator_next_without_peek(this)
+
+        if this.m_should_wrap_lines:
+            if text_type != layout_text_type_for_code_point(code_point):
+                if let result = layout_text_node_chunk_iterator_try_commit_chunk(this, start_of_chunk, this.m_current_index, false, broken_on_tab, can_break_at_current_position, font, text_type):
+                    return result
+
+            if ak.is_ascii_space(code_point):
+                # Whitespace encountered, and we're allowed to break on whitespace.
+                # If we have accumulated some code points in the current chunk, commit them now and continue with the whitespace next time.
+                if let result = layout_text_node_chunk_iterator_try_commit_chunk(this, start_of_chunk, this.m_current_index, false, broken_on_tab, false, font, text_type):
+                    return result
+
+                # Otherwise, commit the whitespace!
+                this.m_current_index = layout_text_node_chunk_iterator_next_grapheme_boundary_after(this, this.m_current_index)
+                can_break_at_current_position = layout_text_node_chunk_iterator_is_at_line_break_opportunity(this)
+                let space_font = layout_text_node_chunk_iterator_font_for_space(this, this.m_current_index, code_point)
+                if let result = layout_text_node_chunk_iterator_try_commit_chunk(this, start_of_chunk, this.m_current_index, false, broken_on_tab, false, space_font, text_type):
+                    return result
+                continue
+
+            if can_break_at_current_position:
+                if let result = layout_text_node_chunk_iterator_try_commit_chunk(this, start_of_chunk, this.m_current_index, false, broken_on_tab, true, font, text_type):
+                    return result
+
+        this.m_current_index = layout_text_node_chunk_iterator_next_grapheme_boundary_after(this, this.m_current_index)
+        can_break_at_current_position = layout_text_node_chunk_iterator_is_at_line_break_opportunity(this)
+
+    if start_of_chunk != length:
+        # Try to output whatever's left at the end of the text node.
+        if let result = layout_text_node_chunk_iterator_try_commit_chunk(this, start_of_chunk, length, false, broken_on_tab, false, font, text_type):
+            return result
+
+    return none
+
+## Ported from Libraries/LibWeb/Layout/TextNode.cpp:775 Web::Layout::TextNode::ChunkIterator::try_commit_chunk.
+func layout_text_node_chunk_iterator_try_commit_chunk(this: LayoutTextNodeChunkIterator*, start: usize, end: usize, has_breaking_newline: bool, has_breaking_tab: bool, can_break_after: bool, font: const web_fonts.Font*, text_type: web_fonts.GlyphRunTextType) -> LayoutTextNodeChunk?:
+    let length_in_code_units = end - start
+    if length_in_code_units > 0:
+        let chunk_view = ak.utf16_view_substring_view_usize(&this.m_view, start, length_in_code_units)
+        let is_all_whitespace = ak.utf16_view_is_ascii_whitespace(&chunk_view)
+        if not is_all_whitespace:
+            this.m_last_non_whitespace_font = font
+        return LayoutTextNodeChunk(view = chunk_view, font = font, start = start, length = length_in_code_units, has_breaking_newline = has_breaking_newline, has_breaking_tab = has_breaking_tab, is_all_whitespace = is_all_whitespace, can_break_after = can_break_after, text_type = text_type)
+
+    return none
