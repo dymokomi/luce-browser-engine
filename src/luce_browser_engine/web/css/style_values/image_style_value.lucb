@@ -1,0 +1,278 @@
+#==============================================================================================
+#
+#   image_style_value - ImageStyleValue: an image from a url(), its loading and animation
+#
+#   DESCRIPTION:
+#       Port of LibWeb/CSS/StyleValues/ImageStyleValue.cpp (lines 1-259) and the inline members
+#       of ImageStyleValue.h.
+#
+#       Copyright (c) 2018-2023, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2021, Tobias Christiansen <tobyase@serenityos.org>
+#       Copyright (c) 2021-2025, Sam Atkins <sam@ladybird.org>
+#       Copyright (c) 2022-2023, MacDue <macdue@dueutil.tech>
+#       Copyright (c) 2018-2020, Andreas Kling <andreas@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Creation ================================================================================
+
+## Ported from Libraries/LibWeb/CSS/StyleValues/ImageStyleValue.cpp:27 Web::CSS::ImageStyleValue::create.
+pub func css_image_style_value_create_css_url(url: CssUrl) -> CssImageStyleValue*:
+    let this = &(alloc CssImageStyleValue[1] else trap("out of memory"))[0]
+    css_image_style_value_construct(this, url)
+    return this
+
+## Ported from Libraries/LibWeb/CSS/StyleValues/ImageStyleValue.cpp:32 Web::CSS::ImageStyleValue::create.
+pub func css_image_style_value_create_url(url: web_url.Url) -> CssImageStyleValue*:
+    var css_url: CssUrl = ---
+    css_url_construct(&css_url, web_url.url_to_string(&url), CssUrlType.url, ak.Vector[CssRequestUrlModifier]())
+    let this = &(alloc CssImageStyleValue[1] else trap("out of memory"))[0]
+    css_image_style_value_construct(this, css_url)
+    return this
+
+## Ported from Libraries/LibWeb/CSS/StyleValues/ImageStyleValue.cpp:37 Web::CSS::ImageStyleValue::ImageStyleValue.
+pub func css_image_style_value_construct(this: CssImageStyleValue*, url: CssUrl):
+    css_style_value_construct(this.css_style_value(), CssStyleValueType.image)
+    css_style_value_set_class(this.css_style_value(), (const CssStyleValueVTable*)&css_image_style_value_vtable, &css_image_style_value_class)
+    this.on_animate = ak.Function0[unit](call = none, context = none)
+    this.m_resource_request = none
+    this.m_style_sheet = none
+    this.m_url = url
+    this.m_document = gc.Weak[DomDocument]()
+    this.m_current_frame_index = 0
+    this.m_loops_completed = 0
+    this.m_timer = none
+    this.m_clients = ak.HashTable[CssImageStyleValueClient*?, ak.PtrTraits[CssImageStyleValueClient]]()
+
+## Ported from Libraries/LibWeb/CSS/StyleValues/ImageStyleValue.cpp:45 Web::CSS::ImageStyleValue::visit_edges (override).
+pub func css_image_style_value_visit_edges_impl(base: CssStyleValue*, visitor: gc.CellVisitor*):
+    let this = (CssImageStyleValue*)base
+    css_style_value_visit_edges_impl(base, visitor)
+    # FIXME: visit_edges in non-GC allocated classes is confusing pattern.
+    #        Consider making StyleValue to be GC allocated instead.
+    gc.cell_visitor_visit_t(visitor, this.m_resource_request)
+    gc.cell_visitor_visit_t(visitor, this.m_style_sheet)
+    gc.cell_visitor_visit_t(visitor, this.m_timer)
+
+# mark: Loading and animation ===================================================================
+
+## The captures of the `weak_callback(*this, ...)` ImageStyleValue::load_any_resources gives the resource
+## request. NB: it holds the value strongly: weak references exist for cells (DESIGN.md §3.7), and a style
+## value is not one. The callback only acts while the value has a document, as the C++ lambda does.
+struct CssImageStyleValueLoadCallback:
+    var this: CssImageStyleValue*
+
+## The lambda of ImageStyleValue::load_any_resources run when the image has loaded.
+func css_image_style_value_load_callback_run(context: void*?):
+    let captures = (CssImageStyleValueLoadCallback*)(context else trap("VERIFY: captures"))
+    let this = captures.this
+    let document = gc.weak_ptr(&this.m_document) else return
+
+    for client in ak.hash_table_begin(&this.m_clients):
+        css_image_style_value_client_image_style_value_did_update(*client else continue, this)
+
+    let request = this.m_resource_request else trap("VERIFY: a resource request")
+    let image_data = html_shared_resource_request_image_data(request) else trap("VERIFY: image data")
+    if html_decoded_image_data_is_animated(image_data) and html_decoded_image_data_frame_count(image_data) > 1:
+        let heap = gc.cell_heap(document.cell())
+        let timer = platform_timer_create(heap)
+        this.m_timer = timer
+        platform_timer_set_interval(timer, html_decoded_image_data_frame_duration(image_data, 0))
+        timer.on_timeout = gc.create_function0(heap, ak.Function0[unit](call = css_image_style_value_animate_callback, context = this))
+        platform_timer_start(timer)
+
+## `[ptr = &self] { ptr->animate(); }`, the timer's timeout.
+func css_image_style_value_animate_callback(context: void*?):
+    css_image_style_value_animate((CssImageStyleValue*)(context else trap("VERIFY: captures")))
+
+## Ported from Libraries/LibWeb/CSS/StyleValues/ImageStyleValue.cpp:55 Web::CSS::ImageStyleValue::load_any_resources (override).
+pub func css_image_style_value_load_any_resources_dom_document_impl(base: CssAbstractImageStyleValue*, document: DomDocument*):
+    let this = (CssImageStyleValue*)base
+    if this.m_resource_request != none:
+        return
+    gc.weak_assign(&this.m_document, document)
+
+    let rule_or_declaration = CssRuleOrDeclaration(
+        environment_settings_object = dom_document_relevant_settings_object(document),
+        value = .css_rule_or_declaration_rule(CssRuleOrDeclarationRule(parent_style_sheet = this.m_style_sheet)),
+    )
+
+    var fetch_document = document
+    if let style_sheet = this.m_style_sheet:
+        fetch_document = css_css_style_sheet_owning_document(style_sheet) else trap("VERIFY: the style sheet's owning document")
+    this.m_resource_request = css_fetch_an_external_image_for_a_stylesheet(.css_url(this.m_url), rule_or_declaration, fetch_document)
+
+    if let request = this.m_resource_request:
+        let captures = new CssImageStyleValueLoadCallback(this = this) else trap("out of memory")
+        html_shared_resource_request_add_callbacks(request, ak.Function0[unit](call = css_image_style_value_load_callback_run, context = captures), ak.Function0[unit](call = none, context = none))
+
+## Ported from Libraries/LibWeb/CSS/StyleValues/ImageStyleValue.cpp:91 Web::CSS::ImageStyleValue::animate.
+pub func css_image_style_value_animate(this: CssImageStyleValue*):
+    let request = this.m_resource_request else return
+    let image_data = html_shared_resource_request_image_data(request) else return
+
+    this.m_current_frame_index = (this.m_current_frame_index + 1) % html_decoded_image_data_frame_count(image_data)
+    this.m_current_frame_index = html_decoded_image_data_notify_frame_advanced(image_data, this.m_current_frame_index)
+    let current_frame_duration = html_decoded_image_data_frame_duration(image_data, this.m_current_frame_index)
+
+    let timer = this.m_timer else trap("VERIFY: an animation timer")
+    if current_frame_duration != platform_timer_interval(timer):
+        platform_timer_restart_i32(timer, current_frame_duration)
+
+    if this.m_current_frame_index == html_decoded_image_data_frame_count(image_data) - 1:
+        this.m_loops_completed += 1
+        if this.m_loops_completed > 0 and this.m_loops_completed == html_decoded_image_data_loop_count(image_data):
+            platform_timer_stop(timer)
+
+    if ak.function0_is_set(&this.on_animate):
+        ak.function0_call(&this.on_animate)
+
+## Ported from Libraries/LibWeb/CSS/StyleValues/ImageStyleValue.cpp:116 Web::CSS::ImageStyleValue::is_paintable (override).
+pub func css_image_style_value_is_paintable_impl(base: CssAbstractImageStyleValue*) -> bool:
+    return css_image_style_value_image_data((CssImageStyleValue*)base) != none
+
+## Ported from Libraries/LibWeb/CSS/StyleValues/ImageStyleValue.cpp:121 Web::CSS::ImageStyleValue::bitmap.
+pub func css_image_style_value_bitmap(this: CssImageStyleValue*, frame_index: usize, size: gfx.IntSize = gfx.IntSize()) -> const gfx.ImmutableBitmap*?:
+    if let image_data = css_image_style_value_image_data(this):
+        return html_decoded_image_data_bitmap(image_data, frame_index, size)
+    return none
+
+# mark: Serialization and equality ==============================================================
+
+## Ported from Libraries/LibWeb/CSS/StyleValues/ImageStyleValue.cpp:128 Web::CSS::ImageStyleValue::serialize (override).
+pub func css_image_style_value_serialize_impl(base: CssStyleValue*, builder: ak.StringBuilder*, arg1: css_syntax.SerializationMode):
+    discard(arg1)
+    let this = (CssImageStyleValue*)base
+    let string = css_url_to_string(&this.m_url)
+    ak.string_builder_append_string_view(builder, ak.string_bytes_as_string_view(&string))
+
+## Ported from Libraries/LibWeb/CSS/StyleValues/ImageStyleValue.cpp:133 Web::CSS::ImageStyleValue::equals (override).
+pub func css_image_style_value_equals_impl(base: CssStyleValue*, other: CssStyleValue*) -> bool:
+    let this = (CssImageStyleValue*)base
+    if css_style_value_type(base) != css_style_value_type(other):
+        return false
+    return css_url_eq(&this.m_url, css_style_value_as_image(other).m_url)
+
+## Ported from Libraries/LibWeb/CSS/StyleValues/ImageStyleValue.h:48 Web::CSS::ImageStyleValue::is_computationally_independent (override).
+pub func css_image_style_value_is_computationally_independent_impl(base: CssStyleValue*) -> bool:
+    discard(base)
+    return true
+
+# mark: Natural size and painting ===============================================================
+
+## Ported from Libraries/LibWeb/CSS/StyleValues/ImageStyleValue.cpp:140 Web::CSS::ImageStyleValue::natural_width (override).
+pub func css_image_style_value_natural_width_impl(base: CssAbstractImageStyleValue*) -> gfx.CssPixels?:
+    if let image_data = css_image_style_value_image_data((CssImageStyleValue*)base):
+        return html_decoded_image_data_intrinsic_width(image_data)
+    return none
+
+## Ported from Libraries/LibWeb/CSS/StyleValues/ImageStyleValue.cpp:147 Web::CSS::ImageStyleValue::natural_height (override).
+pub func css_image_style_value_natural_height_impl(base: CssAbstractImageStyleValue*) -> gfx.CssPixels?:
+    if let image_data = css_image_style_value_image_data((CssImageStyleValue*)base):
+        return html_decoded_image_data_intrinsic_height(image_data)
+    return none
+
+## Ported from Libraries/LibWeb/CSS/StyleValues/ImageStyleValue.cpp:154 Web::CSS::ImageStyleValue::natural_aspect_ratio (override).
+pub func css_image_style_value_natural_aspect_ratio_impl(base: CssAbstractImageStyleValue*) -> gfx.CssPixelFraction?:
+    if let image_data = css_image_style_value_image_data((CssImageStyleValue*)base):
+        return html_decoded_image_data_intrinsic_aspect_ratio(image_data)
+    return none
+
+## Ported from Libraries/LibWeb/CSS/StyleValues/ImageStyleValue.cpp:161 Web::CSS::ImageStyleValue::paint (override).
+pub func css_image_style_value_paint_impl(base: CssAbstractImageStyleValue*, context: DisplayListRecordingContext*, dest_rect: gfx.DevicePixelRect, image_rendering: css_data.ImageRendering):
+    let this = (CssImageStyleValue*)base
+    let image_data = css_image_style_value_image_data(this) else return
+
+    let dest_int_rect = dest_rect
+    let rect = html_decoded_image_data_frame_rect(image_data, this.m_current_frame_index) else dest_int_rect
+    let scaling_mode = css_to_gfx_scaling_mode(image_rendering, rect.m_size, dest_int_rect.m_size)
+    html_decoded_image_data_paint(image_data, context, this.m_current_frame_index, dest_int_rect, dest_int_rect, scaling_mode)
+
+## Ported from Libraries/LibWeb/CSS/StyleValues/ImageStyleValue.cpp:173 Web::CSS::ImageStyleValue::current_frame_bitmap.
+pub func css_image_style_value_current_frame_bitmap(this: CssImageStyleValue*, dest_rect: gfx.DevicePixelRect) -> const gfx.ImmutableBitmap*?:
+    return css_image_style_value_bitmap(this, this.m_current_frame_index, dest_rect.m_size)
+
+## Ported from Libraries/LibWeb/CSS/StyleValues/ImageStyleValue.cpp:178 Web::CSS::ImageStyleValue::image_data.
+pub func css_image_style_value_image_data(this: CssImageStyleValue*) -> HtmlDecodedImageData*?:
+    let request = this.m_resource_request else return none
+    return html_shared_resource_request_image_data(request)
+
+## Ported from Libraries/LibWeb/CSS/StyleValues/ImageStyleValue.cpp:185 Web::CSS::ImageStyleValue::color_if_single_pixel_bitmap (override).
+pub func css_image_style_value_color_if_single_pixel_bitmap_impl(base: CssAbstractImageStyleValue*) -> gfx.Color?:
+    let this = (CssImageStyleValue*)base
+    if let b = css_image_style_value_bitmap(this, this.m_current_frame_index):
+        if gfx.immutable_bitmap_width(b) == 1 and gfx.immutable_bitmap_height(b) == 1:
+            return gfx.immutable_bitmap_get_pixel(b, 0, 0)
+    return none
+
+# mark: Style sheets and absolutization =========================================================
+
+## Ported from Libraries/LibWeb/CSS/StyleValues/ImageStyleValue.cpp:194 Web::CSS::ImageStyleValue::set_style_sheet (override).
+pub func css_image_style_value_set_style_sheet_impl(base: CssStyleValue*, style_sheet: CssCssStyleSheet*?):
+    let this = (CssImageStyleValue*)base
+    css_style_value_set_style_sheet_impl(base, style_sheet)
+    this.m_style_sheet = style_sheet
+
+    if let sheet = this.m_style_sheet:
+        css_css_style_sheet_register_pending_image_value(sheet, this)
+
+## The `base_url` lambda of ImageStyleValue::absolutized.
+func css_image_style_value_base_url(this: CssImageStyleValue*) -> web_url.Url?:
+    if let style_sheet = this.m_style_sheet:
+        if let base_url = css_css_style_sheet_base_url(style_sheet):
+            return base_url
+        if let location = css_style_sheet_location(style_sheet.css_style_sheet()):
+            return location
+        return html_environment_settings_object_api_base_url(html_relevant_settings_object_js_object((JsObject*)style_sheet))
+
+    if let document = gc.weak_ptr(&this.m_document):
+        return dom_document_base_url(document)
+
+    return none
+
+## Ported from Libraries/LibWeb/CSS/StyleValues/ImageStyleValue.cpp:203 Web::CSS::ImageStyleValue::absolutized (override).
+pub func css_image_style_value_absolutized_impl(base: CssStyleValue*, arg0: CssComputationContext) -> CssStyleValue*:
+    discard(arg0)
+    let this = (CssImageStyleValue*)base
+    let url_string = css_url_url(&this.m_url)
+    if ak.string_is_empty(&url_string):
+        return base
+
+    # FIXME: The spec has been updated to handle this better. The computation of the base URL here is roughly based on:
+    #        https://drafts.csswg.org/css-values-4/#style-resource-base-url
+    #        https://github.com/w3c/csswg-drafts/pull/12261
+    let base_url = css_image_style_value_base_url(this)
+
+    if let url_base = base_url:
+        if let resolved_url = domurl_parse(ak.string_bytes_as_string_view(&url_string), url_base):
+            return css_image_style_value_create_url(resolved_url).css_style_value()
+
+    return base
+
+# mark: Clients =================================================================================
+
+## Ported from Libraries/LibWeb/CSS/StyleValues/ImageStyleValue.cpp:232 Web::CSS::ImageStyleValue::register_client.
+pub func css_image_style_value_register_client(this: CssImageStyleValue*, client: CssImageStyleValueClient*):
+    let result = ak.hash_table_set(&this.m_clients, client)
+    assert(result == ak.HashSetResult.inserted_new_entry)
+
+## Ported from Libraries/LibWeb/CSS/StyleValues/ImageStyleValue.cpp:238 Web::CSS::ImageStyleValue::unregister_client.
+pub func css_image_style_value_unregister_client(this: CssImageStyleValue*, client: CssImageStyleValueClient*):
+    let did_remove = ak.hash_table_remove_t(&this.m_clients, client)
+    assert(did_remove)
+
+## Ported from Libraries/LibWeb/CSS/StyleValues/ImageStyleValue.cpp:244 Web::CSS::ImageStyleValue::Client::Client.
+pub func css_image_style_value_client_construct(this: CssImageStyleValueClient*, image_style_value: CssImageStyleValue*):
+    this.m_image_style_value = image_style_value
+    css_image_style_value_register_client(this.m_image_style_value, this)
+
+## Ported from Libraries/LibWeb/CSS/StyleValues/ImageStyleValue.h:31 Web::CSS::ImageStyleValue::Client::image_style_value_did_update (virtual).
+pub func css_image_style_value_client_image_style_value_did_update_impl(this: CssImageStyleValueClient*, arg0: CssImageStyleValue*):
+    discard(this)
+    discard(arg0)
+    trap("pure virtual: Web::CSS::ImageStyleValue::Client::image_style_value_did_update")
+
+## Ported from Libraries/LibWeb/CSS/StyleValues/ImageStyleValue.cpp:254 Web::CSS::ImageStyleValue::Client::image_style_value_finalize.
+pub func css_image_style_value_client_image_style_value_finalize(this: CssImageStyleValueClient*):
+    css_image_style_value_unregister_client(this.m_image_style_value, this)
