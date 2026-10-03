@@ -1,0 +1,824 @@
+#==============================================================================================
+#
+#   tests_computed_properties - ComputedProperties' readers print what the reference build prints
+#
+#   DESCRIPTION:
+#       Ladybird has no unit tests for ComputedProperties. A local oracle
+#       (luce-browser-tools/oracles/luce-browser-engine/computed_properties: oracle.cpp, cases.txt,
+#       gen_luce_cases.py) builds a ComputedProperties as StyleComputer::compute_property_values
+#       does without an element: every longhand's specified value is its initial value or the
+#       case's declared value, computed with StyleComputer::compute_value_of_property in an
+#       800x600 context with a 16px font (r34's length context). Then it calls one reader (or a
+#       group of related readers) and prints the result. The port does the same with its own
+#       parser, StyleComputer (r39) and ComputedProperties, and the printouts are compared.
+#
+#==============================================================================================
+
+# mark: Printing ================================================================================
+
+## Appends `text`.
+func tcp_put(out: ak.StringBuilder*, text: str):
+    ak.string_builder_append(out, text)
+
+## Appends a String.
+func tcp_string(out: ak.StringBuilder*, text: ak.String):
+    ak.string_builder_append_string_view(out, ak.string_bytes_as_string_view(&text))
+
+## Appends a FlyString.
+func tcp_fly(out: ak.StringBuilder*, text: ak.FlyString):
+    ak.string_builder_append_string_view(out, ak.fly_string_bytes_as_string_view(&text))
+
+## A double as AK's `{}` prints it (the oracle's `num`).
+func tcp_num(out: ak.StringBuilder*, value: f64):
+    tcp_string(out, css_string_formatted("{}", [ak.arg_f64(value)]))
+
+## An integer, or an enum's underlying value (the oracle's `en`).
+func tcp_int(out: ak.StringBuilder*, value: i64):
+    tcp_string(out, css_string_formatted("{}", [ak.arg_i64(value)]))
+
+## CSSPixels as a double.
+func tcp_px(out: ak.StringBuilder*, value: gfx.CssPixels):
+    tcp_num(out, gfx.css_pixels_to_double_const(&value))
+
+## A bool as 0 or 1.
+func tcp_flag(out: ak.StringBuilder*, value: bool):
+    tcp_put(out, "1" if value else "0")
+
+## A color as its u32 value.
+func tcp_color(out: ak.StringBuilder*, value: gfx.Color):
+    tcp_int(out, (i64)gfx.color_value(&value))
+
+## A style value's normal serialization.
+func tcp_value(out: ak.StringBuilder*, value: CssStyleValue*):
+    tcp_string(out, css_style_value_to_string(value, css_syntax.SerializationMode.normal))
+
+## A LengthPercentage's serialization.
+func tcp_lp(out: ak.StringBuilder*, value: CssLengthPercentage):
+    tcp_string(out, css_percentage_or_to_string(&value.percentage_or, css_syntax.SerializationMode.normal))
+
+## A LengthPercentageOrAuto's serialization.
+func tcp_lpa(out: ak.StringBuilder*, value: CssLengthPercentageOrAuto):
+    tcp_string(out, css_length_percentage_or_auto_to_string(&value, css_syntax.SerializationMode.normal))
+
+## A Length's serialization.
+func tcp_length(out: ak.StringBuilder*, value: CssLength):
+    tcp_string(out, css_length_to_string(&value))
+
+## A Size's serialization.
+func tcp_size(out: ak.StringBuilder*, value: CssSize):
+    tcp_string(out, css_size_to_string(&value, css_syntax.SerializationMode.normal))
+
+## A Position: the edges and offsets.
+func tcp_position(out: ak.StringBuilder*, value: CssPosition):
+    tcp_int(out, (i64)value.edge_x)
+    tcp_put(out, " ")
+    tcp_lp(out, value.offset_x)
+    tcp_put(out, " ")
+    tcp_int(out, (i64)value.edge_y)
+    tcp_put(out, " ")
+    tcp_lp(out, value.offset_y)
+
+## A LengthBox: top, right, bottom, left.
+func tcp_box(out: ak.StringBuilder*, value: CssLengthBox):
+    tcp_lpa(out, css_length_box_top_const(&value))
+    tcp_put(out, " ")
+    tcp_lpa(out, css_length_box_right_const(&value))
+    tcp_put(out, " ")
+    tcp_lpa(out, css_length_box_bottom_const(&value))
+    tcp_put(out, " ")
+    tcp_lpa(out, css_length_box_left_const(&value))
+
+## A Filter: its value list, or "none".
+func tcp_filter(out: ak.StringBuilder*, value: CssFilter):
+    if let list = value.m_filter_value_list:
+        tcp_value(out, list)
+    else:
+        tcp_put(out, "none")
+
+## A gap: a length-percentage or "normal-gap".
+func tcp_gap(out: ak.StringBuilder*, value: CssLengthPercentageOrCssNormalGap):
+    match value:
+        .css_length_percentage(lp):
+            tcp_lp(out, lp)
+        .css_normal_gap:
+            tcp_put(out, "normal-gap")
+
+## The separator between the items of a printed list (the oracle's `[a | b]`).
+func tcp_separator(out: ak.StringBuilder*, index: usize):
+    if index > 0:
+        tcp_put(out, " | ")
+
+## An optional enum value, or "-".
+func tcp_optional_int(out: ak.StringBuilder*, present: bool, value: i64):
+    if present:
+        tcp_int(out, value)
+    else:
+        tcp_put(out, "-")
+
+# mark: Building the ComputedProperties =========================================================
+
+## The specified value of every longhand, for compute_value_of_property's `get_property_specified_value`.
+struct TestComputedPropertiesSpecified:
+    var values: (CssStyleValue*?)[314]
+
+## `get_property_specified_value`: the specified value of a longhand.
+func tcp_specified_value(context: void*?, property_id: css_data.PropertyId) -> CssStyleValue*:
+    let specified = (TestComputedPropertiesSpecified*)(context else trap("a context"))
+    return specified.values[(usize)property_id - (usize)css_data.first_longhand_property_id] else trap("a specified value")
+
+## `text` without its leading spaces.
+func tcp_trim(text: str) -> str:
+    var start: usize = 0
+    while start < text.bytes.length and text.bytes[start] == ' ':
+        start += 1
+    return (str)text.bytes[start..]
+
+## The oracle's `build`: initial values, the declarations, then the computed values.
+func tcp_build(realm: Realm*, declarations: str) -> CssComputedProperties*:
+    assert(css_data.number_of_longhand_properties == 314)
+    var specified = TestComputedPropertiesSpecified()
+    for i in 0..<css_data.number_of_longhand_properties:
+        specified.values[i] = css_property_initial_value((css_data.PropertyId)(i + (usize)css_data.first_longhand_property_id))
+
+    var params: CssParsingParams = ---
+    css_parsing_params_construct_realm_css_parsing_mode(&params, realm)
+    var rest = declarations
+    while rest.bytes.length > 0:
+        var declaration = rest
+        if let semicolon = test_css_value_parsing_index_of(rest, ';'):
+            declaration = (str)rest.bytes[0..<semicolon]
+            rest = (str)rest.bytes[semicolon + 1..]
+        else:
+            rest = ""
+        let colon = test_css_value_parsing_index_of(declaration, ':') else continue
+        let name = tcp_trim((str)declaration.bytes[0..<colon])
+        let value = tcp_trim((str)declaration.bytes[colon + 1..])
+        let property_id = css_data.property_id_from_string(ak.sv(name)) else trap("a known property")
+        let parsed = parse_css_value(params, ak.sv(value), property_id) else trap("a parsable declaration")
+        specified.values[(usize)property_id - (usize)css_data.first_longhand_property_id] = parsed
+
+    let context = CssComputationContext(length_resolution_context = test_style_length_context())
+    let getter = ak.Function1[css_data.PropertyId, CssStyleValue*](call = tcp_specified_value, context = &specified)
+    let style = heap_allocate_css_computed_properties(vm_heap(realm_vm(realm)))
+    for i in 0..<css_data.number_of_longhand_properties:
+        let property_id = (css_data.PropertyId)(i + (usize)css_data.first_longhand_property_id)
+        let specified_value = specified.values[i] else trap("a specified value")
+        css_computed_properties_set_property(style, property_id, css_style_computer_compute_value_of_property(property_id, specified_value, getter, context, 1.0))
+    return style
+
+# mark: The readers =============================================================================
+
+## The `anchor_names` reader's callback: appends each name.
+func tcp_anchor_name(context: void*?, name: const ak.FlyString*):
+    let names = (ak.Vector[ak.FlyString]*)(context else trap("a context"))
+    ak.vector_append_t(names, *name)
+
+## The oracle's `font_variants` reader.
+func tcp_font_variants(out: ak.StringBuilder*, s: CssComputedProperties*):
+    if let a = css_computed_properties_font_variant_alternates(s):
+        tcp_put(out, "alternates ")
+        tcp_flag(out, a.historical_forms)
+        for entry in ak.vector_span_const(&a.font_feature_value_entries):
+            tcp_put(out, " ")
+            tcp_int(out, (i64)entry.type_)
+            tcp_put(out, ":")
+            tcp_fly(out, entry.name)
+    else:
+        tcp_put(out, "alternates -")
+    tcp_put(out, " caps ")
+    tcp_int(out, (i64)css_computed_properties_font_variant_caps(s))
+    if let e = css_computed_properties_font_variant_east_asian(s):
+        tcp_put(out, " east-asian ")
+        tcp_flag(out, e.ruby)
+        tcp_put(out, " ")
+        tcp_optional_int(out, e.variant != none, (i64)(e.variant else css_data.EastAsianVariant(0)))
+        tcp_put(out, " ")
+        tcp_optional_int(out, e.width != none, (i64)(e.width else css_data.EastAsianWidth(0)))
+    else:
+        tcp_put(out, " east-asian -")
+    tcp_put(out, " emoji ")
+    tcp_int(out, (i64)css_computed_properties_font_variant_emoji(s))
+    if let l = css_computed_properties_font_variant_ligatures(s):
+        tcp_put(out, " ligatures ")
+        tcp_flag(out, l.none_)
+        tcp_put(out, " ")
+        tcp_optional_int(out, l.common != none, (i64)(l.common else css_data.CommonLigValue(0)))
+        tcp_put(out, " ")
+        tcp_optional_int(out, l.discretionary != none, (i64)(l.discretionary else css_data.DiscretionaryLigValue(0)))
+        tcp_put(out, " ")
+        tcp_optional_int(out, l.historical != none, (i64)(l.historical else css_data.HistoricalLigValue(0)))
+        tcp_put(out, " ")
+        tcp_optional_int(out, l.contextual != none, (i64)(l.contextual else css_data.ContextualAltValue(0)))
+    else:
+        tcp_put(out, " ligatures -")
+    if let n = css_computed_properties_font_variant_numeric(s):
+        tcp_put(out, " numeric ")
+        tcp_flag(out, n.ordinal)
+        tcp_flag(out, n.slashed_zero)
+        tcp_put(out, " ")
+        tcp_optional_int(out, n.figure != none, (i64)(n.figure else css_data.NumericFigureValue(0)))
+        tcp_put(out, " ")
+        tcp_optional_int(out, n.spacing != none, (i64)(n.spacing else css_data.NumericSpacingValue(0)))
+        tcp_put(out, " ")
+        tcp_optional_int(out, n.fraction != none, (i64)(n.fraction else css_data.NumericFractionValue(0)))
+    else:
+        tcp_put(out, " numeric -")
+    tcp_put(out, " position ")
+    tcp_int(out, (i64)css_computed_properties_font_variant_position(s))
+    tcp_put(out, " kerning ")
+    tcp_int(out, (i64)css_computed_properties_font_kerning(s))
+    tcp_put(out, " language ")
+    if let language = css_computed_properties_font_language_override(s):
+        tcp_fly(out, language)
+    else:
+        tcp_put(out, "-")
+
+## The oracle's `font_settings` reader.
+func tcp_font_settings(out: ak.StringBuilder*, s: CssComputedProperties*):
+    let features = css_computed_properties_font_feature_settings(s)
+    let variations = css_computed_properties_font_variation_settings(s)
+    tcp_put(out, "features ")
+    tcp_int(out, (i64)ak.hash_map_size(&features))
+    for key in ["liga", "smcp", "kern", "ss01"]:
+        tcp_put(out, " ")
+        tcp_put(out, key)
+        tcp_put(out, "=")
+        if let value = ak.hash_map_get_k_const(&features, ak.fly_string_from_str(key)):
+            tcp_int(out, (i64)*value)
+        else:
+            tcp_put(out, "-")
+    tcp_put(out, " variations ")
+    tcp_int(out, (i64)ak.hash_map_size(&variations))
+    for key in ["wght", "wdth", "slnt"]:
+        tcp_put(out, " ")
+        tcp_put(out, key)
+        tcp_put(out, "=")
+        if let value = ak.hash_map_get_k_const(&variations, ak.fly_string_from_str(key)):
+            tcp_num(out, *value)
+        else:
+            tcp_put(out, "-")
+
+## The oracle's `grid` reader.
+func tcp_grid(out: ak.StringBuilder*, s: CssComputedProperties*):
+    let normal = css_syntax.SerializationMode.normal
+    let columns = css_computed_properties_grid_template_columns(s)
+    let rows = css_computed_properties_grid_template_rows(s)
+    let auto_columns = css_computed_properties_grid_auto_columns(s)
+    let auto_rows = css_computed_properties_grid_auto_rows(s)
+    let flow = css_computed_properties_grid_auto_flow(s)
+    let column_start = css_computed_properties_grid_column_start(s)
+    let column_end = css_computed_properties_grid_column_end(s)
+    let row_start = css_computed_properties_grid_row_start(s)
+    let row_end = css_computed_properties_grid_row_end(s)
+    let areas = css_computed_properties_grid_template_areas(s)
+    tcp_string(out, css_grid_track_size_list_to_string(&columns, normal))
+    tcp_put(out, " / ")
+    tcp_string(out, css_grid_track_size_list_to_string(&rows, normal))
+    tcp_put(out, " / ")
+    tcp_string(out, css_grid_track_size_list_to_string(&auto_columns, normal))
+    tcp_put(out, " / ")
+    tcp_string(out, css_grid_track_size_list_to_string(&auto_rows, normal))
+    tcp_put(out, " / ")
+    tcp_flag(out, flow.row)
+    tcp_flag(out, flow.dense)
+    tcp_put(out, " / ")
+    tcp_string(out, css_grid_track_placement_to_string(&column_start, normal))
+    tcp_put(out, " ")
+    tcp_string(out, css_grid_track_placement_to_string(&column_end, normal))
+    tcp_put(out, " ")
+    tcp_string(out, css_grid_track_placement_to_string(&row_start, normal))
+    tcp_put(out, " ")
+    tcp_string(out, css_grid_track_placement_to_string(&row_end, normal))
+    tcp_put(out, " / areas ")
+    tcp_int(out, (i64)ak.hash_map_size(&areas.areas))
+    tcp_put(out, " ")
+    tcp_int(out, (i64)areas.row_count)
+    tcp_put(out, "x")
+    tcp_int(out, (i64)areas.column_count)
+
+## An optional transformation (rotate, translate, scale), or "-".
+func tcp_optional_transformation(out: ak.StringBuilder*, value: CssTransformationStyleValue*?):
+    if let transformation = value:
+        tcp_value(out, transformation.css_style_value())
+    else:
+        tcp_put(out, "-")
+
+## The oracle's `transforms` reader.
+func tcp_transforms(out: ak.StringBuilder*, s: CssComputedProperties*):
+    let transformations = css_computed_properties_transformations(s)
+    tcp_put(out, "[")
+    for (index, transformation) in ak.vector_span_const(&transformations).indexed():
+        tcp_separator(out, index)
+        tcp_value(out, transformation.css_style_value())
+    tcp_put(out, "] ")
+    let origin = css_computed_properties_transform_origin(s)
+    tcp_int(out, (i64)css_computed_properties_transform_box(s))
+    tcp_put(out, " ")
+    tcp_int(out, (i64)css_computed_properties_transform_style(s))
+    tcp_put(out, " ")
+    tcp_lp(out, origin.x)
+    tcp_put(out, " ")
+    tcp_lp(out, origin.y)
+    tcp_put(out, " ")
+    tcp_lp(out, origin.z)
+    tcp_put(out, " ")
+    tcp_optional_transformation(out, css_computed_properties_rotate(s))
+    tcp_put(out, " ")
+    tcp_optional_transformation(out, css_computed_properties_translate(s))
+    tcp_put(out, " ")
+    tcp_optional_transformation(out, css_computed_properties_scale(s))
+    tcp_put(out, " ")
+    if let perspective = css_computed_properties_perspective(s):
+        tcp_px(out, perspective)
+    else:
+        tcp_put(out, "-")
+    tcp_put(out, " ")
+    tcp_position(out, css_computed_properties_perspective_origin(s))
+
+## The oracle's `background_layers` reader.
+func tcp_background_layers(out: ak.StringBuilder*, s: CssComputedProperties*):
+    let layers = css_computed_properties_background_layers(s)
+    tcp_put(out, "[")
+    for (index, layer) in ak.vector_span_const(&layers).indexed():
+        tcp_separator(out, index)
+        tcp_value(out, layer.background_image.css_style_value())
+        for value in [(i64)layer.attachment, (i64)layer.origin, (i64)layer.clip]:
+            tcp_put(out, " ")
+            tcp_int(out, value)
+        tcp_put(out, " ")
+        tcp_lp(out, layer.position_x)
+        tcp_put(out, " ")
+        tcp_lp(out, layer.position_y)
+        tcp_put(out, " ")
+        tcp_int(out, (i64)layer.size_type)
+        tcp_put(out, " ")
+        tcp_lpa(out, layer.size_x)
+        tcp_put(out, " ")
+        tcp_lpa(out, layer.size_y)
+        for value in [(i64)layer.repeat_x, (i64)layer.repeat_y, (i64)layer.blend_mode]:
+            tcp_put(out, " ")
+            tcp_int(out, value)
+    tcp_put(out, "] clip=")
+    tcp_int(out, (i64)css_computed_properties_background_color_clip(s))
+
+## The oracle's `svg` reader.
+func tcp_svg(out: ak.StringBuilder*, s: CssComputedProperties*):
+    let dashes = css_computed_properties_stroke_dasharray(s)
+    tcp_put(out, "[")
+    for (index, dash) in ak.vector_span_const(&dashes).indexed():
+        tcp_separator(out, index)
+        match dash:
+            .css_length_percentage(lp):
+                tcp_lp(out, lp)
+            .f32_(number):
+                tcp_num(out, (f64)number)
+    tcp_put(out, "]")
+    for value in [(i64)css_computed_properties_stroke_linecap(s), (i64)css_computed_properties_stroke_linejoin(s)]:
+        tcp_put(out, " ")
+        tcp_int(out, value)
+    tcp_put(out, " ")
+    tcp_num(out, css_computed_properties_stroke_miterlimit(s))
+    for value in [(i64)css_computed_properties_fill_rule(s), (i64)css_computed_properties_clip_rule(s), (i64)css_computed_properties_mask_type(s), (i64)css_computed_properties_shape_rendering(s)]:
+        tcp_put(out, " ")
+        tcp_int(out, value)
+
+## The oracle's `counters` reader.
+func tcp_counters(out: ak.StringBuilder*, s: CssComputedProperties*):
+    for property_id in [css_data.PropertyId.counter_reset, css_data.PropertyId.counter_increment, css_data.PropertyId.counter_set]:
+        let counters = css_computed_properties_counter_data(s, property_id)
+        tcp_put(out, "[")
+        for (index, counter) in ak.vector_span_const(&counters).indexed():
+            tcp_separator(out, index)
+            tcp_fly(out, counter.name)
+            tcp_put(out, " ")
+            tcp_flag(out, counter.is_reversed)
+            tcp_put(out, " ")
+            tcp_optional_int(out, counter.value != none, (i64)(counter.value else 0))
+        tcp_put(out, "]")
+
+## The oracle's `initial_values`: InitialValues and a default-constructed ComputedValues.
+func tcp_initial_values(out: ak.StringBuilder*):
+    tcp_px(out, css_initial_values_font_size())
+    tcp_put(out, " ")
+    tcp_num(out, css_initial_values_font_weight())
+    tcp_put(out, " ")
+    tcp_px(out, css_initial_values_line_height())
+    tcp_put(out, " ")
+    tcp_length(out, css_initial_values_border_spacing())
+    tcp_put(out, " ")
+    tcp_color(out, css_initial_values_caret_color())
+    tcp_put(out, " ")
+    tcp_color(out, css_initial_values_background_color())
+    tcp_put(out, " ")
+    let display = css_initial_values_display()
+    tcp_string(out, css_display_to_string(&display))
+    tcp_put(out, " ")
+    tcp_px(out, css_initial_values_text_underline_offset())
+    tcp_put(out, " ")
+    tcp_px(out, css_initial_values_outline_width())
+    tcp_put(out, " ")
+    tcp_num(out, (f64)css_initial_values_stroke_miterlimit())
+    let scrollbar = css_initial_values_scrollbar_color()
+    tcp_put(out, " ")
+    tcp_color(out, scrollbar.thumb_color)
+    tcp_put(out, " ")
+    tcp_color(out, scrollbar.track_color)
+    tcp_put(out, " ")
+    tcp_box(out, css_initial_values_margin())
+    tcp_put(out, " ")
+    tcp_box(out, css_initial_values_inset())
+    tcp_put(out, " ")
+    tcp_size(out, css_initial_values_max_width())
+    tcp_put(out, " ")
+    tcp_lp(out, css_initial_values_stroke_width())
+    tcp_put(out, " ")
+    tcp_lpa(out, css_initial_values_rx())
+    tcp_put(out, " ")
+    let delay = css_initial_values_transition_delay()
+    tcp_string(out, css_time_to_string(&delay))
+    tcp_put(out, " ")
+    let columns = css_initial_values_grid_template_columns()
+    tcp_string(out, css_grid_track_size_list_to_string(&columns, css_syntax.SerializationMode.normal))
+    tcp_put(out, " ")
+    for value in css_initial_values_paint_order():
+        tcp_int(out, (i64)value)
+    tcp_put(out, " ")
+    tcp_int(out, (i64)css_initial_values_quotes().type_)
+
+    let values = css_computed_values_create()
+    tcp_put(out, " | ")
+    tcp_px(out, css_computed_values_font_size(values))
+    tcp_put(out, " ")
+    tcp_color(out, css_computed_values_color(values))
+    tcp_put(out, " ")
+    let cursor = css_computed_values_cursor(values)
+    tcp_int(out, (i64)ak.vector_size(&cursor))
+    tcp_put(out, " ")
+    let lines = css_computed_values_text_decoration_line(values)
+    tcp_int(out, (i64)ak.vector_size(&lines))
+    tcp_put(out, " ")
+    tcp_size(out, css_computed_values_width(values))
+    tcp_put(out, " ")
+    tcp_box(out, css_computed_values_padding(values))
+    tcp_put(out, " ")
+    tcp_position(out, css_computed_values_object_position(values))
+    tcp_put(out, " ")
+    tcp_position(out, css_computed_values_perspective_origin(values))
+    let origin = css_computed_values_transform_origin(values)
+    tcp_put(out, " ")
+    tcp_lp(out, origin.x)
+    tcp_put(out, " ")
+    tcp_lp(out, origin.y)
+    tcp_put(out, " ")
+    tcp_lp(out, origin.z)
+    let radius = css_computed_values_border_top_left_radius(values)
+    tcp_put(out, " ")
+    tcp_lp(out, radius.horizontal_radius)
+    tcp_put(out, " ")
+    tcp_flag(out, css_border_radius_data_is_initial(&radius))
+    let touch_action = css_computed_values_touch_action(values)
+    tcp_put(out, " ")
+    tcp_flag(out, touch_action.allow_left)
+    tcp_flag(out, touch_action.allow_other)
+    tcp_put(out, " ")
+    tcp_flag(out, css_computed_values_has_noninitial_border_radii(values))
+    let border_top = css_computed_values_border_top(values)
+    tcp_put(out, " ")
+    tcp_int(out, (i64)border_top.line_style)
+    tcp_put(out, " ")
+    tcp_px(out, border_top.width)
+    tcp_put(out, " ")
+    tcp_flag(out, css_computed_values_inline_axis_is_reverse(values))
+    tcp_flag(out, css_computed_values_block_axis_is_reverse(values))
+    tcp_put(out, " ")
+    let will_change = css_computed_values_will_change(values)
+    tcp_flag(out, css_will_change_is_auto(&will_change))
+    tcp_put(out, " ")
+    let contain = css_computed_values_contain(values)
+    tcp_flag(out, css_containment_is_empty(&contain))
+
+## Runs one reader (see the oracle's `run`) over the ComputedProperties of `declarations`.
+func tcp_run(realm: Realm*, reader: str, declarations: str) -> ak.String:
+    var builder = ak.string_builder_new()
+    let out = &builder
+    if reader == "initial_values":
+        tcp_initial_values(out)
+        return ak.string_builder_to_string_without_validation(out)
+    let s = tcp_build(realm, declarations)
+    let no_context = CssColorResolutionContext()
+    if reader == "size_value":
+        tcp_size(out, css_computed_properties_size_value(s, css_data.PropertyId.width))
+        tcp_put(out, " ")
+        tcp_size(out, css_computed_properties_size_value(s, css_data.PropertyId.min_height))
+        tcp_put(out, " ")
+        tcp_size(out, css_computed_properties_size_value(s, css_data.PropertyId.max_width))
+    elif reader == "gap_value":
+        tcp_gap(out, css_computed_properties_gap_value(s, css_data.PropertyId.column_gap))
+        tcp_put(out, " ")
+        tcp_gap(out, css_computed_properties_gap_value(s, css_data.PropertyId.row_gap))
+    elif reader == "length_box":
+        let zero = css_length_percentage_or_auto_new(css_length_percentage_new_css_length(css_length_make_px_f64(0.0)))
+        tcp_box(out, css_computed_properties_length_box(s, css_data.PropertyId.margin_left, css_data.PropertyId.margin_top, css_data.PropertyId.margin_right, css_data.PropertyId.margin_bottom, zero))
+        tcp_put(out, " / ")
+        tcp_box(out, css_computed_properties_length_box(s, css_data.PropertyId.left, css_data.PropertyId.top, css_data.PropertyId.right, css_data.PropertyId.bottom, css_length_percentage_or_auto_make_auto()))
+    elif reader == "color":
+        tcp_color(out, css_computed_properties_color(s, css_data.PropertyId.color, no_context))
+        tcp_put(out, " ")
+        tcp_color(out, css_computed_properties_color(s, css_data.PropertyId.background_color, no_context))
+        tcp_put(out, " ")
+        tcp_color(out, css_computed_properties_color(s, css_data.PropertyId.border_top_color, no_context))
+    elif reader == "anchor_names":
+        var names: ak.Vector[ak.FlyString]
+        css_computed_properties_for_each_anchor_name(s, ak.Function1[const ak.FlyString*, unit](call = tcp_anchor_name, context = &names))
+        tcp_put(out, "[")
+        for (index, name) in ak.vector_span_const(&names).indexed():
+            tcp_separator(out, index)
+            tcp_fly(out, name)
+        tcp_put(out, "]")
+    elif reader == "color_interpolation":
+        tcp_int(out, (i64)css_computed_properties_color_interpolation(s))
+    elif reader == "color_scheme":
+        tcp_int(out, (i64)css_computed_properties_color_scheme(s, CssPreferredColorScheme.auto, none))
+        tcp_put(out, " ")
+        tcp_int(out, (i64)css_computed_properties_color_scheme(s, CssPreferredColorScheme.dark, none))
+        tcp_put(out, " ")
+        tcp_int(out, (i64)css_computed_properties_color_scheme(s, CssPreferredColorScheme.light, none))
+    elif reader == "text_anchor":
+        tcp_int(out, (i64)css_computed_properties_text_anchor(s))
+    elif reader == "dominant_baseline":
+        let baseline = css_computed_properties_dominant_baseline(s)
+        tcp_optional_int(out, baseline != none, (i64)(baseline else css_data.BaselineMetric(0)))
+    elif reader == "text_align":
+        tcp_int(out, (i64)css_computed_properties_text_align(s))
+    elif reader == "text_justify":
+        tcp_int(out, (i64)css_computed_properties_text_justify(s))
+    elif reader == "text_overflow":
+        tcp_int(out, (i64)css_computed_properties_text_overflow(s))
+    elif reader == "text_rendering":
+        tcp_int(out, (i64)css_computed_properties_text_rendering(s))
+    elif reader == "text_underline_offset":
+        tcp_px(out, css_computed_properties_text_underline_offset(s))
+    elif reader == "text_underline_position":
+        let position = css_computed_properties_text_underline_position(s)
+        tcp_int(out, (i64)position.horizontal)
+        tcp_put(out, " ")
+        tcp_int(out, (i64)position.vertical)
+    elif reader == "background_layers":
+        tcp_background_layers(out, s)
+    elif reader == "border_spacing":
+        tcp_length(out, css_computed_properties_border_spacing_horizontal(s))
+        tcp_put(out, " ")
+        tcp_length(out, css_computed_properties_border_spacing_vertical(s))
+    elif reader == "caption_side":
+        tcp_int(out, (i64)css_computed_properties_caption_side(s))
+    elif reader == "clip":
+        let clip = css_computed_properties_clip(s)
+        let rect = css_clip_to_rect(&clip)
+        tcp_flag(out, css_clip_is_auto(&clip))
+        for edge in [rect.top_edge, rect.right_edge, rect.bottom_edge, rect.left_edge]:
+            tcp_put(out, " ")
+            tcp_string(out, css_length_or_auto_to_string(&edge))
+    elif reader == "display":
+        let display = css_computed_properties_display(s)
+        tcp_string(out, css_display_to_string(&display))
+    elif reader == "float":
+        tcp_int(out, (i64)css_computed_properties_float(s))
+    elif reader == "clear":
+        tcp_int(out, (i64)css_computed_properties_clear(s))
+    elif reader == "column_span":
+        tcp_int(out, (i64)css_computed_properties_column_span(s))
+    elif reader == "content_visibility":
+        tcp_int(out, (i64)css_computed_properties_content_visibility(s))
+    elif reader == "cursor":
+        let cursors = css_computed_properties_cursor(s)
+        tcp_put(out, "[")
+        for (index, cursor) in ak.vector_span_const(&cursors).indexed():
+            tcp_separator(out, index)
+            match cursor:
+                .css_cursor_style_value(value):
+                    tcp_value(out, value.css_style_value())
+                .cursor_predefined(predefined):
+                    tcp_int(out, (i64)predefined)
+        tcp_put(out, "]")
+    elif reader == "tab_size":
+        match css_computed_properties_tab_size(s):
+            .css_length(length):
+                tcp_put(out, "length ")
+                tcp_length(out, length)
+            .f64_(number):
+                tcp_put(out, "number ")
+                tcp_num(out, number)
+    elif reader == "white_space":
+        let trim = css_computed_properties_white_space_trim(s)
+        tcp_int(out, (i64)css_computed_properties_white_space_collapse(s))
+        tcp_put(out, " ")
+        tcp_flag(out, trim.discard_before)
+        tcp_flag(out, trim.discard_after)
+        tcp_flag(out, trim.discard_inner)
+    elif reader == "word_break":
+        tcp_int(out, (i64)css_computed_properties_word_break(s))
+    elif reader == "spacing":
+        tcp_px(out, css_computed_properties_word_spacing(s))
+        tcp_put(out, " ")
+        tcp_px(out, css_computed_properties_letter_spacing(s))
+    elif reader == "line_style":
+        tcp_int(out, (i64)css_computed_properties_line_style(s, css_data.PropertyId.border_top_style))
+        tcp_put(out, " ")
+        tcp_int(out, (i64)css_computed_properties_outline_style(s))
+    elif reader == "text_decoration":
+        let lines = css_computed_properties_text_decoration_line(s)
+        tcp_put(out, "[")
+        for (index, line) in ak.vector_span_const(&lines).indexed():
+            tcp_separator(out, index)
+            tcp_int(out, (i64)line)
+        tcp_put(out, "] ")
+        tcp_int(out, (i64)css_computed_properties_text_decoration_skip_ink(s))
+        tcp_put(out, " ")
+        tcp_int(out, (i64)css_computed_properties_text_decoration_style(s))
+        tcp_put(out, " ")
+        match css_computed_properties_text_decoration_thickness(s).value:
+            .css_text_decoration_thickness_auto:
+                tcp_put(out, "auto")
+            .css_text_decoration_thickness_from_font:
+                tcp_put(out, "from-font")
+            .css_length_percentage(lp):
+                tcp_lp(out, lp)
+    elif reader == "text_transform":
+        tcp_int(out, (i64)css_computed_properties_text_transform(s))
+    elif reader == "text_indent":
+        let indent = css_computed_properties_text_indent(s)
+        tcp_lp(out, indent.length_percentage)
+        tcp_put(out, " ")
+        tcp_flag(out, indent.each_line)
+        tcp_flag(out, indent.hanging)
+    elif reader == "text_wrap_mode":
+        tcp_int(out, (i64)css_computed_properties_text_wrap_mode(s))
+    elif reader == "list_style_position":
+        tcp_int(out, (i64)css_computed_properties_list_style_position(s))
+    elif reader == "flex":
+        tcp_int(out, (i64)css_computed_properties_flex_direction(s))
+        tcp_put(out, " ")
+        tcp_int(out, (i64)css_computed_properties_flex_wrap(s))
+        tcp_put(out, " ")
+        match css_computed_properties_flex_basis(s):
+            .css_flex_basis_content:
+                tcp_put(out, "content")
+            .css_size(size):
+                tcp_size(out, size)
+        tcp_put(out, " ")
+        tcp_num(out, (f64)css_computed_properties_flex_grow(s))
+        tcp_put(out, " ")
+        tcp_num(out, (f64)css_computed_properties_flex_shrink(s))
+        tcp_put(out, " ")
+        tcp_int(out, (i64)css_computed_properties_order(s))
+    elif reader == "accent_color":
+        tcp_color(out, css_computed_properties_accent_color(s, CssColorResolutionContext(color_scheme = CssPreferredColorScheme.light)))
+        tcp_put(out, " ")
+        tcp_color(out, css_computed_properties_accent_color(s, CssColorResolutionContext(color_scheme = CssPreferredColorScheme.dark)))
+    elif reader == "alignment":
+        let values = [(i64)css_computed_properties_align_content(s), (i64)css_computed_properties_align_items(s), (i64)css_computed_properties_align_self(s), (i64)css_computed_properties_justify_content(s), (i64)css_computed_properties_justify_items(s), (i64)css_computed_properties_justify_self(s)]
+        for (index, value) in values.indexed():
+            if index > 0:
+                tcp_put(out, " ")
+            tcp_int(out, value)
+    elif reader == "appearance":
+        tcp_int(out, (i64)css_computed_properties_appearance(s))
+    elif reader == "filters":
+        tcp_filter(out, css_computed_properties_filter(s))
+        tcp_put(out, " / ")
+        tcp_filter(out, css_computed_properties_backdrop_filter(s))
+    elif reader == "opacities":
+        let values = [css_computed_properties_opacity(s), css_computed_properties_fill_opacity(s), css_computed_properties_stroke_opacity(s), css_computed_properties_stop_opacity(s), css_computed_properties_flood_opacity(s)]
+        for (index, value) in values.indexed():
+            if index > 0:
+                tcp_put(out, " ")
+            tcp_num(out, (f64)value)
+    elif reader == "visibility":
+        tcp_int(out, (i64)css_computed_properties_visibility(s))
+    elif reader == "image_rendering":
+        tcp_int(out, (i64)css_computed_properties_image_rendering(s))
+    elif reader == "overflow":
+        tcp_int(out, (i64)css_computed_properties_overflow_x(s))
+        tcp_put(out, " ")
+        tcp_int(out, (i64)css_computed_properties_overflow_y(s))
+    elif reader == "box_sizing":
+        tcp_int(out, (i64)css_computed_properties_box_sizing(s))
+    elif reader == "pointer_events":
+        tcp_int(out, (i64)css_computed_properties_pointer_events(s))
+    elif reader == "vertical_align":
+        match css_computed_properties_vertical_align(s):
+            .vertical_align(keyword):
+                tcp_put(out, "keyword ")
+                tcp_int(out, (i64)keyword)
+            .css_length_percentage(lp):
+                tcp_lp(out, lp)
+    elif reader == "font_variants":
+        tcp_font_variants(out, s)
+    elif reader == "font_settings":
+        tcp_font_settings(out, s)
+    elif reader == "grid":
+        tcp_grid(out, s)
+    elif reader == "table":
+        tcp_int(out, (i64)css_computed_properties_border_collapse(s))
+        tcp_put(out, " ")
+        tcp_int(out, (i64)css_computed_properties_empty_cells(s))
+        tcp_put(out, " ")
+        tcp_int(out, (i64)css_computed_properties_table_layout(s))
+    elif reader == "object":
+        tcp_int(out, (i64)css_computed_properties_object_fit(s))
+        tcp_put(out, " ")
+        tcp_position(out, css_computed_properties_object_position(s))
+    elif reader == "writing":
+        tcp_int(out, (i64)css_computed_properties_direction(s))
+        tcp_put(out, " ")
+        tcp_int(out, (i64)css_computed_properties_unicode_bidi(s))
+        tcp_put(out, " ")
+        tcp_int(out, (i64)css_computed_properties_writing_mode(s))
+    elif reader == "user_select":
+        tcp_int(out, (i64)css_computed_properties_user_select(s))
+        tcp_put(out, " ")
+        tcp_int(out, (i64)css_computed_properties_isolation(s))
+        tcp_put(out, " ")
+        tcp_int(out, (i64)css_computed_properties_mix_blend_mode(s))
+    elif reader == "touch_action":
+        let t = css_computed_properties_touch_action(s)
+        for value in [t.allow_left, t.allow_right, t.allow_up, t.allow_down, t.allow_pinch_zoom, t.allow_other]:
+            tcp_flag(out, value)
+    elif reader == "contain":
+        let c = css_computed_properties_contain(s)
+        let t = css_computed_properties_container_type(s)
+        for value in [c.size_containment, c.inline_size_containment, c.layout_containment, c.style_containment, c.paint_containment]:
+            tcp_flag(out, value)
+        tcp_put(out, " ")
+        for value in [t.is_size_container, t.is_inline_size_container, t.is_scroll_state_container]:
+            tcp_flag(out, value)
+    elif reader == "view_transition_name":
+        if let name = css_computed_properties_view_transition_name(s):
+            tcp_fly(out, name)
+        else:
+            tcp_put(out, "-")
+    elif reader == "transforms":
+        tcp_transforms(out, s)
+    elif reader == "svg":
+        tcp_svg(out, s)
+    elif reader == "paint_order":
+        let order = css_computed_properties_paint_order(s)
+        for value in order:
+            tcp_int(out, (i64)value)
+    elif reader == "will_change":
+        let w = css_computed_properties_will_change(s)
+        for value in [css_will_change_is_auto(&w), css_will_change_has_contents(&w), css_will_change_has_scroll_position(&w), css_will_change_has_property(&w, css_data.PropertyId.opacity), css_will_change_has_property(&w, css_data.PropertyId.transform)]:
+            tcp_flag(out, value)
+    elif reader == "quotes":
+        let q = css_computed_properties_quotes(s)
+        tcp_int(out, (i64)q.type_)
+        for pair in ak.vector_span_const(&q.strings):
+            tcp_put(out, " ")
+            tcp_fly(out, pair[0])
+            tcp_fly(out, pair[1])
+    elif reader == "counters":
+        tcp_counters(out, s)
+    elif reader == "scrollbar":
+        tcp_int(out, (i64)css_computed_properties_scrollbar_width(s))
+        tcp_put(out, " ")
+        tcp_int(out, (i64)css_computed_properties_resize(s))
+    elif reader == "math":
+        tcp_int(out, (i64)css_computed_properties_math_style(s))
+        tcp_put(out, " ")
+        tcp_int(out, (i64)css_computed_properties_math_depth(s))
+    elif reader == "font":
+        tcp_px(out, css_computed_properties_font_size(s))
+        tcp_put(out, " ")
+        tcp_num(out, css_computed_properties_font_weight(s))
+        tcp_put(out, " ")
+        let width = css_computed_properties_font_width(s)
+        tcp_string(out, css_percentage_to_string(&width))
+        tcp_put(out, " ")
+        tcp_int(out, (i64)css_computed_properties_font_slope(s))
+        tcp_put(out, " ")
+        tcp_int(out, (i64)css_computed_properties_font_optical_sizing(s))
+        tcp_put(out, " ")
+        tcp_px(out, css_computed_properties_line_height(s))
+    elif reader == "position":
+        tcp_int(out, (i64)css_computed_properties_position(s))
+        tcp_put(out, " ")
+        let z_index = css_computed_properties_z_index(s)
+        tcp_optional_int(out, z_index != none, (i64)(z_index else 0))
+    else:
+        tcp_put(out, "unknown reader")
+    return ak.string_builder_to_string_without_validation(out)
+
+test "ComputedProperties' readers match the reference build on the oracle cases":
+    web_initialize_strings()
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        var failures = 0
+        for test_case in &test_computed_properties_cases:
+            let actual = tcp_run(realm, test_case.reader, test_case.declarations)
+            if not ak.string_eq_string_view(&actual, ak.sv(test_case.expected)):
+                failures += 1
+                let view = ak.string_bytes_as_string_view(&actual)
+                print(f"{test_case.reader} {test_case.declarations}: expected {test_case.expected}, got {(str)ak.string_view_bytes(&view)}")
+        assert(failures == 0)
