@@ -1,0 +1,369 @@
+#==============================================================================================
+#
+#   window_4 - HTML::Window: animation frame and idle callbacks, the selection, obsolete
+#   no-ops, External, the navigation API, custom elements, named access on the window and find
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibWeb/HTML/Window.cpp lines 1722-2038 (request_animation_frame
+#       through find).
+#
+#       Copyright (c) 2020-2023, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2021-2023, Linus Groh <linusg@serenityos.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Animation frame callbacks ===============================================================
+
+## The captures of request_animation_frame's handler (`[this, callback]`).
+struct HtmlWindowAnimationFrameCallback:
+    var this: HtmlWindow*
+    var callback: IdlCallbackType*
+
+## request_animation_frame's handler: invoke the callback with now.
+func html_window_run_animation_frame_callback(context: void*?, now: f64):
+    let captures = (HtmlWindowAnimationFrameCallback*)(context else trap("no captures"))
+    # 3. Invoke callback, passing now as the only argument, and if an exception is thrown, report the exception.
+    let args: JsValue[1] = [js_value_from_f64(now)]
+    let result = idl_invoke_callback_span_js_value(captures.callback, none, args[0..<1])
+    if js_completion_is_error(&result):
+        html_report_exception_js_completion(result, bind_platform_object_realm(captures.this.bind_platform_object()))
+
+## Ported from Window.cpp:1724 Web::HTML::Window::request_animation_frame.
+# https://html.spec.whatwg.org/multipage/imagebitmap-and-animations.html#dom-animationframeprovider-requestanimationframe
+pub func html_window_request_animation_frame(this: HtmlWindow*, callback: IdlCallbackType*) -> u32:
+    # FIXME: Make this fully spec compliant. Currently implements a mix of 'requestAnimationFrame()' and 'run the animation frame callbacks'.
+    let captures = new HtmlWindowAnimationFrameCallback(this = this, callback = callback) else trap("out of memory")
+    let handle = html_animation_frame_callback_driver_add(html_window_animation_frame_callback_driver(this), gc.create_function1(gc.cell_heap(this.cell()), ak.Function1[f64, unit](call = html_window_run_animation_frame_callback, context = captures)))
+    page_client_request_frame(page_client(html_window_page(this)))
+    return handle
+
+## Ported from Window.cpp:1738 Web::HTML::Window::cancel_animation_frame.
+# https://html.spec.whatwg.org/multipage/imagebitmap-and-animations.html#animationframeprovider-cancelanimationframe
+pub func html_window_cancel_animation_frame(this: HtmlWindow*, handle: u32):
+    # 1. If this is not supported, then throw a "NotSupportedError" DOMException.
+    # NOTE: Doesn't apply in this Window-specific implementation.
+
+    # 2. Let callbacks be this's target object's map of animation frame callbacks.
+    # 3. Remove callbacks[handle].
+    discard(html_animation_frame_callback_driver_remove(html_window_animation_frame_callback_driver(this), handle))
+
+## Ported from Window.cpp:1748 Web::HTML::Window::animation_frame_callback_driver.
+pub func html_window_animation_frame_callback_driver(this: HtmlWindow*) -> HtmlAnimationFrameCallbackDriver*:
+    if this.m_animation_frame_callback_driver == none:
+        let realm = bind_platform_object_realm(this.bind_platform_object())
+        # realm().create<AnimationFrameCallbackDriver>(): its members' defaults are zero.
+        let driver = (HtmlAnimationFrameCallbackDriver*)web_allocate_cell(realm, &html_animation_frame_callback_driver_class)
+        web_initialize_cell(driver.cell(), realm)
+        this.m_animation_frame_callback_driver = driver
+    return this.m_animation_frame_callback_driver else trap("unreachable")
+
+## Ported from Window.cpp:1755 Web::HTML::Window::has_animation_frame_callbacks.
+pub func html_window_has_animation_frame_callbacks(this: HtmlWindow*) -> bool:
+    let driver = this.m_animation_frame_callback_driver else return false
+    return html_animation_frame_callback_driver_has_callbacks(driver)
+
+# mark: Idle callbacks ==========================================================================
+
+## request_idle_callback's handler (`[callback = GC::make_root(callback)](deadline) { return invoke_callback(...); }`).
+func html_window_invoke_idle_request_callback(context: void*?, deadline: RequestIdleCallbackIdleDeadline*) -> JsCompletion:
+    let callback = (IdlCallbackType*)(context else trap("no callback"))
+    let args: JsValue[1] = [js_value_from_object((JsObject*)deadline)]
+    return idl_invoke_callback_span_js_value(callback, none, args[0..<1])
+
+## Ported from Window.cpp:1763 Web::HTML::Window::request_idle_callback.
+# https://w3c.github.io/requestidlecallback/#dom-window-requestidlecallback
+pub func html_window_request_idle_callback(this: HtmlWindow*, callback: IdlCallbackType*, options: RequestIdleCallbackIdleRequestOptions) -> u32:
+    # 1. Let window be this Window object.
+
+    # 2. Increment the window's idle callback identifier by one.
+    this.m_idle_callback_identifier += 1
+
+    # 3. Let handle be the current value of window's idle callback identifier.
+    let handle = this.m_idle_callback_identifier
+
+    # 4. Push callback to the end of window's list of idle request callbacks, associated with handle.
+    # NOTE: GC::make_root(callback): the window's idle callback lists live in the window's cell, and
+    #       managed memory the callback is referenced from is scanned, so the callback stays alive.
+    let idle_callback = new HtmlIdleCallback() else trap("out of memory")
+    html_idle_callback_construct(idle_callback, ak.Function1[RequestIdleCallbackIdleDeadline*, JsCompletion](call = html_window_invoke_idle_request_callback, context = callback), handle)
+    ak.vector_append_t(&this.m_idle_request_callbacks, idle_callback)
+
+    # 5. Return handle and then continue running this algorithm asynchronously.
+    discard(options)
+    return handle
+
+    # FIXME: 6. If the timeout property is present in options and has a positive value:
+    # FIXME:    1. Wait for timeout milliseconds.
+    # FIXME:    2. Wait until all invocations of this algorithm, whose timeout added to their posted time occurred before this one's, have completed.
+    # FIXME:    3. Optionally, wait a further user-agent defined length of time.
+    # FIXME:    4. Queue a task on the queue associated with the idle-task task source, which performs the invoke idle callback timeout algorithm, passing handle and window as arguments.
+
+## cancel_idle_callback's remove_first_matching predicate (`callback->handle() == handle`).
+func html_window_idle_callback_has_handle(context: void*?, callback: const (HtmlIdleCallback*)*) -> bool:
+    return html_idle_callback_handle(*callback) == *(const u32*)(context else trap("no handle"))
+
+## Ported from Window.cpp:1791 Web::HTML::Window::cancel_idle_callback.
+# https://w3c.github.io/requestidlecallback/#dom-window-cancelidlecallback
+pub func html_window_cancel_idle_callback(this: HtmlWindow*, handle: u32):
+    # 1. Let window be this Window object.
+
+    # 2. Find the entry in either the window's list of idle request callbacks or list of runnable idle callbacks
+    #    that is associated with the value handle.
+    # 3. If there is such an entry, remove it from both window's list of idle request callbacks and the list of runnable idle callbacks.
+    var handle_value = handle
+    let matches = ak.Function1[const (HtmlIdleCallback*)*, bool](call = html_window_idle_callback_has_handle, context = &handle_value)
+    discard(ak.vector_remove_first_matching(&this.m_idle_request_callbacks, matches))
+    discard(ak.vector_remove_first_matching(&this.m_runnable_idle_callbacks, matches))
+
+# mark: Selection, obsolete methods, External and navigation ====================================
+
+## Ported from Window.cpp:1807 Web::HTML::Window::get_selection.
+# https://w3c.github.io/selection-api/#dom-window-getselection
+pub func html_window_get_selection(this: HtmlWindow*) -> SelectionSelection*?:
+    # The method must invoke and return the result of getSelection() on this's Window.document attribute.
+    return dom_document_get_selection(html_window_associated_document_const(this))
+
+## Ported from Window.cpp:1814 Web::HTML::Window::capture_events.
+# https://html.spec.whatwg.org/multipage/obsolete.html#dom-window-captureevents
+pub func html_window_capture_events(this: HtmlWindow*):
+    # Do nothing.
+    return
+
+## Ported from Window.cpp:1820 Web::HTML::Window::release_events.
+# https://html.spec.whatwg.org/multipage/obsolete.html#dom-document-releaseevents
+pub func html_window_release_events(this: HtmlWindow*):
+    # Do nothing.
+    return
+
+## Ported from Window.cpp:1826 Web::HTML::Window::external.
+# https://html.spec.whatwg.org/multipage/obsolete.html#dom-external
+pub func html_window_external(this: HtmlWindow*) -> HtmlExternal*:
+    # The external attribute of the Window interface must return an instance of the External interface
+    if this.m_external == none:
+        let realm = bind_platform_object_realm(this.bind_platform_object())
+        this.m_external = realm_create_html_external(realm, realm)
+    return this.m_external else trap("unreachable")
+
+## Ported from Window.cpp:1835 Web::HTML::Window::navigation.
+# https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-navigation
+pub func html_window_navigation(this: HtmlWindow*) -> HtmlNavigation*:
+    # Upon creation of the Window object, its navigation API must be set
+    # to a new Navigation object created in the Window object's relevant realm.
+    if this.m_navigation == none:
+        let realm = html_relevant_realm((JsObject*)this)
+        this.m_navigation = realm_create_html_navigation(realm, realm)
+
+    # The navigation getter steps are to return this's navigation API.
+    return this.m_navigation else trap("unreachable")
+
+## Ported from Window.cpp:1849 Web::HTML::Window::custom_elements.
+# https://html.spec.whatwg.org/multipage/custom-elements.html#dom-window-customelements
+pub func html_window_custom_elements(this: HtmlWindow*) -> HtmlCustomElementRegistry*:
+    # The Window customElements getter steps are:
+
+    # 1. Assert: this's associated Document's custom element registry is a CustomElementRegistry object.
+    # Note: A Window's associated Document is always created with a new CustomElementRegistry object.
+    let registry = dom_document_custom_element_registry(html_window_associated_document(this)) else trap("VERIFY: registry")
+
+    # 2. Return this's associated Document's custom element registry.
+    return registry
+
+# mark: Named access on the Window object =======================================================
+
+## Ported from Window.cpp:1863 Web::HTML::Window::document_tree_child_navigable_target_name_property_set.
+# https://html.spec.whatwg.org/multipage/nav-history-apis.html#document-tree-child-navigable-target-name-property-set
+pub func html_window_document_tree_child_navigable_target_name_property_set(this: HtmlWindow*) -> ak.OrderedHashMap[ak.FlyString, HtmlNavigable*, ak.FlyStringTraits]:
+    # The document-tree child navigable target name property set of a Window object window is the return value of running these steps:
+
+    # 1. Let children be the document-tree child navigables of window's associated Document.
+    let children = dom_document_document_tree_child_navigables(html_window_associated_document(this))
+
+    # 2. Let firstNamedChildren be an empty ordered set.
+    var first_named_children = ak.OrderedHashMap[ak.FlyString, HtmlNavigable*, ak.FlyStringTraits]()
+
+    # 3. For each navigable of children:
+    for child in ak.vector_span_const(&children):
+        let navigable = child else trap("no navigable")
+        # 1. Let name be navigable's target name.
+        let name = html_navigable_target_name(navigable)
+
+        # 2. If name is the empty string, then continue.
+        if ak.string_is_empty(&name):
+            continue
+
+        # 3. If firstNamedChildren contains a navigable whose target name is name, then continue.
+        let key = ak.fly_string_from_string(name)
+        if ak.ordered_hash_map_contains_k(&first_named_children, key):
+            continue
+
+        # 4. Append navigable to firstNamedChildren.
+        discard(ak.ordered_hash_map_set(&first_named_children, key, navigable))
+
+    # 4. Let names be an empty ordered set.
+    var names = ak.OrderedHashMap[ak.FlyString, HtmlNavigable*, ak.FlyStringTraits]()
+
+    # 5. For each navigable of firstNamedChildren:
+    let relevant_origin = html_environment_settings_object_origin(html_relevant_settings_object_js_object((JsObject*)this))
+    for entry in ak.ordered_hash_map_begin(&first_named_children):
+        # 1. Let name be navigable's target name.
+        # 2. If navigable's active document's origin is same origin with window's relevant settings object's origin, then append name to names.
+        if let document = html_navigable_active_document(entry.value):
+            let document_origin = dom_document_origin(document)
+            if web_url.origin_is_same_origin(&document_origin, relevant_origin):
+                discard(ak.ordered_hash_map_set(&names, entry.key, entry.value))
+
+    return names
+
+## supported_property_names' for_each_id callback (`property_names.set(id, Keep)`).
+func html_window_add_property_name(context: void*?, id: ak.FlyString):
+    let property_names = (ak.OrderedHashTable[ak.FlyString, ak.FlyStringTraits]*)(context else trap("no set"))
+    discard(ak.ordered_hash_table_set(property_names, id, ak.HashSetExistingEntryBehavior.keep))
+
+## Ported from Window.cpp:1906 Web::HTML::Window::supported_property_names (override).
+# https://html.spec.whatwg.org/multipage/nav-history-apis.html#named-access-on-the-window-object
+pub func html_window_supported_property_names_impl(base: BindPlatformObject*) -> ak.Vector[ak.FlyString]:
+    # FIXME: Make the const-correctness of the methods this method calls less cowboy.
+    let mutable_this = (HtmlWindow*)base
+
+    # The Window object supports named properties.
+    # The supported property names of a Window object window at any moment consist of the following,
+    # in tree order according to the element that contributed them, ignoring later duplicates:
+
+    # (A HashTable in C++, whose values() come in bucket order; an insertion-ordered set here,
+    # which gives the order the comment above asks for.)
+    var property_names = ak.OrderedHashTable[ak.FlyString, ak.FlyStringTraits]()
+
+    # - window's document-tree child navigable target name property set;
+    var child_navigable_property_set = html_window_document_tree_child_navigable_target_name_property_set(mutable_this)
+    for entry in ak.ordered_hash_map_begin(&child_navigable_property_set):
+        discard(ak.ordered_hash_table_set(&property_names, entry.key, ak.HashSetExistingEntryBehavior.keep))
+
+    # - the value of the name content attribute for all embed, form, img, and object elements
+    #   that have a non-empty name content attribute and are in a document tree with window's associated Document as their root; and
+    # - the value of the id content attribute for all HTML elements that have a non-empty id content attribute
+    #   and are in a document tree with window's associated Document as their root.
+    for element in ak.vector_span_const(dom_document_potentially_named_elements(html_window_associated_document(mutable_this))):
+        if let name = dom_element_name(element):
+            discard(ak.ordered_hash_table_set(&property_names, name, ak.HashSetExistingEntryBehavior.keep))
+    dom_element_by_id_map_for_each_id(dom_document_element_by_id(html_window_associated_document(mutable_this)), ak.Function1[ak.FlyString, unit](call = html_window_add_property_name, context = &property_names))
+
+    return ak.ordered_hash_table_values(&property_names)
+
+## The captures of named_item_value's for_each_in_subtree_of_type<NavigableContainer> callback.
+struct HtmlWindowFindNamedContainer: TraversalCallback[DomNode]:
+    var navigables: const ak.Vector[HtmlNavigable*]*
+    var container: HtmlNavigableContainer*?
+
+    mutating func call(node: DomNode*) -> TraversalDecision:
+        let navigable_container = as_html_navigable_container(node)
+        let content_navigable = html_navigable_container_content_navigable(navigable_container) else return TraversalDecision.continue_
+        for navigable in ak.vector_span_const(self.navigables):
+            if navigable == content_navigable:
+                self.container = navigable_container
+                return TraversalDecision.break_
+        return TraversalDecision.continue_
+
+## The captures of named_item_value's HTMLCollection filter (`[name]`).
+struct HtmlWindowNamedItemFilter:
+    var name: ak.FlyString
+
+## named_item_value's HTMLCollection filter: the named objects of the window with the name.
+func html_window_named_item_filter(context: void*?, element: DomElement*) -> bool:
+    let captures = (HtmlWindowNamedItemFilter*)(context else trap("no captures"))
+    if is_html_embed_element(element) or is_html_form_element(element) or is_html_image_element(element) or is_html_object_element(element):
+        if let element_name = dom_element_name(element):
+            if ak.fly_string_eq_fly_string(&element_name, &captures.name):
+                return true
+    let id = dom_element_id(element) else return false
+    return ak.fly_string_eq_fly_string(&id, &captures.name)
+
+## Ported from Window.cpp:1938 Web::HTML::Window::named_item_value (override).
+# https://html.spec.whatwg.org/multipage/nav-history-apis.html#named-access-on-the-window-object
+pub func html_window_named_item_value_impl(base: BindPlatformObject*, name: ak.FlyString) -> JsValue:
+    # FIXME: Make the const-correctness of the methods this method calls less cowboy.
+    let mutable_this = (HtmlWindow*)base
+
+    # To determine the value of a named property name in a Window object window, the user agent must return the value obtained using the following steps:
+
+    # 1. Let objects be the list of named objects of window with the name name.
+    # NOTE: There will be at least one such object, since the algorithm would otherwise not have been invoked by Web IDL.
+    let objects = html_window_named_objects(mutable_this, ak.fly_string_bytes_as_string_view(&name))
+
+    # 2. If objects contains a navigable, then:
+    if not ak.vector_is_empty(&objects.navigables):
+        # 1. Let container be the first navigable container in window's associated Document's descendants whose content navigable is in objects.
+        var finder = HtmlWindowFindNamedContainer(navigables = &objects.navigables, container = none)
+        discard(tree_node_for_each_in_subtree_of_type(html_window_associated_document(mutable_this).dom_node(), &html_navigable_container_class, &finder))
+        # 2. Return container's content navigable's active WindowProxy.
+        let container = finder.container else trap("VERIFY: container")
+        return js_value_from_object((JsObject*?)html_navigable_active_window_proxy(html_navigable_container_content_navigable(container) else trap("no content navigable")))
+
+    # 3. Otherwise, if objects has only one element, return that element.
+    if ak.vector_size(&objects.elements) == 1:
+        return js_value_from_object((JsObject*)*ak.vector_at_const(&objects.elements, 0))
+
+    # 4. Otherwise return an HTMLCollection rooted at window's associated Document,
+    #    whose filter matches only named objects of window with the name name. (By definition, these will all be elements.)
+    let filter = new HtmlWindowNamedItemFilter(name = name) else trap("out of memory")
+    return js_value_from_object((JsObject*)dom_html_collection_create(html_window_associated_document(mutable_this).dom_parent_node(), DomHtmlCollectionScope.descendants, ak.Function1[DomElement*, bool](call = html_window_named_item_filter, context = filter), ak.Function2[DomElement*, DomElement*, bool]()))
+
+## named_objects' for_each_element_with_id callback (`objects.elements.append(element)`).
+func html_window_append_named_element(context: void*?, element: DomElement*):
+    let elements = (ak.Vector[DomElement*]*)(context else trap("no list"))
+    ak.vector_append_t(elements, element)
+
+## Ported from Window.cpp:1982 Web::HTML::Window::named_objects.
+# https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-window-nameditem-filter
+func html_window_named_objects(this: HtmlWindow*, name: ak.StringView) -> HtmlWindowNamedObjects:
+    # NOTE: Since the Window interface has the [Global] extended attribute, its named properties
+    #       follow the rules for named properties objects rather than legacy platform objects.
+
+    # Named objects of Window object window with the name name, for the purposes of the above algorithm, consist of the following:
+    var objects = HtmlWindowNamedObjects()
+
+    # document-tree child navigables of window's associated Document whose target name is name;
+    let children = dom_document_document_tree_child_navigables(html_window_associated_document(this))
+    for child in ak.vector_span_const(&children):
+        let navigable = child else trap("no navigable")
+        let target_name = html_navigable_target_name(navigable)
+        if ak.string_eq_string_view(&target_name, name):
+            ak.vector_append_t(&objects.navigables, navigable)
+
+    # embed, form, img, or object elements that have a name content attribute whose value is name
+    # and are in a document tree with window's associated Document as their root; and
+    # HTML elements that have an id content attribute whose value is name and are in a document tree with window's associated Document as their root.
+    for element in ak.vector_span_const(dom_document_potentially_named_elements(html_window_associated_document(this))):
+        if dom_element_id(element) != none:
+            # NOTE: The element will be added when we iterate over the element_by_id() map below.
+            continue
+        if let element_name = dom_element_name(element):
+            if ak.fly_string_eq_string_view(&element_name, name):
+                ak.vector_append_t(&objects.elements, element)
+    let document = html_window_associated_document(this)
+    dom_element_by_id_map_for_each_element_with_id(dom_document_element_by_id(document), name, document.dom_node(), ak.Function1[DomElement*, unit](call = html_window_append_named_element, context = &objects.elements))
+
+    return objects
+
+# mark: Find in page ============================================================================
+
+## Ported from Window.cpp:2016 Web::HTML::Window::find.
+pub func html_window_find(this: HtmlWindow*, string: ak.String) -> bool:
+    if ak.string_is_empty(&string):
+        return false
+
+    let page = html_window_page(this)
+    var result: PageFindInPageResult? = none
+    var repeated = false
+    if let last_query = page_last_find_in_page_query(page):
+        repeated = ak.string_equals(&last_query.string, &string)
+    if repeated:
+        result = page_find_in_page_next_match(page)
+    else:
+        let query = PageFindInPageQuery(string = string, case_sensitivity = ak.CaseSensitivity.case_insensitive, wrap_around = PageWrapAround.no)
+
+        result = page_find_in_page(page, query)
+
+    let found = result else return false
+    let total_match_count = found.total_match_count else return false
+    return total_match_count > 0

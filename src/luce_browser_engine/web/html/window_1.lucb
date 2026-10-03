@@ -1,0 +1,604 @@
+#==============================================================================================
+#
+#   window_1 - HTML::Window: the set of all windows, creation and what a window keeps alive,
+#   window.open()'s steps, media features, page transition events and web storage
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibWeb/HTML/Window.cpp lines 86-553 (all_windows, for_each_active,
+#       run_animation_frame_callbacks, IdleCallback, create, the constructor, visit_edges,
+#       finalize, window_open_steps, get_noopener_for_window_open, window_open_steps_internal,
+#       dispatch_event, page, query_media_feature, fire_a_page_transition_event, local_storage,
+#       session_storage), with the inline functions of Window.h.
+#
+#       all_windows is a GC::WeakHashSet in C++. Its WeakImpls live in a VM's heap and the set is
+#       a static, so here (DESIGN.md §3.3 rule 7) it is a C-heap set of raw pointers that
+#       Window::finalize leaves, as the donor's finalize does: it never points at a dead window.
+#
+#       Copyright (c) 2020-2023, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2021-2022, Sam Atkins <atkinssj@serenityos.org>
+#       Copyright (c) 2021-2023, Linus Groh <linusg@serenityos.org>
+#       Copyright (c) 2023, Luke Wilde <lukew@serenityos.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: All windows =============================================================================
+
+## The static set of all_windows: raw pointers in the C heap, which keep nothing alive; a
+## window's finalize removes it.
+var html_all_windows_storage: ak.HashTable[HtmlWindow*, ak.PtrTraits[HtmlWindow]]
+
+## Ported from Window.cpp:87 Web::HTML::all_windows.
+func html_all_windows() -> ak.HashTable[HtmlWindow*, ak.PtrTraits[HtmlWindow]]*:
+    return &html_all_windows_storage
+
+## Ported from Window.cpp:93 Web::HTML::Window::for_each_active.
+pub func html_window_for_each_active(callback: ak.Function1[HtmlWindow*, ak.IterationDecision]):
+    var windows = ak.Vector[HtmlWindow*]()
+    for window_pointer in ak.hash_table_begin(html_all_windows()):
+        ak.vector_append_t(&windows, *window_pointer)
+    for window in ak.vector_span(&windows):
+        let document = window.m_associated_document else continue
+
+        if not dom_document_is_fully_active(document):
+            continue
+
+        if ak.function1_call(&callback, window) == ak.IterationDecision.break_:
+            break
+
+## Ported from Window.cpp:109 Web::HTML::run_animation_frame_callbacks.
+# https://html.spec.whatwg.org/multipage/imagebitmap-and-animations.html#run-the-animation-frame-callbacks
+pub func html_run_animation_frame_callbacks(document: DomDocument*, now: f64):
+    # FIXME: Bring this closer to the spec.
+    html_animation_frame_callback_driver_run(html_window_animation_frame_callback_driver(dom_document_window(document) else trap("no window")), now)
+
+# mark: IdleCallback ============================================================================
+
+## Ported from Window.cpp:117 Web::HTML::IdleCallback::IdleCallback.
+pub func html_idle_callback_construct(this: HtmlIdleCallback*, handler: ak.Function1[RequestIdleCallbackIdleDeadline*, JsCompletion], handle: u32):
+    this.m_handler = handler
+    this.m_handle = handle
+
+## Ported from Window.cpp:124 Web::HTML::IdleCallback::invoke.
+pub func html_idle_callback_invoke(this: HtmlIdleCallback*, deadline: RequestIdleCallbackIdleDeadline*) -> JsCompletion:
+    return ak.function1_call(&this.m_handler, deadline)
+
+## Ported from Window.cpp:125 Web::HTML::IdleCallback::handle.
+pub func html_idle_callback_handle(this: const HtmlIdleCallback*) -> u32:
+    return this.m_handle
+
+# mark: Creation and lifetime ===================================================================
+
+## Ported from Window.cpp:132 Web::HTML::Window::create.
+pub func html_window_create(realm: Realm*) -> HtmlWindow*:
+    return realm_create_html_window(realm, realm)
+
+## Ported from Window.cpp:137 Web::HTML::Window::Window, with the default member initializers.
+pub func html_window_construct(this: HtmlWindow*, realm: Realm*):
+    dom_event_target_construct(this.dom_event_target(), realm)
+    html_window_init_fields(this)
+    html_window_or_worker_global_scope_mixin_init_fields(&this.window_or_worker_global_scope_mixin)
+    # The vptrs of the mixin bases move to Window's tables.
+    let class_id = this.cell().class_id
+    this.global_event_handlers.vtable = &html_window_global_event_handlers_vtable
+    this.global_event_handlers.class_id = class_id
+    this.window_event_handlers.vtable = &html_window_window_event_handlers_vtable
+    this.window_event_handlers.class_id = class_id
+    this.window_or_worker_global_scope_mixin.vtable = &html_window_window_or_worker_global_scope_mixin_vtable
+    this.window_or_worker_global_scope_mixin.class_id = class_id
+    this.universal_global_scope_mixin.vtable = &html_window_universal_global_scope_mixin_vtable
+    this.universal_global_scope_mixin.class_id = class_id
+    this.window_global_mixin.vtable = &html_window_window_global_mixin_vtable
+    this.window_global_mixin.class_id = class_id
+
+    this.event_target.platform_object.m_legacy_platform_object_flags = BindPlatformObjectLegacyPlatformObjectFlags(supports_named_properties = 1, has_legacy_unenumerable_named_properties_interface_extended_attribute = 1, has_global_interface_extended_attribute = 1)
+
+    with memory.heap:
+        discard(ak.hash_table_set(html_all_windows(), this))
+
+## Ported from Window.cpp:149 Web::HTML::Window::visit_edges (override).
+pub func html_window_visit_edges_impl(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (HtmlWindow*)base
+    dom_event_target_visit_edges_impl(base, visitor)
+    html_window_or_worker_global_scope_mixin_visit_edges(&this.window_or_worker_global_scope_mixin, visitor)
+    html_universal_global_scope_mixin_visit_edges(&this.universal_global_scope_mixin, visitor)
+
+    gc.cell_visitor_visit_t(visitor, this.m_associated_document)
+    gc.cell_visitor_visit_t(visitor, this.m_current_event)
+    gc.cell_visitor_visit_t(visitor, this.m_screen)
+    gc.cell_visitor_visit_cell(visitor, (gc.Cell*?)this.m_location)  # opaque in phase 1
+    gc.cell_visitor_visit_t(visitor, this.m_navigator)
+    gc.cell_visitor_visit_cell(visitor, (gc.Cell*?)this.m_navigation)  # opaque in phase 1
+    gc.cell_visitor_visit_t(visitor, this.m_animation_frame_callback_driver)
+    for plugin in ak.vector_span(&this.m_pdf_viewer_plugin_objects):
+        gc.cell_visitor_visit_cell(visitor, (gc.Cell*?)plugin)  # opaque in phase 1
+    for mime_type in ak.vector_span(&this.m_pdf_viewer_mime_type_objects):
+        gc.cell_visitor_visit_cell(visitor, (gc.Cell*?)mime_type)  # opaque in phase 1
+    gc.cell_visitor_visit_cell(visitor, (gc.Cell*?)this.m_close_watcher_manager)  # opaque in phase 1
+    gc.cell_visitor_visit_cell(visitor, (gc.Cell*?)this.m_cookie_store)  # opaque in phase 1
+    gc.cell_visitor_visit_cell(visitor, (gc.Cell*?)this.m_speech_synthesis)  # opaque in phase 1
+    gc.cell_visitor_visit_cell(visitor, (gc.Cell*?)this.m_locationbar)  # opaque in phase 1
+    gc.cell_visitor_visit_cell(visitor, (gc.Cell*?)this.m_menubar)  # opaque in phase 1
+    gc.cell_visitor_visit_cell(visitor, (gc.Cell*?)this.m_personalbar)  # opaque in phase 1
+    gc.cell_visitor_visit_cell(visitor, (gc.Cell*?)this.m_scrollbars)  # opaque in phase 1
+    gc.cell_visitor_visit_cell(visitor, (gc.Cell*?)this.m_statusbar)  # opaque in phase 1
+    gc.cell_visitor_visit_cell(visitor, (gc.Cell*?)this.m_toolbar)  # opaque in phase 1
+    gc.cell_visitor_visit_cell(visitor, (gc.Cell*?)this.m_external)  # opaque in phase 1
+    for entry in ak.hash_map_begin(&this.m_cross_origin_property_descriptor_map):
+        js_property_descriptor_visit_edges(&entry.value, visitor)
+
+## Ported from Window.cpp:178 Web::HTML::Window::finalize (override).
+pub func html_window_finalize_impl(base: gc.Cell*):
+    let this = (HtmlWindow*)base
+    # Base::finalize(): EventTarget inherits GC::Cell's.
+    gc.cell_finalize_impl(base)
+    html_window_or_worker_global_scope_mixin_finalize(&this.window_or_worker_global_scope_mixin)
+    with memory.heap:
+        discard(ak.hash_table_remove_t(html_all_windows(), this))
+
+# mark: window.open() ===========================================================================
+
+## Ported from Window.cpp:188 Web::HTML::Window::window_open_steps.
+# https://html.spec.whatwg.org/multipage/window-object.html#window-open-steps
+pub func html_window_window_open_steps(this: HtmlWindow*, url: ak.StringView, target: ak.StringView, features: ak.StringView) -> HtmlWindowProxy*?!:
+    let opened = try html_window_window_open_steps_internal(this, url, target, features)
+    let target_navigable = opened.navigable else return none
+
+    # 17. If noopener is true or windowType is "new with no opener", then return null.
+    if opened.no_opener == HtmlNoOpener.yes or opened.window_type == HtmlWindowType.new_with_no_opener:
+        return none
+
+    # 18. Return targetNavigable's active WindowProxy.
+    return html_navigable_active_window_proxy(target_navigable)
+
+## Ported from Window.cpp:203 Web::HTML::get_noopener_for_window_open.
+# https://html.spec.whatwg.org/multipage/nav-history-apis.html#get-noopener-for-window-open
+func html_get_noopener_for_window_open(source_document: DomDocument*, tokenized_features: const ak.OrderedHashMap[ak.String, ak.String, ak.StringTraits]*, url: const web_url.Url*?) -> HtmlNoOpener:
+    # 1. If url is not null and url's blob URL entry is not null:
+    if let url_record = url:
+        if let blob_url_entry = web_url.url_blob_url_entry(url_record):
+            # 1. Let blobOrigin be url's blob URL entry's environment's origin.
+            let blob_origin = blob_url_entry.environment.origin
+
+            # 2. Let topLevelOrigin be sourceDocument's relevant settings object's top-level origin.
+            let top_level_origin = dom_document_relevant_settings_object(source_document).html_environment().top_level_origin
+
+            # 3. If blobOrigin is not same site with topLevelOrigin, then return true.
+            if not web_url.origin_is_same_site(&blob_origin, top_level_origin else trap("Optional::value() on an empty optional")):
+                return HtmlNoOpener.yes
+
+    # 2. Let noopener be false.
+    var noopener = HtmlNoOpener.no
+
+    # 3. If tokenizedFeatures["noopener"] exists, then set noopener to the result of parsing tokenizedFeatures["noopener"] as a boolean feature.
+    if let value = ak.ordered_hash_map_get_k_const(tokenized_features, ak.string_from_str("noopener")):
+        noopener = html_parse_boolean_feature(ak.string_bytes_as_string_view(value), HtmlNoOpener.yes, HtmlNoOpener.no)
+
+    # 4. Return noopener.
+    return noopener
+
+## `Utf16String::formatted("Invalid URL '{}'", url)`.
+func html_window_invalid_url_message(url: ak.StringView) -> ak.Utf16String:
+    var builder = ak.string_builder_new_mode(ak.StringBuilderMode.utf16)
+    ak.string_builder_append(&builder, "Invalid URL '")
+    ak.string_builder_append_string_view(&builder, url)
+    ak.string_builder_append(&builder, "'")
+    return ak.string_builder_to_utf16_string(&builder)
+
+## Ported from Window.cpp:231 Web::HTML::Window::window_open_steps_internal.
+# https://html.spec.whatwg.org/multipage/window-object.html#window-open-steps
+pub func html_window_window_open_steps_internal(this: HtmlWindow*, url: ak.StringView, a_target: ak.StringView, features: ak.StringView) -> HtmlWindowOpenedWindow!:
+    var target = a_target
+
+    # 1. If the event loop's termination nesting level is nonzero, return null.
+    if html_event_loop_termination_nesting_level(html_main_thread_event_loop()) != 0:
+        return HtmlWindowOpenedWindow(navigable = none, no_opener = HtmlNoOpener.no, window_type = HtmlWindowType.existing_or_none)
+
+    # 2. Let sourceDocument be the entry global object's associated Document.
+    let source_document = html_window_associated_document(as_html_window((gc.Cell*)html_entry_global_object()))
+
+    # 3. Let urlRecord be null.
+    var url_record: web_url.Url? = none
+
+    # 4. If url is not the empty string, then:
+    if not ak.string_view_is_empty(&url):
+        # 1. Set urlRecord to the result of encoding-parsing a URL given url, relative to sourceDocument.
+        url_record = dom_document_encoding_parse_url(source_document, url)
+
+        # 2. If urlRecord is failure, then throw a "SyntaxError" DOMException.
+        if url_record == none:
+            return try idl_throw(.idl_dom_exception(idl_syntax_error_create(bind_platform_object_realm(this.bind_platform_object()), html_window_invalid_url_message(url))))
+
+    # 5. If target is the empty string, then set target to "_blank".
+    if ak.string_view_is_empty(&target):
+        target = ak.sv("_blank")
+
+    # 6. Let tokenizedFeatures be the result of tokenizing features.
+    var tokenized_features = html_tokenize_open_features(features)
+
+    # 7. Let noreferrer be false.
+    var no_referrer = HtmlNoReferrer.no
+
+    # 8. If tokenizedFeatures["noreferrer"] exists, then set noreferrer to the result of parsing tokenizedFeatures["noreferrer"] as a boolean feature.
+    if let no_referrer_feature = ak.ordered_hash_map_get_k_const(&tokenized_features, ak.string_from_str("noreferrer")):
+        no_referrer = html_parse_boolean_feature(ak.string_bytes_as_string_view(no_referrer_feature), HtmlNoReferrer.yes, HtmlNoReferrer.no)
+
+    # 9. Let noopener be the result of getting noopener for window open with sourceDocument, tokenizedFeatures, and urlRecord.
+    var no_opener = HtmlNoOpener.no
+    if let record = url_record:
+        no_opener = html_get_noopener_for_window_open(source_document, &tokenized_features, &record)
+    else:
+        no_opener = html_get_noopener_for_window_open(source_document, &tokenized_features, none)
+
+    # 10. Remove tokenizedFeatures["noopener"] and tokenizedFeatures["noreferrer"].
+    discard(ak.ordered_hash_map_remove_k(&tokenized_features, ak.string_from_str("noopener")))
+    discard(ak.ordered_hash_map_remove_k(&tokenized_features, ak.string_from_str("noreferrer")))
+
+    # 11. Let referrerPolicy be the empty string.
+    var referrer_policy = ReferrerPolicyReferrerPolicy.empty_string
+
+    # 12. If noreferrer is true, then set noopener to true and set referrerPolicy to "no-referrer".
+    if no_referrer == HtmlNoReferrer.yes:
+        no_opener = HtmlNoOpener.yes
+        referrer_policy = ReferrerPolicyReferrerPolicy.no_referrer
+
+    # 13. Let targetNavigable and windowType be the result of applying the rules for choosing a navigable given target, sourceDocument's node navigable, and noopener.
+    let source_navigable = dom_document_navigable(source_document) else trap("VERIFY: source_document.navigable()")
+    let chosen = html_navigable_choose_a_navigable(source_navigable, target, no_opener, HtmlActivateTab.yes, &tokenized_features)
+    let window_type = chosen.window_type
+
+    # 14. If targetNavigable is null, then return null.
+    let target_navigable = chosen.navigable else return HtmlWindowOpenedWindow(navigable = none, no_opener = HtmlNoOpener.no, window_type = HtmlWindowType.existing_or_none)
+
+    # 15. If windowType is either "new and unrestricted" or "new with no opener", then:
+    if window_type == HtmlWindowType.new_and_unrestricted or window_type == HtmlWindowType.new_with_no_opener:
+        # 1. Set targetNavigable's active browsing context's is popup to the result of checking if a popup window is requested, given tokenizedFeatures.
+        html_browsing_context_set_is_popup(html_navigable_active_browsing_context(target_navigable) else trap("no active browsing context"), html_check_if_a_popup_window_is_requested(&tokenized_features))
+
+        # 2. Set up browsing context features for target browsing context given tokenizedFeatures. [CSSOMVIEW]
+        # NOTE: This is implemented in choose_a_navigable when creating the top level traversable.
+
+        # 3. If urlRecord is null, then set urlRecord to a URL record representing about:blank.
+        if url_record == none:
+            url_record = web_url.about_blank()
+        let record = url_record else trap("unreachable")
+
+        # 4. If urlRecord matches about:blank, then perform the URL and history update steps given targetNavigable's active document and urlRecord.
+        if html_url_matches_about_blank(record):
+            # AD-HOC: Mark the initial about:blank for the new window as load complete
+            # FIXME: We do this other places too when creating a new about:blank document. Perhaps it's worth a spec issue?
+            let active_document = html_navigable_active_document(target_navigable) else trap("no active document")
+            html_parser_the_end(active_document)
+
+            html_perform_url_and_history_update_steps(active_document, record)
+
+        # 5. Otherwise, navigate targetNavigable to urlRecord using sourceDocument, with referrerPolicy set to referrerPolicy and exceptionsEnabled set to true.
+        else:
+            try html_navigable_navigate(target_navigable, HtmlNavigableNavigateParams(url = record, source_document = source_document, exceptions_enabled = true, referrer_policy = referrer_policy))
+    # 16. Otherwise:
+    else:
+        # 1. If urlRecord is not null, then navigate targetNavigable to urlRecord using sourceDocument, with referrerPolicy set to referrerPolicy and exceptionsEnabled set to true.
+        if let record = url_record:
+            try html_navigable_navigate(target_navigable, HtmlNavigableNavigateParams(url = record, source_document = source_document, exceptions_enabled = true, referrer_policy = referrer_policy))
+
+        # 2. If noopener is false, then set targetNavigable's active browsing context's opener browsing context to sourceDocument's browsing context.
+        if no_opener == HtmlNoOpener.no:
+            html_browsing_context_set_opener_browsing_context(html_navigable_active_browsing_context(target_navigable) else trap("no active browsing context"), dom_document_browsing_context(source_document))
+
+    # NOTE: Steps 17 and 18 are implemented in window_open_steps().
+    return HtmlWindowOpenedWindow(navigable = target_navigable, no_opener = no_opener, window_type = window_type)
+
+# mark: Events and the page =====================================================================
+
+## Ported from Window.cpp:333 Web::HTML::Window::dispatch_event (override).
+pub func html_window_dispatch_event_impl(base: DomEventTarget*, event: DomEvent*) -> bool:
+    return dom_event_dispatcher_dispatch(base, event, true)
+
+## Ported from Window.cpp:338 Web::HTML::Window::page.
+pub func html_window_page(this: HtmlWindow*) -> Page*:
+    return dom_document_page(html_window_associated_document(this))
+
+## Ported from Window.cpp:343 Web::HTML::Window::page.
+pub func html_window_page_const(this: HtmlWindow*) -> Page*:
+    return dom_document_page(html_window_associated_document(this))
+
+## `CSS::MediaFeatureValue(type, value)`.
+func html_media_feature_value(type_: CssMediaFeatureValueType, value: CssStyleValue*) -> CssMediaFeatureValue?:
+    var result: CssMediaFeatureValue = ---
+    css_media_feature_value_construct(&result, type_, value)
+    return result
+
+## `CSS::MediaFeatureValue(Type::Ident, KeywordStyleValue::create(keyword))`.
+func html_media_feature_ident(keyword: css_data.Keyword) -> CssMediaFeatureValue?:
+    return html_media_feature_value(CssMediaFeatureValueType.ident, css_keyword_style_value_create(keyword).css_style_value())
+
+## `CSS::MediaFeatureValue(Type::Integer, IntegerStyleValue::create(value))`.
+func html_media_feature_integer(value: i32) -> CssMediaFeatureValue?:
+    return html_media_feature_value(CssMediaFeatureValueType.integer, css_integer_style_value_create(value).css_style_value())
+
+## `CSS::MediaFeatureValue(Type::Length, LengthStyleValue::create(length))`.
+func html_media_feature_length(length: CssLength) -> CssMediaFeatureValue?:
+    return html_media_feature_value(CssMediaFeatureValueType.length, css_length_style_value_create(length).css_style_value())
+
+## `CSS::MediaFeatureValue(Type::Ratio, RatioStyleValue::create(NumberStyleValue::create(a), NumberStyleValue::create(b)))`.
+func html_media_feature_ratio(numerator: f64, denominator: f64) -> CssMediaFeatureValue?:
+    return html_media_feature_value(CssMediaFeatureValueType.ratio, css_ratio_style_value_create(css_number_style_value_create(numerator).css_style_value(), css_number_style_value_create(denominator).css_style_value()).css_style_value())
+
+## Ported from Window.cpp:348 Web::HTML::Window::query_media_feature.
+pub func html_window_query_media_feature(this: HtmlWindow*, media_feature: css_data.MediaFeatureId) -> CssMediaFeatureValue?:
+    # FIXME: Many of these should be dependent on the hardware
+
+    # https://www.w3.org/TR/mediaqueries-5/#media-descriptor-table
+    match media_feature:
+        .any_hover:
+            return html_media_feature_ident(css_data.Keyword.hover)
+        .any_pointer:
+            return html_media_feature_ident(css_data.Keyword.fine)
+        .aspect_ratio:
+            return html_media_feature_ratio((f64)html_window_inner_width(this), (f64)html_window_inner_height(this))
+        .color:
+            return html_media_feature_integer(8)
+        .color_gamut:
+            return html_media_feature_ident(css_data.Keyword.srgb)
+        .color_index:
+            return html_media_feature_integer(0)
+        .device_aspect_ratio:
+            let screen_area = page_client_screen_rect(page_client(html_window_page(this)))
+            return html_media_feature_ratio((f64)gfx.device_pixel_rect_width(&screen_area), (f64)gfx.device_pixel_rect_height(&screen_area))
+        .device_height:
+            let area = page_web_exposed_screen_area(html_window_page(this))
+            return html_media_feature_length(css_length_make_px_css_pixels(gfx.css_pixel_rect_height(&area)))
+        .device_width:
+            let area = page_web_exposed_screen_area(html_window_page(this))
+            return html_media_feature_length(css_length_make_px_css_pixels(gfx.css_pixel_rect_width(&area)))
+        .display_mode:
+            # FIXME: Detect if window is fullscreen
+            return html_media_feature_ident(css_data.Keyword.browser)
+        .dynamic_range:
+            return html_media_feature_ident(css_data.Keyword.standard)
+        .environment_blending:
+            return html_media_feature_ident(css_data.Keyword.opaque)
+        .forced_colors:
+            return html_media_feature_ident(css_data.Keyword.none_)
+        .grid:
+            return html_media_feature_integer(0)
+        .height:
+            return html_media_feature_length(css_length_make_px_f64((f64)html_window_inner_height(this)))
+        .horizontal_viewport_segments:
+            return html_media_feature_integer(1)
+        .hover:
+            return html_media_feature_ident(css_data.Keyword.hover)
+        .inverted_colors:
+            return html_media_feature_ident(css_data.Keyword.none_)
+        .monochrome:
+            return html_media_feature_integer(0)
+        .nav_controls:
+            return html_media_feature_ident(css_data.Keyword.back)
+        .orientation:
+            return html_media_feature_ident(css_data.Keyword.portrait if html_window_inner_height(this) >= html_window_inner_width(this) else css_data.Keyword.landscape)
+        .overflow_block:
+            return html_media_feature_ident(css_data.Keyword.scroll)
+        .overflow_inline:
+            return html_media_feature_ident(css_data.Keyword.scroll)
+        .pointer:
+            return html_media_feature_ident(css_data.Keyword.fine)
+        .prefers_color_scheme:
+            match page_preferred_color_scheme(html_window_page(this)):
+                .light:
+                    return html_media_feature_ident(css_data.Keyword.light)
+                .dark:
+                    return html_media_feature_ident(css_data.Keyword.dark)
+                _:
+                    trap("VERIFY_NOT_REACHED")
+        .prefers_contrast:
+            match page_preferred_contrast(html_window_page(this)):
+                .less:
+                    return html_media_feature_ident(css_data.Keyword.less)
+                .more:
+                    return html_media_feature_ident(css_data.Keyword.more)
+                .no_preference:
+                    return html_media_feature_ident(css_data.Keyword.no_preference)
+                _:
+                    # FIXME: Fallback to system settings
+                    return html_media_feature_ident(css_data.Keyword.no_preference)
+        .prefers_reduced_data:
+            # FIXME: Make this a preference
+            return html_media_feature_ident(css_data.Keyword.no_preference)
+        .prefers_reduced_motion:
+            match page_preferred_motion(html_window_page(this)):
+                .no_preference:
+                    return html_media_feature_ident(css_data.Keyword.no_preference)
+                .reduce:
+                    return html_media_feature_ident(css_data.Keyword.reduce)
+                _:
+                    # FIXME: Fallback to system settings
+                    return html_media_feature_ident(css_data.Keyword.no_preference)
+        .prefers_reduced_transparency:
+            # FIXME: Make this a preference
+            return html_media_feature_ident(css_data.Keyword.no_preference)
+        .resolution:
+            return html_media_feature_value(CssMediaFeatureValueType.resolution, css_resolution_style_value_create(css_resolution_make_dots_per_pixel(html_window_device_pixel_ratio(this))).css_style_value())
+        .scan:
+            # FIXME: Detect this from the display, if we can. Most displays aren't scanning and should return None.
+            return html_media_feature_ident(css_data.Keyword.none_)
+        .scripting:
+            if dom_node_is_scripting_enabled(html_window_associated_document(this).dom_node()):
+                return html_media_feature_ident(css_data.Keyword.enabled)
+            return html_media_feature_ident(css_data.Keyword.none_)
+        .update:
+            return html_media_feature_ident(css_data.Keyword.fast)
+        .vertical_viewport_segments:
+            return html_media_feature_integer(1)
+        .video_color_gamut:
+            return html_media_feature_ident(css_data.Keyword.srgb)
+        .video_dynamic_range:
+            return html_media_feature_ident(css_data.Keyword.standard)
+        .width:
+            return html_media_feature_length(css_length_make_px_f64((f64)html_window_inner_width(this)))
+        _:
+            discard(0)
+
+    return none
+
+## Ported from Window.cpp:473 Web::HTML::Window::fire_a_page_transition_event.
+# https://html.spec.whatwg.org/multipage/nav-history-apis.html#fire-a-page-transition-event
+pub func html_window_fire_a_page_transition_event(this: HtmlWindow*, event_name: ak.FlyString, persisted: bool):
+    # To fire a page transition event named eventName at a Window window with a boolean persisted,
+    # fire an event named eventName at window, using PageTransitionEvent,
+    # with the persisted attribute initialized to persisted,
+    #
+    # PageTransitionEvent is outside the phase-1 classes (it has no class id in Event's range):
+    # phase 1 dispatches a plain Event, whose type, flags and target are the same; only a script
+    # can read `persisted` (phase 3 ports PageTransitionEvent and creates it here).
+    discard(persisted)
+    let event = dom_event_create(bind_platform_object_realm(html_window_associated_document(this).bind_platform_object()), event_name)
+
+    # ...the cancelable attribute initialized to true,
+    dom_event_set_cancelable(event, true)
+
+    # the bubbles attribute initialized to true,
+    dom_event_set_bubbles(event, true)
+
+    # isTrusted is a convenience that indicates whether an event is dispatched by the user agent (as opposed to using dispatchEvent())
+    dom_event_set_is_trusted(event, true)
+
+    # and legacy target override flag set.
+    discard(html_window_dispatch_event_impl(this.dom_event_target(), event))
+
+# mark: Web storage =============================================================================
+
+## Ported from Window.cpp:496 Web::HTML::Window::local_storage.
+# https://html.spec.whatwg.org/multipage/webstorage.html#dom-localstorage
+pub func html_window_local_storage(this: HtmlWindow*) -> HtmlStorage*!:
+    let realm = bind_platform_object_realm(this.bind_platform_object())
+
+    # 1. If this's associated Document's local storage holder is non-null, then return this's associated Document's local storage holder.
+    let associated_document = html_window_associated_document(this)
+    if let storage = dom_document_local_storage_holder(associated_document):
+        return storage
+
+    # 2. Let map be the result of running obtain a local storage bottle map with this's relevant settings object and "localStorage".
+    var map: StorageApiLocalStorageBottle*? = none
+    let storage_key = storage_api_obtain_a_storage_key(html_relevant_settings_object_js_object((JsObject*)this).html_environment())
+    if let key = storage_key:
+        map = storage_api_local_storage_bottle_create(gc.cell_heap(this.cell()), html_window_page(this), key, storage_api_storage_endpoint_local_storage_quota)
+
+    # 3. If map is failure, then throw a "SecurityError" DOMException.
+    let bottle = map else return try idl_throw(.idl_dom_exception(idl_security_error_create(realm, ak.utf16_string_from_str("localStorage is not available"))))
+
+    # 4. Let storage be a new Storage object whose map is map.
+    let storage = html_storage_create(realm, HtmlStorageType.local_, (StorageApiStorageBottle*)bottle)
+
+    # 5. Set this's associated Document's local storage holder to storage.
+    dom_document_set_local_storage_holder(associated_document, storage)
+
+    # 6. Return storage.
+    return storage
+
+## Ported from Window.cpp:527 Web::HTML::Window::session_storage.
+# https://html.spec.whatwg.org/multipage/webstorage.html#dom-sessionstorage
+pub func html_window_session_storage(this: HtmlWindow*) -> HtmlStorage*!:
+    let realm = bind_platform_object_realm(this.bind_platform_object())
+
+    # 1. If this's associated Document's session storage holder is non-null, then return this's associated Document's session storage holder.
+    let associated_document = html_window_associated_document(this)
+    if let storage = dom_document_session_storage_holder(associated_document):
+        return storage
+
+    # 2. Let map be the result of running obtain a session storage bottle map with this's relevant settings object and "sessionStorage".
+    let map = storage_api_obtain_a_session_storage_bottle_map(html_relevant_settings_object_js_object((JsObject*)this), StorageApiStorageEndpointType.session_storage)
+
+    # 3. If map is failure, then throw a "SecurityError" DOMException.
+    let bottle = map else return try idl_throw(.idl_dom_exception(idl_security_error_create(realm, ak.utf16_string_from_str("sessionStorage is not available"))))
+
+    # 4. Let storage be a new Storage object whose map is map.
+    let storage = html_storage_create(realm, HtmlStorageType.session, bottle)
+
+    # 5. Set this's associated Document's session storage holder to storage.
+    dom_document_set_session_storage_holder(associated_document, storage)
+
+    # 6. Return storage.
+    return storage
+
+# mark: Window.h ================================================================================
+
+## Ported from Window.h:101 Web::HTML::Window::this_impl (override).
+pub func html_window_this_impl_impl(base: HtmlWindowOrWorkerGlobalScopeMixin*) -> DomEventTarget*:
+    return (DomEventTarget*)html_window_from_window_or_worker_global_scope_mixin(base)
+
+## Ported from Window.h:102 Web::HTML::Window::this_impl (override).
+pub func html_window_this_impl_const_impl(base: HtmlWindowOrWorkerGlobalScopeMixin*) -> DomEventTarget*:
+    return (DomEventTarget*)html_window_from_window_or_worker_global_scope_mixin(base)
+
+## The Window a WindowOrWorkerGlobalScopeMixin lives in (C++'s `this` adjustment).
+func html_window_from_window_or_worker_global_scope_mixin(base: HtmlWindowOrWorkerGlobalScopeMixin*) -> HtmlWindow*:
+    return (HtmlWindow*)((u8*)base - offsetof(HtmlWindow, window_or_worker_global_scope_mixin))
+
+## Ported from Window.h:107 Web::HTML::Window::extract_an_origin (override).
+pub func html_window_extract_an_origin_impl(base: BindPlatformObject*) -> web_url.Origin?:
+    let this = (HtmlWindow*)base
+    return html_window_or_worker_global_scope_mixin_window_or_worker_global_scope_extract_an_origin(&this.window_or_worker_global_scope_mixin)
+
+## Ported from Window.h:113 Web::HTML::Window::associated_document.
+pub func html_window_associated_document_const(this: HtmlWindow*) -> DomDocument*:
+    return this.m_associated_document else trap("no associated document")
+
+## Ported from Window.h:114 Web::HTML::Window::associated_document.
+pub func html_window_associated_document(this: HtmlWindow*) -> DomDocument*:
+    return this.m_associated_document else trap("no associated document")
+
+## Ported from Window.h:123 Web::HTML::Window::append_resolved_module.
+pub func html_window_append_resolved_module(this: HtmlWindow*, resolution: HtmlSpecifierResolution):
+    ak.vector_append_t(&this.m_resolved_module_set, resolution)
+
+## Ported from Window.h:124 Web::HTML::Window::resolved_module_set.
+pub func html_window_resolved_module_set(this: HtmlWindow*) -> ak.Vector[HtmlSpecifierResolution]:
+    return this.m_resolved_module_set
+
+## Ported from Window.h:135 Web::HTML::Window::current_event.
+pub func html_window_current_event(this: HtmlWindow*) -> DomEvent*?:
+    return this.m_current_event
+
+## Ported from Window.h:136 Web::HTML::Window::current_event.
+pub func html_window_current_event_const(this: HtmlWindow*) -> DomEvent*?:
+    return this.m_current_event
+
+## Ported from Window.h:162 Web::HTML::Window::cross_origin_property_descriptor_map.
+pub func html_window_cross_origin_property_descriptor_map_const(this: HtmlWindow*) -> ak.HashMap[HtmlCrossOriginKey, JsPropertyDescriptor, HtmlCrossOriginKeyTraits]:
+    return this.m_cross_origin_property_descriptor_map
+
+## Ported from Window.h:163 Web::HTML::Window::cross_origin_property_descriptor_map.
+pub func html_window_cross_origin_property_descriptor_map(this: HtmlWindow*) -> ak.HashMap[HtmlCrossOriginKey, JsPropertyDescriptor, HtmlCrossOriginKeyTraits]*:
+    return &this.m_cross_origin_property_descriptor_map
+
+## Ported from Window.h:259 Web::HTML::Window::last_activation_timestamp.
+pub func html_window_last_activation_timestamp(this: HtmlWindow*) -> f64:
+    return this.m_last_activation_timestamp
+
+## Ported from Window.h:260 Web::HTML::Window::set_last_activation_timestamp.
+pub func html_window_set_last_activation_timestamp(this: HtmlWindow*, timestamp: f64):
+    this.m_last_activation_timestamp = timestamp
+
+## Ported from Window.h:264 Web::HTML::Window::last_history_action_activation_timestamp.
+pub func html_window_last_history_action_activation_timestamp(this: HtmlWindow*) -> f64:
+    return this.m_last_history_action_activation_timestamp
+
+## Ported from Window.h:265 Web::HTML::Window::set_last_history_action_activation_timestamp.
+pub func html_window_set_last_history_action_activation_timestamp(this: HtmlWindow*, timestamp: f64):
+    this.m_last_history_action_activation_timestamp = timestamp
+
+## Ported from Window.h:286 Web::HTML::Window::is_universal_global_scope_mixin (override).
+pub func html_window_is_universal_global_scope_mixin_impl(base: DomEventTarget*) -> bool:
+    return true
+
+## Ported from Window.h:291 Web::HTML::Window::is_html_window (virtual).
+pub func html_window_is_html_window_impl(this: HtmlWindow*) -> bool:
+    return true
+
+## Ported from Window.h:294 Web::HTML::Window::global_event_handlers_to_event_target (override).
+pub func html_window_global_event_handlers_to_event_target_impl(base: HtmlGlobalEventHandlers*, arg0: ak.FlyString) -> DomEventTarget*?:
+    return (DomEventTarget*)((u8*)base - offsetof(HtmlWindow, global_event_handlers))
+
+## Ported from Window.h:297 Web::HTML::Window::window_event_handlers_to_event_target (override).
+pub func html_window_window_event_handlers_to_event_target_impl(base: HtmlWindowEventHandlers*) -> DomEventTarget*?:
+    return (DomEventTarget*)((u8*)base - offsetof(HtmlWindow, window_event_handlers))
