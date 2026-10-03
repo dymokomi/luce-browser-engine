@@ -1,0 +1,247 @@
+#==============================================================================================
+#
+#   shared_resource_request - HTML::SharedResourceRequest: one image fetch shared by a document
+#
+#   DESCRIPTION:
+#       Port of LibWeb/HTML/SharedResourceRequest.cpp (lines 1-239) and the inline functions of
+#       SharedResourceRequest.h: the document's map from URLs to requests, fetching the
+#       resource and its callbacks, and decoding the fetched bytes into image data (SVG or a
+#       bitmap through the image codec plugin). Fetching and decoding are phase 2: the fetch,
+#       the body reader and the decoders are closure stubs.
+#
+#==============================================================================================
+
+# mark: Creation ================================================================================
+
+## Ported from SharedResourceRequest.cpp:30 Web::HTML::SharedResourceRequest::get_or_create.
+pub func html_shared_resource_request_get_or_create(realm: Realm*, page: Page*, url: web_url.Url) -> HtmlSharedResourceRequest*:
+    let document = html_environment_settings_object_responsible_document(bind_principal_host_defined_environment_settings_object(realm)) else trap("VERIFY: a responsible document")
+    let shared_resource_requests = dom_document_shared_resource_requests(document)
+    if let existing = ak.hash_map_get_k(shared_resource_requests, url):
+        return *existing else trap("a shared resource request")
+    let request = realm_create_html_shared_resource_request(realm, page, url, document)
+    discard(ak.hash_map_set(shared_resource_requests, url, request))
+    return request
+
+## Ported from SharedResourceRequest.cpp:42 Web::HTML::SharedResourceRequest::SharedResourceRequest.
+pub func html_shared_resource_request_construct(this: HtmlSharedResourceRequest*, page: Page*, url: web_url.Url, document: DomDocument*):
+    this.m_page = page
+    this.m_url = url
+    this.m_document = document
+
+## Ported from SharedResourceRequest.cpp:51 Web::HTML::SharedResourceRequest::finalize (override).
+pub func html_shared_resource_request_finalize_impl(base: gc.Cell*):
+    let this = (HtmlSharedResourceRequest*)base
+    gc.cell_finalize_impl(base)
+    let document = this.m_document else trap("a shared resource request's document")
+    let shared_resource_requests = dom_document_shared_resource_requests(document)
+    discard(ak.hash_map_remove_k(shared_resource_requests, this.m_url))
+
+## Ported from SharedResourceRequest.cpp:58 Web::HTML::SharedResourceRequest::visit_edges (override).
+pub func html_shared_resource_request_visit_edges_impl(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (HtmlSharedResourceRequest*)base
+    gc.cell_visit_edges_impl(base, visitor)
+    gc.cell_visitor_visit_cell(visitor, (gc.Cell*?)this.m_fetch_controller)  # opaque in phase 1
+    gc.cell_visitor_visit_t(visitor, this.m_document)
+    gc.cell_visitor_visit_t_2(visitor, this.m_page)
+    for callback in ak.vector_span(&this.m_callbacks):
+        gc.cell_visitor_visit_t(visitor, callback.on_finish)
+        gc.cell_visitor_visit_t(visitor, callback.on_fail)
+    gc.cell_visitor_visit_t(visitor, this.m_image_data)
+
+# mark: Accessors ===============================================================================
+
+## Ported from SharedResourceRequest.cpp:71 Web::HTML::SharedResourceRequest::image_data.
+pub func html_shared_resource_request_image_data(this: HtmlSharedResourceRequest*) -> HtmlDecodedImageData*?:
+    return this.m_image_data
+
+## Ported from SharedResourceRequest.cpp:76 Web::HTML::SharedResourceRequest::fetch_controller.
+pub func html_shared_resource_request_fetch_controller(this: HtmlSharedResourceRequest*) -> FetchController*?:
+    return this.m_fetch_controller
+
+## Ported from SharedResourceRequest.cpp:81 Web::HTML::SharedResourceRequest::set_fetch_controller.
+pub func html_shared_resource_request_set_fetch_controller(this: HtmlSharedResourceRequest*, fetch_controller: FetchController*?):
+    this.m_fetch_controller = fetch_controller
+
+## Ported from SharedResourceRequest.h:29 Web::HTML::SharedResourceRequest::url.
+pub func html_shared_resource_request_url(this: HtmlSharedResourceRequest*) -> web_url.Url:
+    return this.m_url
+
+# mark: Fetching ================================================================================
+
+## The captures of fetch_resource's process_response: `[this, &realm, request]`.
+struct HtmlSharedResourceRequestFetch:
+    var this: HtmlSharedResourceRequest*
+    var realm: Realm*
+    var request: FetchRequest*
+    var response: FetchResponse*?
+
+    ## process_response.
+    static func process_response(context: void*?, response_: FetchResponse*):
+        let captures = (HtmlSharedResourceRequestFetch*)(context else trap("processResponse: no captures"))
+        let this = captures.this
+        # FIXME: If the response is CORS cross-origin, we must use its internal response to query any of its data. See:
+        #        https://github.com/whatwg/html/issues/9355
+        let response = fetch_response_unsafe_response(response_)
+
+        # process_body and process_body_error capture [this, request, response] and [this].
+        let body_captures = new HtmlSharedResourceRequestFetch(this = this, realm = captures.realm, request = captures.request, response = response) else trap("out of memory")
+        let heap = gc.cell_heap(this.cell())
+        let process_body = gc.create_function1(heap, ak.Function1[ak.ByteBuffer, unit](call = HtmlSharedResourceRequestFetch.process_body, context = body_captures))
+        let process_body_error = gc.create_function1(heap, ak.Function1[JsValue, unit](call = HtmlSharedResourceRequestFetch.process_body_error, context = body_captures))
+
+        # Check for failed fetch response
+        let body = fetch_response_body(response)
+        if not fetch_is_ok_status(fetch_response_status(response)) or body == none:
+            html_shared_resource_request_handle_failed_fetch(this)
+            return
+
+        fetch_body_fully_read(body else trap("VERIFY_NOT_REACHED"), captures.realm, process_body, process_body_error, realm_global_object(captures.realm))
+
+    ## process_body.
+    static func process_body(context: void*?, data: ak.ByteBuffer):
+        let captures = (HtmlSharedResourceRequestFetch*)(context else trap("processBody: no captures"))
+        let response = captures.response else trap("processBody: no response")
+        let extracted_mime_type = fetch_extract_mime_type(fetch_response_header_list(response))
+        var mime_type = ak.StringView()
+        var essence = ak.string_new()
+        if let mime = extracted_mime_type:
+            essence = mime_type_essence(&mime)
+            mime_type = ak.string_bytes_as_string_view(&essence)
+        html_shared_resource_request_handle_successful_fetch(captures.this, fetch_request_url(captures.request), mime_type, data)
+
+    ## process_body_error.
+    static func process_body_error(context: void*?, error_: JsValue):
+        let captures = (HtmlSharedResourceRequestFetch*)(context else trap("processBodyError: no captures"))
+        html_shared_resource_request_handle_failed_fetch(captures.this)
+
+## Ported from SharedResourceRequest.cpp:86 Web::HTML::SharedResourceRequest::fetch_resource.
+pub func html_shared_resource_request_fetch_resource(this: HtmlSharedResourceRequest*, realm: Realm*, request: FetchRequest*):
+    let captures = new HtmlSharedResourceRequestFetch(this = this, realm = realm, request = request, response = none) else trap("out of memory")
+
+    this.m_state = HtmlSharedResourceRequestState.fetching
+    # m_load_event_delayer.emplace(*m_document): a previous delayer, if any, is destroyed first.
+    if let delayer = this.m_load_event_delayer:
+        var released = delayer
+        dom_document_load_event_delayer_destruct(&released)
+    var delayer: DomDocumentLoadEventDelayer = ---
+    dom_document_load_event_delayer_construct(&delayer, this.m_document else trap("a shared resource request's document"))
+    this.m_load_event_delayer = delayer
+
+    let fetch_controller = fetch_fetching_fetch(realm, request, fetch_algorithms_create_with_process_response(realm_vm(realm), ak.Function1[FetchResponse*, unit](call = HtmlSharedResourceRequestFetch.process_response, context = captures)))
+
+    html_shared_resource_request_set_fetch_controller(this, fetch_controller)
+
+## Ported from SharedResourceRequest.cpp:123 Web::HTML::SharedResourceRequest::add_callbacks.
+pub func html_shared_resource_request_add_callbacks(this: HtmlSharedResourceRequest*, on_finish: ak.Function0[unit], on_fail: ak.Function0[unit]):
+    if this.m_state == HtmlSharedResourceRequestState.finished:
+        if ak.function0_is_set(&on_finish):
+            ak.function0_call(&on_finish)
+        return
+
+    if this.m_state == HtmlSharedResourceRequestState.failed:
+        if ak.function0_is_set(&on_fail):
+            ak.function0_call(&on_fail)
+        return
+
+    var callbacks = HtmlSharedResourceRequestCallbacks()
+    let heap = gc.cell_heap(this.cell())
+    if ak.function0_is_set(&on_finish):
+        callbacks.on_finish = gc.create_function0(heap, on_finish)
+    if ak.function0_is_set(&on_fail):
+        callbacks.on_fail = gc.create_function0(heap, on_fail)
+
+    ak.vector_append_t(&this.m_callbacks, callbacks)
+
+# mark: Handling the fetched resource ===========================================================
+
+## handle_successful_fetch's handle_successful_bitmap_decode and handle_failed_decode
+## (`[strong_this = GC::Root(*this)]`: the captures are managed memory, which keeps the request).
+struct HtmlSharedResourceRequestDecode:
+    var strong_this: HtmlSharedResourceRequest*
+
+    ## handle_successful_bitmap_decode.
+    static func decoded(context: void*?, result: PlatformDecodedImage*):
+        let captures = (HtmlSharedResourceRequestDecode*)(context else trap("decode: no captures"))
+        let strong_this = captures.strong_this
+        let realm = dom_document_realm(strong_this.m_document else trap("a shared resource request's document"))
+        if result.session_id != 0:
+            # Streaming animated decode: create AnimatedDecodedImageData.
+            var initial_bitmaps: ak.Vector[gfx.Bitmap*]
+            ak.vector_ensure_capacity(&initial_bitmaps, ak.vector_size(&result.frames))
+            for frame in ak.vector_span(&result.frames):
+                ak.vector_append_t(&initial_bitmaps, frame.bitmap else trap("a decoded frame has a bitmap"))
+
+            let first_bitmap = ak.vector_first(&result.frames).bitmap else trap("a decoded frame has a bitmap")
+            let size = gfx.bitmap_size(first_bitmap)
+
+            strong_this.m_image_data = html_animated_decoded_image_data_create(realm, result.session_id, result.frame_count, result.loop_count, size, result.color_space, result.all_durations, initial_bitmaps).html_decoded_image_data()
+        else:
+            # Single-shot decode: create BitmapDecodedImageData as before.
+            var frames: ak.Vector[HtmlBitmapDecodedImageDataFrame]
+            for frame in ak.vector_span(&result.frames):
+                let bitmap = frame.bitmap else trap("a decoded frame has a bitmap")
+                ak.vector_append_t(&frames, HtmlBitmapDecodedImageDataFrame(bitmap = gfx.immutable_bitmap_create_color_space(bitmap, result.color_space), duration = (i32)frame.duration))
+            strong_this.m_image_data = html_bitmap_decoded_image_data_create(realm, frames, (usize)result.loop_count, result.is_animated) else trap("FIXME: should propagate errors")
+        html_shared_resource_request_handle_successful_resource_load(strong_this)
+
+    ## handle_failed_decode.
+    static func failed(context: void*?, error_: ak.AkError*):
+        let captures = (HtmlSharedResourceRequestDecode*)(context else trap("decode failed: no captures"))
+        html_shared_resource_request_handle_failed_fetch(captures.strong_this)
+
+## Ported from SharedResourceRequest.cpp:146 Web::HTML::SharedResourceRequest::handle_successful_fetch.
+pub func html_shared_resource_request_handle_successful_fetch(this: HtmlSharedResourceRequest*, url_string: web_url.Url, mime_type: ak.StringView, data: ak.ByteBuffer):
+    # AD-HOC: At this point, things gets very ad-hoc.
+    # FIXME: Bring this closer to spec.
+
+    var is_svg_image = ak.string_view_eq_string_view(&mime_type, ak.sv("image/svg+xml"))
+    if not is_svg_image and ak.string_view_is_empty(&mime_type):
+        let basename = web_url.url_basename(&url_string)
+        let basename_view = ak.byte_string_view(&basename)
+        is_svg_image = ak.string_view_ends_with_string_view(&basename_view, ak.sv(".svg"))
+
+    if is_svg_image:
+        let document = this.m_document else trap("a shared resource request's document")
+        let result = svg_decoded_image_data_create(dom_document_realm(document), this.m_page, url_string, ak.byte_buffer_bytes_const(&data)) catch:
+            html_shared_resource_request_handle_failed_fetch(this)
+            return
+        this.m_image_data = result.html_decoded_image_data()
+        html_shared_resource_request_handle_successful_resource_load(this)
+        return
+
+    let captures = new HtmlSharedResourceRequestDecode(strong_this = this) else trap("out of memory")
+    discard(platform_image_codec_plugin_decode_image(platform_image_codec_plugin_the(), ak.byte_buffer_bytes_const(&data), ak.Function1[PlatformDecodedImage*, unit](call = HtmlSharedResourceRequestDecode.decoded, context = captures), ak.Function1[ak.AkError*, unit](call = HtmlSharedResourceRequestDecode.failed, context = captures)))
+
+## `m_load_event_delayer.clear()`: destroys a held delayer.
+func html_shared_resource_request_clear_load_event_delayer(this: HtmlSharedResourceRequest*):
+    if let delayer = this.m_load_event_delayer:
+        var released = delayer
+        dom_document_load_event_delayer_destruct(&released)
+    this.m_load_event_delayer = none
+
+## Ported from SharedResourceRequest.cpp:207 Web::HTML::SharedResourceRequest::handle_failed_fetch.
+pub func html_shared_resource_request_handle_failed_fetch(this: HtmlSharedResourceRequest*):
+    this.m_state = HtmlSharedResourceRequestState.failed
+    html_shared_resource_request_clear_load_event_delayer(this)
+    for callback in ak.vector_span(&this.m_callbacks):
+        if let on_fail = callback.on_fail:
+            ak.function0_call(&on_fail.function)
+    ak.vector_clear(&this.m_callbacks)
+
+## Ported from SharedResourceRequest.cpp:218 Web::HTML::SharedResourceRequest::handle_successful_resource_load.
+pub func html_shared_resource_request_handle_successful_resource_load(this: HtmlSharedResourceRequest*):
+    this.m_state = HtmlSharedResourceRequestState.finished
+    html_shared_resource_request_clear_load_event_delayer(this)
+    for callback in ak.vector_span(&this.m_callbacks):
+        if let on_finish = callback.on_finish:
+            ak.function0_call(&on_finish.function)
+    ak.vector_clear(&this.m_callbacks)
+
+## Ported from SharedResourceRequest.cpp:229 Web::HTML::SharedResourceRequest::needs_fetching.
+pub func html_shared_resource_request_needs_fetching(this: HtmlSharedResourceRequest*) -> bool:
+    return this.m_state == HtmlSharedResourceRequestState.new_
+
+## Ported from SharedResourceRequest.cpp:234 Web::HTML::SharedResourceRequest::is_fetching.
+pub func html_shared_resource_request_is_fetching(this: HtmlSharedResourceRequest*) -> bool:
+    return this.m_state == HtmlSharedResourceRequestState.fetching

@@ -1,0 +1,416 @@
+#==============================================================================================
+#
+#   source_set - HTML::SourceSet: srcset and sizes, and selecting an image source
+#
+#   DESCRIPTION:
+#       Port of LibWeb/HTML/SourceSet.cpp (lines 1-435) and SourceSet.h: parsing a srcset
+#       attribute (the spec's goto-structured state machine as labeled loops), parsing a sizes
+#       attribute, creating a source set, normalizing its source densities and selecting an
+#       image source from it.
+#
+#       Characters are read as C++ reads them, `input[position]` (a signed char on the
+#       reference build) widened to u32.
+#
+#==============================================================================================
+
+## A source's descriptor (`Variant<Empty, PixelDensityDescriptorValue, WidthDescriptorValue>`).
+type HtmlImageSourceDescriptor = EmptyOrHtmlImageSourcePixelDensityDescriptorValueOrHtmlImageSourceWidthDescriptorValue
+
+## Ported from SourceSet.cpp:19 Web::HTML::SourceSet::SourceSet.
+pub func html_source_set_construct(this: HtmlSourceSet*):
+    # Note: m_source_size always gets reassigned to its proper value during one of the construction algorithms.
+    #       0px is just a fake value here so that we don't have to muddy the type system by using Optional.
+    this.m_source_size = css_length_style_value_create(css_length_make_px_f64(0.0)).css_style_value()
+
+## `SourceSet {}`: a constructed, empty source set.
+func html_source_set_new() -> HtmlSourceSet:
+    var source_set: HtmlSourceSet = ---
+    source_set.m_sources = ak.Vector[HtmlImageSource]()
+    html_source_set_construct(&source_set)
+    return source_set
+
+## Ported from SourceSet.cpp:26 Web::HTML::SourceSet::is_empty.
+pub func html_source_set_is_empty(this: const HtmlSourceSet*) -> bool:
+    return ak.vector_is_empty(&this.m_sources)
+
+## Ported from SourceSet.cpp:31 Web::HTML::pixel_density.
+func html_pixel_density(image_source: HtmlImageSource) -> f64:
+    match image_source.descriptor:
+        .html_image_source_pixel_density_descriptor_value(value): return value.value
+        _: trap("VERIFY: Variant::get<PixelDensityDescriptorValue> of another alternative")
+
+## select_an_image_source's sort: by pixel density.
+func html_source_set_pixel_density_less_than(context: void*?, a: const HtmlImageSource*, b: const HtmlImageSource*) -> bool:
+    return html_pixel_density(*a) < html_pixel_density(*b)
+
+## Ported from SourceSet.cpp:37 Web::HTML::SourceSet::select_an_image_source.
+# https://html.spec.whatwg.org/multipage/images.html#select-an-image-source-from-a-source-set
+pub func html_source_set_select_an_image_source(this: HtmlSourceSet*) -> HtmlImageSourceAndPixelDensity:
+    # 1. If an entry b in sourceSet has the same associated pixel density descriptor as an earlier entry a in sourceSet,
+    #    then remove entry b.
+    #    Repeat this step until none of the entries in sourceSet have the same associated pixel density descriptor
+    #    as an earlier entry.
+
+    # (C++ keeps a HashMap<double, ImageSource> beside the vector only to test membership; the port
+    # tests the densities kept so far, with the same `==`.)
+    var unique_pixel_density_sources: ak.Vector[HtmlImageSource]
+    for source in ak.vector_span(&this.m_sources):
+        let source_pixel_density = html_pixel_density(source)
+        var seen = false
+        for kept in ak.vector_span(&unique_pixel_density_sources):
+            if html_pixel_density(kept) == source_pixel_density:
+                seen = true
+                break
+        if not seen:
+            ak.vector_append_t(&unique_pixel_density_sources, source)
+
+    # 2. In an implementation-defined manner, choose one image source from sourceSet. Let selectedSource be this choice.
+    #    In our case, select the lowest density greater than 1, otherwise the greatest density available.
+    # 3. Return selectedSource and its associated pixel density.
+
+    ak.quick_sort_t_collection_t_less_than(ak.vector_span(&unique_pixel_density_sources), ak.Function2[const HtmlImageSource*, const HtmlImageSource*, bool](call = html_source_set_pixel_density_less_than, context = none))
+    for source in ak.vector_span(&unique_pixel_density_sources):
+        if html_pixel_density(source) >= 1.0:
+            return HtmlImageSourceAndPixelDensity(source = source, pixel_density = html_pixel_density(source))
+
+    let last = *ak.vector_last(&unique_pixel_density_sources)
+    return HtmlImageSourceAndPixelDensity(source = last, pixel_density = html_pixel_density(last))
+
+## Ported from SourceSet.cpp:70 Web::HTML::collect_a_sequence_of_code_points.
+func html_collect_a_sequence_of_code_points(condition: ak.Function1[u32, bool], input: ak.StringView, position: usize*) -> ak.StringView:
+    # 1. Let result be the empty string.
+    # 2. While position doesn’t point past the end of input and the code point at position within input meets the condition condition:
+    #    1. Append that code point to the end of result.
+    #    2. Advance position by 1.
+    # 3. Return result.
+
+    let start = *position
+    while *position < ak.string_view_length(&input) and ak.function1_call(&condition, html_source_set_char_at(input, *position)):
+        *position += 1
+    return ak.string_view_substring_view_usize(&input, start, *position - start)
+
+## `input[position]` as C++ reads it: a (signed) char widened to u32.
+func html_source_set_char_at(input: ak.StringView, position: usize) -> u32:
+    return (u32)(i32)(i8)ak.string_view_at(&input, position)
+
+## The splitting loop's condition: ASCII whitespace or U+002C COMMA.
+func html_source_set_is_whitespace_or_comma(context: void*?, code_point: u32) -> bool:
+    if code_point == (u32)',':
+        # FIXME: Report a parse error somehow.
+        return true
+    return web_infra.is_ascii_whitespace(code_point)
+
+## The URL's condition: not ASCII whitespace.
+func html_source_set_is_not_whitespace(context: void*?, code_point: u32) -> bool:
+    return not web_infra.is_ascii_whitespace(code_point)
+
+## The descriptor tokenizer's condition: ASCII whitespace.
+func html_source_set_is_whitespace(context: void*?, code_point: u32) -> bool:
+    return web_infra.is_ascii_whitespace(code_point)
+
+## The states of the descriptor tokenizer (parse_a_srcset_attribute's local `enum class State`).
+enum HtmlParseASrcsetAttributeState:
+    in_descriptor
+    in_parens
+    after_descriptor
+
+## `current_descriptor.to_string().release_value_but_fixme_should_propagate_errors()`.
+func html_source_set_descriptor_string(builder: ak.StringBuilder*) -> ak.String:
+    return ak.string_builder_to_string(builder) else trap("FIXME: should propagate errors")
+
+## Ported from SourceSet.cpp:85 Web::HTML::parse_a_srcset_attribute.
+# https://html.spec.whatwg.org/multipage/images.html#parse-a-srcset-attribute
+pub func html_parse_a_srcset_attribute(input: ak.StringView) -> HtmlSourceSet:
+    # 1. Let input be the value passed to this algorithm.
+
+    # 2. Let position be a pointer into input, initially pointing at the start of the string.
+    var position: usize = 0
+
+    # 3. Let candidates be an initially empty source set.
+    var candidates = html_source_set_new()
+
+    let input_length = ak.string_view_length(&input)
+
+    # (`splitting_loop:` ... `goto splitting_loop;`)
+    while true:
+        # 4. Splitting loop: Collect a sequence of code points that are ASCII whitespace or U+002C COMMA characters from input given position.
+        #    If any U+002C COMMA characters were collected, that is a parse error.
+        discard(html_collect_a_sequence_of_code_points(ak.Function1[u32, bool](call = html_source_set_is_whitespace_or_comma, context = none), input, &position))
+
+        # 5. If position is past the end of input, return candidates.
+        if position >= input_length:
+            return candidates
+
+        # 6. Collect a sequence of code points that are not ASCII whitespace from input given position, and let url be that result.
+        var url = html_collect_a_sequence_of_code_points(ak.Function1[u32, bool](call = html_source_set_is_not_whitespace, context = none), input, &position)
+
+        # 7. Let descriptors be a new empty list.
+        var descriptors: ak.Vector[ak.String]
+
+        # 8. If url ends with U+002C (,), then:
+        if ak.string_view_ends_with_u8(&url, ','):
+            # 1. Remove all trailing U+002C COMMA characters from url. If this removed more than one character, that is a parse error.
+            while ak.string_view_ends_with_u8(&url, ','):
+                url = ak.string_view_substring_view_usize(&url, 0, ak.string_view_length(&url) - 1)
+        # Otherwise:
+        else:
+            # 1. Descriptor tokenizer: Skip ASCII whitespace within input given position.
+            discard(html_collect_a_sequence_of_code_points(ak.Function1[u32, bool](call = html_source_set_is_whitespace, context = none), input, &position))
+
+            # 2. Let current descriptor be the empty string.
+            var current_descriptor = ak.string_builder_new()
+
+            # 3. Let state be in descriptor.
+            var state = HtmlParseASrcsetAttributeState.in_descriptor
+
+            # 4. Let c be the character at position. Do the following depending on the value of state.
+            #    For the purpose of this step, "EOF" is a special character representing that position is past the end of input.
+            # (`goto descriptor_parser;` breaks this loop.)
+            descriptor_tokenizer: while true:
+                var c: u32? = none
+                if position < input_length:
+                    c = html_source_set_char_at(input, position)
+
+                match state:
+                    # - In descriptor
+                    .in_descriptor:
+                        # Do the following, depending on the value of c:
+
+                        # - ASCII whitespace
+                        if c != none and web_infra.is_ascii_whitespace(c else 0):
+                            # If current descriptor is not empty, append current descriptor to descriptors and let current descriptor be the empty string.
+                            if not ak.string_builder_is_empty(&current_descriptor):
+                                ak.vector_append_t(&descriptors, html_source_set_descriptor_string(&current_descriptor))
+                            # Set state to after descriptor.
+                            state = HtmlParseASrcsetAttributeState.after_descriptor
+                        # U+002C COMMA (,)
+                        elif c == (u32)',':
+                            # Advance position to the next character in input.
+                            position += 1
+
+                            # If current descriptor is not empty, append current descriptor to descriptors.
+                            if not ak.string_builder_is_empty(&current_descriptor):
+                                ak.vector_append_t(&descriptors, html_source_set_descriptor_string(&current_descriptor))
+
+                            # Jump to the step labeled descriptor parser.
+                            break descriptor_tokenizer
+                        # U+0028 LEFT PARENTHESIS (()
+                        elif c == (u32)'(':
+                            # Append c to current descriptor.
+                            ak.string_builder_try_append_code_point(&current_descriptor, c else 0) else trap("FIXME: should propagate errors")
+
+                            # Set state to in parens.
+                            state = HtmlParseASrcsetAttributeState.in_parens
+                        # EOF
+                        elif c == none:
+                            # If current descriptor is not empty, append current descriptor to descriptors.
+                            if not ak.string_builder_is_empty(&current_descriptor):
+                                ak.vector_append_t(&descriptors, html_source_set_descriptor_string(&current_descriptor))
+
+                            # Jump to the step labeled descriptor parser.
+                            break descriptor_tokenizer
+                        # Anything else
+                        else:
+                            # Append c to current descriptor.
+                            ak.string_builder_try_append_code_point(&current_descriptor, c else 0) else trap("FIXME: should propagate errors")
+
+                    # - In parens
+                    .in_parens:
+                        # Do the following, depending on the value of c:
+                        # U+0029 RIGHT PARENTHESIS ())
+                        if c == (u32)')':
+                            # Append c to current descriptor.
+                            ak.string_builder_try_append_code_point(&current_descriptor, c else 0) else trap("FIXME: should propagate errors")
+                            # Set state to in descriptor.
+                            state = HtmlParseASrcsetAttributeState.in_descriptor
+                        # EOF
+                        elif c == none:
+                            # Append current descriptor to descriptors.
+                            ak.vector_append_t(&descriptors, html_source_set_descriptor_string(&current_descriptor))
+
+                            # Jump to the step labeled descriptor parser.
+                            break descriptor_tokenizer
+                        # Anything else
+                        else:
+                            # Append c to current descriptor.
+                            ak.string_builder_try_append_code_point(&current_descriptor, c else 0) else trap("FIXME: should propagate errors")
+
+                    # - After descriptor
+                    .after_descriptor:
+                        # Do the following, depending on the value of c:
+                        # ASCII whitespace
+                        if c != none and web_infra.is_ascii_whitespace(c else 0):
+                            # Stay in this state.
+                            discard(0)
+                        # EOF
+                        elif c == none:
+                            # Jump to the step labeled descriptor parser.
+                            break descriptor_tokenizer
+                        # Anything else
+                        else:
+                            # Set state to in descriptor.
+                            state = HtmlParseASrcsetAttributeState.in_descriptor
+                            # Set position to the previous character in input.
+                            position -%= 1
+                # Advance position to the next character in input. Repeat this step.
+                position +%= 1
+
+        # descriptor_parser:
+        # 9. Descriptor parser: Let error be no.
+        var error_ = false
+
+        # 10. Let width be absent.
+        var width: i32? = none
+
+        # 11. Let density be absent.
+        var density: f32? = none
+
+        # 12. Let future-compat-h be absent.
+        var future_compat_h: i32? = none
+
+        # 13. For each descriptor in descriptors, run the appropriate set of steps from the following list:
+        for descriptor in ak.vector_span(&descriptors):
+            let descriptor_view = ak.string_bytes_as_string_view(&descriptor)
+            let last_character = ak.string_view_at(&descriptor_view, ak.string_view_length(&descriptor_view) - 1)
+            let descriptor_without_last_character = ak.string_view_substring_view_usize(&descriptor_view, 0, ak.string_view_length(&descriptor_view) - 1)
+
+            let as_int = ak.string_view_to_number_i32(&descriptor_without_last_character)
+            let as_float = ak.string_view_to_number_f32(&descriptor_without_last_character)
+
+            # - If the descriptor consists of a valid non-negative integer followed by a U+0077 LATIN SMALL LETTER W character
+            if last_character == 'w' and as_int != none:
+                # NOOP: 1. If the user agent does not support the sizes attribute, let error be yes.
+
+                # 2. If width and density are not both absent, then let error be yes.
+
+                if width != none or density != none:
+                    error_ = true
+
+                # FIXME: 3. Apply the rules for parsing non-negative integers to the descriptor.
+                #           If the result is zero, let error be yes. Otherwise, let width be the result.
+                width = as_int
+
+            # - If the descriptor consists of a valid floating-point number followed by a U+0078 LATIN SMALL LETTER X character
+            elif last_character == 'x' and as_float != none:
+                # 1. If width, density and future-compat-h are not all absent, then let error be yes.
+                if width != none or density != none or future_compat_h != none:
+                    error_ = true
+
+                # FIXME: 2. Apply the rules for parsing floating-point number values to the descriptor.
+                #           If the result is less than zero, let error be yes. Otherwise, let density be the result.
+                density = as_float
+            # - If the descriptor consists of a valid non-negative integer followed by a U+0068 LATIN SMALL LETTER H character
+            elif last_character == 'h' and as_int != none:
+                # This is a parse error.
+                # 1. If future-compat-h and density are not both absent, then let error be yes.
+                if future_compat_h != none or density != none:
+                    error_ = true
+                # FIXME: 2. Apply the rules for parsing non-negative integers to the descriptor.
+                #           If the result is zero, let error be yes. Otherwise, let future-compat-h be the result.
+                future_compat_h = as_int
+            # - Anything else
+            else:
+                # Let error be yes.
+                error_ = true
+
+        # 14. If future-compat-h is not absent and width is absent, let error be yes.
+        if future_compat_h != none and width == none:
+            error_ = true
+
+        # 15. If error is still no, then append a new image source to candidates whose URL is url,
+        #     associated with a width width if not absent and a pixel density density if not absent.
+        #     Otherwise, there is a parse error.
+        if not error_:
+            var source = HtmlImageSource(url = ak.string_from_utf8(url) else trap("FIXME: should propagate errors"), descriptor = HtmlImageSourceDescriptor.empty)
+            if let width_value = width:
+                source.descriptor = HtmlImageSourceDescriptor.html_image_source_width_descriptor_value(HtmlImageSourceWidthDescriptorValue(value = gfx.CssPixels.from_int(width_value)))
+            elif let density_value = density:
+                source.descriptor = HtmlImageSourceDescriptor.html_image_source_pixel_density_descriptor_value(HtmlImageSourcePixelDensityDescriptorValue(value = f64(density_value)))
+            ak.vector_append_t(&candidates.m_sources, source)
+
+        # 16. Return to the step labeled splitting loop.
+
+## Ported from SourceSet.cpp:344 Web::HTML::parse_a_sizes_attribute.
+# https://html.spec.whatwg.org/multipage/images.html#parse-a-sizes-attribute
+pub func html_parse_a_sizes_attribute(element: DomElement*, sizes: ak.StringView, img: HtmlImageElement*? = none) -> CssStyleValue*:
+    var css_parser = css_parser_create(html_document_parsing_params(dom_node_document(element.dom_node())), sizes)
+    return css_parser_parse_as_sizes_attribute(&css_parser, element, img)
+
+## Ported from SourceSet.cpp:351 Web::HTML::SourceSet::create.
+# https://html.spec.whatwg.org/multipage/images.html#create-a-source-set
+pub func html_source_set_create(element: DomElement*, default_source: ak.String, srcset: ak.String, sizes: ak.String, img: HtmlImageElement*? = none) -> HtmlSourceSet:
+    # When asked to create a source set given a string default source, a string srcset, a string sizes, and an element or null img:
+
+    # 1. Let source set be an empty source set.
+    var source_set = html_source_set_new()
+
+    # 2. If srcset is not an empty string, then set source set to the result of parsing srcset.
+    if not ak.string_is_empty(&srcset):
+        source_set = html_parse_a_srcset_attribute(ak.string_bytes_as_string_view(&srcset))
+
+    # 3. Set source set's source size to the result of parsing sizes with img.
+    source_set.m_source_size = html_parse_a_sizes_attribute(element, ak.string_bytes_as_string_view(&sizes), img)
+
+    # 4. If default source is not the empty string and source set does not contain an image source
+    #    with a pixel density descriptor value of 1, and no image source with a width descriptor,
+    #    append default source to source set.
+    if not ak.string_is_empty(&default_source):
+        var contains_image_source_with_pixel_density_descriptor_value_of_1 = false
+        var contains_image_source_with_width_descriptor = false
+        for source in ak.vector_span(&source_set.m_sources):
+            match source.descriptor:
+                .html_image_source_pixel_density_descriptor_value(value):
+                    if value.value == 1.0:
+                        contains_image_source_with_pixel_density_descriptor_value_of_1 = true
+                .html_image_source_width_descriptor_value(_):
+                    contains_image_source_with_width_descriptor = true
+                .empty:
+                    discard(0)
+        if not contains_image_source_with_pixel_density_descriptor_value_of_1 and not contains_image_source_with_width_descriptor:
+            ak.vector_append_t(&source_set.m_sources, HtmlImageSource(url = default_source, descriptor = HtmlImageSourceDescriptor.empty))
+
+    # 5. Normalize the source densities of source set.
+    html_source_set_normalize_source_densities(&source_set, element)
+
+    # 6. Return source set.
+    return source_set
+
+## Ported from SourceSet.cpp:391 Web::HTML::SourceSet::normalize_source_densities.
+# https://html.spec.whatwg.org/multipage/images.html#normalise-the-source-densities
+pub func html_source_set_normalize_source_densities(this: HtmlSourceSet*, element: DomElement*):
+    # 1. Let source size be source set's source size.
+
+    # https://html.spec.whatwg.org/multipage/images.html#source-size-2
+    # When a source size has a unit relative to the viewport, it must be interpreted relative to the img element's
+    # node document's viewport. Other units must be interpreted the same as in Media Queries.
+
+    # https://drafts.csswg.org/mediaqueries/#units
+    # Relative length units in media queries are based on the initial value, which means that units are never based on
+    # results of declarations.
+    let length_resolution_context = css_length_resolution_context_for_document(dom_node_document(element.dom_node()))
+
+    let length = css_length_from_style_value(css_style_value_absolutized(this.m_source_size, CssComputationContext(length_resolution_context = length_resolution_context)), none)
+    let source_size = css_length_absolute_length_to_px(&length)
+
+    # 2. For each image source in source set:
+    for image_source in &ak.vector_span(&this.m_sources):
+        # 1. If the image source has a pixel density descriptor, continue to the next image source.
+        # 2. Otherwise, if the image source has a width descriptor,
+        #    replace the width descriptor with a pixel density descriptor
+        #    with a value of the width descriptor value divided by source size and a unit of x.
+        var descriptor_value_set = false
+        match image_source.descriptor:
+            .html_image_source_pixel_density_descriptor_value(_):
+                continue
+            .html_image_source_width_descriptor_value(width_descriptor):
+                if source_size.m_value != 0:
+                    # (CSSPixelFraction::to_double, which luce-browser-render does not have yet: numerator / denominator.)
+                    let fraction = width_descriptor.value.div(source_size)
+                    image_source.descriptor = HtmlImageSourceDescriptor.html_image_source_pixel_density_descriptor_value(HtmlImageSourcePixelDensityDescriptorValue(value = fraction.m_numerator.to_double() / fraction.m_denominator.to_double()))
+                    descriptor_value_set = true
+            .empty:
+                discard(0)
+
+        # 3. Otherwise, give the image source a pixel density descriptor of 1x.
+        if not descriptor_value_set:
+            image_source.descriptor = HtmlImageSourceDescriptor.html_image_source_pixel_density_descriptor_value(HtmlImageSourcePixelDensityDescriptorValue(value = 1.0))
