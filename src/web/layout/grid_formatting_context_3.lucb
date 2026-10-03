@@ -1,0 +1,488 @@
+#==============================================================================================
+#
+#   grid_formatting_context_3 - Layout::GridFormattingContext: initializing track sizes and
+#                               resolving intrinsic track sizes
+#
+#   DESCRIPTION:
+#       Port of LibWeb/Layout/GridFormattingContext.cpp (lines 661-1121): steps 1 and 2 of the
+#       track sizing algorithm (https://www.w3.org/TR/css-grid-2/#algo-init,
+#       https://www.w3.org/TR/css-grid-2/#algo-content): each track's base size and growth
+#       limit, then the items' contributions, single-track items first, then spanning items
+#       by span size, distributing extra space across the spanned tracks' base sizes and
+#       growth limits, and items crossing flexible tracks.
+#
+#       The C++ templates' `Match matcher` lambdas are ak.Function1 predicates over a track
+#       whose context is the available size they capture.
+#
+#       Copyright (c) 2023-2025, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
+#       Copyright (c) 2022-2023, Martin Falisse <mfalisse@outlook.com>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Initialize track sizes ==================================================================
+
+## Ported from Libraries/LibWeb/Layout/GridFormattingContext.cpp:661 Web::Layout::GridFormattingContext::initialize_track_sizes.
+func layout_grid_formatting_context_initialize_track_sizes(this: LayoutGridFormattingContext*, dimension: LayoutGridDimension):
+    # https://www.w3.org/TR/css-grid-2/#algo-init
+    # 12.4. Initialize Track Sizes
+    # Initialize each track’s base size and growth limit.
+
+    let tracks_and_gaps = ak.vector_span(layout_grid_formatting_context_tracks_and_gaps(this, dimension))
+    let available_size = layout_grid_formatting_context_available_size(this, dimension)
+    let grid_container = layout_grid_formatting_context_grid_container(this).layout_node()
+
+    if dimension == LayoutGridDimension.column:
+        this.m_has_flexible_column_tracks = false
+    else:
+        this.m_has_flexible_row_tracks = false
+
+    for track in tracks_and_gaps:
+        track.base_size_frozen = false
+        track.growth_limit_frozen = false
+        track.infinitely_growable = false
+        track.space_to_distribute = layout_zero_px()
+        track.planned_increase = layout_zero_px()
+        track.item_incurred_increase = layout_zero_px()
+
+        if track.is_gap:
+            continue
+
+        # Normalize fit-content tracks with unresolvable percentage arguments to max-content,
+        # since the percentage cannot be resolved against an indefinite available size.
+        if not layout_available_size_is_definite(&available_size) and css_grid_size_is_fit_content(&track.max_track_sizing_function):
+            let max_css_size = css_grid_size_css_size(&track.max_track_sizing_function)
+            if css_size_contains_percentage(&max_css_size):
+                track.max_track_sizing_function = css_grid_size_new(css_keyword_style_value_create(css_data.Keyword.max_content).css_style_value())
+
+        if css_grid_size_is_fixed(&track.min_track_sizing_function, available_size):
+            let min_css_size = css_grid_size_css_size(&track.min_track_sizing_function)
+            track.base_size = css_size_to_px(&min_css_size, grid_container, layout_available_size_to_px_or_zero(&available_size))
+        elif css_grid_size_is_intrinsic(&track.min_track_sizing_function, available_size):
+            track.base_size = layout_zero_px()
+
+        if css_grid_size_is_fixed(&track.max_track_sizing_function, available_size):
+            let max_css_size = css_grid_size_css_size(&track.max_track_sizing_function)
+            track.growth_limit = css_size_to_px(&max_css_size, grid_container, layout_available_size_to_px_or_zero(&available_size))
+        elif css_grid_size_is_flexible_length(&track.max_track_sizing_function):
+            if dimension == LayoutGridDimension.column:
+                this.m_has_flexible_column_tracks = true
+            else:
+                this.m_has_flexible_row_tracks = true
+            track.growth_limit = none
+        elif css_grid_size_is_intrinsic(&track.max_track_sizing_function, available_size):
+            track.growth_limit = none
+        else:
+            trap("VERIFY_NOT_REACHED")
+
+        # In all cases, if the growth limit is less than the base size, increase the growth limit to match
+        # the base size.
+        if let growth_limit = track.growth_limit:
+            if growth_limit.lt(track.base_size):
+                track.growth_limit = track.base_size
+
+# mark: Resolve intrinsic track sizes ===========================================================
+
+## Ported from Libraries/LibWeb/Layout/GridFormattingContext.cpp:722 Web::Layout::GridFormattingContext::resolve_intrinsic_track_sizes.
+func layout_grid_formatting_context_resolve_intrinsic_track_sizes(this: LayoutGridFormattingContext*, dimension: LayoutGridDimension):
+    # https://www.w3.org/TR/css-grid-2/#algo-content
+    # 12.5. Resolve Intrinsic Track Sizes
+    # This step resolves intrinsic track sizing functions to absolute lengths. First it resolves those
+    # sizes based on items that are contained wholly within a single track. Then it gradually adds in
+    # the space requirements of items that span multiple tracks, evenly distributing the extra space
+    # across those tracks insofar as possible.
+
+    # FIXME: 1. Shim baseline-aligned items so their intrinsic size contributions reflect their baseline alignment.
+
+    # 2. Size tracks to fit non-spanning items:
+    layout_grid_formatting_context_increase_sizes_to_accommodate_spanning_items_crossing_content_sized_tracks(this, dimension, 1)
+
+    # 3. Increase sizes to accommodate spanning items crossing content-sized tracks: Next, consider the
+    # items with a span of 2 that do not span a track with a flexible sizing function.
+    # Repeat incrementally for items with greater spans until all items have been considered.
+    var max_item_span: usize = 1
+    let items = ak.vector_span(&this.m_grid_items)
+    for item in &items:
+        max_item_span = ak.max(layout_grid_item_span(item, dimension), max_item_span)
+    var span: usize = 2
+    while span <= max_item_span:
+        layout_grid_formatting_context_increase_sizes_to_accommodate_spanning_items_crossing_content_sized_tracks(this, dimension, span)
+        span += 1
+
+    # 4. Increase sizes to accommodate spanning items crossing flexible tracks: Next, repeat the previous
+    # step instead considering (together, rather than grouped by span size) all items that do span a
+    # track with a flexible sizing function while
+    if layout_grid_formatting_context_has_flexible_tracks(this, dimension):
+        layout_grid_formatting_context_increase_sizes_to_accommodate_spanning_items_crossing_flexible_tracks(this, dimension)
+
+    # 5. If any track still has an infinite growth limit (because, for example, it had no items placed in
+    # it or it is a flexible track), set its growth limit to its base size.
+    let tracks_and_gaps = ak.vector_span(layout_grid_formatting_context_tracks_and_gaps(this, dimension))
+    for track in tracks_and_gaps:
+        if track.growth_limit == none:
+            track.growth_limit = track.base_size
+
+## Calls a `Match matcher` (a predicate over a track).
+func layout_grid_formatting_context_matches(matcher: ak.Function1[const LayoutGridFormattingContextGridTrack*, bool], track: const LayoutGridFormattingContextGridTrack*) -> bool:
+    let call = matcher.call else trap("a grid track matcher without its function")
+    return call(matcher.context, track)
+
+## Ported from Libraries/LibWeb/Layout/GridFormattingContext.cpp:763 Web::Layout::GridFormattingContext::distribute_extra_space_across_spanned_tracks_base_size.
+func layout_grid_formatting_context_distribute_extra_space_across_spanned_tracks_base_size(this: LayoutGridFormattingContext*, dimension: LayoutGridDimension, item_size_contribution: gfx.CssPixels, phase: LayoutGridFormattingContextSpaceDistributionPhase, spanned_tracks: ak.Vector[LayoutGridFormattingContextGridTrack*]*, matcher: ak.Function1[const LayoutGridFormattingContextGridTrack*, bool]):
+    let available_size = layout_grid_formatting_context_available_size(this, dimension)
+
+    var affected_tracks = ak.Vector[LayoutGridFormattingContextGridTrack*]()
+    for track in ak.vector_span(spanned_tracks):
+        if layout_grid_formatting_context_matches(matcher, track):
+            ak.vector_append_t(&affected_tracks, track)
+
+    if ak.vector_size(&affected_tracks) == 0:
+        return
+
+    for track in ak.vector_span(&affected_tracks):
+        track.item_incurred_increase = layout_zero_px()
+
+    # 1. Find the space to distribute:
+    var spanned_tracks_sizes_sum = layout_zero_px()
+    for track in ak.vector_span(spanned_tracks):
+        spanned_tracks_sizes_sum = spanned_tracks_sizes_sum.add(track.base_size)
+
+    # Subtract the corresponding size of every spanned track from the item’s size contribution to find the item’s
+    # remaining size contribution.
+    var extra_space = ak.max(layout_zero_px(), item_size_contribution.sub(spanned_tracks_sizes_sum))
+
+    # 2. Distribute space up to limits:
+    while gfx.gt_css_pixels_int(extra_space, 0):
+        var all_frozen = true
+        for frozen_track in ak.vector_span(&affected_tracks):
+            if not frozen_track.base_size_frozen:
+                all_frozen = false
+                break
+        if all_frozen:
+            break
+
+        # Find the item-incurred increase for each spanned track with an affected size by: distributing the space
+        # equally among such tracks, freezing a track’s item-incurred increase as its affected size + item-incurred
+        # increase reaches its limit
+        let increase_per_track = ak.max(gfx.css_pixels_smallest_positive_value(), layout_grid_formatting_context_div_count(extra_space, ak.vector_size(&affected_tracks)))
+        for track in ak.vector_span(&affected_tracks):
+            if track.base_size_frozen:
+                continue
+
+            var increase = ak.min(increase_per_track, extra_space)
+
+            if let growth_limit = track.growth_limit:
+                let maximum_increase = growth_limit.sub(track.base_size)
+                if track.item_incurred_increase.add(increase).ge(maximum_increase):
+                    track.base_size_frozen = true
+                    increase = maximum_increase.sub(track.item_incurred_increase)
+            track.item_incurred_increase = track.item_incurred_increase.add(increase)
+            extra_space = extra_space.sub(increase)
+
+    # 3. Distribute space beyond limits
+    if gfx.gt_css_pixels_int(extra_space, 0):
+        var tracks_to_grow_beyond_limits = ak.Vector[LayoutGridFormattingContextGridTrack*]()
+
+        # If space remains after all tracks are frozen, unfreeze and continue to
+        # distribute space to the item-incurred increase of...
+        if phase == LayoutGridFormattingContextSpaceDistributionPhase.accommodate_minimum_contribution or phase == LayoutGridFormattingContextSpaceDistributionPhase.accommodate_min_content_contribution:
+            # when accommodating minimum contributions or accommodating min-content contributions: any affected track
+            # that happens to also have an intrinsic max track sizing function
+            for track in ak.vector_span(&affected_tracks):
+                if css_grid_size_is_intrinsic(&track.max_track_sizing_function, available_size):
+                    ak.vector_append_t(&tracks_to_grow_beyond_limits, track)
+
+            # if there are no such tracks, then all affected tracks.
+            if ak.vector_is_empty(&tracks_to_grow_beyond_limits):
+                tracks_to_grow_beyond_limits = ak.vector_clone(&affected_tracks)
+        elif phase == LayoutGridFormattingContextSpaceDistributionPhase.accommodate_max_content_contribution:
+            # when accommodating max-content contributions into base sizes: any affected track that happens to also have
+            # a max-content max track sizing function;
+            for track in ak.vector_span(&affected_tracks):
+                if css_grid_size_is_max_content(&track.max_track_sizing_function):
+                    ak.vector_append_t(&tracks_to_grow_beyond_limits, track)
+
+            # if there are no such tracks, then all affected tracks.
+            if ak.vector_is_empty(&tracks_to_grow_beyond_limits):
+                tracks_to_grow_beyond_limits = ak.vector_clone(&affected_tracks)
+
+        let increase_per_track = layout_grid_formatting_context_div_count(extra_space, ak.vector_size(&tracks_to_grow_beyond_limits))
+        for track in ak.vector_span(&tracks_to_grow_beyond_limits):
+            let increase = ak.min(increase_per_track, extra_space)
+            track.item_incurred_increase = track.item_incurred_increase.add(increase)
+            extra_space = extra_space.sub(increase)
+
+    # 4. For each affected track, if the track’s item-incurred increase is larger than the track’s planned increase
+    #    set the track’s planned increase to that value.
+    for track in ak.vector_span(&affected_tracks):
+        if track.item_incurred_increase.gt(track.planned_increase):
+            track.planned_increase = track.item_incurred_increase
+
+## Ported from Libraries/LibWeb/Layout/GridFormattingContext.cpp:863 Web::Layout::GridFormattingContext::distribute_extra_space_across_spanned_tracks_growth_limit.
+func layout_grid_formatting_context_distribute_extra_space_across_spanned_tracks_growth_limit(this: LayoutGridFormattingContext*, item_size_contribution: gfx.CssPixels, spanned_tracks: ak.Vector[LayoutGridFormattingContextGridTrack*]*, matcher: ak.Function1[const LayoutGridFormattingContextGridTrack*, bool]):
+    discard(this)
+    var affected_tracks = ak.Vector[LayoutGridFormattingContextGridTrack*]()
+    for track in ak.vector_span(spanned_tracks):
+        if layout_grid_formatting_context_matches(matcher, track):
+            ak.vector_append_t(&affected_tracks, track)
+
+    for track in ak.vector_span(&affected_tracks):
+        track.item_incurred_increase = layout_zero_px()
+
+    if ak.vector_size(&affected_tracks) == 0:
+        return
+
+    # 1. Find the space to distribute:
+    var spanned_tracks_sizes_sum = layout_zero_px()
+    for track in ak.vector_span(spanned_tracks):
+        if let growth_limit = track.growth_limit:
+            spanned_tracks_sizes_sum = spanned_tracks_sizes_sum.add(growth_limit)
+        else:
+            spanned_tracks_sizes_sum = spanned_tracks_sizes_sum.add(track.base_size)
+
+    # Subtract the corresponding size of every spanned track from the item’s size contribution to find the item’s
+    # remaining size contribution.
+    var extra_space = ak.max(layout_zero_px(), item_size_contribution.sub(spanned_tracks_sizes_sum))
+
+    # 2. Distribute space up to limits:
+    while gfx.gt_css_pixels_int(extra_space, 0):
+        var all_frozen = true
+        for frozen_track in ak.vector_span(&affected_tracks):
+            if not frozen_track.growth_limit_frozen:
+                all_frozen = false
+                break
+        if all_frozen:
+            break
+
+        # Find the item-incurred increase for each spanned track with an affected size by: distributing the space
+        # equally among such tracks, freezing a track’s item-incurred increase as its affected size + item-incurred
+        # increase reaches its limit
+        let increase_per_track = ak.max(gfx.css_pixels_smallest_positive_value(), layout_grid_formatting_context_div_count(extra_space, ak.vector_size(&affected_tracks)))
+        for track in ak.vector_span(&affected_tracks):
+            if track.growth_limit_frozen:
+                continue
+
+            var increase = ak.min(increase_per_track, extra_space)
+
+            # For growth limits, the limit is infinity if it is marked as infinitely growable, and equal to the
+            # growth limit otherwise.
+            if not track.infinitely_growable:
+                if let growth_limit = track.growth_limit:
+                    let maximum_increase = growth_limit.sub(track.base_size)
+                    if track.item_incurred_increase.add(increase).ge(maximum_increase):
+                        track.growth_limit_frozen = true
+                        increase = maximum_increase.sub(track.item_incurred_increase)
+            track.item_incurred_increase = track.item_incurred_increase.add(increase)
+            extra_space = extra_space.sub(increase)
+
+    # FIXME: 3. Distribute space beyond limits
+
+    # 4. For each affected track, if the track’s item-incurred increase is larger than the track’s planned increase
+    #    set the track’s planned increase to that value.
+    for track in ak.vector_span(spanned_tracks):
+        if track.item_incurred_increase.gt(track.planned_increase):
+            track.planned_increase = track.item_incurred_increase
+
+# mark: Matchers ================================================================================
+
+## The available size a matcher lambda captures by reference, as its context.
+func layout_grid_formatting_context_matcher_available_size(context: void*?) -> const LayoutAvailableSize*:
+    return (const LayoutAvailableSize*)(context else trap("a grid track matcher without its available size"))
+
+## `[&](GridTrack const& track) { return track.min_track_sizing_function.is_intrinsic(available_size); }`
+func layout_grid_formatting_context_min_is_intrinsic(context: void*?, track: const LayoutGridFormattingContextGridTrack*) -> bool:
+    return css_grid_size_is_intrinsic(&track.min_track_sizing_function, *layout_grid_formatting_context_matcher_available_size(context))
+
+## `[&](GridTrack const& track) { return track.min_track_sizing_function.is_min_content() || track.min_track_sizing_function.is_max_content(); }`
+func layout_grid_formatting_context_min_is_min_or_max_content(context: void*?, track: const LayoutGridFormattingContextGridTrack*) -> bool:
+    discard(context)
+    return css_grid_size_is_min_content(&track.min_track_sizing_function) or css_grid_size_is_max_content(&track.min_track_sizing_function)
+
+## `[&](GridTrack const& track) { return track.min_track_sizing_function.is_auto(available_size) || track.min_track_sizing_function.is_max_content(); }`
+func layout_grid_formatting_context_min_is_auto_or_max_content(context: void*?, track: const LayoutGridFormattingContextGridTrack*) -> bool:
+    return css_grid_size_is_auto(&track.min_track_sizing_function, *layout_grid_formatting_context_matcher_available_size(context)) or css_grid_size_is_max_content(&track.min_track_sizing_function)
+
+## `[&](GridTrack const& track) { return track.max_track_sizing_function.is_intrinsic(available_size); }`
+func layout_grid_formatting_context_max_is_intrinsic(context: void*?, track: const LayoutGridFormattingContextGridTrack*) -> bool:
+    return css_grid_size_is_intrinsic(&track.max_track_sizing_function, *layout_grid_formatting_context_matcher_available_size(context))
+
+## `[&](GridTrack const& track) { return track.max_track_sizing_function.is_max_content() || track.max_track_sizing_function.is_auto(available_size) || track.max_track_sizing_function.is_fit_content(); }`
+func layout_grid_formatting_context_max_is_max_content_auto_or_fit_content(context: void*?, track: const LayoutGridFormattingContextGridTrack*) -> bool:
+    return css_grid_size_is_max_content(&track.max_track_sizing_function) or css_grid_size_is_auto(&track.max_track_sizing_function, *layout_grid_formatting_context_matcher_available_size(context)) or css_grid_size_is_fit_content(&track.max_track_sizing_function)
+
+## A matcher lambda over `available_size` (captured by reference).
+func layout_grid_formatting_context_matcher(call: func(void*?, const LayoutGridFormattingContextGridTrack*) -> bool, available_size: const LayoutAvailableSize*) -> ak.Function1[const LayoutGridFormattingContextGridTrack*, bool]:
+    return ak.Function1[const LayoutGridFormattingContextGridTrack*, bool](call = call, context = (void*)available_size)
+
+# mark: Spanning items ==========================================================================
+
+## The `item_size_contribution` lambda of increase_sizes_to_accommodate_spanning_items_crossing_content_sized_tracks
+## and increase_sizes_to_accommodate_spanning_items_crossing_flexible_tracks.
+func layout_grid_formatting_context_item_size_contribution(this: LayoutGridFormattingContext*, item: const LayoutGridItem*, dimension: LayoutGridDimension, available_size: const LayoutAvailableSize*) -> gfx.CssPixels:
+    # If the grid container is being sized under a min- or max-content constraint, use the items’ limited
+    # min-content contributions in place of their minimum contributions here.
+    if layout_available_size_is_intrinsic_sizing_constraint(available_size):
+        return layout_grid_formatting_context_calculate_limited_min_content_contribution(this, item, dimension)
+    return layout_grid_formatting_context_calculate_minimum_contribution(this, item, dimension)
+
+## `for (auto& track : spanned_tracks) { track.base_size += track.planned_increase; track.planned_increase = 0; }`
+func layout_grid_formatting_context_apply_planned_increases_to_base_sizes(spanned_tracks: ak.Vector[LayoutGridFormattingContextGridTrack*]*):
+    for track in ak.vector_span(spanned_tracks):
+        track.base_size = track.base_size.add(track.planned_increase)
+        track.planned_increase = layout_zero_px()
+
+## Ported from Libraries/LibWeb/Layout/GridFormattingContext.cpp:931 Web::Layout::GridFormattingContext::increase_sizes_to_accommodate_spanning_items_crossing_content_sized_tracks.
+func layout_grid_formatting_context_increase_sizes_to_accommodate_spanning_items_crossing_content_sized_tracks(this: LayoutGridFormattingContext*, dimension: LayoutGridDimension, span: usize):
+    let available_size = layout_grid_formatting_context_available_size(this, dimension)
+    let tracks = layout_grid_formatting_context_tracks(this, dimension)
+    let grid_container = layout_grid_formatting_context_grid_container(this).layout_node()
+    let items = ak.vector_span(&this.m_grid_items)
+    for item in &items:
+        let item_span = layout_grid_item_span(item, dimension)
+        if item_span != span:
+            continue
+
+        var spanned_tracks = ak.Vector[LayoutGridFormattingContextGridTrack*]()
+        for spanned_track in layout_grid_formatting_context_for_each_spanned_track_by_item(this, item, dimension):
+            ak.vector_append_t(&spanned_tracks, spanned_track)
+
+        var item_spans_tracks_with_flexible_sizing_function = false
+        var item_spans_tracks_with_intrinsic_sizing_function = false
+        for track in ak.vector_span(&spanned_tracks):
+            if css_grid_size_is_flexible_length(&track.max_track_sizing_function):
+                item_spans_tracks_with_flexible_sizing_function = true
+            if css_grid_size_is_intrinsic(&track.min_track_sizing_function, available_size) or css_grid_size_is_intrinsic(&track.max_track_sizing_function, available_size):
+                item_spans_tracks_with_intrinsic_sizing_function = true
+        if not item_spans_tracks_with_intrinsic_sizing_function or item_spans_tracks_with_flexible_sizing_function:
+            continue
+
+        # 1. For intrinsic minimums: First increase the base size of tracks with an intrinsic min track sizing
+        #    function by distributing extra space as needed to accommodate these items’ minimum contributions.
+        let item_size_contribution = layout_grid_formatting_context_item_size_contribution(this, item, dimension, &available_size)
+        layout_grid_formatting_context_distribute_extra_space_across_spanned_tracks_base_size(this, dimension, item_size_contribution, LayoutGridFormattingContextSpaceDistributionPhase.accommodate_minimum_contribution, &spanned_tracks, layout_grid_formatting_context_matcher(layout_grid_formatting_context_min_is_intrinsic, &available_size))
+        layout_grid_formatting_context_apply_planned_increases_to_base_sizes(&spanned_tracks)
+
+        # 2. For content-based minimums: Next continue to increase the base size of tracks with a min track
+        #    sizing function of min-content or max-content by distributing extra space as needed to account for
+        #    these items' min-content contributions.
+        let item_min_content_contribution = layout_grid_formatting_context_calculate_min_content_contribution(this, item, dimension)
+        layout_grid_formatting_context_distribute_extra_space_across_spanned_tracks_base_size(this, dimension, item_min_content_contribution, LayoutGridFormattingContextSpaceDistributionPhase.accommodate_min_content_contribution, &spanned_tracks, layout_grid_formatting_context_matcher(layout_grid_formatting_context_min_is_min_or_max_content, &available_size))
+        layout_grid_formatting_context_apply_planned_increases_to_base_sizes(&spanned_tracks)
+
+        # 3. For max-content minimums: Next, if the grid container is being sized under a max-content constraint,
+        #    continue to increase the base size of tracks with a min track sizing function of auto or max-content by
+        #    distributing extra space as needed to account for these items' limited max-content contributions.
+        if layout_available_size_is_max_content(&available_size):
+            let item_limited_max_content_contribution = layout_grid_formatting_context_calculate_limited_max_content_contribution(this, item, dimension)
+            layout_grid_formatting_context_distribute_extra_space_across_spanned_tracks_base_size(this, dimension, item_limited_max_content_contribution, LayoutGridFormattingContextSpaceDistributionPhase.accommodate_max_content_contribution, &spanned_tracks, layout_grid_formatting_context_matcher(layout_grid_formatting_context_min_is_auto_or_max_content, &available_size))
+            layout_grid_formatting_context_apply_planned_increases_to_base_sizes(&spanned_tracks)
+
+        # 4. If at this point any track’s growth limit is now less than its base size, increase its growth limit to
+        #    match its base size.
+        let all_tracks = ak.vector_span(tracks)
+        for track in &all_tracks:
+            if let growth_limit = track.growth_limit:
+                if growth_limit.lt(track.base_size):
+                    track.growth_limit = track.base_size
+
+        # 5. For intrinsic maximums: Next increase the growth limit of tracks with an intrinsic max track sizing
+        layout_grid_formatting_context_distribute_extra_space_across_spanned_tracks_growth_limit(this, item_min_content_contribution, &spanned_tracks, layout_grid_formatting_context_matcher(layout_grid_formatting_context_max_is_intrinsic, &available_size))
+        for track in ak.vector_span(&spanned_tracks):
+            if let growth_limit = track.growth_limit:
+                track.growth_limit = growth_limit.add(track.planned_increase)
+            else:
+                # If the affected size is an infinite growth limit, set it to the track’s base size plus the planned increase.
+                track.growth_limit = track.base_size.add(track.planned_increase)
+                # Mark any tracks whose growth limit changed from infinite to finite in this step as infinitely growable
+                # for the next step.
+                track.infinitely_growable = true
+            track.planned_increase = layout_zero_px()
+
+        # 6. For max-content maximums: Lastly continue to increase the growth limit of tracks with a max track
+        #    sizing function of max-content by distributing extra space as needed to account for these items' max-
+        #    content contributions. However, limit the growth of any fit-content() tracks by their fit-content() argument.
+        let item_max_content_contribution = layout_grid_formatting_context_calculate_max_content_contribution(this, item, dimension)
+        layout_grid_formatting_context_distribute_extra_space_across_spanned_tracks_growth_limit(this, item_max_content_contribution, &spanned_tracks, layout_grid_formatting_context_matcher(layout_grid_formatting_context_max_is_max_content_auto_or_fit_content, &available_size))
+        for track in ak.vector_span(&spanned_tracks):
+            if css_grid_size_is_fit_content(&track.max_track_sizing_function):
+                var growth_limit = (track.growth_limit else trap("VERIFY: the fit-content track's growth limit has a value")).add(track.planned_increase)
+                track.growth_limit = growth_limit
+                if growth_limit.lt(track.base_size):
+                    growth_limit = track.base_size
+                    track.growth_limit = growth_limit
+                let max_css_size = css_grid_size_css_size(&track.max_track_sizing_function)
+                let fit_content_limit = css_size_to_px(&max_css_size, grid_container, layout_available_size_to_px_or_zero(&available_size))
+                if growth_limit.gt(fit_content_limit):
+                    track.growth_limit = ak.max(track.base_size, fit_content_limit)
+            elif track.growth_limit == none:
+                # If the affected size is an infinite growth limit, set it to the track’s base size plus the planned increase.
+                track.growth_limit = track.base_size.add(track.planned_increase)
+            else:
+                track.growth_limit = (track.growth_limit else trap("VERIFY: the growth limit has a value")).add(track.planned_increase)
+            track.planned_increase = layout_zero_px()
+
+## The `dominated_by_available_size` lambda of increase_sizes_to_accommodate_spanning_items_crossing_flexible_tracks.
+func layout_grid_formatting_context_dominated_by_available_size(available_size: const LayoutAvailableSize*, track: const LayoutGridFormattingContextGridTrack*) -> bool:
+    return layout_available_size_is_intrinsic_sizing_constraint(available_size) or css_grid_size_is_intrinsic(&track.min_track_sizing_function, *available_size)
+
+## Ported from Libraries/LibWeb/Layout/GridFormattingContext.cpp:1049 Web::Layout::GridFormattingContext::increase_sizes_to_accommodate_spanning_items_crossing_flexible_tracks.
+func layout_grid_formatting_context_increase_sizes_to_accommodate_spanning_items_crossing_flexible_tracks(this: LayoutGridFormattingContext*, dimension: LayoutGridDimension):
+    # https://www.w3.org/TR/css-grid-1/#algo-spanning-flex-items
+    # 11.5.4. Increase sizes to accommodate spanning items crossing flexible tracks
+
+    let available_size = layout_grid_formatting_context_available_size(this, dimension)
+
+    var track_contributions = ak.HashMap[LayoutGridFormattingContextGridTrack*, gfx.CssPixels, ak.PtrTraits[LayoutGridFormattingContextGridTrack]]()
+    let items = ak.vector_span(&this.m_grid_items)
+    for item in &items:
+        var spanned_tracks = ak.Vector[LayoutGridFormattingContextGridTrack*]()
+        for spanned_track in layout_grid_formatting_context_for_each_spanned_track_by_item(this, item, dimension):
+            ak.vector_append_t(&spanned_tracks, spanned_track)
+
+        var total_flex: f64 = 0.0
+        var intrinsic_flexible_track_count: usize = 0
+        var non_flexible_space = layout_zero_px()
+        for track in ak.vector_span(&spanned_tracks):
+            if css_grid_size_is_flexible_length(&track.max_track_sizing_function) and layout_grid_formatting_context_dominated_by_available_size(&available_size, track):
+                total_flex += css_grid_size_flex_factor(&track.max_track_sizing_function)
+                intrinsic_flexible_track_count += 1
+            else:
+                non_flexible_space = non_flexible_space.add(track.base_size)
+
+        if intrinsic_flexible_track_count == 0:
+            continue
+
+        # If the grid container is being sized under a min- or max-content constraint, use the items' limited
+        # min-content contributions in place of their minimum contributions here.
+        var item_size_contribution = layout_grid_formatting_context_item_size_contribution(this, item, dimension, &available_size)
+        # NB: Subtract the space already accounted for by non-flexible spanned tracks (sized in 11.5.3), since only
+        #     the remaining contribution needs to be distributed among flexible tracks.
+        item_size_contribution = ak.max(layout_zero_px(), item_size_contribution.sub(non_flexible_space))
+
+        # Distributing space to flexible tracks:
+        # - If the sum of the flexible sizing functions of all flexible tracks spanned by the item is greater
+        #   than or equal to one, distributing space to such tracks according to the ratios of their flexible
+        #   sizing functions rather than distributing space equally.
+        # - If the sum is less than one, distributing that proportion of space according to the ratios of their
+        #   flexible sizing functions and the rest equally.
+        # FIXME: Handle 0 < total_flex < 1 case separately per spec.
+        for track in ak.vector_span(&spanned_tracks):
+            if not css_grid_size_is_flexible_length(&track.max_track_sizing_function) or not layout_grid_formatting_context_dominated_by_available_size(&available_size, track):
+                continue
+            let flex = css_grid_size_flex_factor(&track.max_track_sizing_function)
+            let contribution = gfx.css_pixels_nearest_value_for_f64(item_size_contribution.to_double() * (flex / total_flex)) if total_flex > 0.0 else layout_grid_formatting_context_div_count(item_size_contribution, intrinsic_flexible_track_count)
+            # `track_contributions.ensure(&track, [] { return 0; })`: a new entry is zero.
+            let track_contribution = ak.hash_map_ensure(&track_contributions, track)
+            if track_contribution.lt(contribution):
+                *track_contribution = contribution
+
+    for entry in ak.hash_map_begin(&track_contributions):
+        let track = entry.key
+        let contribution = entry.value
+        if contribution.gt(track.base_size):
+            track.base_size = contribution
+        # If at this point any track's growth limit is now less than its base size, increase its growth limit to match
+        # its base size.
+        if let growth_limit = track.growth_limit:
+            if growth_limit.lt(track.base_size):
+                track.growth_limit = track.base_size
