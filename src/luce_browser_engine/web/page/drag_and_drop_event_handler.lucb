@@ -1,0 +1,627 @@
+#==============================================================================================
+#
+#   drag_and_drop_event_handler - Web::DragAndDropEventHandler: the HTML drag-and-drop
+#   processing model (starting a drag, its iterations, its end, and firing DND events)
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibWeb/Page/DragAndDropEventHandler.cpp (lines 1-670) with the inline
+#       functions of DragAndDropEventHandler.h. The drag data store, DataTransfer and DragEvent
+#       are phase 4 (closure stubs).
+#
+#       Copyright (c) 2024-2026, Tim Flynn <trflynn89@serenityos.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Visiting and state ======================================================================
+
+## Ported from DragAndDropEventHandler.cpp:25 Web::DragAndDropEventHandler::visit_edges.
+pub func drag_and_drop_event_handler_visit_edges(this: const DragAndDropEventHandler*, visitor: gc.CellVisitor*):
+    gc.cell_visitor_visit_t(visitor, this.m_source_node)
+    gc.cell_visitor_visit_t(visitor, this.m_immediate_user_selection)
+    gc.cell_visitor_visit_t(visitor, this.m_current_target_element)
+
+## Ported from DragAndDropEventHandler.h:23 Web::DragAndDropEventHandler::has_ongoing_drag_and_drop_operation.
+pub func drag_and_drop_event_handler_has_ongoing_drag_and_drop_operation(this: const DragAndDropEventHandler*) -> bool:
+    return this.m_drag_data_store != none
+
+## The arguments the handlers' fire_a_drag_and_drop_event lambdas capture (`[&]`).
+struct DragAndDropEventArguments:
+    var realm: Realm*
+    var screen_position: gfx.CssPixelPoint
+    var page_offset: gfx.CssPixelPoint
+    var client_offset: gfx.CssPixelPoint
+    var offset: gfx.CssPixelPoint
+    var button: u32
+    var buttons: u32
+    var modifiers: u32
+
+## The handlers' fire_a_drag_and_drop_event lambda.
+func drag_and_drop_fire(this: DragAndDropEventHandler*, arguments: const DragAndDropEventArguments*, target: DomEventTarget*?, name: ak.FlyString, related_target: DomEventTarget*? = none) -> HtmlDragEvent*:
+    return drag_and_drop_event_handler_fire_a_drag_and_drop_event(this, arguments.realm, target, name, arguments.screen_position, arguments.page_offset, arguments.client_offset, arguments.offset, arguments.button, arguments.buttons, arguments.modifiers, related_target)
+
+## `node` as the EventTarget it is (or null).
+func drag_and_drop_event_target(node: DomNode*?) -> DomEventTarget*?:
+    let value = node else return none
+    return value.dom_event_target()
+
+## Whether a drag event was canceled (`drag_event->cancelled()`).
+func drag_and_drop_cancelled(drag_event: HtmlDragEvent*) -> bool:
+    return dom_event_cancelled((DomEvent*)drag_event)
+
+# mark: Starting a drag =========================================================================
+
+## The captures of handle_drag_start's for_each_inclusive_ancestor_of_type<HTMLElement> callback.
+struct DragAndDropFindDraggable: IterationCallback[DomNode]:
+    var dragged_node: DomNode*?
+
+    mutating func call(node: DomNode*) -> ak.IterationDecision:
+        if not html_element_draggable(as_html_element(node)):
+            return ak.IterationDecision.continue_
+
+        self.dragged_node = node
+        return ak.IterationDecision.break_
+
+## Adds the encoding-parsed-and-serialized `name` attribute of `element` to `urls`, when it parses.
+func drag_and_drop_add_url_of_attribute(urls: ak.Vector[ak.String]*, element: DomElement*, name: ak.FlyString):
+    let value = dom_element_get_attribute_value(element, name)
+    if let url = dom_document_encoding_parse_and_serialize_url(dom_node_document(element.dom_node()), ak.string_bytes_as_string_view(&value)):
+        ak.vector_append_t(urls, url)
+
+## handle_drag_start's step 7: the text/uri-list item of the dragged links and images.
+func drag_and_drop_add_uri_list_item(this: DragAndDropEventHandler*):
+    # 1. Let urls be « ».
+    var urls = ak.Vector[ak.String]()
+
+    # 2. For each node in the list of dragged nodes:
+    if let source = this.m_source_node:
+        if let element = as_if_dom_element(source):
+            # If the node is an a element with an href attribute
+            if is_html_anchor_element(element) and dom_element_has_attribute(element, html_attribute_names_href):
+                # Add to urls the result of encoding-parsing-and-serializing a URL given the element's href content
+                # attribute's value, relative to the element's node document.
+                drag_and_drop_add_url_of_attribute(&urls, element, html_attribute_names_href)
+            # If the node is an img element with a src attribute
+            if is_html_image_element(element) and dom_element_has_attribute(element, html_attribute_names_src):
+                # Add to urls the result of encoding-parsing-and-serializing a URL given the element's src content
+                # attribute's value, relative to the element's node document.
+                drag_and_drop_add_url_of_attribute(&urls, element, html_attribute_names_src)
+
+    # 3. If urls is still empty, then return.
+    if ak.vector_is_empty(&urls):
+        return
+
+    # 4. Let url string be the result of concatenating the strings in urls, in the order they were added, separated
+    #    by a U+000D CARRIAGE RETURN U+000A LINE FEED character pair (CRLF).
+    var builder = ak.string_builder_new()
+    for i in 0..<ak.vector_size(&urls):
+        if i > 0:
+            ak.string_builder_append(&builder, "\r\n")
+        ak.string_builder_append_string_view(&builder, ak.string_bytes_as_string_view(ak.vector_at(&urls, i)))
+    let url = ak.string_from_string_builder(&builder) else trap("MUST: String::join")
+
+    # 5. Add one item to the drag data store item list, with its properties set as follows:
+    #
+    #    The drag data item type string
+    #        text/uri-list
+    #    The drag data item kind
+    #        Text
+    #    The actual data
+    #        url string
+    let url_view = ak.string_bytes_as_string_view(&url)
+    let data = ak.byte_buffer_copy_span_u8(ak.string_view_bytes(&url_view)) else trap("MUST: ByteBuffer::copy")
+    html_drag_data_store_add_item(this.m_drag_data_store else trap("no drag data store"), HtmlDragDataStoreItem(kind = HtmlDragDataStoreItemKind.text, type_string = ak.string_from_str("text/uri-list"), data = data, file_name = ak.byte_string_from_str("")))
+
+## Ported from DragAndDropEventHandler.cpp:33 Web::DragAndDropEventHandler::handle_drag_start.
+# https://html.spec.whatwg.org/multipage/dnd.html#drag-and-drop-processing-model
+pub func drag_and_drop_event_handler_handle_drag_start(this: DragAndDropEventHandler*, realm: Realm*, drag_target: DomNode*?, screen_position: gfx.CssPixelPoint, page_offset: gfx.CssPixelPoint, client_offset: gfx.CssPixelPoint, offset: gfx.CssPixelPoint, button: u32, buttons: u32, modifiers: u32, files: ak.Vector[HtmlSelectedFile]) -> EventResult:
+    let arguments = DragAndDropEventArguments(realm = realm, screen_position = screen_position, page_offset = page_offset, client_offset = client_offset, offset = offset, button = button, buttons = buttons, modifiers = modifiers)
+
+    # 1. Determine what is being dragged, as follows:
+    var dragged_node: DomNode*? = none
+
+    #    FIXME: If the drag operation was invoked on a selection, then it is the selection that is being dragged.
+
+    #    Otherwise, if the drag operation was invoked on a Document, it is the first element, going up the ancestor chain,
+    #    starting at the node that the user tried to drag, that has the IDL attribute draggable set to true. If there is
+    #    no such element, then nothing is being dragged; return, the drag-and-drop operation is never started.
+    if let target = drag_target:
+        var finder = DragAndDropFindDraggable(dragged_node = none)
+        discard(tree_node_for_each_inclusive_ancestor_of_type(target, &html_element_class, &finder))
+        dragged_node = finder.dragged_node
+
+        if dragged_node == none:
+            return EventResult.cancelled
+
+    #    Otherwise, the drag operation was invoked outside the user agent's purview. What is being dragged is defined by
+    #    the document or application where the drag was started.
+
+    # 2. Create a drag data store. All the DND events fired subsequently by the steps in this section must use this drag
+    #    data store.
+    let drag_data_store = html_drag_data_store_create()
+    this.m_drag_data_store = drag_data_store
+
+    # 3. Establish which DOM node is the source node, as follows:
+    #
+    #    FIXME: If it is a selection that is being dragged, then the source node is the Text node that the user started the
+    #           drag on (typically the Text node that the user originally clicked). If the user did not specify a particular
+    #           node, for example if the user just told the user agent to begin a drag of "the selection", then the source
+    #           node is the first Text node containing a part of the selection.
+
+    #    Otherwise, if it is an element that is being dragged, then the source node is the element that is being dragged.
+    if let node = dragged_node:
+        this.m_source_node = node.dom_event_target()
+    #    Otherwise, the source node is part of another document or application. When this specification requires that
+    #    an event be dispatched at the source node in this case, the user agent must instead follow the platform-specific
+    #    conventions relevant to that situation.
+    else:
+        this.m_source_node = none
+
+    # FIXME: 4. Determine the list of dragged nodes, as follows:
+    #
+    #    If it is a selection that is being dragged, then the list of dragged nodes contains, in tree order, every node
+    #    that is partially or completely included in the selection (including all their ancestors).
+    #
+    #    Otherwise, the list of dragged nodes contains only the source node, if any.
+
+    # 5. If it is a selection that is being dragged, then add an item to the drag data store item list, with its
+    #    properties set as follows:
+    #
+    #    The drag data item type string
+    #        "text/plain"
+    #    The drag data item kind
+    #        Text
+    #    The actual data
+    #        The text of the selection
+    #
+    #    Otherwise, if any files are being dragged, then add one item per file to the drag data store item list, with
+    #    their properties set as follows:
+    #
+    #    The drag data item type string
+    #        The MIME type of the file, if known, or "application/octet-stream" otherwise.
+    #    The drag data item kind
+    #        File
+    #    The actual data
+    #        The file's contents and name.
+    var files_to_add = files
+    for file in &ak.vector_span(&files_to_add):
+        let contents = html_selected_file_take_contents(file)
+        let mime_type = mime_resource_sniff(ak.byte_buffer_bytes_const(&contents))
+
+        html_drag_data_store_add_item(drag_data_store, HtmlDragDataStoreItem(kind = HtmlDragDataStoreItemKind.file, type_string = mime_type_essence(&mime_type), data = contents, file_name = html_selected_file_name(file)))
+
+    # FIXME: 6. If the list of dragged nodes is not empty, then extract the microdata from those nodes into a JSON form, and
+    #           add one item to the drag data store item list, with its properties set as follows:
+    #
+    #    The drag data item type string
+    #        application/microdata+json
+    #    The drag data item kind
+    #        Text
+    #    The actual data
+    #        The resulting JSON string.
+
+    # 7. Run the following substeps:
+    drag_and_drop_add_uri_list_item(this)
+
+    # FIXME: 8. Update the drag data store default feedback as appropriate for the user agent (if the user is dragging the
+    #           selection, then the selection would likely be the basis for this feedback; if the user is dragging an element,
+    #           then that element's rendering would be used; if the drag began outside the user agent, then the platform
+    #           conventions for determining the drag feedback should be used).
+
+    # 9. Fire a DND event named dragstart at the source node.
+    let drag_event = drag_and_drop_fire(this, &arguments, this.m_source_node, html_event_names_dragstart)
+
+    # If the event is canceled, then the drag-and-drop operation should not occur; return.
+    if drag_and_drop_cancelled(drag_event):
+        drag_and_drop_event_handler_reset(this)
+        return EventResult.cancelled
+
+    # FIXME: 10. Fire a pointer event at the source node named pointercancel, and fire any other follow-up events as
+    #            required by Pointer Events.
+
+    # 11. Initiate the drag-and-drop operation in a manner consistent with platform conventions, and as described below.
+    #
+    #     The drag-and-drop feedback must be generated from the first of the following sources that is available:
+    #
+    #         1. The drag data store bitmap, if any. In this case, the drag data store hot spot coordinate should be
+    #            used as hints for where to put the cursor relative to the resulting image. The values are expressed
+    #            as distances in CSS pixels from the left side and from the top side of the image respectively.
+    #         2. The drag data store default feedback.
+
+    return EventResult.handled
+
+# mark: Iterations ==============================================================================
+
+## Whether `effect` is one of `names` (FlyString::is_one_of).
+func drag_and_drop_effect_is_one_of(effect: ak.FlyString, names: const ak.FlyString[]) -> bool:
+    for name in &names:
+        if ak.fly_string_eq_fly_string(&effect, name):
+            return true
+    return false
+
+## Ported from DragAndDropEventHandler.cpp:220 Web::DragAndDropEventHandler::handle_drag_move.
+# https://html.spec.whatwg.org/multipage/dnd.html#drag-and-drop-processing-model:queue-a-task
+pub func drag_and_drop_event_handler_handle_drag_move(this: DragAndDropEventHandler*, realm: Realm*, node: DomNode*, screen_position: gfx.CssPixelPoint, page_offset: gfx.CssPixelPoint, client_offset: gfx.CssPixelPoint, offset: gfx.CssPixelPoint, button: u32, buttons: u32, modifiers: u32) -> EventResult:
+    if not drag_and_drop_event_handler_has_ongoing_drag_and_drop_operation(this):
+        return EventResult.cancelled
+
+    let arguments = DragAndDropEventArguments(realm = realm, screen_position = screen_position, page_offset = page_offset, client_offset = client_offset, offset = offset, button = button, buttons = buttons, modifiers = modifiers)
+
+    # FIXME: 1. If the user agent is still performing the previous iteration of the sequence (if any) when the next iteration
+    #           becomes due, return for this iteration (effectively "skipping missed frames" of the drag-and-drop operation).
+
+    # 2. Fire a DND event named drag at the source node. If this event is canceled, the user agent must set the current
+    #    drag operation to "none" (no drag operation).
+    let drag_event = drag_and_drop_fire(this, &arguments, this.m_source_node, html_event_names_drag)
+    if drag_and_drop_cancelled(drag_event):
+        this.m_current_drag_operation = html_data_transfer_effect_none
+
+    # 3. If the drag event was not canceled and the user has not ended the drag-and-drop operation, check the state of
+    #    the drag-and-drop operation, as follows:
+    if not drag_and_drop_cancelled(drag_event):
+        let previous_target_element = this.m_current_target_element
+
+        # 1. If the user is indicating a different immediate user selection than during the last iteration (or if this
+        #    is the first iteration), and if this immediate user selection is not the same as the current target element,
+        #    then update the current target element as follows:
+        if this.m_immediate_user_selection != (DomNode*?)node and (DomNode*?)node != this.m_current_target_element:
+            this.m_immediate_user_selection = node
+
+            # -> If the new immediate user selection is null
+            # (It cannot be: it is `node`.)
+            # FIXME: -> If the new immediate user selection is in a non-DOM document or application
+            #           Set the current target element to the immediate user selection.
+            # -> Otherwise
+            # Fire a DND event named dragenter at the immediate user selection.
+            discard(drag_and_drop_fire(this, &arguments, node.dom_event_target(), html_event_names_dragenter))
+
+            # If the event is canceled, then set the current target element to the immediate user selection.
+            # Otherwise, run the appropriate step from the following list:
+            # -> If the immediate user selection is a text control (e.g., textarea, or an input element whose
+            #    type attribute is in the Text state) or an editing host or editable element, and the drag data
+            #    store item list has an item with the drag data item type string "text/plain" and the drag data
+            #    item kind text
+            #        Set the current target element to the immediate user selection anyway.
+            # -> If the immediate user selection is the body element
+            #        Leave the current target element unchanged.
+            # -> Otherwise
+            #        Fire a DND event named dragenter at the body element, if there is one, or at the Document
+            #        object, if not. Then, set the current target element to the body element, regardless of
+            #        whether that event was canceled or not.
+
+            # FIXME: Spec isue: Contrary to the spec, all browsers do not require the user script to cancel the
+            #        dragenter event. See: https://github.com/whatwg/html/issues/11608
+            if is_dom_element(node):
+                this.m_current_target_element = node
+            elif let ancestor = tree_node_first_ancestor_of_type(node, &dom_element_class):
+                this.m_current_target_element = ancestor
+            else:
+                this.m_current_target_element = none
+
+        # 2. If the previous step caused the current target element to change, and if the previous target element
+        #    was not null or a part of a non-DOM document, then fire a DND event named dragleave at the previous
+        #    target element, with the new current target element as the specific related target.
+        if let previous = previous_target_element:
+            if (DomNode*?)previous != this.m_current_target_element:
+                discard(drag_and_drop_fire(this, &arguments, previous.dom_event_target(), html_event_names_dragleave, drag_and_drop_event_target(this.m_current_target_element)))
+
+        # 3. If the current target element is a DOM element, then fire a DND event named dragover at this current
+        #    target element.
+        if let current_target = this.m_current_target_element:
+            if is_dom_element(current_target):
+                let dragover_event = drag_and_drop_fire(this, &arguments, current_target.dom_event_target(), html_event_names_dragover)
+
+                # If the dragover event is not canceled, run the appropriate step from the following list:
+                if not drag_and_drop_cancelled(dragover_event):
+                    # -> If the current target element is a text control (e.g., textarea, or an input element whose type
+                    #    attribute is in the Text state) or an editing host or editable element, and the drag data store
+                    #    item list has an item with the drag data item type string "text/plain" and the drag data item kind
+                    #    text.
+                    if drag_and_drop_event_handler_allow_text_drop(this, current_target):
+                        # Set the current drag operation to either "copy" or "move", as appropriate given the platform
+                        # conventions.
+                        this.m_current_drag_operation = html_data_transfer_effect_copy
+                    # -> Otherwise
+                    else:
+                        # Reset the current drag operation to "none".
+                        this.m_current_drag_operation = html_data_transfer_effect_none
+                # Otherwise (if the dragover event is canceled), set the current drag operation based on the values of the
+                # effectAllowed and dropEffect attributes of the DragEvent object's dataTransfer object as they stood after
+                # the event dispatch finished, as per the following table:
+                else:
+                    let data_transfer = html_drag_event_data_transfer(dragover_event) else trap("no data transfer")
+                    let effect_allowed = html_data_transfer_effect_allowed(data_transfer)
+                    let drop_effect = html_data_transfer_drop_effect(data_transfer)
+
+                    # effectAllowed                                             | dropEffect | Drag operation
+                    # ---------------------------------------------------------------------------------------
+                    # "uninitialized", "copy", "copyLink", "copyMove", or "all" | "copy"     | "copy"
+                    # "uninitialized", "link", "copyLink", "linkMove", or "all" | "link"     | "link"
+                    # "uninitialized", "move", "copyMove", "linkMove", or "all" | "move"     | "move"
+                    # Any other case                                            |            | "none"
+                    let copy_effects: ak.FlyString[5] = [html_data_transfer_effect_uninitialized, html_data_transfer_effect_copy, html_data_transfer_effect_copy_link, html_data_transfer_effect_copy_move, html_data_transfer_effect_all]
+                    let link_effects: ak.FlyString[5] = [html_data_transfer_effect_uninitialized, html_data_transfer_effect_link, html_data_transfer_effect_copy_link, html_data_transfer_effect_link_move, html_data_transfer_effect_all]
+                    let move_effects: ak.FlyString[5] = [html_data_transfer_effect_uninitialized, html_data_transfer_effect_move, html_data_transfer_effect_copy_move, html_data_transfer_effect_link_move, html_data_transfer_effect_all]
+                    if drag_and_drop_effect_is_one_of(effect_allowed, copy_effects[0..<5]) and ak.fly_string_eq_fly_string(&drop_effect, &html_data_transfer_effect_copy):
+                        this.m_current_drag_operation = html_data_transfer_effect_copy
+                    elif drag_and_drop_effect_is_one_of(effect_allowed, link_effects[0..<5]) and ak.fly_string_eq_fly_string(&drop_effect, &html_data_transfer_effect_link):
+                        this.m_current_drag_operation = html_data_transfer_effect_link
+                    elif drag_and_drop_effect_is_one_of(effect_allowed, move_effects[0..<5]) and ak.fly_string_eq_fly_string(&drop_effect, &html_data_transfer_effect_move):
+                        this.m_current_drag_operation = html_data_transfer_effect_move
+                    else:
+                        this.m_current_drag_operation = html_data_transfer_effect_none
+
+    # Set 4 continues in handle_drag_end.
+    if drag_and_drop_cancelled(drag_event):
+        return drag_and_drop_event_handler_handle_drag_end(this, realm, DragAndDropEventHandlerCancelled.yes, screen_position, page_offset, client_offset, offset, button, buttons, modifiers)
+
+    return EventResult.handled
+
+## Ported from DragAndDropEventHandler.cpp:357 Web::DragAndDropEventHandler::handle_drag_leave.
+pub func drag_and_drop_event_handler_handle_drag_leave(this: DragAndDropEventHandler*, realm: Realm*, screen_position: gfx.CssPixelPoint, page_offset: gfx.CssPixelPoint, client_offset: gfx.CssPixelPoint, offset: gfx.CssPixelPoint, button: u32, buttons: u32, modifiers: u32) -> EventResult:
+    return drag_and_drop_event_handler_handle_drag_end(this, realm, DragAndDropEventHandlerCancelled.yes, screen_position, page_offset, client_offset, offset, button, buttons, modifiers)
+
+## Ported from DragAndDropEventHandler.cpp:370 Web::DragAndDropEventHandler::handle_drop.
+pub func drag_and_drop_event_handler_handle_drop(this: DragAndDropEventHandler*, realm: Realm*, screen_position: gfx.CssPixelPoint, page_offset: gfx.CssPixelPoint, client_offset: gfx.CssPixelPoint, offset: gfx.CssPixelPoint, button: u32, buttons: u32, modifiers: u32) -> EventResult:
+    return drag_and_drop_event_handler_handle_drag_end(this, realm, DragAndDropEventHandlerCancelled.no, screen_position, page_offset, client_offset, offset, button, buttons, modifiers)
+
+# mark: The end of a drag =======================================================================
+
+## Ported from DragAndDropEventHandler.cpp:384 Web::DragAndDropEventHandler::handle_drag_end.
+# https://html.spec.whatwg.org/multipage/dnd.html#drag-and-drop-processing-model:event-dnd-drag-3
+func drag_and_drop_event_handler_handle_drag_end(this: DragAndDropEventHandler*, realm: Realm*, cancelled: DragAndDropEventHandlerCancelled, screen_position: gfx.CssPixelPoint, page_offset: gfx.CssPixelPoint, client_offset: gfx.CssPixelPoint, offset: gfx.CssPixelPoint, button: u32, buttons: u32, modifiers: u32) -> EventResult:
+    if not drag_and_drop_event_handler_has_ongoing_drag_and_drop_operation(this):
+        return EventResult.cancelled
+
+    let arguments = DragAndDropEventArguments(realm = realm, screen_position = screen_position, page_offset = page_offset, client_offset = client_offset, offset = offset, button = button, buttons = buttons, modifiers = modifiers)
+
+    defer drag_and_drop_event_handler_reset(this)
+
+    # 4. Otherwise, if the user ended the drag-and-drop operation (e.g. by releasing the mouse button in a mouse-driven
+    #    drag-and-drop interface), or if the drag event was canceled, then this will be the last iteration. Run the
+    #    following steps, then stop the drag-and-drop operation:
+    var dropped = false
+
+    # 1. If the current drag operation is "none" (no drag operation), or if the user ended the drag-and-drop
+    #    operation by canceling it (e.g. by hitting the Escape key), or if the current target element is null, then
+    #    the drag operation failed. Run these substeps:
+    if ak.fly_string_eq_fly_string(&this.m_current_drag_operation, &html_data_transfer_effect_none) or cancelled == DragAndDropEventHandlerCancelled.yes or this.m_current_target_element == none:
+        # 1. Let dropped be false.
+        dropped = false
+
+        # 2. If the current target element is a DOM element, fire a DND event named dragleave at it; otherwise, if
+        #    it is not null, use platform-specific conventions for drag cancelation.
+        if let current_target = this.m_current_target_element:
+            if is_dom_element(current_target):
+                discard(drag_and_drop_fire(this, &arguments, current_target.dom_event_target(), html_event_names_dragleave))
+            else:
+                # FIXME: "use platform-specific conventions for drag cancelation"
+                discard(0)
+
+        # 3. Set the current drag operation to "none".
+        this.m_current_drag_operation = html_data_transfer_effect_none
+    # Otherwise, the drag operation might be a success; run these substeps:
+    else:
+        let current_target = this.m_current_target_element else trap("unreachable")
+        var drag_event: HtmlDragEvent*? = none
+
+        # 1. Let dropped be true.
+        dropped = true
+
+        # 2. If the current target element is a DOM element, fire a DND event named drop at it; otherwise, use
+        #    platform-specific conventions for indicating a drop.
+        if is_dom_element(current_target):
+            drag_event = drag_and_drop_fire(this, &arguments, current_target.dom_event_target(), html_event_names_drop)
+        else:
+            # FIXME: "use platform-specific conventions for indicating a drop"
+            discard(0)
+
+        # 3. If the event is canceled, set the current drag operation to the value of the dropEffect attribute of
+        #    the DragEvent object's dataTransfer object as it stood after the event dispatch finished.
+        var drop_cancelled = false
+        if let event = drag_event:
+            drop_cancelled = drag_and_drop_cancelled(event)
+        if drop_cancelled:
+            let event = drag_event else trap("unreachable")
+            this.m_current_drag_operation = html_data_transfer_drop_effect(html_drag_event_data_transfer(event) else trap("no data transfer"))
+        # Otherwise, the event is not canceled; perform the event's default action, which depends on the exact
+        # target as follows:
+        else:
+            # -> If the current target element is a text control (e.g., textarea, or an input element whose type
+            #    attribute is in the Text state) or an editing host or editable element, and the drag data store
+            #    item list has an item with the drag data item type string "text/plain" and the drag data item
+            #    kind text
+            if drag_and_drop_event_handler_allow_text_drop(this, current_target):
+                # FIXME: Insert the actual data of the first item in the drag data store item list to have a drag data item
+                #        type string of "text/plain" and a drag data item kind that is text into the text control or editing
+                #        host or editable element in a manner consistent with platform-specific conventions (e.g. inserting
+                #        it at the current mouse cursor position, or inserting it at the end of the field).
+                discard(0)
+            # -> Otherwise
+            else:
+                # Reset the current drag operation to "none".
+                this.m_current_drag_operation = html_data_transfer_effect_none
+
+    # 2. Fire a DND event named dragend at the source node.
+    discard(drag_and_drop_fire(this, &arguments, this.m_source_node, html_event_names_dragend))
+
+    # 3. Run the appropriate steps from the following list as the default action of the dragend event:
+
+    # -> If dropped is true, the current target element is a text control (see below), the current drag operation
+    #    is "move", and the source of the drag-and-drop operation is a selection in the DOM that is entirely
+    #    contained within an editing host
+    #        FIXME: Delete the selection. (`if (false)` in C++.)
+    # -> If dropped is true, the current target element is a text control (see below), the current drag operation
+    #    is "move", and the source of the drag-and-drop operation is a selection in a text control
+    #        FIXME: The user agent should delete the dragged selection from the relevant text control. (`if (false)`.)
+    # -> If dropped is false or if the current drag operation is "none"
+    if not dropped or ak.fly_string_eq_fly_string(&this.m_current_drag_operation, &html_data_transfer_effect_none):
+        # The drag was canceled. If the platform conventions dictate that this be represented to the user (e.g. by
+        # animating the dragged selection going back to the source of the drag-and-drop operation), then do so.
+        return EventResult.cancelled
+    # -> Otherwise
+    #        The event has no default action.
+
+    return EventResult.handled
+
+# mark: Firing a DND event ======================================================================
+
+## Ported from DragAndDropEventHandler.cpp:502 Web::DragAndDropEventHandler::fire_a_drag_and_drop_event.
+# https://html.spec.whatwg.org/multipage/dnd.html#fire-a-dnd-event
+func drag_and_drop_event_handler_fire_a_drag_and_drop_event(this: DragAndDropEventHandler*, realm: Realm*, target: DomEventTarget*?, name: ak.FlyString, screen_position: gfx.CssPixelPoint, page_offset: gfx.CssPixelPoint, client_offset: gfx.CssPixelPoint, offset: gfx.CssPixelPoint, button: u32, buttons: u32, modifiers: u32, related_target: DomEventTarget*? = none) -> HtmlDragEvent*:
+    # NOTE: When the source node is determined above, the spec indicates we must follow platform-specific conventions
+    #       for dispatching events at the source node if the source node is an out-of-document object. We currently
+    #       handle this by allowing callers to pass a null `target` node. This allows us to execute all state-change
+    #       operations in the fire-a-DND-event AO, and simply skip event dispatching for now if the target is null.
+    let drag_data_store = this.m_drag_data_store else trap("no drag data store")
+
+    # 1. Let dataDragStoreWasChanged be false.
+    var drag_data_store_was_changed = false
+
+    # 2. If no specific related target was provided, set related target to null.
+
+    # 3. Let window be the relevant global object of the Document object of the specified target element.
+    # NOTE: We defer this until it's needed later, to more easily handle when the target is not an element.
+
+    # 4. If e is dragstart, then set the drag data store mode to the read/write mode and set dataDragStoreWasChanged to true.
+    if ak.fly_string_eq_fly_string(&name, &html_event_names_dragstart):
+        html_drag_data_store_set_mode(drag_data_store, HtmlDragDataStoreMode.read_write)
+        drag_data_store_was_changed = true
+
+    # 5. If e is drop, set the drag data store mode to the read-only mode.
+    elif ak.fly_string_eq_fly_string(&name, &html_event_names_drop):
+        html_drag_data_store_set_mode(drag_data_store, HtmlDragDataStoreMode.read_only)
+
+    # 6. Let dataTransfer be a newly created DataTransfer object associated with the given drag data store.
+    let data_transfer = html_data_transfer_create(realm, drag_data_store)
+
+    # 7. Set the effectAllowed attribute to the drag data store's drag data store allowed effects state.
+    html_data_transfer_set_effect_allowed_internal(data_transfer, html_drag_data_store_allowed_effects_state(drag_data_store))
+
+    # 8. Set the dropEffect attribute to "none" if e is dragstart, drag, or dragleave; to the value corresponding to the
+    #    current drag operation if e is drop or dragend; and to a value based on the effectAllowed attribute's value and
+    #    the drag-and-drop source, as given by the following table, otherwise (i.e. if e is dragenter or dragover):
+    let none_effect_events: ak.FlyString[3] = [html_event_names_dragstart, html_event_names_drag, html_event_names_dragleave]
+    let current_operation_events: ak.FlyString[2] = [html_event_names_drop, html_event_names_dragend]
+    if drag_and_drop_effect_is_one_of(name, none_effect_events[0..<3]):
+        html_data_transfer_set_drop_effect(data_transfer, html_data_transfer_effect_none)
+    elif drag_and_drop_effect_is_one_of(name, current_operation_events[0..<2]):
+        html_data_transfer_set_drop_effect(data_transfer, this.m_current_drag_operation)
+    else:
+        # effectAllowed                                                                     | dropEffect
+        # ---------------------------------------------------------------------------------------------------------------------------------------
+        # "none"                                                                            | "none"
+        # "copy"                                                                            | "copy"
+        # "copyLink"                                                                        | "copy", or, if appropriate, "link"
+        # "copyMove"                                                                        | "copy", or, if appropriate, "move"
+        # "all"                                                                             | "copy", or, if appropriate, either "link" or "move"
+        # "link"                                                                            | "link"
+        # "linkMove"                                                                        | "link", or, if appropriate, "move"
+        # "move"                                                                            | "move"
+        # "uninitialized" when what is being dragged is a selection from a text control     | "move", or, if appropriate, either "copy" or "link"
+        # "uninitialized" when what is being dragged is a selection                         | "copy", or, if appropriate, either "link" or "move"
+        # "uninitialized" when what is being dragged is an a element with an href attribute | "link", or, if appropriate, either "copy" or "move"
+        # Any other case                                                                    | "copy", or, if appropriate, either "link" or "move"
+        let effect_allowed = html_data_transfer_effect_allowed(data_transfer)
+        if ak.fly_string_eq_fly_string(&effect_allowed, &html_data_transfer_effect_none):
+            html_data_transfer_set_drop_effect(data_transfer, html_data_transfer_effect_none)
+        elif ak.fly_string_eq_fly_string(&effect_allowed, &html_data_transfer_effect_copy):
+            html_data_transfer_set_drop_effect(data_transfer, html_data_transfer_effect_copy)
+        elif ak.fly_string_eq_fly_string(&effect_allowed, &html_data_transfer_effect_copy_link):
+            html_data_transfer_set_drop_effect(data_transfer, html_data_transfer_effect_copy)
+        elif ak.fly_string_eq_fly_string(&effect_allowed, &html_data_transfer_effect_copy_move):
+            html_data_transfer_set_drop_effect(data_transfer, html_data_transfer_effect_copy)
+        elif ak.fly_string_eq_fly_string(&effect_allowed, &html_data_transfer_effect_all):
+            html_data_transfer_set_drop_effect(data_transfer, html_data_transfer_effect_copy)
+        elif ak.fly_string_eq_fly_string(&effect_allowed, &html_data_transfer_effect_link):
+            html_data_transfer_set_drop_effect(data_transfer, html_data_transfer_effect_link)
+        elif ak.fly_string_eq_fly_string(&effect_allowed, &html_data_transfer_effect_link_move):
+            html_data_transfer_set_drop_effect(data_transfer, html_data_transfer_effect_link)
+        elif ak.fly_string_eq_fly_string(&effect_allowed, &html_data_transfer_effect_move):
+            html_data_transfer_set_drop_effect(data_transfer, html_data_transfer_effect_move)
+        # FIXME: Handle "uninitialized" when element drag operations are supported.
+        else:
+            html_data_transfer_set_drop_effect(data_transfer, html_data_transfer_effect_copy)
+
+    # 9. Let event be the result of creating an event using DragEvent.
+    # FIXME: Implement https://dom.spec.whatwg.org/#concept-event-create
+    var event_init = HtmlDragEventInit(mouse_event_init = UiEventsMouseEventInit(), data_transfer = none)
+
+    # 10. Initialize event's type attribute to e, its bubbles attribute to true, its view attribute to window, its
+    #     relatedTarget attribute to related target, and its dataTransfer attribute to dataTransfer.
+    event_init.mouse_event_init.event_modifier_init.ui_event_init.event_init.bubbles = true
+    event_init.mouse_event_init.related_target = related_target
+    event_init.data_transfer = data_transfer
+
+    if let event_target = target:
+        let window = (HtmlWindow*)html_relevant_global_object((JsObject*)event_target)
+        event_init.mouse_event_init.event_modifier_init.ui_event_init.view = html_window_window(window)
+
+    #     If e is not dragleave or dragend, then initialize event's cancelable attribute to true.
+    let not_cancelable_events: ak.FlyString[2] = [html_event_names_dragleave, html_event_names_dragend]
+    if not drag_and_drop_effect_is_one_of(name, not_cancelable_events[0..<2]):
+        event_init.mouse_event_init.event_modifier_init.ui_event_init.event_init.cancelable = true
+
+    # 11. Initialize event's mouse and key attributes according to the state of the input devices as they would be for
+    #     user interaction events.
+    event_init.mouse_event_init.event_modifier_init.ctrl_key = (modifiers & (u32)UiEventsKeyModifier.mod_ctrl) != 0
+    event_init.mouse_event_init.event_modifier_init.shift_key = (modifiers & (u32)UiEventsKeyModifier.mod_shift) != 0
+    event_init.mouse_event_init.event_modifier_init.alt_key = (modifiers & (u32)UiEventsKeyModifier.mod_alt) != 0
+    event_init.mouse_event_init.event_modifier_init.meta_key = (modifiers & (u32)UiEventsKeyModifier.mod_super) != 0
+    event_init.mouse_event_init.screen_x = screen_position.m_x.to_double()
+    event_init.mouse_event_init.screen_y = screen_position.m_y.to_double()
+    event_init.mouse_event_init.client_x = client_offset.m_x.to_double()
+    event_init.mouse_event_init.client_y = client_offset.m_y.to_double()
+    event_init.mouse_event_init.button = (i16)button
+    event_init.mouse_event_init.buttons = (u16)buttons
+
+    let event = html_drag_event_create_html_drag_event_init(realm, name, event_init, page_offset.m_x.to_double(), page_offset.m_y.to_double(), offset.m_x.to_double(), offset.m_y.to_double())
+
+    # The "create an event" AO in step 9 should set these.
+    dom_event_set_is_trusted((DomEvent*)event, true)
+    dom_event_set_initialized((DomEvent*)event, true)
+    dom_event_set_composed((DomEvent*)event, true)
+
+    # 12. Dispatch event at the specified target element.
+    if let event_target = target:
+        discard(dom_event_target_dispatch_event(event_target, (DomEvent*)event))
+
+    # 13. Set the drag data store allowed effects state to the current value of dataTransfer's effectAllowed attribute.
+    #     (It can only have changed value if e is dragstart.)
+    html_drag_data_store_set_allowed_effects_state(drag_data_store, html_data_transfer_effect_allowed(data_transfer))
+
+    # 14. If dataDragStoreWasChanged is true, then set the drag data store mode back to the protected mode.
+    if drag_data_store_was_changed:
+        html_drag_data_store_set_mode(drag_data_store, HtmlDragDataStoreMode.protected)
+
+    # 15. Break the association between dataTransfer and the drag data store.
+    html_data_transfer_disassociate_with_drag_data_store(data_transfer)
+
+    return event
+
+## Ported from DragAndDropEventHandler.cpp:640 Web::DragAndDropEventHandler::allow_text_drop.
+func drag_and_drop_event_handler_allow_text_drop(this: const DragAndDropEventHandler*, node: DomNode*) -> bool:
+    if not html_drag_data_store_has_text_item(this.m_drag_data_store else trap("no drag data store")):
+        return false
+
+    if dom_node_is_editable_or_editing_host(node):
+        return true
+
+    if is_html_text_area_element(node):
+        return true
+
+    if is_html_input_element(node):
+        let input = as_html_input_element(node)
+        return html_input_element_type_state(input) == HtmlInputElementTypeAttributeState.text
+
+    return false
+
+## Ported from DragAndDropEventHandler.cpp:659 Web::DragAndDropEventHandler::reset.
+pub func drag_and_drop_event_handler_reset(this: DragAndDropEventHandler*):
+    # When the drag-and-drop operation has completed, we no longer need the drag data store and its related fields.
+    # Clear them, as we currently use the existence of the drag data store to ignore other input events.
+    this.m_drag_data_store = none
+    this.m_source_node = none
+    this.m_immediate_user_selection = none
+    this.m_current_target_element = none
+    this.m_current_drag_operation = html_data_transfer_effect_none
