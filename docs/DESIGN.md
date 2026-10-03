@@ -1135,7 +1135,7 @@ luce-browser-engine/
   docs/PORTING.md                     # the day-to-day rules (a digest of §2–§4)
   docs/namemap.tsv                    # C++ name → package, module, Luce name (generated locally, committed)
   docs/regions.tsv, docs/donor-quirks.md, docs/compiler-issues/
-  src/luce_browser_engine/web/        ORDER + subdirectories mirroring LibWeb:
+  src/web/        ORDER + subdirectories mirroring LibWeb:
       module.lucb  dom/ css/ css/parser/ css/style_values/ css/invalidation/ html/ html/parser/
       html/event_loop/ html/scripting/ layout/ painting/ svg/ page/ platform/ bindings/
       webidl/ mime_sniff/ fetch/ … generated/
@@ -1222,7 +1222,7 @@ works the same way.
 - Header box as in luce-js, naming the C++ file and line range; `# mark:` sections in fragments
   over 150 lines; `##` doc line on every `pub` declaration and `## Ported from <file>:<line>
   <C++ name>.` on every ported function; spec comments kept verbatim.
-- `luce-base check src/luce_browser_engine/web -W` (and the same for every module of the lower
+- `luce-base check src/web -W` (and the same for every module of the lower
   packages) is clean before any merge.
 
 ### 4.4 The skeleton generator
