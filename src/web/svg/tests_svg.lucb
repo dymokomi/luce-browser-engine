@@ -1,0 +1,497 @@
+#==============================================================================================
+#
+#   tests_svg - region r55 against the reference build: SVG attribute parsing and elements
+#
+#   DESCRIPTION:
+#       Runs the cases of tests_svg_cases (a local oracle's output: the reference Ladybird build
+#       on the same inputs) through the port and compares, line by line, with f32 bits allowed
+#       test_libm_ulps apart (trigonometry in transforms and arcs):
+#
+#           coord, length, integer, numpct, poslen, viewbox, par, units, spread, table, points
+#                      the AttributeParser entry points
+#           transform  parse_transform and transform_from_transform_list
+#           path       parse_path_data: instructions, serialize() and to_gfx_path()
+#           shape      get_path of rect, ellipse, line, polygon, polyline and path elements
+#           svgroot    an <svg>'s viewBox, preserveAspectRatio, active viewBox, the width and
+#                      height style values from the attributes and its natural metrics
+#           xform      the transform attribute (element_transform)
+#           hints      presentation attributes (is_presentational_hint, apply_presentational_hints)
+#           role       SVG-AAM default roles
+#           lengths    the SVGAnimatedLength accessors of rect, ellipse and line
+#           href       SVGURIReference's href and className (SVGAnimatedString)
+#           ctf        SVGComponentTransferFunctionElement: animated values and the color table
+#           animnum, animint  SVGAnimatedNumber and SVGAnimatedInteger reflection
+#
+#       The documents are tests_html_elements' (web_test_create_document's heap documents of
+#       type HTML, parsed with scripting disabled, without a browsing context).
+#
+#==============================================================================================
+
+# mark: Output helpers ==========================================================================
+
+## The 8 lowercase hex digits of a u32.
+func test_svg_put_hex(builder: ak.StringBuilder*, value: u64, digits: u32):
+    var shift = digits * 4
+    while shift > 0:
+        shift -= 4
+        let digit = (u8)((value >> (u64)shift) & 0xf)
+        ak.string_builder_append_u8(builder, (u8)('0' + digit) if digit < 10 else (u8)('a' + digit - 10))
+
+## Appends formatted text.
+func test_svg_append(builder: ak.StringBuilder*, text: fmt):
+    var buffer: u8[256] = ---
+    let formatted = format(buffer, text) else trap("formatted text too long")
+    ak.string_builder_append(builder, formatted)
+
+## An f32 as its bits.
+func test_svg_put_f32(builder: ak.StringBuilder*, value: f32):
+    test_svg_put_hex(builder, (u64)value.bits(), 8)
+
+## An f64 as its bits.
+func test_svg_put_f64(builder: ak.StringBuilder*, value: f64):
+    test_svg_put_hex(builder, value.bits(), 16)
+
+## " " and an f32's bits.
+func test_svg_put_word_f32(builder: ak.StringBuilder*, value: f32):
+    ak.string_builder_append(builder, " ")
+    test_svg_put_f32(builder, value)
+
+## A view box as four f64s, or "none".
+func test_svg_put_view_box(builder: ak.StringBuilder*, view_box: SvgViewBox?):
+    if view_box == none:
+        ak.string_builder_append(builder, "none")
+        return
+    let box = view_box else trap("a view box")
+    test_svg_put_f64(builder, box.min_x)
+    ak.string_builder_append(builder, " ")
+    test_svg_put_f64(builder, box.min_y)
+    ak.string_builder_append(builder, " ")
+    test_svg_put_f64(builder, box.width)
+    ak.string_builder_append(builder, " ")
+    test_svg_put_f64(builder, box.height)
+
+## A preserveAspectRatio as its two enum values, or "none".
+func test_svg_put_par(builder: ak.StringBuilder*, par: SvgPreserveAspectRatio?):
+    if par == none:
+        ak.string_builder_append(builder, "none")
+        return
+    let value = par else trap("a preserveAspectRatio")
+    test_svg_append(builder, f"{(i32)value.align} {(i32)value.meet_or_slice}")
+
+## An AffineTransform's six values.
+func test_svg_put_matrix(builder: ak.StringBuilder*, matrix: gfx.AffineTransform):
+    ak.string_builder_append(builder, "matrix")
+    for value in matrix.m_values:
+        test_svg_put_word_f32(builder, value)
+    ak.string_builder_append(builder, "\n")
+
+## A Gfx::Path's SkPath: its verbs, its points and its conic weights.
+func test_svg_put_path(builder: ak.StringBuilder*, path: const gfx.Path*):
+    let sk_path = gfx.path_sk_path_const(path)
+    ak.string_builder_append(builder, "verbs ")
+    for verb in gfx.sk_path_verbs(sk_path):
+        let letters = "MLQKCZ"
+        ak.string_builder_append_u8(builder, letters.bytes[(usize)verb])
+    ak.string_builder_append(builder, "\npoints")
+    for point in gfx.sk_path_points(sk_path):
+        test_svg_put_word_f32(builder, point.x)
+        test_svg_put_word_f32(builder, point.y)
+    ak.string_builder_append(builder, "\nweights")
+    for weight in gfx.sk_path_conic_weights(sk_path):
+        test_svg_put_word_f32(builder, weight)
+    ak.string_builder_append(builder, "\n")
+
+## A FlyString or a String's text.
+func test_svg_put_string(builder: ak.StringBuilder*, string: ak.String):
+    ak.string_builder_append_string_view(builder, ak.string_bytes_as_string_view(&string))
+
+## A style value's serialization, or "none".
+func test_svg_put_style_value(builder: ak.StringBuilder*, label: str, value: CssStyleValue*?):
+    ak.string_builder_append(builder, label)
+    ak.string_builder_append(builder, " ")
+    if let style_value = value:
+        test_svg_put_string(builder, css_style_value_to_string(style_value, css_syntax.SerializationMode.normal))
+    else:
+        ak.string_builder_append(builder, "none")
+    ak.string_builder_append(builder, "\n")
+
+## A FlyString made from a case argument.
+func test_svg_name(text: str) -> ak.FlyString:
+    return ak.fly_string_from_str(text)
+
+## A String made from a case argument.
+func test_svg_string(text: str) -> ak.String:
+    return ak.string_from_str(text)
+
+# mark: The attribute parser =====================================================================
+
+## The parser modes: one AttributeParser entry point on the argument.
+func test_svg_run_parser(mode: str, input: ak.StringView, out: ak.StringBuilder*):
+    if mode == "coord" or mode == "length" or mode == "poslen":
+        var value: f32? = none
+        if mode == "coord":
+            value = svg_attribute_parser_parse_coordinate_string_view(input)
+        elif mode == "length":
+            value = svg_attribute_parser_parse_length_string_view(input)
+        else:
+            value = svg_attribute_parser_parse_positive_length(input)
+        if let number = value:
+            test_svg_put_f32(out, number)
+        else:
+            ak.string_builder_append(out, "none")
+        ak.string_builder_append(out, "\n")
+    elif mode == "integer":
+        if let integer = svg_attribute_parser_parse_integer_string_view(input):
+            test_svg_append(out, f"{integer}\n")
+        else:
+            ak.string_builder_append(out, "none\n")
+    elif mode == "numpct":
+        if let value = svg_attribute_parser_parse_number_percentage(input):
+            test_svg_put_f32(out, svg_number_percentage_value(&value))
+            ak.string_builder_append(out, " % " if svg_number_percentage_is_percentage(&value) else " n ")
+            test_svg_put_f32(out, svg_number_percentage_resolve_relative_to(&value, 250.0))
+            ak.string_builder_append(out, "\n")
+        else:
+            ak.string_builder_append(out, "none\n")
+    elif mode == "viewbox":
+        test_svg_put_view_box(out, svg_attribute_parser_parse_viewbox(input))
+        ak.string_builder_append(out, "\n")
+    elif mode == "par":
+        test_svg_put_par(out, svg_attribute_parser_parse_preserve_aspect_ratio(input))
+        ak.string_builder_append(out, "\n")
+    elif mode == "units":
+        if let units = svg_attribute_parser_parse_units(input):
+            test_svg_append(out, f"{(i32)units}\n")
+        else:
+            ak.string_builder_append(out, "none\n")
+    elif mode == "spread":
+        if let spread = svg_attribute_parser_parse_spread_method(input):
+            test_svg_append(out, f"{(i32)spread}\n")
+        else:
+            ak.string_builder_append(out, "none\n")
+    elif mode == "table":
+        ak.string_builder_append(out, "table")
+        let values = svg_attribute_parser_parse_table_values(input)
+        for value in ak.vector_span_const(&values):
+            test_svg_put_word_f32(out, value)
+        ak.string_builder_append(out, "\n")
+    elif mode == "points":
+        ak.string_builder_append(out, "points")
+        let points = svg_attribute_parser_parse_points(input)
+        for point in ak.vector_span_const(&points):
+            test_svg_put_word_f32(out, point.m_x)
+            test_svg_put_word_f32(out, point.m_y)
+        ak.string_builder_append(out, "\n")
+    elif mode == "transform":
+        let maybe_list = svg_attribute_parser_parse_transform_string_view(input)
+        if maybe_list == none:
+            ak.string_builder_append(out, "none\n")
+            return
+        let list = maybe_list else trap("a transform list")
+        for transform in ak.vector_span_const(&list):
+            match transform.operation:
+                .svg_transform_translate(t):
+                    ak.string_builder_append(out, "translate")
+                    test_svg_put_word_f32(out, t.x)
+                    test_svg_put_word_f32(out, t.y)
+                .svg_transform_scale(t):
+                    ak.string_builder_append(out, "scale")
+                    test_svg_put_word_f32(out, t.x)
+                    test_svg_put_word_f32(out, t.y)
+                .svg_transform_rotate(t):
+                    ak.string_builder_append(out, "rotate")
+                    test_svg_put_word_f32(out, t.a)
+                    test_svg_put_word_f32(out, t.x)
+                    test_svg_put_word_f32(out, t.y)
+                .svg_transform_skew_x(t):
+                    ak.string_builder_append(out, "skewX")
+                    test_svg_put_word_f32(out, t.a)
+                .svg_transform_skew_y(t):
+                    ak.string_builder_append(out, "skewY")
+                    test_svg_put_word_f32(out, t.a)
+                .svg_transform_matrix(t):
+                    ak.string_builder_append(out, "matrix")
+                    test_svg_put_word_f32(out, t.a)
+                    test_svg_put_word_f32(out, t.b)
+                    test_svg_put_word_f32(out, t.c)
+                    test_svg_put_word_f32(out, t.d)
+                    test_svg_put_word_f32(out, t.e)
+                    test_svg_put_word_f32(out, t.f)
+            ak.string_builder_append(out, "\n")
+        test_svg_put_matrix(out, svg_transform_from_transform_list(ak.vector_span_const(&list)))
+    elif mode == "path":
+        let path = svg_attribute_parser_parse_path_data(input)
+        for instruction in svg_path_instructions(&path):
+            test_svg_append(out, f"instruction {(i32)instruction.type_} {1 if instruction.absolute else 0}")
+            for value in ak.vector_span_const(&instruction.data):
+                test_svg_put_word_f32(out, value)
+            ak.string_builder_append(out, "\n")
+        ak.string_builder_append(out, "serialize ")
+        test_svg_put_string(out, svg_path_serialize(&path))
+        ak.string_builder_append(out, "\n")
+        let gfx_path = svg_path_to_gfx_path(&path)
+        test_svg_put_path(out, &gfx_path)
+    else:
+        trap("not a parser mode")
+
+# mark: Elements ================================================================================
+
+## A parsed decimal integer argument.
+func test_svg_parse_int(text: str) -> i64:
+    var value: i64 = 0
+    for c in text.bytes:
+        value = value * 10 + (i64)(c - '0')
+    return value
+
+## An SVGAnimatedLength's base value, unit and animated value.
+func test_svg_put_length(out: ak.StringBuilder*, name: str, length: SvgAnimatedLength*):
+    ak.string_builder_append(out, name)
+    test_svg_put_word_f32(out, svg_length_value(svg_animated_length_base_val(length)))
+    test_svg_append(out, f" {svg_length_unit_type(svg_animated_length_base_val(length))}")
+    test_svg_put_word_f32(out, svg_length_value(svg_animated_length_anim_val(length)))
+    ak.string_builder_append(out, "\n")
+
+## The element modes.
+func test_svg_run_element(realm: Realm*, test_case: const TestSvgCase*, out: ak.StringBuilder*):
+    let mode = test_case.mode
+    if mode == "shape":
+        let document = test_html_elements_parse(realm, test_case.arguments[3])
+        let element = as_svg_geometry_element(test_html_elements_first(document, test_case.arguments[0]))
+        let viewport = gfx.CssPixelSize(m_width = gfx.CssPixels.from_int(test_svg_parse_int(test_case.arguments[1])),
+                                        m_height = gfx.CssPixels.from_int(test_svg_parse_int(test_case.arguments[2])))
+        let path = svg_geometry_element_get_path(element, viewport)
+        test_svg_put_path(out, &path)
+    elif mode == "svgroot":
+        let document = test_html_elements_parse(realm, test_case.arguments[0])
+        let svg = as_svg_svgsvg_element(test_html_elements_first(document, "svg"))
+        ak.string_builder_append(out, "viewbox ")
+        test_svg_put_view_box(out, svg_fit_to_view_box_view_box(&svg.svg_fit_to_view_box))
+        ak.string_builder_append(out, "\npar ")
+        test_svg_put_par(out, svg_fit_to_view_box_preserve_aspect_ratio(&svg.svg_fit_to_view_box))
+        ak.string_builder_append(out, "\nactive ")
+        test_svg_put_view_box(out, svg_graphics_element_active_view_box(svg.svg_graphics_element()))
+        let nulled = svg_fit_to_view_box_view_box_for_bindings(&svg.svg_fit_to_view_box).m_nulled
+        test_svg_append(out, f"\nnulled {1 if nulled else 0}\n")
+        test_svg_put_style_value(out, "width", svg_svgsvg_element_width_style_value_from_attribute(svg))
+        test_svg_put_style_value(out, "height", svg_svgsvg_element_height_style_value_from_attribute(svg))
+        let metrics = svg_svgsvg_element_negotiate_natural_metrics(svg)
+        ak.string_builder_append(out, "natural ")
+        if let width = metrics.width:
+            test_svg_append(out, f"{width.m_value}")
+        else:
+            ak.string_builder_append(out, "none")
+        if let height = metrics.height:
+            test_svg_append(out, f" {height.m_value}")
+        else:
+            ak.string_builder_append(out, " none")
+        if let ratio = metrics.aspect_ratio:
+            test_svg_append(out, f" {ratio.m_numerator.m_value}/{ratio.m_denominator.m_value}\n")
+        else:
+            ak.string_builder_append(out, " none\n")
+    elif mode == "xform":
+        let document = test_html_elements_parse(realm, test_case.arguments[1])
+        let element = as_svg_graphics_element(test_html_elements_first(document, test_case.arguments[0]))
+        test_svg_put_matrix(out, svg_graphics_element_element_transform(element))
+    elif mode == "hints":
+        let document = test_html_elements_parse(realm, test_case.arguments[1])
+        let element = test_html_elements_first(document, test_case.arguments[0])
+        let attributes = element.m_attributes else trap("no attributes")
+        for i in 0..<dom_named_node_map_length(attributes):
+            let attribute = dom_named_node_map_item(attributes, (u32)i) else trap("NamedNodeMap::item in range")
+            let name = dom_attr_name(attribute)
+            ak.string_builder_append(out, "hint ")
+            ak.string_builder_append_string_view(out, ak.fly_string_bytes_as_string_view(&name))
+            ak.string_builder_append(out, " 1\n" if dom_element_is_presentational_hint(element, name) else " 0\n")
+        var properties = ak.Vector[CssStyleProperty]()
+        dom_element_apply_presentational_hints(element, &properties)
+        for property in ak.vector_span_const(&properties):
+            let name = css_data.string_from_property_id(property.property_id)
+            ak.string_builder_append_string_view(out, ak.fly_string_bytes_as_string_view(&name))
+            ak.string_builder_append(out, ": ")
+            test_svg_put_string(out, css_style_value_to_string(property.value, css_syntax.SerializationMode.normal))
+            ak.string_builder_append(out, "\n")
+    elif mode == "role":
+        let document = test_html_elements_parse(realm, test_case.arguments[1])
+        let element = test_html_elements_first(document, test_case.arguments[0])
+        if let role = aria_mixin_default_role(&element.aria_mixin):
+            test_svg_append(out, f"{(i32)role}\n")
+        else:
+            ak.string_builder_append(out, "none\n")
+    elif mode == "lengths":
+        let document = test_html_elements_parse(realm, test_case.arguments[1])
+        let element = test_html_elements_first(document, test_case.arguments[0])
+        if let rect = as_if_svg_rect_element(element):
+            test_svg_put_length(out, "x", svg_rect_element_x(rect))
+            test_svg_put_length(out, "y", svg_rect_element_y(rect))
+            test_svg_put_length(out, "width", svg_rect_element_width(rect))
+            test_svg_put_length(out, "height", svg_rect_element_height(rect))
+            test_svg_put_length(out, "rx", svg_rect_element_rx(rect))
+            test_svg_put_length(out, "ry", svg_rect_element_ry(rect))
+        elif let ellipse = as_if_svg_ellipse_element(element):
+            test_svg_put_length(out, "cx", svg_ellipse_element_cx(ellipse))
+            test_svg_put_length(out, "cy", svg_ellipse_element_cy(ellipse))
+            test_svg_put_length(out, "rx", svg_ellipse_element_rx(ellipse))
+            test_svg_put_length(out, "ry", svg_ellipse_element_ry(ellipse))
+        elif let line = as_if_svg_line_element(element):
+            test_svg_put_length(out, "x1", svg_line_element_x1(line))
+            test_svg_put_length(out, "y1", svg_line_element_y1(line))
+            test_svg_put_length(out, "x2", svg_line_element_x2(line))
+            test_svg_put_length(out, "y2", svg_line_element_y2(line))
+    elif mode == "href":
+        let document = test_html_elements_parse(realm, test_case.arguments[0])
+        let script = as_svg_script_element(test_html_elements_first(document, "script"))
+        let href = svg_svguri_reference_mixin_href(&script.svguri_reference_mixin, script.svg_element(), SvgSupportsXLinkHref.yes)
+        ak.string_builder_append(out, "href ")
+        test_svg_put_string(out, svg_animated_string_base_val(href))
+        let svg = as_svg_element(test_html_elements_first(document, "svg"))
+        ak.string_builder_append(out, "\nclass ")
+        test_svg_put_string(out, svg_animated_string_base_val(svg_element_class_name(svg)))
+        ak.string_builder_append(out, "\n")
+    elif mode == "ctf":
+        test_svg_run_component_transfer(realm, test_case, out)
+    elif mode == "animnum" or mode == "animint":
+        test_svg_run_animated(realm, test_case, out)
+    else:
+        trap("unknown mode")
+
+## The ctf mode: an SVGComponentTransferFunctionElement made as a feFuncR with the case's attributes.
+func test_svg_run_component_transfer(realm: Realm*, test_case: const TestSvgCase*, out: ak.StringBuilder*):
+    let document = test_html_elements_parse(realm, "<!DOCTYPE html><body>")
+    var qualified_name: DomQualifiedName = ---
+    dom_qualified_name_construct(&qualified_name, test_svg_name("feFuncR"), none, namespace_svg)
+    let element = realm_create_svg_component_transfer_function_element(realm, document, qualified_name)
+    for argument in test_case.arguments:
+        if argument.length == 0:
+            continue
+        var equals: usize = 0
+        while argument.bytes[equals] != '=':
+            equals += 1
+        let name = ak.fly_string_from_str((str)argument.bytes[0..<equals])
+        let value = ak.string_from_str((str)argument.bytes[equals + 1..])
+        dom_element_set_attribute_value(element.dom_element(), name, value)
+    test_svg_append(out, f"type {svg_animated_enumeration_base_val(svg_component_transfer_function_element_type(element))}\ntable")
+    let table = svg_component_transfer_function_element_table_float_values(element)
+    for value in ak.vector_span_const(&table):
+        test_svg_put_word_f32(out, value)
+    ak.string_builder_append(out, "\nnumbers")
+    test_svg_put_word_f32(out, svg_animated_number_base_val(svg_component_transfer_function_element_slope(element)))
+    test_svg_put_word_f32(out, svg_animated_number_base_val(svg_component_transfer_function_element_intercept(element)))
+    test_svg_put_word_f32(out, svg_animated_number_base_val(svg_component_transfer_function_element_amplitude(element)))
+    test_svg_put_word_f32(out, svg_animated_number_base_val(svg_component_transfer_function_element_exponent(element)))
+    test_svg_put_word_f32(out, svg_animated_number_base_val(svg_component_transfer_function_element_offset(element)))
+    ak.string_builder_append(out, "\ncolors")
+    for byte in svg_component_transfer_function_element_color_table(element):
+        test_svg_put_hex(out, (u64)byte, 2)
+    ak.string_builder_append(out, "\n")
+
+## The animnum and animint modes: an SVGAnimatedNumber or SVGAnimatedInteger of stdDeviation on a <g>.
+func test_svg_run_animated(realm: Realm*, test_case: const TestSvgCase*, out: ak.StringBuilder*):
+    let document = test_html_elements_parse(realm, "<!DOCTYPE html><svg><g></g></svg>")
+    let g = as_svg_element(test_html_elements_first(document, "g"))
+    let attribute_name = test_svg_name("stdDeviation")
+    if test_case.arguments[0] != "-":
+        dom_element_set_attribute_value(g.dom_element(), attribute_name, test_svg_string(test_case.arguments[0]))
+    var qualified_name: DomQualifiedName = ---
+    dom_qualified_name_construct(&qualified_name, attribute_name, none, none)
+    let second = test_case.arguments[1] == "1"
+    let represents_second = test_case.arguments[2] == "second"
+    if test_case.mode == "animnum":
+        let number = svg_animated_number_create(realm, g, qualified_name, 2.0,
+                                                SvgAnimatedNumberSupportsSecondValue.yes if second else SvgAnimatedNumberSupportsSecondValue.no,
+                                                SvgAnimatedNumberValueRepresented.second if represents_second else SvgAnimatedNumberValueRepresented.first)
+        ak.string_builder_append(out, "base")
+        test_svg_put_word_f32(out, svg_animated_number_base_val(number))
+        svg_animated_number_set_base_val(number, 7.5)
+    else:
+        let integer = svg_animated_integer_create(realm, g, qualified_name, 2,
+                                                  SvgAnimatedIntegerSupportsSecondValue.yes if second else SvgAnimatedIntegerSupportsSecondValue.no,
+                                                  SvgAnimatedIntegerValueRepresented.second if represents_second else SvgAnimatedIntegerValueRepresented.first)
+        test_svg_append(out, f"base {svg_animated_integer_base_val(integer)}")
+        svg_animated_integer_set_base_val(integer, 7)
+    ak.string_builder_append(out, "\nattribute ")
+    test_svg_put_string(out, dom_element_get_attribute_value(g.dom_element(), attribute_name))
+    ak.string_builder_append(out, "\n")
+
+# mark: Running the cases ========================================================================
+
+## Whether the actual output matches the expected one line by line (f32 bits within test_libm_ulps).
+func test_svg_outputs_match(actual: str, expected: str) -> bool:
+    var actual_rest = actual
+    var expected_rest = expected
+    while true:
+        if actual_rest.length == 0 or expected_rest.length == 0:
+            return actual_rest.length == expected_rest.length
+        var a_end: usize = 0
+        while a_end < actual_rest.length and actual_rest.bytes[a_end] != '\n':
+            a_end += 1
+        var e_end: usize = 0
+        while e_end < expected_rest.length and expected_rest.bytes[e_end] != '\n':
+            e_end += 1
+        if not test_lines_match_within_libm_ulps((str)actual_rest.bytes[0..<a_end], (str)expected_rest.bytes[0..<e_end]):
+            return false
+        actual_rest = (str)actual_rest.bytes[(a_end + 1 if a_end < actual_rest.length else a_end)..]
+        expected_rest = (str)expected_rest.bytes[(e_end + 1 if e_end < expected_rest.length else e_end)..]
+
+## Whether a mode works on elements of a parsed document (the others run the attribute parser).
+func test_svg_is_element_mode(mode: str) -> bool:
+    for element_mode in ["shape", "svgroot", "xform", "hints", "role", "lengths", "href", "ctf", "animnum", "animint"]:
+        if mode == element_mode:
+            return true
+    return false
+
+## Runs every case whose mode is one of `modes` and compares with the reference build.
+func test_svg_run_modes(modes: const str[]):
+    web_initialize_strings()
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    var failures = 0
+    var count = 0
+    # The documents and their trees live in the VM's heap (the test's own allocator is a small
+    # fixed buffer).
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        for test_case in &test_svg_cases:
+            var selected = false
+            for mode in modes:
+                if test_case.mode == mode:
+                    selected = true
+            if not selected:
+                continue
+            count += 1
+            var out = ak.string_builder_new()
+            if test_svg_is_element_mode(test_case.mode):
+                test_svg_run_element(realm, test_case, &out)
+            else:
+                test_svg_run_parser(test_case.mode, ak.sv(test_case.arguments[0]), &out)
+            let actual = ak.string_builder_to_string_without_validation(&out)
+            let view = ak.string_bytes_as_string_view(&actual)
+            let text = (str)ak.string_view_bytes(&view)
+            if test_svg_outputs_match(text, test_case.expected):
+                continue
+            failures += 1
+            print(f"{test_case.mode} {test_case.arguments[0]} {test_case.arguments[1]} {test_case.arguments[2]} {test_case.arguments[3]}\nexpected:\n{test_case.expected}actual:\n{text}")
+    assert(count > 0, "no cases of the modes")
+    assert(failures == 0, "cases differ from the reference build")
+
+# mark: Oracle tests =============================================================================
+
+test "SVG attribute parser: coordinates, lengths, integers, number-percentages, viewBox, preserveAspectRatio, keywords, tableValues and points as the reference build":
+    test_svg_run_modes(["coord", "length", "poslen", "integer", "numpct", "viewbox", "par", "units", "spread", "table", "points"])
+
+test "SVG transform lists and their matrices as the reference build":
+    test_svg_run_modes(["transform"])
+
+test "SVG path data: instructions, serialization and the Gfx::Path as the reference build":
+    test_svg_run_modes(["path"])
+
+test "SVG shapes: the paths of rect, ellipse, line, polygon, polyline and path as the reference build":
+    test_svg_run_modes(["shape"])
+
+test "<svg>: viewBox, preserveAspectRatio, the width and height attributes and the natural metrics as the reference build":
+    test_svg_run_modes(["svgroot"])
+
+test "SVG elements: transform attributes, presentation attributes, roles and animated lengths as the reference build":
+    test_svg_run_modes(["xform", "hints", "role", "lengths"])
+
+test "SVG animated values: href, className, component transfer functions, numbers and integers as the reference build":
+    test_svg_run_modes(["href", "ctf", "animnum", "animint"])
