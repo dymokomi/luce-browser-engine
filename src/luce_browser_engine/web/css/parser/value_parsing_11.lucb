@@ -1,0 +1,426 @@
+#==============================================================================================
+#
+#   value_parsing_11 - parsing CSS values: math functions, tree-counting functions and
+#                      <if-condition>
+#
+#   DESCRIPTION:
+#       Port of LibWeb/CSS/Parser/ValueParsing.cpp (lines 4930-5333): parse_calculated_value,
+#       parse_a_calc_function_node, the conversion of a CalcParsing tree into calculation nodes,
+#       "parse a calculation" (css-values-4), sibling-count()/sibling-index() and <if-condition>
+#       (its <if-test> lambda is a function of its own).
+#
+#       Copyright (c) 2018-2024, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2021-2025, Sam Atkins <sam@ladybird.org>
+#       (the full list of ValueParsing.cpp's copyright holders is in value_parsing_1)
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Math functions ==========================================================================
+
+## Ported from Libraries/LibWeb/CSS/Parser/ValueParsing.cpp:4930 Web::CSS::Parser::Parser::parse_calculated_value.
+pub func css_parser_parse_calculated_value(this: CssParser*, component_value: css_syntax.ComponentValue, context: CssCalculationContext) -> CssCalculatedStyleValue*?:
+    if not css_syntax.component_value_is_function(&component_value):
+        return none
+
+    let function_node = css_parser_parse_a_calc_function_node(this, css_syntax.component_value_function(&component_value), context) else return none
+
+    let function_type = css_calculation_node_numeric_type(function_node) else return none
+
+    return css_calculated_style_value_create(function_node, function_type, context)
+
+## Ported from Libraries/LibWeb/CSS/Parser/ValueParsing.cpp:4946 Web::CSS::Parser::Parser::parse_a_calc_function_node.
+pub func css_parser_parse_a_calc_function_node(this: CssParser*, function: css_syntax.Function, context: CssCalculationContext) -> CssCalculationNode*?:
+    css_parser_push_temporary_value_parsing_context(this, css_function_context_of(&function))
+    defer css_parser_pop_temporary_value_parsing_context(this)
+
+    if ak.fly_string_equals_ignoring_ascii_case_string_view(&function.name, ak.sv("calc")):
+        var tokens = css_syntax.token_stream_create(function.value)
+        return css_parser_parse_a_calculation(this, &tokens, context)
+
+    if let maybe_function = css_parser_parse_math_function(this, &function, &context):
+        # NOTE: We have to simplify manually here, since parse_math_function() is a helper for calc() parsing
+        #       that doesn't do it directly by itself.
+        return css_simplify_a_calculation_tree(maybe_function, context, CssCalculationResolutionContext())
+
+    return none
+
+## `children` converted with convert_to_calculation_node, or none when one of them does not convert (the product and
+## sum branches of convert_to_calculation_node).
+func css_parser_convert_children_to_calculation_nodes(this: CssParser*, children: const ak.Vector[CssNode]*, context: CssCalculationContext) -> ak.Vector[CssCalculationNode*]?:
+    var converted = ak.Vector[CssCalculationNode*]()
+    ak.vector_ensure_capacity(&converted, ak.vector_size(children))
+
+    for child in ak.vector_span_const(children):
+        if let child_as_node = css_parser_convert_to_calculation_node(this, child, context):
+            ak.vector_append_t(&converted, child_as_node)
+        else:
+            return none
+
+    return converted
+
+## `ErrorReporter::the().report(InvalidValueError { .value_type = "math-function"_fly_string, ... })`.
+func css_report_invalid_math_function(value_string: ak.String, description: str):
+    css_error_reporter_report(css_error_reporter_the(), CssParsingError.css_invalid_value_error(CssInvalidValueError(
+        value_type = ak.fly_string_from_str("math-function"),
+        value_string = value_string,
+        description = ak.string_from_str(description),
+    )))
+
+## The leaf branch of convert_to_calculation_node (the `NonnullRawPtr<ComponentValue const>` lambda).
+func css_parser_convert_leaf_to_calculation_node(this: CssParser*, component_value: const css_syntax.ComponentValue*, context: CssCalculationContext) -> CssCalculationNode*?:
+    # NOTE: This is the "process the leaf nodes" part of step 5 of https://drafts.csswg.org/css-values-4/#parse-a-calculation
+    #       We divert a little from the spec: Rather than modify an existing tree of values, we construct a new one from that source tree.
+    #       This lets us make CalculationNodes immutable.
+
+    # 1. If leaf is a parenthesized simple block, replace leaf with the result of parsing a calculation from leaf’s contents.
+    if css_component_value_is_paren_block(component_value):
+        let block = css_syntax.component_value_block(component_value)
+        var tokens = css_syntax.token_stream_create(block.value)
+        let leaf_calculation = css_parser_parse_a_calculation(this, &tokens, context) else return none
+
+        return leaf_calculation
+
+    # 2. If leaf is a math function, replace leaf with the internal representation of that math function.
+    if css_syntax.component_value_is_function(component_value):
+        let function = css_syntax.component_value_function(component_value)
+        if css_data.math_function_from_string(ak.fly_string_bytes_as_string_view(&function.name)) != none:
+            let leaf_calculation = css_parser_parse_a_calc_function_node(this, function, context) else return none
+
+            return leaf_calculation
+
+    # AD-HOC: We also need to convert tokens into their numeric types.
+
+    if css_syntax.component_value_is(component_value, .ident):
+        let ident = css_component_value_ident(component_value)
+        let maybe_keyword = css_data.keyword_from_string(ak.fly_string_bytes_as_string_view(&ident)) else return none
+        if let node = css_numeric_calculation_node_from_keyword(maybe_keyword, context):
+            return node.css_calculation_node()
+        return none
+
+    if css_syntax.component_value_is(component_value, .number):
+        let token = css_syntax.component_value_token(component_value)
+        return css_numeric_calculation_node_create(CssCalculationNodeNumericValue.number(css_syntax.number_create(css_syntax.NumberType.number, css_syntax.token_number_value(&token))), context).css_calculation_node()
+
+    if css_syntax.component_value_is(component_value, .dimension):
+        let token = css_syntax.component_value_token(component_value)
+        let numeric_value = css_syntax.token_dimension_value(&token)
+        let unit_fly_string = css_syntax.token_dimension_unit(&token)
+        let unit_string = ak.fly_string_bytes_as_string_view(&unit_fly_string)
+
+        if let length_type = css_data.string_to_length_unit(unit_string):
+            return css_numeric_calculation_node_create(CssCalculationNodeNumericValue.css_length(css_length_new(numeric_value, length_type)), context).css_calculation_node()
+
+        if let angle_type = css_data.string_to_angle_unit(unit_string):
+            return css_numeric_calculation_node_create(CssCalculationNodeNumericValue.css_angle(css_angle_new(numeric_value, angle_type)), context).css_calculation_node()
+
+        if let flex_type = css_data.string_to_flex_unit(unit_string):
+            return css_numeric_calculation_node_create(CssCalculationNodeNumericValue.css_flex(css_flex_new(numeric_value, flex_type)), context).css_calculation_node()
+
+        if let frequency_type = css_data.string_to_frequency_unit(unit_string):
+            return css_numeric_calculation_node_create(CssCalculationNodeNumericValue.css_frequency(css_frequency_new(numeric_value, frequency_type)), context).css_calculation_node()
+
+        if let resolution_type = css_data.string_to_resolution_unit(unit_string):
+            return css_numeric_calculation_node_create(CssCalculationNodeNumericValue.css_resolution(css_resolution_new(numeric_value, resolution_type)), context).css_calculation_node()
+
+        if let time_type = css_data.string_to_time_unit(unit_string):
+            return css_numeric_calculation_node_create(CssCalculationNodeNumericValue.css_time(css_time_new(numeric_value, time_type)), context).css_calculation_node()
+
+        css_report_invalid_math_function(css_syntax.component_value_to_string(component_value), "Unrecognized dimension type.")
+        return none
+
+    if css_syntax.component_value_is(component_value, .percentage):
+        let token = css_syntax.component_value_token(component_value)
+        return css_numeric_calculation_node_create(CssCalculationNodeNumericValue.css_percentage(css_percentage_new(css_syntax.token_percentage(&token))), context).css_calculation_node()
+
+    var tree_counting_function_tokens = css_syntax.token_stream_of_single_token(component_value)
+    if let tree_counting_function = css_parser_parse_tree_counting_function(this, &tree_counting_function_tokens, CssTreeCountingFunctionStyleValueComputedType.number):
+        return css_non_math_function_calculation_node_create(tree_counting_function.css_abstract_non_math_calc_function_style_value(), CssNumericType()).css_calculation_node()
+
+    # NOTE: If we get here, then we have a ComponentValue that didn't get replaced with something else,
+    #       so the calc() is invalid.
+    css_report_invalid_math_function(css_syntax.component_value_to_string(component_value), "Left-over ComponentValue in calculation tree.")
+    return none
+
+## Ported from Libraries/LibWeb/CSS/Parser/ValueParsing.cpp:4964 Web::CSS::Parser::Parser::convert_to_calculation_node.
+pub func css_parser_convert_to_calculation_node(this: CssParser*, node: CssNode, context: CssCalculationContext) -> CssCalculationNode*?:
+    match node:
+        .css_product_node(product_node):
+            let children = css_parser_convert_children_to_calculation_nodes(this, &product_node.children, context) else return none
+
+            return css_product_calculation_node_create(children).css_calculation_node()
+        .css_sum_node(sum_node):
+            let children = css_parser_convert_children_to_calculation_nodes(this, &sum_node.children, context) else return none
+
+            return css_sum_calculation_node_create(children).css_calculation_node()
+        .css_invert_node(invert_node):
+            if let child_as_node = css_parser_convert_to_calculation_node(this, invert_node.child, context):
+                return css_invert_calculation_node_create(child_as_node).css_calculation_node()
+            return none
+        .css_negate_node(negate_node):
+            if let child_as_node = css_parser_convert_to_calculation_node(this, negate_node.child, context):
+                return css_negate_calculation_node_create(child_as_node).css_calculation_node()
+            return none
+        .component_value(component_value):
+            return css_parser_convert_leaf_to_calculation_node(this, component_value, context)
+        .css_operator(op):
+            css_report_invalid_math_function(ak.string_from_code_point((u32)op.delim), "Left-over Operator in calculation tree.")
+            return none
+
+## `item.has<CalcParsing::Operator>()`.
+func css_calc_node_is_operator(item: const CssNode*) -> bool:
+    match *item:
+        .css_operator(_): return true
+        _: return false
+
+## `item.get<CalcParsing::Operator>().delim`.
+func css_calc_node_operator_delim(item: const CssNode*) -> u8:
+    match *item:
+        .css_operator(op): return op.delim
+        _: trap("VERIFY: Variant::get<CalcParsing::Operator>")
+
+## `has<CalcParsing::Operator>() && first_is_one_of(get<CalcParsing::Operator>().delim, '*', '/')`.
+func css_calc_node_is_product_operator(item: const CssNode*) -> bool:
+    return css_calc_node_is_operator(item) and (css_calc_node_operator_delim(item) == '*' or css_calc_node_operator_delim(item) == '/')
+
+## Ported from Libraries/LibWeb/CSS/Parser/ValueParsing.cpp:5099 Web::CSS::Parser::Parser::parse_a_calculation.
+# https://drafts.csswg.org/css-values-4/#parse-a-calculation
+pub func css_parser_parse_a_calculation(this: CssParser*, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*, context: CssCalculationContext) -> CssCalculationNode*?:
+    var transaction = css_syntax.token_stream_begin_transaction(tokens)
+    defer css_syntax.state_transaction_destroy(&transaction)
+
+    # 1. Discard any <whitespace-token>s from values.
+    # 2. An item in values is an “operator” if it’s a <delim-token> with the value "+", "-", "*", or "/". Otherwise, it’s a “value”.
+
+    var values = ak.Vector[CssNode]()
+    while css_syntax.token_stream_has_next_token(tokens):
+        # NB: `auto const& value = tokens.consume_a_token();` refers to the element in the stream's storage, which the
+        #     tree's leaves point to.
+        let index = css_syntax.token_stream_current_index(tokens)
+        discard(css_syntax.token_stream_consume_a_token(tokens))
+        let value = &tokens.m_tokens[index]
+        if css_syntax.component_value_is(value, .whitespace):
+            continue
+        if css_syntax.component_value_is(value, .delim):
+            let token = css_syntax.component_value_token(value)
+            let delim = css_syntax.token_delim(&token)
+            if delim == (u32)'+' or delim == (u32)'-' or delim == (u32)'*' or delim == (u32)'/':
+                # NOTE: Sequential operators are invalid syntax.
+                if not ak.vector_is_empty(&values) and css_calc_node_is_operator(ak.vector_last_const(&values)):
+                    return none
+
+                ak.vector_append_t(&values, CssNode.css_operator(CssOperator(delim = (u8)delim)))
+                continue
+
+        ak.vector_append_t(&values, CssNode.component_value(value))
+
+    # If we have no values, the syntax is invalid.
+    if ak.vector_is_empty(&values):
+        return none
+
+    # NOTE: If the first or last value is an operator, the syntax is invalid.
+    if css_calc_node_is_operator(ak.vector_first_const(&values)) or css_calc_node_is_operator(ak.vector_last_const(&values)):
+        return none
+
+    # 3. Collect children into Product and Invert nodes.
+    #    For every consecutive run of value items in values separated by "*" or "/" operators:
+    while true:
+        var first_product_operator: usize? = none
+        for i in 0..<ak.vector_size(&values):
+            if css_calc_node_is_product_operator(ak.vector_at_const(&values, i)):
+                first_product_operator = i
+                break
+
+        let operator_index = first_product_operator else break
+
+        let start_of_run = operator_index - 1
+        var end_of_run = operator_index + 1
+        var i = start_of_run + 1
+        while i < ak.vector_size(&values):
+            let item = ak.vector_at_const(&values, i)
+            if not css_calc_node_is_operator(item):
+                end_of_run = i - 1
+                break
+
+            let delim = css_calc_node_operator_delim(item)
+            if not (delim == '*' or delim == '/'):
+                end_of_run = i - 1
+                break
+            i += 2
+
+        # 1. For each "/" operator in the run, replace its right-hand value item rhs with an Invert node containing rhs as its child.
+        var run_values = ak.Vector[CssNode]()
+        ak.vector_append_t(&run_values, *ak.vector_at_const(&values, start_of_run))
+        var j = start_of_run + 1
+        while j <= end_of_run:
+            let operator_ = css_calc_node_operator_delim(ak.vector_at_const(&values, j))
+            let rhs = *ak.vector_at_const(&values, j + 1)
+            if operator_ == '/':
+                ak.vector_append_t(&run_values, CssNode.css_invert_node(new CssInvertNode(child = rhs) else trap("out of memory")))
+                j += 2
+                continue
+            assert(operator_ == '*')
+            ak.vector_append_t(&run_values, rhs)
+            j += 2
+        # 2. Replace the entire run with a Product node containing the value items of the run as its children.
+        ak.vector_remove_usize(&values, start_of_run, end_of_run - start_of_run + 1)
+        ak.vector_insert(&values, start_of_run, CssNode.css_product_node(new CssProductNode(children = run_values) else trap("out of memory")))
+
+    # 4. Collect children into Sum and Negate nodes.
+    var single_value: CssNode? = none
+    # 1. For each "-" operator item in values, replace its right-hand value item rhs with a Negate node containing rhs as its child.
+    var k: usize = 0
+    while k < ak.vector_size(&values):
+        let maybe_minus_operator = ak.vector_at_const(&values, k)
+        if not css_calc_node_is_operator(maybe_minus_operator) or css_calc_node_operator_delim(maybe_minus_operator) != '-':
+            k += 1
+            continue
+
+        k += 1
+        let rhs_index = k
+        let negate_node = CssNode.css_negate_node(new CssNegateNode(child = *ak.vector_at_const(&values, rhs_index)) else trap("out of memory"))
+        ak.vector_remove(&values, rhs_index)
+        ak.vector_insert(&values, rhs_index, negate_node)
+        k += 1
+
+    # 2. If values has only one item, and it is a Product node or a parenthesized simple block, replace values with that item.
+    # NB: In the donor the parenthesized-block alternative is a `ComponentValue const&` lambda, which Variant::visit
+    #     does not select for the `NonnullRawPtr<ComponentValue const>` alternative (the generic `auto&` lambda wins),
+    #     so only a Product node is taken here; a lone block becomes a one-child Sum node below.
+    if ak.vector_size(&values) == 1:
+        match *ak.vector_first_const(&values):
+            .css_product_node(node):
+                single_value = CssNode.css_product_node(node)
+            _:
+                discard(this)
+    #    Otherwise, replace values with a Sum node containing the value items of values as its children.
+    if single_value == none:
+        var operator_count: usize = 0
+        var m: usize = 0
+        while m < ak.vector_size(&values):
+            if css_calc_node_is_operator(ak.vector_at_const(&values, m)):
+                operator_count += 1
+                ak.vector_remove(&values, m)
+            else:
+                m += 1
+        if ak.vector_size(&values) == 0 or operator_count != ak.vector_size(&values) - 1:
+            return none
+
+        single_value = CssNode.css_sum_node(new CssSumNode(children = values) else trap("out of memory"))
+    let calculation_values = single_value else trap("VERIFY: a single value")
+
+    # 5. At this point values is a tree of Sum, Product, Negate, and Invert nodes, with other types of values at the leaf nodes. Process the leaf nodes.
+    # NOTE: We process leaf nodes as part of this conversion.
+    let calculation_tree = css_parser_convert_to_calculation_node(this, calculation_values, context) else return none
+
+    # 6. Return the result of simplifying a calculation tree from values.
+    css_syntax.state_transaction_commit(&transaction)
+    return css_simplify_a_calculation_tree(calculation_tree, context, CssCalculationResolutionContext())
+
+# mark: Tree-counting functions =================================================================
+
+## The `has_no_arguments` lambda of parse_tree_counting_function.
+func css_component_values_have_no_arguments(component_values: const ak.Vector[css_syntax.ComponentValue]*) -> bool:
+    for value in ak.vector_span_const(component_values):
+        if not css_syntax.component_value_is(&value, .whitespace):
+            return false
+    return true
+
+## Ported from Libraries/LibWeb/CSS/Parser/ValueParsing.cpp:5237 Web::CSS::Parser::Parser::parse_tree_counting_function.
+# https://drafts.csswg.org/css-values-5/#tree-counting
+pub func css_parser_parse_tree_counting_function(this: CssParser*, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*, computed_type: CssTreeCountingFunctionStyleValueComputedType) -> CssTreeCountingFunctionStyleValue*?:
+    if not css_parser_context_allows_tree_counting_functions(this):
+        return none
+
+    var transaction = css_syntax.token_stream_begin_transaction(tokens)
+    defer css_syntax.state_transaction_destroy(&transaction)
+
+    let token = css_syntax.token_stream_consume_a_token(tokens)
+
+    if css_syntax.component_value_is_function_string_view(&token, ak.sv("sibling-count")):
+        let function = css_syntax.component_value_function(&token)
+        if css_component_values_have_no_arguments(&function.value):
+            css_syntax.state_transaction_commit(&transaction)
+            return css_tree_counting_function_style_value_create(CssTreeCountingFunctionStyleValueTreeCountingFunction.sibling_count, computed_type)
+
+    if css_syntax.component_value_is_function_string_view(&token, ak.sv("sibling-index")):
+        let function = css_syntax.component_value_function(&token)
+        if css_component_values_have_no_arguments(&function.value):
+            css_syntax.state_transaction_commit(&transaction)
+            return css_tree_counting_function_style_value_create(CssTreeCountingFunctionStyleValueTreeCountingFunction.sibling_index, computed_type)
+
+    return none
+
+# mark: <if-condition> ==========================================================================
+
+## The `<if-test>` lambda of parse_if_condition.
+func css_parser_parse_if_test(context: void*?, test_tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssBooleanExpression*?:
+    let this = (CssParser*)(context else trap("no parser"))
+    let maybe_function_token = css_syntax.token_stream_consume_a_token(test_tokens)
+
+    if not css_syntax.component_value_is_function(&maybe_function_token):
+        return none
+
+    let function = css_syntax.component_value_function(&maybe_function_token)
+    var argument_tokens = css_syntax.token_stream_create(function.value)
+
+    # supports( [ <ident> : <declaration-value> ] | <supports-condition> )
+    if ak.fly_string_equals_ignoring_ascii_case_string_view(&function.name, ak.sv("supports")):
+        # [ <ident> : <declaration-value> ]
+        ak.vector_append_t(&this.m_rule_context, CssRuleContext.supports_condition)
+        let maybe_supports_declaration = css_parser_parse_supports_declaration(this, &argument_tokens)
+        discard(ak.vector_take_last(&this.m_rule_context))
+
+        if let supports_declaration = maybe_supports_declaration:
+            return (CssBooleanExpression*)supports_declaration
+
+        # <supports-condition>
+        if let maybe_supports_condition = css_parser_parse_supports_condition(this, &argument_tokens):
+            return maybe_supports_condition
+
+        return none
+
+    # media( <media-feature> | <media-condition> )
+    if ak.fly_string_equals_ignoring_ascii_case_string_view(&function.name, ak.sv("media")):
+        # <media-feature>
+        if let maybe_media_feature = css_parser_parse_media_feature(this, &argument_tokens):
+            return maybe_media_feature.css_boolean_expression()
+
+        # <media-condition>
+        if let maybe_media_condition = css_parser_parse_media_condition(this, &argument_tokens):
+            return maybe_media_condition
+
+        return none
+
+    # FIXME: Support style()
+    return none
+
+## Ported from Libraries/LibWeb/CSS/Parser/ValueParsing.cpp:5264 Web::CSS::Parser::Parser::parse_if_condition.
+# https://drafts.csswg.org/css-values-5/#typedef-if-condition
+pub func css_parser_parse_if_condition(this: CssParser*, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssBooleanExpression*?:
+    # <if-condition> = <boolean-expr[ <if-test> ]> | else
+    # <if-test> =
+    #   supports( [ <ident> : <declaration-value> ] | <supports-condition> ) |
+    #   media( <media-feature> | <media-condition> ) |
+    #   style( <style-query> )
+
+    var transaction = css_syntax.token_stream_begin_transaction(tokens)
+    defer css_syntax.state_transaction_destroy(&transaction)
+
+    # <boolean-expr[ <if-test> ]>
+    let parsed_boolean_expression = css_parser_parse_boolean_expression(this, tokens, CssMatchResult.false_, ak.Function1[css_syntax.TokenStream[css_syntax.ComponentValue]*, CssBooleanExpression*?](call = css_parser_parse_if_test, context = this))
+
+    css_syntax.token_stream_discard_whitespace(tokens)
+
+    if let boolean_expression = parsed_boolean_expression:
+        if not css_syntax.token_stream_has_next_token(tokens):
+            css_syntax.state_transaction_commit(&transaction)
+            return boolean_expression
+
+    # else
+    if css_parser_parse_all_as_single_keyword_value(this, tokens, css_data.Keyword.else_) != none:
+        css_syntax.state_transaction_commit(&transaction)
+        # The else keyword represents a condition that is always true.
+        return css_constant_boolean_expression_create(CssMatchResult.true_).css_boolean_expression()
+
+    return none

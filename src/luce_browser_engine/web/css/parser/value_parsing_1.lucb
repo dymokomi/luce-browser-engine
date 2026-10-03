@@ -1,0 +1,475 @@
+#==============================================================================================
+#
+#   value_parsing_1 - parsing CSS values: comma-separated lists, <declaration-value>,
+#                     <family-name> and <urange>
+#
+#   DESCRIPTION:
+#       Port of LibWeb/CSS/Parser/ValueParsing.cpp (lines 1-578): parse_comma_separated_value_list,
+#       parse_declaration_value (its recursive lambda is a function of its own),
+#       parse_family_name_value, both parse_unicode_range overloads, parse_unicode_ranges and
+#       parse_unicode_range_value.
+#
+#       Copyright (c) 2018-2024, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2020-2021, the SerenityOS developers.
+#       Copyright (c) 2021-2025, Sam Atkins <sam@ladybird.org>
+#       Copyright (c) 2021, Tobias Christiansen <tobyase@serenityos.org>
+#       Copyright (c) 2022, MacDue <macdue@dueutil.tech>
+#       Copyright (c) 2024, Shannon Booth <shannon@serenityos.org>
+#       Copyright (c) 2024, Tommy van der Vorst <tommy@pixelspark.nl>
+#       Copyright (c) 2024, Matthew Olsson <mattco@serenityos.org>
+#       Copyright (c) 2024, Glenn Skrzypczak <glenn.skrzypczak@gmail.com>
+#       Copyright (c) 2025, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
+#       Copyright (c) 2025, Jelle Raaijmakers <jelle@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Comma-separated lists ===================================================================
+
+## Ported from Libraries/LibWeb/CSS/Parser/ValueParsing.cpp:88 Web::CSS::Parser::Parser::parse_comma_separated_value_list.
+pub func css_parser_parse_comma_separated_value_list(this: CssParser*, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*, parse_one_value: ak.Function1[css_syntax.TokenStream[css_syntax.ComponentValue]*, CssStyleValue*?]) -> CssStyleValueList*?:
+    discard(this)
+    css_syntax.token_stream_discard_whitespace(tokens)
+    let first = ak.function1_call(&parse_one_value, tokens)
+    css_syntax.token_stream_discard_whitespace(tokens)
+    if first == none:
+        return none
+
+    var values = ak.Vector[CssStyleValue*]()
+    ak.vector_append_t(&values, first else trap("VERIFY: a first value"))
+
+    while css_syntax.token_stream_has_next_token(tokens):
+        let comma = css_syntax.token_stream_consume_a_token(tokens)
+        if not css_syntax.component_value_is(&comma, .comma):
+            return none
+
+        css_syntax.token_stream_discard_whitespace(tokens)
+
+        if let maybe_value = ak.function1_call(&parse_one_value, tokens):
+            ak.vector_append_t(&values, maybe_value)
+            css_syntax.token_stream_discard_whitespace(tokens)
+            continue
+        return none
+
+    return css_style_value_list_create(values, CssStyleValueListSeparator.comma)
+
+# mark: <declaration-value> =====================================================================
+
+## The recursive `parse_declaration_value_impl` lambda of parse_declaration_value: it appends the top-level
+## tokens it accepts to `top_level_declaration_value` (and only checks nested blocks and functions).
+func css_parser_parse_declaration_value_impl(current_tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*, nested: CssParserNested, end_token_type: css_syntax.TokenType?, top_level_declaration_value: ak.Vector[css_syntax.ComponentValue]*):
+    var transaction = css_syntax.token_stream_begin_transaction(current_tokens)
+    defer css_syntax.state_transaction_destroy(&transaction)
+    while css_syntax.token_stream_has_next_token(current_tokens):
+        let peek = css_syntax.token_stream_next_token(current_tokens)
+
+        if css_syntax.component_value_is_block(&peek):
+            let block = css_syntax.component_value_block(&peek)
+            var block_stream = css_syntax.token_stream_create(block.value)
+            css_parser_parse_declaration_value_impl(&block_stream, CssParserNested.yes, end_token_type, top_level_declaration_value)
+            if css_syntax.token_stream_is_empty(&block_stream):
+                css_parser_parse_declaration_value_consume_a_token(current_tokens, nested, top_level_declaration_value)
+                continue
+
+            break
+
+        if css_syntax.component_value_is_function(&peek):
+            let function = css_syntax.component_value_function(&peek)
+            var function_stream = css_syntax.token_stream_create(function.value)
+            css_parser_parse_declaration_value_impl(&function_stream, CssParserNested.yes, end_token_type, top_level_declaration_value)
+            if css_syntax.token_stream_is_empty(&function_stream):
+                css_parser_parse_declaration_value_consume_a_token(current_tokens, nested, top_level_declaration_value)
+                continue
+
+            break
+
+        if not css_syntax.component_value_is_token(&peek):
+            css_parser_parse_declaration_value_consume_a_token(current_tokens, nested, top_level_declaration_value)
+            continue
+
+        var valid = true
+        let token = css_syntax.component_value_token(&peek)
+        match css_syntax.token_type(&token):
+            # NB: We're dealing with ComponentValues, so all valid function and block-related tokens will already be
+            #     converted to Function or SimpleBlock ComponentValues. Any remaining ones are invalid.
+            .invalid, .end_of_file, .bad_string, .bad_url, .function, .open_curly, .open_paren, .open_square, .close_curly, .close_paren, .close_square:
+                valid = false
+            .semicolon:
+                valid = nested == CssParserNested.yes
+            .delim:
+                valid = nested == CssParserNested.yes or css_syntax.token_delim(&token) != (u32)'!'
+            _:
+                valid = nested == CssParserNested.yes or end_token_type == none or not css_syntax.component_value_is(&peek, end_token_type else trap("VERIFY: an end token type"))
+
+        if not valid:
+            break
+
+        css_parser_parse_declaration_value_consume_a_token(current_tokens, nested, top_level_declaration_value)
+
+    css_syntax.state_transaction_commit(&transaction)
+
+## The `consume_a_token` lambda of parse_declaration_value_impl: top-level tokens are kept, nested ones dropped.
+func css_parser_parse_declaration_value_consume_a_token(current_tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*, nested: CssParserNested, top_level_declaration_value: ak.Vector[css_syntax.ComponentValue]*):
+    if nested == CssParserNested.no:
+        ak.vector_append_t(top_level_declaration_value, css_syntax.token_stream_consume_a_token(current_tokens))
+    else:
+        css_syntax.token_stream_discard_a_token(current_tokens)
+
+## Ported from Libraries/LibWeb/CSS/Parser/ValueParsing.cpp:117 Web::CSS::Parser::Parser::parse_declaration_value.
+# https://drafts.csswg.org/css-syntax/#typedef-declaration-value
+pub func css_parser_parse_declaration_value(tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*, end_token_type: css_syntax.TokenType? = none) -> ak.Vector[css_syntax.ComponentValue]?:
+    # The <declaration-value> production matches any sequence of one or more tokens, so long as the sequence does not
+    # contain <bad-string-token>, <bad-url-token>, unmatched <)-token>, <]-token>, or <}-token>, or top-level
+    # <semicolon-token> tokens or <delim-token> tokens with a value of "!". It represents the entirety of what a valid
+    # declaration can have as its value.
+    var top_level_declaration_value = ak.Vector[css_syntax.ComponentValue]()
+
+    css_parser_parse_declaration_value_impl(tokens, CssParserNested.no, end_token_type, &top_level_declaration_value)
+
+    if ak.vector_is_empty(&top_level_declaration_value):
+        return none
+
+    return top_level_declaration_value
+
+# mark: <family-name> ===========================================================================
+
+## Ported from Libraries/LibWeb/CSS/Parser/ValueParsing.cpp:210 Web::CSS::Parser::Parser::parse_family_name_value.
+# https://drafts.csswg.org/css-fonts-4/#family-name-syntax
+pub func css_parser_parse_family_name_value(this: CssParser*, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssStyleValue*?:
+    discard(this)
+    var transaction = css_syntax.token_stream_begin_transaction(tokens)
+    defer css_syntax.state_transaction_destroy(&transaction)
+    css_syntax.token_stream_discard_whitespace(tokens)
+
+    # <family-name> = <string> | <custom-ident>+
+    var parts = ak.Vector[ak.String]()
+    while css_syntax.token_stream_has_next_token(tokens):
+        let peek = css_syntax.token_stream_next_token(tokens)
+
+        if css_syntax.component_value_is(&peek, .string):
+            # `font-family: my cool "font";` is invalid.
+            if not ak.vector_is_empty(&parts):
+                return none
+            css_syntax.token_stream_discard_a_token(tokens)  # String
+            css_syntax.token_stream_discard_whitespace(tokens)
+            css_syntax.state_transaction_commit(&transaction)
+            let token = css_syntax.component_value_token(&peek)
+            return css_string_style_value_create(css_syntax.token_string(&token)).css_style_value()
+
+        # AD-HOC: We allow all <ident>'s rather than just <custom-ident>, although we check below that the whole value
+        #         isn't a CSS-wide keyword, see https://github.com/w3c/csswg-drafts/issues/13692
+        if css_syntax.component_value_is(&peek, .ident):
+            let consumed = css_syntax.token_stream_consume_a_token(tokens)
+            let ident = css_component_value_ident(&consumed)
+            ak.vector_append_t(&parts, ak.fly_string_to_string_const(&ident))
+            css_syntax.token_stream_discard_whitespace(tokens)
+            continue
+
+        break
+
+    if ak.vector_is_empty(&parts):
+        return none
+
+    if ak.vector_size(&parts) == 1:
+        # <generic-family> is a separate type from <family-name>, and so isn't allowed here.
+        let first_part = ak.vector_first_const(&parts)
+        let maybe_keyword = css_data.keyword_from_string(ak.string_bytes_as_string_view(first_part))
+        var no_blacklist: const ak.StringView[]
+        if not is_valid_custom_ident(ak.fly_string_from_string(*first_part), no_blacklist):
+            return none
+        if let keyword = maybe_keyword:
+            if css_data.keyword_to_generic_font_family(keyword) != none:
+                return none
+
+    let complete_name = ak.string_join_string(ak.sv(" "), ak.vector_span_const(&parts)) else trap("MUST: String::join")
+
+    css_syntax.state_transaction_commit(&transaction)
+    return css_custom_ident_style_value_create(ak.fly_string_from_string(complete_name)).css_style_value()
+
+# mark: <urange> ================================================================================
+
+## `ErrorReporter::the().report(InvalidValueError { .value_type = "<urange>"_fly_string, ... })`.
+func css_report_invalid_urange(value_string: ak.String, description: ak.String):
+    css_error_reporter_report(css_error_reporter_the(), CssParsingError.css_invalid_value_error(CssInvalidValueError(
+        value_type = ak.fly_string_from_str("<urange>"),
+        value_string = value_string,
+        description = description,
+    )))
+
+## The `is_ending_token` lambda of parse_unicode_range(TokenStream&).
+func css_parser_unicode_range_is_ending_token(component_value: const css_syntax.ComponentValue*) -> bool:
+    return (css_syntax.component_value_is(component_value, .end_of_file) or css_syntax.component_value_is(component_value, .comma) or css_syntax.component_value_is(component_value, .semicolon) or css_syntax.component_value_is(component_value, .whitespace))
+
+## The `create_unicode_range` lambda of parse_unicode_range(TokenStream&): parse the concatenated text, and
+## commit both transactions if it is a valid <urange>.
+func css_parser_create_unicode_range(this: CssParser*, text: ak.StringView, local_transaction: css_syntax.StateTransaction*, transaction: css_syntax.StateTransaction*) -> web_fonts.UnicodeRange?:
+    let maybe_unicode_range = css_parser_parse_unicode_range_string_view(this, text)
+    if maybe_unicode_range != none:
+        css_syntax.state_transaction_commit(local_transaction)
+        css_syntax.state_transaction_commit(transaction)
+    return maybe_unicode_range
+
+## `string_builder.append(token.token().original_source_text())`.
+func css_append_original_source_text(builder: ak.StringBuilder*, component_value: const css_syntax.ComponentValue*):
+    let token = css_syntax.component_value_token(component_value)
+    let text = css_syntax.token_original_source_text(&token)
+    ak.string_builder_append_string_view(builder, ak.string_bytes_as_string_view(&text))
+
+## Ported from Libraries/LibWeb/CSS/Parser/ValueParsing.cpp:261 Web::CSS::Parser::Parser::parse_unicode_range.
+# https://www.w3.org/TR/css-syntax-3/#urange-syntax
+pub func css_parser_parse_unicode_range_token_stream(this: CssParser*, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> web_fonts.UnicodeRange?:
+    var transaction = css_syntax.token_stream_begin_transaction(tokens)
+    defer css_syntax.state_transaction_destroy(&transaction)
+    css_syntax.token_stream_discard_whitespace(tokens)
+
+    # <urange> =
+    #  u '+' <ident-token> '?'* |
+    #  u <dimension-token> '?'* |
+    #  u <number-token> '?'* |
+    #  u <number-token> <dimension-token> |
+    #  u <number-token> <number-token> |
+    #  u '+' '?'+
+    # (All with no whitespace in between tokens.)
+
+    # NOTE: Parsing this is different from usual. We take these steps:
+    # 1. Match the grammar above against the tokens, concatenating them into a string using their original representation.
+    # 2. Then, parse that string according to the spec algorithm.
+    # Step 2 is performed by calling the other parse_unicode_range() overload.
+
+    # All options start with 'u'/'U'.
+    let u = css_syntax.token_stream_consume_a_token(tokens)
+    if not css_syntax.component_value_is_ident(&u, ak.sv("u")):
+        css_report_invalid_urange(css_syntax.token_stream_dump_string(tokens), ak.string_from_str("Doesn't start with 'u'."))
+        return none
+
+    let second_token = css_syntax.token_stream_consume_a_token(tokens)
+
+    #  u '+' <ident-token> '?'* |
+    #  u '+' '?'+
+    if css_syntax.component_value_is_delim(&second_token, (u32)'+'):
+        var local_transaction = css_syntax.token_stream_begin_transaction(tokens)
+        defer css_syntax.state_transaction_destroy(&local_transaction)
+        var string_builder = ak.string_builder_new()
+        css_append_original_source_text(&string_builder, &second_token)
+
+        let third_token = css_syntax.token_stream_consume_a_token(tokens)
+        if css_syntax.component_value_is(&third_token, .ident) or css_syntax.component_value_is_delim(&third_token, (u32)'?'):
+            css_append_original_source_text(&string_builder, &third_token)
+            while css_next_token_is_delim(tokens, (u32)'?'):
+                let question_mark = css_syntax.token_stream_consume_a_token(tokens)
+                css_append_original_source_text(&string_builder, &question_mark)
+            let next = css_syntax.token_stream_next_token(tokens)
+            if css_parser_unicode_range_is_ending_token(&next):
+                return css_parser_create_unicode_range(this, ak.string_builder_string_view(&string_builder), &local_transaction, &transaction)
+
+    #  u <dimension-token> '?'*
+    if css_syntax.component_value_is(&second_token, .dimension):
+        var local_transaction = css_syntax.token_stream_begin_transaction(tokens)
+        defer css_syntax.state_transaction_destroy(&local_transaction)
+        var string_builder = ak.string_builder_new()
+        css_append_original_source_text(&string_builder, &second_token)
+        while css_next_token_is_delim(tokens, (u32)'?'):
+            let question_mark = css_syntax.token_stream_consume_a_token(tokens)
+            css_append_original_source_text(&string_builder, &question_mark)
+        let next = css_syntax.token_stream_next_token(tokens)
+        if css_parser_unicode_range_is_ending_token(&next):
+            return css_parser_create_unicode_range(this, ak.string_builder_string_view(&string_builder), &local_transaction, &transaction)
+
+    #  u <number-token> '?'* |
+    #  u <number-token> <dimension-token> |
+    #  u <number-token> <number-token>
+    if css_syntax.component_value_is(&second_token, .number):
+        var local_transaction = css_syntax.token_stream_begin_transaction(tokens)
+        defer css_syntax.state_transaction_destroy(&local_transaction)
+        var string_builder = ak.string_builder_new()
+        css_append_original_source_text(&string_builder, &second_token)
+
+        let after_number = css_syntax.token_stream_next_token(tokens)
+        if css_parser_unicode_range_is_ending_token(&after_number):
+            return css_parser_create_unicode_range(this, ak.string_builder_string_view(&string_builder), &local_transaction, &transaction)
+
+        let third_token = css_syntax.token_stream_consume_a_token(tokens)
+        if css_syntax.component_value_is_delim(&third_token, (u32)'?'):
+            css_append_original_source_text(&string_builder, &third_token)
+            while css_next_token_is_delim(tokens, (u32)'?'):
+                let question_mark = css_syntax.token_stream_consume_a_token(tokens)
+                css_append_original_source_text(&string_builder, &question_mark)
+            let next = css_syntax.token_stream_next_token(tokens)
+            if css_parser_unicode_range_is_ending_token(&next):
+                return css_parser_create_unicode_range(this, ak.string_builder_string_view(&string_builder), &local_transaction, &transaction)
+        elif css_syntax.component_value_is(&third_token, .dimension):
+            css_append_original_source_text(&string_builder, &third_token)
+            let next = css_syntax.token_stream_next_token(tokens)
+            if css_parser_unicode_range_is_ending_token(&next):
+                return css_parser_create_unicode_range(this, ak.string_builder_string_view(&string_builder), &local_transaction, &transaction)
+        elif css_syntax.component_value_is(&third_token, .number):
+            css_append_original_source_text(&string_builder, &third_token)
+            let next = css_syntax.token_stream_next_token(tokens)
+            if css_parser_unicode_range_is_ending_token(&next):
+                return css_parser_create_unicode_range(this, ak.string_builder_string_view(&string_builder), &local_transaction, &transaction)
+
+    css_report_invalid_urange(css_syntax.token_stream_dump_string(tokens), ak.string_from_str("Did not match grammar."))
+    return none
+
+## `tokens.next_token().is_delim(delim)`.
+func css_next_token_is_delim(tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*, delim: u32) -> bool:
+    let next = css_syntax.token_stream_next_token(tokens)
+    return css_syntax.component_value_is_delim(&next, delim)
+
+## The `make_valid_unicode_range` lambda of parse_unicode_range(StringView).
+func css_make_valid_unicode_range(text: ak.StringView, start_value: u32, end_value: u32) -> web_fonts.UnicodeRange?:
+    # https://www.w3.org/TR/css-syntax-3/#maximum-allowed-code-point
+    let maximum_allowed_code_point: u32 = 0x10FFFF
+
+    # To determine what codepoints the <urange> represents:
+    # 1. If end value is greater than the maximum allowed code point,
+    #    the <urange> is invalid and a syntax error.
+    if end_value > maximum_allowed_code_point:
+        css_report_invalid_urange(ak.string_from_utf8(text) else trap("MUST: String::from_utf8"),
+                                  css_string_formatted("end_value ({}) > maximum ({})", [ak.arg_u64((u64)end_value), ak.arg_u64((u64)maximum_allowed_code_point)]))
+        return none
+
+    # 2. If start value is greater than end value, the <urange> is invalid and a syntax error.
+    if start_value > end_value:
+        css_report_invalid_urange(ak.string_from_utf8(text) else trap("MUST: String::from_utf8"),
+                                  css_string_formatted("start_value ({}) > end_value ({})", [ak.arg_u64((u64)start_value), ak.arg_u64((u64)end_value)]))
+        return none
+
+    # 3. Otherwise, the <urange> represents a contiguous range of codepoints from start value to end value, inclusive.
+    return web_fonts.unicode_range_create(start_value, end_value)
+
+## Ported from Libraries/LibWeb/CSS/Parser/ValueParsing.cpp:374 Web::CSS::Parser::Parser::parse_unicode_range.
+pub func css_parser_parse_unicode_range_string_view(this: CssParser*, text: ak.StringView) -> web_fonts.UnicodeRange?:
+    discard(this)
+    let is_ascii_hex_digit = ak.CharPredicateFunction(function = ak.is_ascii_hex_digit)
+    let is_question_mark = CssIsQuestionMark(unused = 0)
+
+    # 1. Skipping the first u token, concatenate the representations of all the tokens in the production together.
+    #    Let this be text.
+    # NOTE: The concatenation is already done by the caller.
+    var lexer = ak.generic_lexer_new(text)
+
+    # 2. If the first character of text is U+002B PLUS SIGN, consume it.
+    #    Otherwise, this is an invalid <urange>, and this algorithm must exit.
+    if ak.generic_lexer_next_is_t_char_type(&lexer, '+'):
+        discard(ak.generic_lexer_consume(&lexer))
+    else:
+        css_report_invalid_urange(ak.string_from_utf8(text) else trap("MUST: String::from_utf8"),
+                                  css_string_formatted("Second character was '{}', expected '+'.", [ak.arg_char(ak.generic_lexer_consume(&lexer))]))
+        return none
+
+    # 3. Consume as many hex digits from text as possible.
+    #    then consume as many U+003F QUESTION MARK (?) code points as possible.
+    let start_position = ak.generic_lexer_tell(&lexer)
+    let hex_digits = ak.generic_lexer_consume_while(&lexer, &is_ascii_hex_digit)
+    let question_marks = ak.generic_lexer_consume_while(&lexer, &is_question_mark)
+    #    If zero code points were consumed, or more than six code points were consumed,
+    #    this is an invalid <urange>, and this algorithm must exit.
+    let consumed_code_points = ak.string_view_length(&hex_digits) + ak.string_view_length(&question_marks)
+    if consumed_code_points == 0 or consumed_code_points > 6:
+        css_report_invalid_urange(ak.string_from_utf8(text) else trap("MUST: String::from_utf8"),
+                                  css_string_formatted("Start value had {} digits/?s, expected between 1 and 6.", [ak.arg_u64((u64)consumed_code_points)]))
+        return none
+    let start_value_code_points = ak.string_view_substring_view_usize(&text, start_position, consumed_code_points)
+
+    #    If any U+003F QUESTION MARK (?) code points were consumed, then:
+    if ak.string_view_length(&question_marks) > 0:
+        # 1. If there are any code points left in text, this is an invalid <urange>,
+        #    and this algorithm must exit.
+        if ak.generic_lexer_tell_remaining(&lexer) != 0:
+            css_report_invalid_urange(ak.string_from_utf8(text) else trap("MUST: String::from_utf8"),
+                                      css_string_formatted("Has {} trailing unused code points.", [ak.arg_u64((u64)ak.generic_lexer_tell_remaining(&lexer))]))
+            return none
+
+        # 2. Interpret the consumed code points as a hexadecimal number,
+        #    with the U+003F QUESTION MARK (?) code points replaced by U+0030 DIGIT ZERO (0) code points.
+        #    This is the start value.
+        let start_value_string = ak.string_view_replace(&start_value_code_points, ak.sv("?"), ak.sv("0"), ak.ReplaceMode.all)
+        let maybe_start_value = ak.parse_hexadecimal_number_string_view_u32(ak.byte_string_view(&start_value_string))
+        if maybe_start_value == none:
+            css_report_invalid_urange(ak.string_from_utf8(text) else trap("MUST: String::from_utf8"), ak.string_from_str("?-converted start value did not parse as hex number."))
+            return none
+        let start_value = maybe_start_value else trap("VERIFY: a start value")
+
+        # 3. Interpret the consumed code points as a hexadecimal number again,
+        #    with the U+003F QUESTION MARK (?) code points replaced by U+0046 LATIN CAPITAL LETTER F (F) code points.
+        #    This is the end value.
+        let end_value_string = ak.string_view_replace(&start_value_code_points, ak.sv("?"), ak.sv("F"), ak.ReplaceMode.all)
+        let maybe_end_value = ak.parse_hexadecimal_number_string_view_u32(ak.byte_string_view(&end_value_string))
+        if maybe_end_value == none:
+            css_report_invalid_urange(ak.string_from_utf8(text) else trap("MUST: String::from_utf8"), ak.string_from_str("?-converted end value did not parse as hex number."))
+            return none
+        let end_value = maybe_end_value else trap("VERIFY: an end value")
+
+        # 4. Exit this algorithm.
+        return css_make_valid_unicode_range(text, start_value, end_value)
+    #   Otherwise, interpret the consumed code points as a hexadecimal number. This is the start value.
+    let maybe_start_value = ak.parse_hexadecimal_number_string_view_u32(start_value_code_points)
+    if maybe_start_value == none:
+        css_report_invalid_urange(ak.string_from_utf8(text) else trap("MUST: String::from_utf8"), ak.string_from_str("Start value did not parse as hex number."))
+        return none
+    let start_value = maybe_start_value else trap("VERIFY: a start value")
+
+    # 4. If there are no code points left in text, The end value is the same as the start value.
+    #    Exit this algorithm.
+    if ak.generic_lexer_tell_remaining(&lexer) == 0:
+        return css_make_valid_unicode_range(text, start_value, start_value)
+
+    # 5. If the next code point in text is U+002D HYPHEN-MINUS (-), consume it.
+    if ak.generic_lexer_next_is_t_char_type(&lexer, '-'):
+        discard(ak.generic_lexer_consume(&lexer))
+    #    Otherwise, this is an invalid <urange>, and this algorithm must exit.
+    else:
+        css_report_invalid_urange(ak.string_from_utf8(text) else trap("MUST: String::from_utf8"), ak.string_from_str("Start and end values not separated by '-'."))
+        return none
+
+    # 6. Consume as many hex digits as possible from text.
+    let end_hex_digits = ak.generic_lexer_consume_while(&lexer, &is_ascii_hex_digit)
+
+    #   If zero hex digits were consumed, or more than 6 hex digits were consumed,
+    #   this is an invalid <urange>, and this algorithm must exit.
+    if ak.string_view_length(&end_hex_digits) == 0 or ak.string_view_length(&end_hex_digits) > 6:
+        css_report_invalid_urange(ak.string_from_utf8(text) else trap("MUST: String::from_utf8"),
+                                  css_string_formatted("End value had {} digits, expected between 1 and 6.", [ak.arg_u64((u64)ak.string_view_length(&end_hex_digits))]))
+        return none
+
+    #   If there are any code points left in text, this is an invalid <urange>, and this algorithm must exit.
+    if ak.generic_lexer_tell_remaining(&lexer) != 0:
+        css_report_invalid_urange(ak.string_from_utf8(text) else trap("MUST: String::from_utf8"),
+                                  css_string_formatted("Has {} trailing unused code points.", [ak.arg_u64((u64)ak.generic_lexer_tell_remaining(&lexer))]))
+        return none
+
+    # 7. Interpret the consumed code points as a hexadecimal number. This is the end value.
+    let maybe_end_value = ak.parse_hexadecimal_number_string_view_u32(end_hex_digits)
+    if maybe_end_value == none:
+        css_report_invalid_urange(ak.string_from_utf8(text) else trap("MUST: String::from_utf8"), ak.string_from_str("End value did not parse as hex number."))
+        return none
+    let end_value = maybe_end_value else trap("VERIFY: an end value")
+
+    return css_make_valid_unicode_range(text, start_value, end_value)
+
+## The `[](auto it) { return it == '?'; }` predicate of parse_unicode_range(StringView).
+struct CssIsQuestionMark: ak.CharPredicate:
+    var unused: u8
+
+    func matches(ch: u8) -> bool:
+        return ch == '?'
+
+## Ported from Libraries/LibWeb/CSS/Parser/ValueParsing.cpp:558 Web::CSS::Parser::Parser::parse_unicode_ranges.
+pub func css_parser_parse_unicode_ranges(this: CssParser*, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> ak.Vector[web_fonts.UnicodeRange]:
+    var unicode_ranges = ak.Vector[web_fonts.UnicodeRange]()
+    let range_token_lists = css_parser_parse_a_comma_separated_list_of_component_values(this, tokens)
+    for range_tokens in ak.vector_span_const(&range_token_lists):
+        var range_token_stream = css_syntax.token_stream_create(range_tokens)
+        let maybe_unicode_range = css_parser_parse_unicode_range_token_stream(this, &range_token_stream)
+        if let unicode_range = maybe_unicode_range:
+            ak.vector_append_t(&unicode_ranges, unicode_range)
+        else:
+            return ak.Vector[web_fonts.UnicodeRange]()
+    return unicode_ranges
+
+## Ported from Libraries/LibWeb/CSS/Parser/ValueParsing.cpp:572 Web::CSS::Parser::Parser::parse_unicode_range_value.
+pub func css_parser_parse_unicode_range_value(this: CssParser*, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssUnicodeRangeStyleValue*?:
+    if let range = css_parser_parse_unicode_range_token_stream(this, tokens):
+        return css_unicode_range_style_value_create(range)
+    return none

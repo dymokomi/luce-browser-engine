@@ -1,0 +1,505 @@
+#==============================================================================================
+#
+#   gradient_parsing - parsing the CSS gradient functions
+#
+#   DESCRIPTION:
+#       Port of LibWeb/CSS/Parser/GradientParsing.cpp (lines 1-504): color stop lists (linear
+#       and angular), linear-gradient() (with -webkit-linear-gradient() and the repeating
+#       forms), conic-gradient() and radial-gradient(). The C++ lambdas are the functions
+#       before the parser that uses them; parse_color_stop_list's `auto parse_position` is an
+#       ak.Function1.
+#
+#       Copyright (c) 2018-2022, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2020-2021, the SerenityOS developers.
+#       Copyright (c) 2021-2025, Sam Atkins <sam@ladybird.org>
+#       Copyright (c) 2021, Tobias Christiansen <tobyase@serenityos.org>
+#       Copyright (c) 2022, MacDue <macdue@dueutil.tech>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Color stop lists ========================================================================
+
+## The `ElementType` enum of parse_color_stop_list.
+enum CssColorStopListElementType:
+    garbage
+    color_stop
+    color_hint
+
+## The `parse_color_stop_list_element` lambda of parse_color_stop_list: parse one element into `element`.
+func css_parser_parse_color_stop_list_element(this: CssParser*, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*, parse_position: ak.Function1[css_syntax.TokenStream[css_syntax.ComponentValue]*, CssStyleValue*?], element: CssColorStopListElement*) -> CssColorStopListElementType:
+    css_syntax.token_stream_discard_whitespace(tokens)
+    if not css_syntax.token_stream_has_next_token(tokens):
+        return CssColorStopListElementType.garbage
+
+    var color: CssStyleValue*? = none
+    var position: CssStyleValue*? = none
+    var second_position: CssStyleValue*? = none
+    position = ak.function1_call(&parse_position, tokens)
+    if position != none:
+        # [<T-percentage> <color>] or [<T-percentage>]
+        css_syntax.token_stream_discard_whitespace(tokens)
+        # <T-percentage>
+        if not css_syntax.token_stream_has_next_token(tokens) or css_next_token_is(tokens, .comma):
+            element.transition_hint = position
+            return CssColorStopListElementType.color_hint
+        # <T-percentage> <color>
+        let maybe_color = css_parser_parse_color_value(this, tokens) else return CssColorStopListElementType.garbage
+        color = maybe_color
+    else:
+        # [<color> <T-percentage>?]
+        let maybe_color = css_parser_parse_color_value(this, tokens) else return CssColorStopListElementType.garbage
+        color = maybe_color
+        css_syntax.token_stream_discard_whitespace(tokens)
+        # Allow up to [<color> <T-percentage> <T-percentage>] (double-position color stops)
+        # Note: Double-position color stops only appear to be valid in this order.
+        # NB: The donor's `if (!stop_position)` tests the pointer to the variable, which is never null, so a
+        #     position that does not parse is stored as null and the element is not garbage.
+        for stop_index in 0..<2:
+            if css_syntax.token_stream_has_next_token(tokens) and not css_next_token_is(tokens, .comma):
+                if stop_index == 0:
+                    position = ak.function1_call(&parse_position, tokens)
+                else:
+                    second_position = ak.function1_call(&parse_position, tokens)
+                css_syntax.token_stream_discard_whitespace(tokens)
+
+    element.color_stop = CssColorStopListElementColorStop(color = color, position = position, second_position = second_position)
+    return CssColorStopListElementType.color_stop
+
+## Ported from Libraries/LibWeb/CSS/Parser/GradientParsing.cpp:23 Web::CSS::Parser::Parser::parse_color_stop_list.
+pub func css_parser_parse_color_stop_list(this: CssParser*, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*, parse_position: ak.Function1[css_syntax.TokenStream[css_syntax.ComponentValue]*, CssStyleValue*?]) -> ak.Vector[CssColorStopListElement]?:
+    var first_element = CssColorStopListElement()
+    if css_parser_parse_color_stop_list_element(this, tokens, parse_position, &first_element) != CssColorStopListElementType.color_stop:
+        return none
+
+    var color_stops = ak.Vector[CssColorStopListElement]()
+    ak.vector_append_t(&color_stops, first_element)
+    while css_syntax.token_stream_has_next_token(tokens):
+        var list_element = CssColorStopListElement()
+        css_syntax.token_stream_discard_whitespace(tokens)
+        if not css_next_token_is_consumed(tokens, .comma):
+            return none
+        let element_type = css_parser_parse_color_stop_list_element(this, tokens, parse_position, &list_element)
+        if element_type == CssColorStopListElementType.color_hint:
+            # <color-hint>, <color-stop>
+            css_syntax.token_stream_discard_whitespace(tokens)
+            if not css_next_token_is_consumed(tokens, .comma):
+                return none
+            # Note: This fills in the color stop on the same list_element as the color hint (it does not overwrite it).
+            if css_parser_parse_color_stop_list_element(this, tokens, parse_position, &list_element) != CssColorStopListElementType.color_stop:
+                return none
+        elif element_type == CssColorStopListElementType.color_stop:
+            # <color-stop>
+            discard(element_type)
+        else:
+            return none
+        ak.vector_append_t(&color_stops, list_element)
+
+    return color_stops
+
+## Ported from Libraries/LibWeb/CSS/Parser/GradientParsing.cpp:105 Web::CSS::Parser::consume_if_starts_with.
+## The C++ `found_callback` sets a flag of its caller; here the flag is `found`.
+func css_consume_if_starts_with(str_: ak.StringView, start: ak.StringView, found: bool*) -> ak.StringView:
+    if ak.string_view_starts_with_string_view(&str_, start, ak.CaseSensitivity.case_insensitive):
+        *found = true
+        return ak.string_view_substring_view(&str_, ak.string_view_length(&start))
+    return str_
+
+## The `[&](auto& it) { return parse_length_percentage_value(it, infinite_range, infinite_range); }` position parser.
+func css_parser_parse_linear_color_stop_position(context: void*?, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssStyleValue*?:
+    return css_parser_parse_length_percentage_value((CssParser*)(context else trap("no parser")), tokens, css_infinite_range, css_infinite_range)
+
+## Ported from Libraries/LibWeb/CSS/Parser/GradientParsing.cpp:114 Web::CSS::Parser::Parser::parse_linear_color_stop_list.
+pub func css_parser_parse_linear_color_stop_list(this: CssParser*, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> ak.Vector[CssColorStopListElement]?:
+    # <color-stop-list> =
+    #   <linear-color-stop> , [ <linear-color-hint>? , <linear-color-stop> ]#
+    return css_parser_parse_color_stop_list(this, tokens, ak.Function1[css_syntax.TokenStream[css_syntax.ComponentValue]*, CssStyleValue*?](call = css_parser_parse_linear_color_stop_position, context = this))
+
+## The angular position parser of parse_angular_color_stop_list: <zero> or <angle-percentage>.
+func css_parser_parse_angular_color_stop_position(context: void*?, it: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssStyleValue*?:
+    let this = (CssParser*)(context else trap("no parser"))
+    # NB: The donor's lambda reads the outer `tokens`, which is the same stream as `it`.
+    if css_next_token_is(it, .number):
+        var transaction = css_syntax.token_stream_begin_transaction(it)
+        defer css_syntax.state_transaction_destroy(&transaction)
+        let number_token = css_consume_a_token_token(it)
+        let numeric_value = css_syntax.token_number_value(&number_token)
+        if numeric_value == 0.0:
+            css_syntax.state_transaction_commit(&transaction)
+            return css_angle_style_value_create(css_angle_make_degrees(0.0)).css_style_value()
+
+    return css_parser_parse_angle_percentage_value(this, it, css_infinite_range, css_infinite_range)
+
+## Ported from Libraries/LibWeb/CSS/Parser/GradientParsing.cpp:123 Web::CSS::Parser::Parser::parse_angular_color_stop_list.
+pub func css_parser_parse_angular_color_stop_list(this: CssParser*, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> ak.Vector[CssColorStopListElement]?:
+    # <angular-color-stop-list> =
+    #   <angular-color-stop> , [ <angular-color-hint>? , <angular-color-stop> ]#
+    return css_parser_parse_color_stop_list(this, tokens, ak.Function1[css_syntax.TokenStream[css_syntax.ComponentValue]*, CssStyleValue*?](call = css_parser_parse_angular_color_stop_position, context = this))
+
+# mark: linear-gradient() =======================================================================
+
+## The `to_side` lambda of parse_linear_gradient_function.
+func css_to_side(value: ak.StringView) -> CssSideOrCorner?:
+    if ak.string_view_equals_ignoring_ascii_case(&value, ak.sv("top")):
+        return CssSideOrCorner.top
+    if ak.string_view_equals_ignoring_ascii_case(&value, ak.sv("bottom")):
+        return CssSideOrCorner.bottom
+    if ak.string_view_equals_ignoring_ascii_case(&value, ak.sv("left")):
+        return CssSideOrCorner.left
+    if ak.string_view_equals_ignoring_ascii_case(&value, ak.sv("right")):
+        return CssSideOrCorner.right
+    return none
+
+## The `is_to_side_or_corner` lambda of parse_linear_gradient_function.
+func css_is_to_side_or_corner(token: const css_syntax.ComponentValue*, gradient_type: CssLinearGradientStyleValueGradientType) -> bool:
+    if not css_syntax.component_value_is(token, .ident):
+        return false
+    let ident = css_component_value_ident(token)
+    if gradient_type == CssLinearGradientStyleValueGradientType.web_kit:
+        return css_to_side(ak.fly_string_bytes_as_string_view(&ident)) != none
+    return ak.fly_string_equals_ignoring_ascii_case_string_view(&ident, ak.sv("to"))
+
+## `RefPtr<ColorInterpolationMethodStyleValue const>` as a `RefPtr<StyleValue const>`.
+func css_style_value_of_interpolation_method(method: CssColorInterpolationMethodStyleValue*?) -> CssStyleValue*?:
+    if let value = method:
+        return value.css_style_value()
+    return none
+
+## Ported from Libraries/LibWeb/CSS/Parser/GradientParsing.cpp:143 Web::CSS::Parser::Parser::parse_linear_gradient_function.
+pub func css_parser_parse_linear_gradient_function(this: CssParser*, outer_tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssLinearGradientStyleValue*?:
+    var transaction = css_syntax.token_stream_begin_transaction(outer_tokens)
+    defer css_syntax.state_transaction_destroy(&transaction)
+    let component_value = css_syntax.token_stream_consume_a_token(outer_tokens)
+
+    if not css_syntax.component_value_is_function(&component_value):
+        return none
+
+    var repeating = false
+    var is_webkit = false
+
+    let function = css_syntax.component_value_function(&component_value)
+    var function_name = ak.fly_string_bytes_as_string_view(&function.name)
+
+    function_name = css_consume_if_starts_with(function_name, ak.sv("-webkit-"), &is_webkit)
+    let gradient_type = CssLinearGradientStyleValueGradientType.web_kit if is_webkit else CssLinearGradientStyleValueGradientType.standard
+
+    css_parser_push_temporary_value_parsing_context(this, CssValueParsingContext.css_function_context(CssFunctionContext(name = function_name)))
+    defer css_parser_pop_temporary_value_parsing_context(this)
+
+    function_name = css_consume_if_starts_with(function_name, ak.sv("repeating-"), &repeating)
+    let repeating_gradient = CssGradientRepeating.yes if repeating else CssGradientRepeating.no
+
+    if not ak.string_view_equals_ignoring_ascii_case(&function_name, ak.sv("linear-gradient")):
+        return none
+
+    # <linear-gradient-syntax> = [ [ <angle> | <zero> | to <side-or-corner> ] || <color-interpolation-method> ]? , <color-stop-list>
+
+    var tokens = css_syntax.token_stream_create(function.value)
+    css_syntax.token_stream_discard_whitespace(&tokens)
+
+    if not css_syntax.token_stream_has_next_token(&tokens):
+        return none
+
+    var has_direction_param = true
+    var gradient_direction = CssLinearGradientStyleValueGradientDirection.css_side_or_corner(CssSideOrCorner.bottom if gradient_type == CssLinearGradientStyleValueGradientType.standard else CssSideOrCorner.top)
+
+    var maybe_interpolation_method = css_parser_parse_color_interpolation_method_value(this, &tokens)
+    css_syntax.token_stream_discard_whitespace(&tokens)
+
+    let first_param = css_syntax.token_stream_next_token(&tokens)
+    if let maybe_angle = css_parser_parse_angle_value(this, &tokens, css_infinite_range):
+        gradient_direction = CssLinearGradientStyleValueGradientDirection.css_style_value(maybe_angle)
+    elif css_syntax.component_value_is(&first_param, .number) and css_component_value_number_is_zero(&first_param):
+        # <zero>
+        css_syntax.token_stream_discard_a_token(&tokens)  # <zero>
+        gradient_direction = CssLinearGradientStyleValueGradientDirection.css_style_value(css_angle_style_value_create(css_angle_make_degrees(0.0)).css_style_value())
+    elif css_is_to_side_or_corner(&first_param, gradient_type):
+        # <side-or-corner> = [left | right] || [top | bottom]
+
+        # Note: -webkit-linear-gradient does not include to the "to" prefix on the side or corner
+        if gradient_type == CssLinearGradientStyleValueGradientType.standard:
+            css_syntax.token_stream_discard_a_token(&tokens)
+            css_syntax.token_stream_discard_whitespace(&tokens)
+
+            if not css_syntax.token_stream_has_next_token(&tokens):
+                return none
+
+        # [left | right] || [top | bottom]
+        let first_side = css_syntax.token_stream_consume_a_token(&tokens)
+        if not css_syntax.component_value_is(&first_side, .ident):
+            return none
+
+        let first_side_ident = css_component_value_ident(&first_side)
+        var side_a = css_to_side(ak.fly_string_bytes_as_string_view(&first_side_ident))
+        css_syntax.token_stream_discard_whitespace(&tokens)
+        var side_b: CssSideOrCorner? = none
+        if css_syntax.token_stream_has_next_token(&tokens) and css_next_token_is(&tokens, .ident):
+            let next = css_syntax.token_stream_next_token(&tokens)
+            let next_ident = css_component_value_ident(&next)
+            side_b = css_to_side(ak.fly_string_bytes_as_string_view(&next_ident))
+
+        if side_a != none and side_b == none:
+            gradient_direction = CssLinearGradientStyleValueGradientDirection.css_side_or_corner(side_a else trap("VERIFY: a side"))
+        elif side_a != none and side_b != none:
+            css_syntax.token_stream_discard_a_token(&tokens)
+            # Convert two sides to a corner
+            if (i32)(side_b else trap("VERIFY: a side")) < (i32)(side_a else trap("VERIFY: a side")):
+                let swapped = side_a
+                side_a = side_b
+                side_b = swapped
+            if side_a == CssSideOrCorner.top and side_b == CssSideOrCorner.left:
+                gradient_direction = CssLinearGradientStyleValueGradientDirection.css_side_or_corner(CssSideOrCorner.top_left)
+            elif side_a == CssSideOrCorner.top and side_b == CssSideOrCorner.right:
+                gradient_direction = CssLinearGradientStyleValueGradientDirection.css_side_or_corner(CssSideOrCorner.top_right)
+            elif side_a == CssSideOrCorner.bottom and side_b == CssSideOrCorner.left:
+                gradient_direction = CssLinearGradientStyleValueGradientDirection.css_side_or_corner(CssSideOrCorner.bottom_left)
+            elif side_a == CssSideOrCorner.bottom and side_b == CssSideOrCorner.right:
+                gradient_direction = CssLinearGradientStyleValueGradientDirection.css_side_or_corner(CssSideOrCorner.bottom_right)
+            else:
+                return none
+        else:
+            return none
+    else:
+        has_direction_param = false
+
+    if maybe_interpolation_method == none:
+        css_syntax.token_stream_discard_whitespace(&tokens)
+        maybe_interpolation_method = css_parser_parse_color_interpolation_method_value(this, &tokens)
+
+    css_syntax.token_stream_discard_whitespace(&tokens)
+    if not css_syntax.token_stream_has_next_token(&tokens):
+        return none
+
+    if (has_direction_param or maybe_interpolation_method != none) and not css_next_token_is_consumed(&tokens, .comma):
+        return none
+
+    let color_stops = css_parser_parse_linear_color_stop_list(this, &tokens) else return none
+
+    css_syntax.state_transaction_commit(&transaction)
+    return css_linear_gradient_style_value_create(gradient_direction, color_stops, gradient_type, repeating_gradient, css_style_value_of_interpolation_method(maybe_interpolation_method))
+
+## `token.is(Token::Type::Number) && token.token().number_value() == 0` for a number token.
+func css_component_value_number_is_zero(component_value: const css_syntax.ComponentValue*) -> bool:
+    let token = css_syntax.component_value_token(component_value)
+    return css_syntax.token_number_value(&token) == 0.0
+
+# mark: conic-gradient() ========================================================================
+
+## The `consume_identifier` lambda of parse_conic_gradient_function.
+func css_consume_identifier(tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*, token: const css_syntax.ComponentValue*, identifier: str) -> bool:
+    let token_string = css_component_value_ident(token)
+    if ak.fly_string_equals_ignoring_ascii_case_string_view(&token_string, ak.sv(identifier)):
+        css_syntax.token_stream_discard_a_token(tokens)
+        css_syntax.token_stream_discard_whitespace(tokens)
+        return true
+    return false
+
+## `token->token().ident().equals_ignoring_ascii_case(identifier)`.
+func css_component_value_ident_equals_ignoring_ascii_case(token: const css_syntax.ComponentValue*, identifier: str) -> bool:
+    let ident = css_component_value_ident(token)
+    return ak.fly_string_equals_ignoring_ascii_case_string_view(&ident, ak.sv(identifier))
+
+## Ported from Libraries/LibWeb/CSS/Parser/GradientParsing.cpp:281 Web::CSS::Parser::Parser::parse_conic_gradient_function.
+pub func css_parser_parse_conic_gradient_function(this: CssParser*, outer_tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssConicGradientStyleValue*?:
+    var transaction = css_syntax.token_stream_begin_transaction(outer_tokens)
+    defer css_syntax.state_transaction_destroy(&transaction)
+    let component_value = css_syntax.token_stream_consume_a_token(outer_tokens)
+
+    if not css_syntax.component_value_is_function(&component_value):
+        return none
+
+    var repeating = false
+
+    let function = css_syntax.component_value_function(&component_value)
+    var function_name = ak.fly_string_bytes_as_string_view(&function.name)
+    css_parser_push_temporary_value_parsing_context(this, CssValueParsingContext.css_function_context(CssFunctionContext(name = function_name)))
+    defer css_parser_pop_temporary_value_parsing_context(this)
+
+    function_name = css_consume_if_starts_with(function_name, ak.sv("repeating-"), &repeating)
+    let repeating_gradient = CssGradientRepeating.yes if repeating else CssGradientRepeating.no
+
+    if not ak.string_view_equals_ignoring_ascii_case(&function_name, ak.sv("conic-gradient")):
+        return none
+
+    var tokens = css_syntax.token_stream_create(function.value)
+    css_syntax.token_stream_discard_whitespace(&tokens)
+
+    if not css_syntax.token_stream_has_next_token(&tokens):
+        return none
+
+    var from_angle: CssStyleValue*? = none
+    var at_position: CssPositionStyleValue*? = none
+    var maybe_interpolation_method: CssStyleValue*? = none
+
+    # conic-gradient( [ [ [ from [ <angle> | <zero> ] ]? [ at <position> ]? ] || <color-interpolation-method> ]? , <angular-color-stop-list> )
+    var token = css_syntax.token_stream_next_token(&tokens)
+    while css_syntax.component_value_is(&token, .ident):
+        if css_consume_identifier(&tokens, &token, "from"):
+            # from [ <angle> | <zero> ]
+            if from_angle != none or at_position != none:
+                return none
+            if let maybe_angle = css_parser_parse_angle_value(this, &tokens, css_infinite_range):
+                from_angle = maybe_angle
+            else:
+                let peek_token = css_syntax.token_stream_next_token(&tokens)
+                if css_syntax.component_value_is(&peek_token, .number) and css_component_value_number_is_zero(&peek_token):
+                    css_syntax.token_stream_discard_a_token(&tokens)  # 0
+                    from_angle = css_angle_style_value_create(css_angle_make_degrees(0.0)).css_style_value()
+                else:
+                    return none
+        elif css_consume_identifier(&tokens, &token, "at"):
+            # at <position>
+            if at_position != none:
+                return none
+            let position = css_parser_parse_position_value(this, &tokens) else return none
+            at_position = position
+        elif css_component_value_ident_equals_ignoring_ascii_case(&token, "in"):
+            # <color-interpolation-method>
+            if maybe_interpolation_method != none:
+                return none
+            maybe_interpolation_method = css_style_value_of_interpolation_method(css_parser_parse_color_interpolation_method_value(this, &tokens))
+            if maybe_interpolation_method == none:
+                return none
+        else:
+            break
+        css_syntax.token_stream_discard_whitespace(&tokens)
+        if not css_syntax.token_stream_has_next_token(&tokens):
+            return none
+        token = css_syntax.token_stream_next_token(&tokens)
+
+    css_syntax.token_stream_discard_whitespace(&tokens)
+    if not css_syntax.token_stream_has_next_token(&tokens):
+        return none
+    if (from_angle != none or at_position != none or maybe_interpolation_method != none) and not css_next_token_is_consumed(&tokens, .comma):
+        return none
+
+    let color_stops = css_parser_parse_angular_color_stop_list(this, &tokens) else return none
+
+    if at_position == none:
+        at_position = css_position_style_value_create_center()
+
+    css_syntax.state_transaction_commit(&transaction)
+    return css_conic_gradient_style_value_create(from_angle, at_position else trap("VERIFY: a position"), color_stops, repeating_gradient, maybe_interpolation_method)
+
+# mark: radial-gradient() =======================================================================
+
+## The `parse_ending_shape` lambda of parse_radial_gradient_function (`commit_value` commits its transaction).
+func css_parse_ending_shape(tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssRadialGradientStyleValueEndingShape?:
+    var transaction = css_syntax.token_stream_begin_transaction(tokens)
+    defer css_syntax.state_transaction_destroy(&transaction)
+    css_syntax.token_stream_discard_whitespace(tokens)
+    let token = css_syntax.token_stream_consume_a_token(tokens)
+    if not css_syntax.component_value_is(&token, .ident):
+        return none
+    let ident = css_component_value_ident(&token)
+    if ak.fly_string_equals_ignoring_ascii_case_string_view(&ident, ak.sv("circle")):
+        css_syntax.state_transaction_commit(&transaction)
+        return CssRadialGradientStyleValueEndingShape.circle
+    if ak.fly_string_equals_ignoring_ascii_case_string_view(&ident, ak.sv("ellipse")):
+        css_syntax.state_transaction_commit(&transaction)
+        return CssRadialGradientStyleValueEndingShape.ellipse
+    return none
+
+## `component.has<RadialExtent>()`.
+func css_radial_size_component_is_extent(component: const CssRadialSizeStyleValueComponent*) -> bool:
+    match *component:
+        .radial_extent(_): return true
+        _: return false
+
+## Ported from Libraries/LibWeb/CSS/Parser/GradientParsing.cpp:377 Web::CSS::Parser::Parser::parse_radial_gradient_function.
+pub func css_parser_parse_radial_gradient_function(this: CssParser*, outer_tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssRadialGradientStyleValue*?:
+    var transaction = css_syntax.token_stream_begin_transaction(outer_tokens)
+    defer css_syntax.state_transaction_destroy(&transaction)
+    let component_value = css_syntax.token_stream_consume_a_token(outer_tokens)
+
+    if not css_syntax.component_value_is_function(&component_value):
+        return none
+
+    var repeating = false
+
+    let function = css_syntax.component_value_function(&component_value)
+    var function_name = ak.fly_string_bytes_as_string_view(&function.name)
+    css_parser_push_temporary_value_parsing_context(this, CssValueParsingContext.css_function_context(CssFunctionContext(name = function_name)))
+    defer css_parser_pop_temporary_value_parsing_context(this)
+
+    function_name = css_consume_if_starts_with(function_name, ak.sv("repeating-"), &repeating)
+    let repeating_gradient = CssGradientRepeating.yes if repeating else CssGradientRepeating.no
+
+    if not ak.string_view_equals_ignoring_ascii_case(&function_name, ak.sv("radial-gradient")):
+        return none
+
+    var tokens = css_syntax.token_stream_create(function.value)
+    css_syntax.token_stream_discard_whitespace(&tokens)
+    if not css_syntax.token_stream_has_next_token(&tokens):
+        return none
+
+    var expect_comma = false
+
+    # <radial-gradient-syntax> = [ [ [ <radial-shape> || <radial-size> ]? [ at <position> ]? ] || <color-interpolation-method> ]? , <color-stop-list>
+    # FIXME: Maybe rename ending-shape things to radial-shape
+
+    let farthest_corner: css_data.RadialExtent[1] = [css_data.RadialExtent.farthest_corner]
+    var size = css_radial_size_of_extents(farthest_corner)
+    var ending_shape = CssRadialGradientStyleValueEndingShape.circle
+    var at_position: CssPositionStyleValue*? = none
+
+    var maybe_interpolation_method = css_parser_parse_color_interpolation_method_value(this, &tokens)
+    css_syntax.token_stream_discard_whitespace(&tokens)
+
+    # [ <ending-shape> || <size> ]?
+    var maybe_ending_shape = css_parse_ending_shape(&tokens)
+    let maybe_size = css_parser_parse_radial_size(this, &tokens)
+    if maybe_ending_shape == none and maybe_size != none:
+        maybe_ending_shape = css_parse_ending_shape(&tokens)
+    if let parsed_size = maybe_size:
+        size = parsed_size
+        expect_comma = true
+    let components = css_radial_size_style_value_components(size)
+    if let parsed_ending_shape = maybe_ending_shape:
+        expect_comma = true
+        ending_shape = parsed_ending_shape
+        if ending_shape == CssRadialGradientStyleValueEndingShape.circle and ak.vector_size(&components) != 1:
+            return none
+        # AD-HOC: The spec is unclear how a single <length-percentage> value should work with an ellipse
+        #         (see https://github.com/w3c/csswg-drafts/issues/10812#issuecomment-2325997811) so we disallow it
+        #         for now which aligns with WPT and level 3 of the spec.
+        if ending_shape == CssRadialGradientStyleValueEndingShape.ellipse and ak.vector_size(&components) != 2 and not css_radial_size_component_is_extent(ak.vector_at_const(&components, 0)):
+            return none
+    else:
+        # https://drafts.csswg.org/css-images-3/#typedef-radial-gradient-syntax
+        # If <radial-shape> is omitted, the ending shape defaults to a circle if the <radial-size> is a single
+        # <length>, and to an ellipse otherwise.
+        # NB: Level 4 allows <length-percentage> rather than just <length> for circles
+        ending_shape = CssRadialGradientStyleValueEndingShape.circle if (ak.vector_size(&components) == 1 and not css_radial_size_component_is_extent(ak.vector_at_const(&components, 0))) else CssRadialGradientStyleValueEndingShape.ellipse
+
+    css_syntax.token_stream_discard_whitespace(&tokens)
+    if not css_syntax.token_stream_has_next_token(&tokens):
+        return none
+
+    if css_next_token_is_ident(&tokens, "at"):
+        css_syntax.token_stream_discard_a_token(&tokens)
+        let position = css_parser_parse_position_value(this, &tokens) else return none
+        at_position = position
+        expect_comma = true
+
+    css_syntax.token_stream_discard_whitespace(&tokens)
+    if maybe_interpolation_method == none:
+        maybe_interpolation_method = css_parser_parse_color_interpolation_method_value(this, &tokens)
+        css_syntax.token_stream_discard_whitespace(&tokens)
+
+    if maybe_interpolation_method != none:
+        expect_comma = true
+
+    if not css_syntax.token_stream_has_next_token(&tokens):
+        return none
+    if expect_comma and not css_next_token_is_consumed(&tokens, .comma):
+        return none
+
+    # <color-stop-list>
+    let color_stops = css_parser_parse_linear_color_stop_list(this, &tokens) else return none
+
+    if at_position == none:
+        at_position = css_position_style_value_create_center()
+
+    css_syntax.state_transaction_commit(&transaction)
+    return css_radial_gradient_style_value_create(ending_shape, size.css_style_value(), at_position else trap("VERIFY: a position"), color_stops, repeating_gradient, css_style_value_of_interpolation_method(maybe_interpolation_method))
