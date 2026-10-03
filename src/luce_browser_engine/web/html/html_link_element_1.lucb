@@ -1,0 +1,513 @@
+#==============================================================================================
+#
+#   html_link_element_1 - HTML::HTMLLinkElement: <link>, its relationships and link requests
+#
+#   DESCRIPTION:
+#       Port of LibWeb/HTML/HTMLLinkElement.cpp (lines 1-471) and the inline functions of
+#       HTMLLinkElement.h: the constructor (which moves the mixin tables to HTMLLinkElement's,
+#       as C++'s vptrs move), initialize, visit_edges, insertion and removal (which drop the
+#       loaded style sheet), relList/sizes/media/sheet, the rel/type/disabled/media attribute
+#       change steps, the script-blocking and render-blocking answers, link processing options
+#       and link requests, and the default fetch of a linked resource. Fetching is phase 2:
+#       the fetch itself and the request setters are closure stubs. html_link_element_2 has the
+#       other link types, the processing of fetched resources and favicons.
+#
+#==============================================================================================
+
+# mark: Link types ==============================================================================
+
+## HTMLLinkElement::Relationship::Alternate (HTMLLinkElement.h:173): the bits of m_relationship.
+let html_link_element_relationship_alternate: u32 = 1 << 0
+## Relationship::Stylesheet.
+let html_link_element_relationship_stylesheet: u32 = 1 << 1
+## Relationship::Preload.
+let html_link_element_relationship_preload: u32 = 1 << 2
+## Relationship::DNSPrefetch.
+let html_link_element_relationship_dns_prefetch: u32 = 1 << 3
+## Relationship::Preconnect.
+let html_link_element_relationship_preconnect: u32 = 1 << 4
+## Relationship::Icon.
+let html_link_element_relationship_icon: u32 = 1 << 5
+
+# mark: Construction ============================================================================
+
+## Ported from HTMLLinkElement.cpp:46 Web::HTML::HTMLLinkElement::HTMLLinkElement.
+pub func html_link_element_construct(this: HtmlLinkElement*, document: DomDocument*, qualified_name: DomQualifiedName):
+    html_element_construct(this.html_element(), document, qualified_name)
+    # The vptrs of the mixin bases move to HTMLLinkElement's tables.
+    let element = this.html_element()
+    element.element.slottable_mixin.vtable = &html_link_element_slottable_mixin_vtable
+    element.element.aria_mixin.vtable = &html_link_element_aria_mixin_vtable
+    element.element.animatable.vtable = &html_link_element_animatable_vtable
+    element.global_event_handlers.vtable = &html_link_element_global_event_handlers_vtable
+    element.form_associated_element.vtable = &html_link_element_form_associated_element_vtable
+
+## Ported from HTMLLinkElement.cpp:53 Web::HTML::HTMLLinkElement::initialize (override).
+pub func html_link_element_initialize_impl(base: JsCell*, realm: Realm*):
+    web_set_prototype_for_interface(base, realm, BindInterfaceName.html_link_element)
+    html_element_initialize_impl(base, realm)
+
+## Ported from HTMLLinkElement.cpp:59 Web::HTML::HTMLLinkElement::visit_edges (override).
+pub func html_link_element_visit_edges_impl(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (HtmlLinkElement*)base
+    html_element_visit_edges_impl(base, visitor)
+    gc.cell_visitor_visit_cell(visitor, (gc.Cell*?)this.m_fetch_controller)  # opaque in phase 1
+    gc.cell_visitor_visit_t(visitor, this.m_loaded_style_sheet)
+    gc.cell_visitor_visit_t(visitor, this.m_rel_list)
+    gc.cell_visitor_visit_t(visitor, this.m_sizes)
+
+# mark: Insertion and removal ===================================================================
+
+## Ported from HTMLLinkElement.cpp:68 Web::HTML::HTMLLinkElement::inserted (override).
+pub func html_link_element_inserted_impl(base: DomNode*):
+    let this = (HtmlLinkElement*)base
+    html_element_inserted_impl(base)
+
+    if dom_document_browsing_context(dom_node_document(base)) == none:
+        return
+
+    if html_link_element_should_fetch_and_process_resource_type(this) and dom_node_is_browsing_context_connected(base):
+        # The appropriate times to fetch and process this type of link are:
+        #  - When the external resource link is created on a link element that is already browsing-context connected.
+        #  - When the external resource link's link element becomes browsing-context connected.
+        html_link_element_fetch_and_process_linked_resource(this)
+
+## Ported from HTMLLinkElement.cpp:83 Web::HTML::HTMLLinkElement::removed_from (override).
+pub func html_link_element_removed_from_impl(base: DomNode*, is_subtree_root: DomNodeIsSubtreeRoot, old_ancestor: DomNode*?, old_root: DomNode*):
+    let this = (HtmlLinkElement*)base
+    html_element_removed_from_impl(base, is_subtree_root, old_ancestor, old_root)
+
+    if let loaded_style_sheet = this.m_loaded_style_sheet:
+        # NB: We can't use `old_root` here. When this link element is nested
+        #     inside a shadow tree within a larger removed subtree, `old_root`
+        #     is the outer subtree's root, not the shadow root that actually
+        #     contains our stylesheet. Use the sheet's own tracked owning
+        #     root, which is the one whose StyleSheetList it belongs to.
+        var owning_roots = css_css_style_sheet_owning_documents_or_shadow_roots(loaded_style_sheet)
+        assert(ak.hash_table_size(&owning_roots) == 1)
+        var owning_root: DomNode*? = none
+        for root in ak.hash_table_begin(&owning_roots):
+            owning_root = *root
+            break
+        let root_node = owning_root else trap("VERIFY: an owning root")
+        var style_sheet_list: CssStyleSheetList*? = none
+        if let shadow_root = as_if_dom_shadow_root(root_node):
+            style_sheet_list = dom_shadow_root_style_sheets(shadow_root)
+        else:
+            style_sheet_list = dom_document_style_sheets(as_dom_document(root_node))
+
+        css_style_sheet_list_remove_a_css_style_sheet(style_sheet_list else trap("a style sheet list"), loaded_style_sheet)
+        this.m_loaded_style_sheet = none
+
+# mark: IDL attributes ==========================================================================
+
+## Ported from HTMLLinkElement.cpp:108 Web::HTML::HTMLLinkElement::rel_list.
+# https://html.spec.whatwg.org/multipage/semantics.html#dom-link-rellist
+pub func html_link_element_rel_list(this: HtmlLinkElement*) -> DomTokenList*:
+    # The relList IDL attribute must reflect the rel content attribute.
+    if this.m_rel_list == none:
+        this.m_rel_list = dom_token_list_create(this.dom_element(), html_attribute_names_rel)
+    return this.m_rel_list else trap("the relList token list")
+
+## Ported from HTMLLinkElement.cpp:117 Web::HTML::HTMLLinkElement::sizes.
+# https://html.spec.whatwg.org/multipage/semantics.html#dom-link-sizes
+pub func html_link_element_sizes(this: HtmlLinkElement*) -> DomTokenList*:
+    # The size IDL attribute must reflect the size content attribute.
+    if this.m_sizes == none:
+        this.m_sizes = dom_token_list_create(this.dom_element(), html_attribute_names_sizes)
+    return this.m_sizes else trap("the sizes token list")
+
+## Ported from HTMLLinkElement.cpp:125 Web::HTML::HTMLLinkElement::set_media.
+pub func html_link_element_set_media(this: HtmlLinkElement*, media: ak.String):
+    dom_element_set_attribute_value(this.dom_element(), html_attribute_names_media, media)
+    if let sheet = this.m_loaded_style_sheet:
+        css_style_sheet_set_media(sheet.css_style_sheet(), media)
+
+## Ported from HTMLLinkElement.cpp:132 Web::HTML::HTMLLinkElement::media.
+pub func html_link_element_media(this: HtmlLinkElement*) -> ak.String:
+    return dom_element_attribute(this.dom_element(), html_attribute_names_media) else ak.string_new()
+
+## Ported from HTMLLinkElement.cpp:138 Web::HTML::HTMLLinkElement::sheet.
+# https://drafts.csswg.org/cssom/#dom-linkstyle-sheet
+pub func html_link_element_sheet(this: HtmlLinkElement*) -> CssCssStyleSheet*?:
+    return this.m_loaded_style_sheet
+
+## Ported from HTMLLinkElement.cpp:143 Web::HTML::HTMLLinkElement::finished_loading_critical_style_subresources.
+pub func html_link_element_finished_loading_critical_style_subresources(this: HtmlLinkElement*, arg0: HtmlLinkElementAnyFailed):
+    html_link_element_clear_document_load_event_delayer(this)
+
+## `m_document_load_event_delayer.clear()`: destroys a held delayer.
+func html_link_element_clear_document_load_event_delayer(this: HtmlLinkElement*):
+    if let delayer = this.m_document_load_event_delayer:
+        var released = delayer
+        dom_document_load_event_delayer_destruct(&released)
+    this.m_document_load_event_delayer = none
+
+## Ported from HTMLLinkElement.cpp:148 Web::HTML::HTMLLinkElement::has_loaded_icon.
+pub func html_link_element_has_loaded_icon(this: HtmlLinkElement*) -> bool:
+    return (this.m_relationship & html_link_element_relationship_icon) != 0 and this.m_loaded_icon != none
+
+# mark: Attribute changes =======================================================================
+
+## Ported from HTMLLinkElement.cpp:153 Web::HTML::HTMLLinkElement::attribute_changed (override).
+pub func html_link_element_attribute_changed_impl(base: DomElement*, name: ak.FlyString, old_value: ak.String?, value: ak.String?, namespace_: ak.FlyString?):
+    let this = (HtmlLinkElement*)base
+    html_element_attribute_changed_impl(base, name, old_value, value, namespace_)
+
+    # https://html.spec.whatwg.org/multipage/semantics.html#processing-the-type-attribute:attr-link-type
+    if ak.fly_string_eq_fly_string(&name, &html_attribute_names_type):
+        if let type_value = value:
+            this.m_mime_type = ak.string_to_ascii_lowercase(&type_value)
+        else:
+            this.m_mime_type = none
+
+        return
+
+    # 4.6.7 Link types - https://html.spec.whatwg.org/multipage/links.html#linkTypes
+    let old_relationship = this.m_relationship
+    if ak.fly_string_eq_fly_string(&name, &html_attribute_names_rel):
+        this.m_relationship = 0
+        # Keywords are always ASCII case-insensitive, and must be compared as such.
+        let rel_value = value else ak.string_new()
+        let lowercased_value = ak.string_to_ascii_lowercase(&rel_value)
+        # To determine which link types apply to a link, a, area, or form element,
+        # the element's rel attribute must be split on ASCII whitespace.
+        # The resulting tokens are the keywords for the link types that apply to that element.
+        let is_ascii_whitespace = ak.CharPredicateFunction(function = web_infra.is_ascii_whitespace)
+        let lowercased_view = ak.string_bytes_as_string_view(&lowercased_value)
+        var parts = ak.string_view_split_view_if(&lowercased_view, &is_ascii_whitespace)
+        for part in ak.vector_span(&parts):
+            if ak.string_view_eq_string_view(&part, ak.sv("stylesheet")):
+                this.m_relationship |= html_link_element_relationship_stylesheet
+            elif ak.string_view_eq_string_view(&part, ak.sv("alternate")):
+                this.m_relationship |= html_link_element_relationship_alternate
+            elif ak.string_view_eq_string_view(&part, ak.sv("preload")):
+                this.m_relationship |= html_link_element_relationship_preload
+            elif ak.string_view_eq_string_view(&part, ak.sv("dns-prefetch")):
+                this.m_relationship |= html_link_element_relationship_dns_prefetch
+            elif ak.string_view_eq_string_view(&part, ak.sv("preconnect")):
+                this.m_relationship |= html_link_element_relationship_preconnect
+            elif ak.string_view_eq_string_view(&part, ak.sv("icon")):
+                this.m_relationship |= html_link_element_relationship_icon
+
+        if let rel_list = this.m_rel_list:
+            dom_token_list_associated_attribute_changed(rel_list, ak.string_bytes_as_string_view(&rel_value))
+
+    # https://html.spec.whatwg.org/multipage/semantics.html#the-link-element:explicitly-enabled
+    # Whenever the disabled attribute is removed, set the link element's explicitly enabled attribute to true.
+    if value == none and ak.fly_string_eq_fly_string(&name, &html_attribute_names_disabled):
+        this.m_explicitly_enabled = true
+
+    if (this.m_relationship & html_link_element_relationship_stylesheet) != 0:
+        if let loaded_style_sheet = this.m_loaded_style_sheet:
+            if ak.fly_string_eq_fly_string(&name, &html_attribute_names_disabled):
+                css_style_sheet_list_remove_a_css_style_sheet(dom_element_document_or_shadow_root_style_sheets(base), loaded_style_sheet)
+                this.m_loaded_style_sheet = none
+            elif ak.fly_string_eq_fly_string(&name, &html_attribute_names_media):
+                css_style_sheet_set_media(loaded_style_sheet.css_style_sheet(), value else ak.string_new())
+
+    if html_link_element_should_fetch_and_process_resource_type(this) and dom_node_is_browsing_context_connected(base.dom_node()):
+        # The appropriate times to fetch and process this type of link are:
+        # - When the href attribute of the link element of an external resource link that is already browsing-context connected is changed.
+        var fetch = ak.fly_string_eq_fly_string(&name, &html_attribute_names_href)
+
+        if not fetch and (this.m_relationship & (html_link_element_relationship_preconnect | html_link_element_relationship_stylesheet)) != 0:
+            # - When the crossorigin attribute of the link element of an external resource link that is already browsing-context connected is set, changed, or removed.
+            fetch = ak.fly_string_eq_fly_string(&name, &html_attribute_names_crossorigin)
+
+        if not fetch and (this.m_relationship & html_link_element_relationship_preload) != 0:
+            # - When the as attribute of the link element of an external resource link that is already browsing-context connected is changed.
+            # FIXME: - When the type attribute of the link element of an external resource link that is already browsing-context connected, but was previously not obtained due to the type attribute specifying an unsupported type for the request destination, is set, removed, or changed.
+            # FIXME: - When the media attribute of the link element of an external resource link that is already browsing-context connected, but was previously not obtained due to the media attribute not matching the environment, is changed or removed.
+            fetch = ak.fly_string_eq_fly_string(&name, &html_attribute_names_as)
+
+        if not fetch and (this.m_relationship & html_link_element_relationship_stylesheet) != 0:
+            # - When the disabled attribute of the link element of an external resource link that is already browsing-context connected is set, changed, or removed.
+            # FIXME: - When the type attribute of the link element of an external resource link that is already browsing-context connected is set or changed to a value that does not or no longer matches the Content-Type metadata of the previous obtained external resource, if any.
+            # FIXME: - When the type attribute of the link element of an external resource link that is already browsing-context connected, but was previously not obtained due to the type attribute specifying an unsupported type, is removed or changed.
+            # AD-HOC: When the link element's type becomes a stylesheet
+            fetch = ak.fly_string_eq_fly_string(&name, &html_attribute_names_disabled) or (old_relationship & html_link_element_relationship_stylesheet) == 0
+
+        if fetch:
+            html_link_element_fetch_and_process_linked_resource(this)
+
+# mark: Script blocking and render blocking =====================================================
+
+## Ported from HTMLLinkElement.cpp:249 Web::HTML::HTMLLinkElement::contributes_a_script_blocking_style_sheet (override).
+# https://html.spec.whatwg.org/multipage/semantics.html#contributes-a-script-blocking-style-sheet
+pub func html_link_element_contributes_a_script_blocking_style_sheet_impl(base: DomElement*) -> bool:
+    let this = (HtmlLinkElement*)base
+    # An element el in the context of a Document of an HTML parser or XML parser
+    # contributes a script-blocking style sheet if all of the following are true:
+
+    # el was created by that Document's parser.
+    if gc.weak_ptr(&this.m_parser_document) != dom_node_document(base.dom_node()):
+        return false
+
+    # FIXME: el is either a style element or a link element that was an external resource link that contributes to the styling processing model when the el was created by the parser.
+
+    # FIXME: el's media attribute's value matches the environment.
+
+    # el's style sheet was enabled when the element was created by the parser.
+    if not this.m_was_enabled_when_created_by_parser:
+        return false
+
+    # FIXME: The last time the event loop reached step 1, el's root was that Document.
+
+    # The user agent hasn't given up on loading that particular style sheet yet.
+    # A user agent may give up on loading a style sheet at any time.
+    if let fetch_controller = this.m_fetch_controller:
+        if fetch_controller_state(fetch_controller) == FetchControllerState.terminated:
+            return false
+        if fetch_controller_state(fetch_controller) == FetchControllerState.aborted:
+            return false
+
+    return true
+
+## Ported from HTMLLinkElement.cpp:278 Web::HTML::HTMLLinkElement::is_implicitly_potentially_render_blocking (override).
+pub func html_link_element_is_implicitly_potentially_render_blocking_impl(base: DomElement*) -> bool:
+    let this = (HtmlLinkElement*)base
+    # A link element of this type is implicitly potentially render-blocking if the element was created by its node document's parser.
+    return dom_node_document(base.dom_node()) == gc.weak_ptr(&this.m_parser_document)
+
+# mark: Link processing options and link requests ===============================================
+
+## Ported from HTMLLinkElement.cpp:1030 Web::HTML::HTMLLinkElement::LinkProcessingOptions::LinkProcessingOptions.
+pub func html_link_element_link_processing_options_construct(this: HtmlLinkElementLinkProcessingOptions*, crossorigin: HtmlCorsSettingAttribute, referrer_policy: ReferrerPolicyReferrerPolicy, base_url: web_url.Url, origin: web_url.Origin, environment: HtmlEnvironmentSettingsObject*, policy_container: HtmlPolicyContainer*, document: DomDocument*?, cryptographic_nonce_metadata: ak.String, fetch_priority: FetchRequestPriority):
+    # The member defaults: the strings empty, initiator "link", no destination.
+    this.href = ak.string_new()
+    this.initiator = FetchRequestInitiatorType.link
+    this.integrity = ak.string_new()
+    this.type_ = ak.string_new()
+    this.destination = none
+    this.on_document_ready = none
+
+    this.cryptographic_nonce_metadata = cryptographic_nonce_metadata
+    this.crossorigin = crossorigin
+    this.referrer_policy = referrer_policy
+    this.base_url = base_url
+    this.origin = origin
+    this.environment = environment
+    this.policy_container = policy_container
+    this.document = document
+    this.fetch_priority = fetch_priority
+
+## Ported from HTMLLinkElement.cpp:1052 Web::HTML::HTMLLinkElement::LinkProcessingOptions::visit_edges (override).
+pub func html_link_element_link_processing_options_visit_edges_impl(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (HtmlLinkElementLinkProcessingOptions*)base
+    gc.cell_visit_edges_impl(base, visitor)
+    gc.cell_visitor_visit_t_2(visitor, this.environment)
+    gc.cell_visitor_visit_t_2(visitor, this.policy_container)
+    gc.cell_visitor_visit_t(visitor, this.document)
+    gc.cell_visitor_visit_t(visitor, this.on_document_ready)
+
+## Ported from HTMLLinkElement.cpp:285 Web::HTML::HTMLLinkElement::create_link_options.
+# https://html.spec.whatwg.org/multipage/semantics.html#create-link-options-from-element
+pub func html_link_element_create_link_options(this: HtmlLinkElement*) -> HtmlLinkElementLinkProcessingOptions*:
+    let element = this.dom_element()
+    let realm = html_element_realm(this.html_element())
+
+    # 1. Let document be el's node document.
+    let document = dom_node_document(this.dom_node())
+
+    # 2. Let options be a new link processing options with
+    # crossorigin
+    #     the state of el's crossorigin content attribute
+    let crossorigin = html_cors_setting_attribute_from_keyword(dom_element_get_attribute(element, html_attribute_names_crossorigin))
+
+    # referrer policy
+    #     the state of el's referrerpolicy content attribute
+    let referrer_policy_attribute = dom_element_get_attribute(element, html_attribute_names_referrerpolicy) else ak.string_new()
+    let referrer_policy = referrer_policy_from_string(ak.string_bytes_as_string_view(&referrer_policy_attribute)) else ReferrerPolicyReferrerPolicy.empty_string
+
+    # FIXME: source set
+    #     el's source set
+
+    # fetch priority
+    #     the state of el's fetchpriority content attribute
+    let fetchpriority_attribute = dom_element_get_attribute_value(element, html_attribute_names_fetchpriority)
+    let fetch_priority = fetch_request_priority_from_string(ak.string_bytes_as_string_view(&fetchpriority_attribute)) else FetchRequestPriority.auto
+
+    # (realm().create<LinkProcessingOptions>(...): JS::Cell's initialize does nothing.)
+    let options = (HtmlLinkElementLinkProcessingOptions*)web_allocate_cell(realm, &html_link_element_link_processing_options_class)
+    html_link_element_link_processing_options_construct(options,
+                                                        crossorigin,
+                                                        referrer_policy, dom_document_base_url(document), dom_document_origin(document), dom_document_relevant_settings_object(document), dom_document_policy_container(document), document, this.html_element().html_or_svg_element.m_cryptographic_nonce,
+                                                        fetch_priority)
+    # base URL
+    #     document's document base URL
+    # origin
+    #     document's origin
+    # environment
+    #     document's relevant settings object
+    # policy container
+    #     document's policy container
+    # document
+    #     document
+    # cryptographic nonce metadata
+    #     the current value of el's [[CryptographicNonce]] internal slot
+    web_initialize_cell(options.cell(), realm)
+
+    # 3. If el has an href attribute, then set options's href to the value of el's href attribute.
+    if let maybe_href = dom_element_get_attribute(element, html_attribute_names_href):
+        options.href = maybe_href
+
+    # 4. If el has an integrity attribute, then set options's integrity to the value of el's integrity content attribute.
+    if let maybe_integrity = dom_element_get_attribute(element, html_attribute_names_integrity):
+        options.integrity = maybe_integrity
+
+    # 5. If el has a type attribute, then set options's type to the value of el's type attribute.
+    if let maybe_type = dom_element_get_attribute(element, html_attribute_names_type):
+        options.type_ = maybe_type
+
+    # FIXME: 6. Assert: options's href is not the empty string, or options's source set is not null.
+    #           A link element with neither an href or an imagesrcset does not represent a link.
+
+    # 7. Return options.
+    return options
+
+## Ported from HTMLLinkElement.cpp:351 Web::HTML::HTMLLinkElement::create_link_request.
+# https://html.spec.whatwg.org/multipage/semantics.html#create-a-link-request
+pub func html_link_element_create_link_request(this: HtmlLinkElement*, options: HtmlLinkElementLinkProcessingOptions*) -> FetchRequest*?:
+    # 1. Assert: options's href is not the empty string.
+    assert(not ak.string_is_empty(&options.href))
+
+    # FIXME: 2. If options's destination is null, then return null.
+
+    # 3. Let url be the result of encoding-parsing a URL given options's href, relative to options's base URL.
+    # FIXME: Spec issue: We should be parsing this URL relative to a document or environment settings object.
+    #        https://github.com/whatwg/html/issues/9715
+    let url = domurl_parse(ak.string_bytes_as_string_view(&options.href), options.base_url)
+
+    # 4. If url is failure, then return null.
+    let url_record = url else return none
+
+    # 5. Let request be the result of creating a potential-CORS request given url, options's destination, and options's crossorigin.
+    let request = html_create_potential_cors_request(realm_vm(html_element_realm(this.html_element())), url_record, options.destination, options.crossorigin)
+
+    # 6. Set request's policy container to options's policy container.
+    fetch_request_set_policy_container(request, options.policy_container)
+
+    # 7. Set request's integrity metadata to options's integrity.
+    fetch_request_set_integrity_metadata(request, options.integrity)
+
+    # 8. Set request's cryptographic nonce metadata to options's cryptographic nonce metadata.
+    fetch_request_set_cryptographic_nonce_metadata(request, options.cryptographic_nonce_metadata)
+
+    # 9. Set request's referrer policy to options's referrer policy.
+    fetch_request_set_referrer_policy(request, options.referrer_policy)
+
+    # 10. Set request's client to options's environment.
+    fetch_request_set_client(request, options.environment)
+
+    # 11. Set request's priority to options's fetch priority.
+    fetch_request_set_priority(request, options.fetch_priority)
+
+    # 12. Return request.
+    return request
+
+# mark: Fetching and processing the linked resource =============================================
+
+## Ported from HTMLLinkElement.cpp:393 Web::HTML::HTMLLinkElement::fetch_and_process_linked_resource.
+# https://html.spec.whatwg.org/multipage/semantics.html#fetch-and-process-the-linked-resource
+pub func html_link_element_fetch_and_process_linked_resource(this: HtmlLinkElement*):
+    if (this.m_relationship & ~(html_link_element_relationship_dns_prefetch | html_link_element_relationship_preconnect | html_link_element_relationship_preload)) != 0:
+        html_link_element_default_fetch_and_process_linked_resource(this)
+    elif (this.m_relationship & html_link_element_relationship_preload) != 0:
+        html_link_element_fetch_and_process_linked_preload_resource(this)
+    elif (this.m_relationship & html_link_element_relationship_preconnect) != 0:
+        html_link_element_fetch_and_process_linked_preconnect_resource(this)
+    elif (this.m_relationship & html_link_element_relationship_dns_prefetch) != 0:
+        html_link_element_fetch_and_process_linked_dns_prefetch_resource(this)
+
+## default_fetch_and_process_linked_resource's processResponseConsumeBody (its context is the element).
+func html_link_element_process_response_consume_body(context: void*?, response_: FetchResponse*, body_bytes: FetchAlgorithmsBodyBytes):
+    let this = (HtmlLinkElement*)(context else trap("processResponseConsumeBody: no link element"))
+    # FIXME: If the response is CORS cross-origin, we must use its internal response to query any of its data. See:
+    #        https://github.com/whatwg/html/issues/9355
+    let response = fetch_response_unsafe_response(response_)
+
+    # 1. Let success be true.
+    var success = true
+    var successful_body_bytes = ak.ByteBuffer()
+
+    # 2. If either of the following conditions are met:
+    # - bodyBytes is null or failure; or
+    # - response's status is not an ok status,
+    # then set success to false.
+    match body_bytes:
+        .byte_buffer(bytes):
+            if fetch_is_ok_status(fetch_response_status(response)):
+                successful_body_bytes = bytes
+            else:
+                success = false
+        _:
+            success = false
+
+    # FIXME: 3. Otherwise, wait for the link resource's critical subresources to finish loading.
+
+    # 4. Process the linked resource given el, success, response, and bodyBytes.
+    html_link_element_process_linked_resource(this, success, response, successful_body_bytes)
+
+## Ported from HTMLLinkElement.cpp:406 Web::HTML::HTMLLinkElement::default_fetch_and_process_linked_resource.
+# https://html.spec.whatwg.org/multipage/semantics.html#default-fetch-and-process-the-linked-resource
+pub func html_link_element_default_fetch_and_process_linked_resource(this: HtmlLinkElement*):
+    let realm = html_element_realm(this.html_element())
+    # https://html.spec.whatwg.org/multipage/semantics.html#the-link-element:attr-link-href-4
+    # If both the href and imagesrcset attributes are absent, then the element does not define a link.
+    # FIXME: Support imagesrcset attribute
+    let href = html_link_element_href(this)
+    if not dom_element_has_attribute(this.dom_element(), html_attribute_names_href) or ak.string_is_empty(&href):
+        return
+
+    # 1. Let options be the result of creating link options from el.
+    let options = html_link_element_create_link_options(this)
+
+    # 2. Let request be the result of creating a link request given options.
+    # 3. If request is null, then return.
+    let request = html_link_element_create_link_request(this, options) else return
+
+    # FIXME: 4. Set request's synchronous flag.
+
+    # 5. Run the linked resource fetch setup steps, given el and request. If the result is false, then return.
+    if not html_link_element_linked_resource_fetch_setup_steps(this, request):
+        return
+
+    # 6. Set request's initiator type to "css" if el's rel attribute contains the keyword stylesheet; "link" otherwise.
+    if (this.m_relationship & html_link_element_relationship_stylesheet) != 0:
+        fetch_request_set_initiator_type(request, FetchRequestInitiatorType.css)
+    else:
+        fetch_request_set_initiator_type(request, FetchRequestInitiatorType.link)
+
+    # 7. Fetch request with processResponseConsumeBody set to the following steps given response response and null, failure, or a byte sequence bodyBytes:
+    let algorithms = fetch_algorithms_create_with_process_response_consume_body(realm_vm(realm), ak.Function2[FetchResponse*, FetchAlgorithmsBodyBytes, unit](call = html_link_element_process_response_consume_body, context = this))
+
+    if let fetch_controller = this.m_fetch_controller:
+        fetch_controller_abort(fetch_controller, realm, none)
+    this.m_fetch_controller = fetch_fetching_fetch(realm, request, algorithms)
+
+# mark: Inline functions of HTMLLinkElement.h ===================================================
+
+## Ported from HTMLLinkElement.h:32 Web::HTML::HTMLLinkElement::rel.
+pub func html_link_element_rel(this: HtmlLinkElement*) -> ak.String:
+    return dom_element_get_attribute_value(this.dom_element(), html_attribute_names_rel)
+
+## Ported from HTMLLinkElement.h:33 Web::HTML::HTMLLinkElement::type.
+pub func html_link_element_type(this: HtmlLinkElement*) -> ak.String:
+    return dom_element_get_attribute_value(this.dom_element(), html_attribute_names_type)
+
+## Ported from HTMLLinkElement.h:34 Web::HTML::HTMLLinkElement::href.
+pub func html_link_element_href(this: HtmlLinkElement*) -> ak.String:
+    return dom_element_get_attribute_value(this.dom_element(), html_attribute_names_href)
+
+## Ported from HTMLLinkElement.h:44 Web::HTML::HTMLLinkElement::set_parser_document.
+pub func html_link_element_set_parser_document(this: HtmlLinkElement*, document: DomDocument*):
+    this.m_parser_document = gc.make_weak(document)
+
+## Ported from HTMLLinkElement.h:45 Web::HTML::HTMLLinkElement::set_was_enabled_when_created_by_parser.
+pub func html_link_element_set_was_enabled_when_created_by_parser(this: HtmlLinkElement*, was_enabled_when_created_by_parser: bool):
+    this.m_was_enabled_when_created_by_parser = was_enabled_when_created_by_parser
+
+## Ported from HTMLLinkElement.h:143 Web::HTML::HTMLLinkElement::is_html_link_element (override).
+pub func html_link_element_is_html_link_element_impl(base: DomNode*) -> bool:
+    return true
