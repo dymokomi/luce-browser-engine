@@ -1,0 +1,403 @@
+#==============================================================================================
+#
+#   arbitrary_substitution_functions_2 - var(), attr(), env(), if() and inherit(): the other
+#                                        functions and the substitution
+#
+#   DESCRIPTION:
+#       Port of LibWeb/CSS/Parser/ArbitrarySubstitutionFunctions.cpp (lines 267-656): "replace
+#       an env()/if()/inherit()/var() function", "substitute arbitrary substitution functions"
+#       in a list of component values, and the argument grammars of the functions.
+#
+#==============================================================================================
+
+# mark: replace an env(), if(), inherit() or var() function =====================================
+
+## Ported from Libraries/LibWeb/CSS/Parser/ArbitrarySubstitutionFunctions.cpp:268 Web::CSS::Parser::replace_an_env_function.
+# https://drafts.csswg.org/css-env/#substitute-an-env
+func css_replace_an_env_function(element: DomAbstractElement*, guarded_contexts: CssGuardedSubstitutionContexts*, arguments: CssArbitrarySubstitutionFunctionArguments) -> ak.Vector[css_syntax.ComponentValue]:
+    # AD-HOC: env() is not defined as an ASF (and was defined before the ASF concept was), but behaves a lot like one.
+    # So, this is a combination of the spec's "substitute an env()" algorithm linked above, and the "replace a FOO function()" algorithms.
+    let declaration_value_list = css_arbitrary_substitution_function_arguments_declaration_value_list(arguments)
+
+    let first_argument = *ak.vector_first_const(&declaration_value_list)
+    let second_argument = css_declaration_value_list_second(&declaration_value_list)
+
+    # AD-HOC: Substitute ASFs in the first argument.
+    let substituted_first_argument = css_substitute_arbitrary_substitution_functions(element, guarded_contexts, first_argument)
+
+    # AD-HOC: Parse the arguments.
+    # env() = env( <custom-ident> <integer [0,∞]>*, <declaration-value>? )
+    var first_argument_tokens = css_syntax.token_stream_create(substituted_first_argument)
+    css_syntax.token_stream_discard_whitespace(&first_argument_tokens)
+    let name_token = css_syntax.token_stream_consume_a_token(&first_argument_tokens)
+    if not css_syntax.component_value_is(&name_token, .ident):
+        return css_guaranteed_invalid_component_values()
+    let name = css_component_value_ident(&name_token)
+    css_syntax.token_stream_discard_whitespace(&first_argument_tokens)
+
+    var indices = ak.Vector[i32]()
+    # FIXME: Are non-literal <integer>s allowed here?
+    while css_syntax.token_stream_has_next_token(&first_argument_tokens):
+        let maybe_integer = css_syntax.token_stream_consume_a_token(&first_argument_tokens)
+        if not css_syntax.component_value_is(&maybe_integer, .number):
+            return css_guaranteed_invalid_component_values()
+        let integer_token = css_syntax.component_value_token(&maybe_integer)
+        if css_syntax.token_is_integer(&integer_token) and css_syntax.token_to_integer(&integer_token) >= 0:
+            ak.vector_append_t(&indices, css_syntax.token_to_integer(&integer_token))
+        else:
+            return css_guaranteed_invalid_component_values()
+        css_syntax.token_stream_discard_whitespace(&first_argument_tokens)
+
+    # 1. If the name provided by the first argument of the env() function is a recognized environment variable name,
+    #    the number of supplied integers matches the number of dimensions of the environment variable referenced by
+    #    that name, and values of the indices correspond to a known sub-value, replace the env() function by the value
+    #    of the named environment variable.
+    if let environment_variable = css_data.environment_variable_from_string(ak.fly_string_bytes_as_string_view(&name)):
+        if ak.vector_size(&indices) == (usize)css_data.environment_variable_dimension_count(environment_variable):
+            let result = dom_document_environment_variable_value(dom_abstract_element_document(element), environment_variable, ak.vector_span(&indices))
+            if let value = result:
+                return value
+
+    # 2. Otherwise, if the env() function has a fallback value as its second argument, replace the env() function by
+    #    the fallback value. If there are any env() references in the fallback, substitute them as well.
+    # AD-HOC: Substitute all ASFs in the result.
+    if let second = second_argument:
+        return css_substitute_arbitrary_substitution_functions(element, guarded_contexts, second)
+
+    # 3. Otherwise, the property or descriptor containing the env() function is invalid at computed-value time.
+    return css_guaranteed_invalid_component_values()
+
+## Ported from Libraries/LibWeb/CSS/Parser/ArbitrarySubstitutionFunctions.cpp:326 Web::CSS::Parser::replace_an_if_function.
+# https://drafts.csswg.org/css-values-5/#replace-an-if-function
+func css_replace_an_if_function(element: DomAbstractElement*, guarded_contexts: CssGuardedSubstitutionContexts*, arguments: CssArbitrarySubstitutionFunctionArguments) -> ak.Vector[css_syntax.ComponentValue]:
+    # NB: We create a single parser and reuse that for parsing all the conditions
+    var parsing_params: CssParsingParams = ---
+    css_parsing_params_construct_dom_document(&parsing_params, dom_node_document(dom_abstract_element_element(element).dom_node()))
+    var parser = css_parser_create(parsing_params, ak.sv(""))
+
+    let branches = match arguments:
+        .vector_css_if_args_branch(value) => value
+        _ => trap("VERIFY: the arguments are IfArgs")
+
+    # 1. For each <if-args-branch> branch in arguments:
+    for branch in ak.vector_span_const(&branches):
+        # 1. Substitute arbitrary substitution functions in the first <declaration-value> of branch, then parse the
+        #    result as an <if-condition>. If parsing returns failure, continue; otherwise, let the result be condition.
+        let substituted_condition = css_substitute_arbitrary_substitution_functions(element, guarded_contexts, branch.condition)
+        let condition_is_attr_tainted = css_contains_attr_tainted_value(substituted_condition)
+
+        var tokens = css_syntax.token_stream_create(substituted_condition)
+        let parsed_if_condition = css_parser_parse_if_condition(&parser, &tokens) else continue
+
+        # 2. Evaluate condition.
+        #    If a <style-query> in condition tests the value of a property, and guarding a substitution context
+        #    «"property", referenced-property-name» would mark it as a cyclic substitution context, that query
+        #    evaluates to false.
+        #    If the result of condition is false, continue.
+        # FIXME: Implement the above behavior once we support style queries.
+        let condition_evaluation_result = css_boolean_expression_evaluate(parsed_if_condition, dom_node_document(dom_abstract_element_element(element).dom_node()))
+
+        if condition_evaluation_result == CssMatchResult.false_:
+            continue
+
+        # 3. Substitute arbitrary substitution functions in the second <declaration-value> of branch, and return the result.
+        let branch_value = branch.value else return ak.Vector[css_syntax.ComponentValue]()
+
+        let result = css_substitute_arbitrary_substitution_functions(element, guarded_contexts, branch_value)
+        if condition_is_attr_tainted:
+            return css_mark_as_attr_tainted(result)
+        return result
+
+    # 2. Return nothing (an empty sequence of component values).
+    return ak.Vector[css_syntax.ComponentValue]()
+
+## Ported from Libraries/LibWeb/CSS/Parser/ArbitrarySubstitutionFunctions.cpp:370 Web::CSS::Parser::replace_an_inherit_function.
+# https://drafts.csswg.org/css-values-5/#replace-an-inherit-function
+func css_replace_an_inherit_function(element: DomAbstractElement*, guarded_contexts: CssGuardedSubstitutionContexts*, arguments: CssArbitrarySubstitutionFunctionArguments) -> ak.Vector[css_syntax.ComponentValue]:
+    # To replace an inherit() function, given a list of arguments:
+    let declaration_value_list = css_arbitrary_substitution_function_arguments_declaration_value_list(arguments)
+    let first_argument = *ak.vector_first_const(&declaration_value_list)
+    let second_argument = css_declaration_value_list_second(&declaration_value_list)
+
+    # 1. Substitute arbitrary substitution functions in the first <declaration-value> of arguments, then parse it as a
+    #    <custom-property-name>.
+    let substituted_first_argument = css_substitute_arbitrary_substitution_functions(element, guarded_contexts, first_argument)
+
+    var first_argument_tokens = css_syntax.token_stream_create(substituted_first_argument)
+    css_syntax.token_stream_discard_whitespace(&first_argument_tokens)
+    let name_token = css_syntax.token_stream_consume_a_token(&first_argument_tokens)
+    css_syntax.token_stream_discard_whitespace(&first_argument_tokens)
+
+    # 2. If parsing returned a <custom-property-name>, and the inherited value of that custom property on the element
+    #    does not contain the guaranteed-invalid value, return that inherited value.
+    if css_syntax.component_value_is(&name_token, .ident) and css_is_custom_property_name_token(&name_token) and css_syntax.token_stream_is_empty(&first_argument_tokens):
+        if let element_to_inherit_style_from = dom_abstract_element_element_to_inherit_style_from(element):
+            if let inherited_value = dom_abstract_element_get_custom_property(&element_to_inherit_style_from, css_component_value_ident(&name_token)):
+                let inherited_value_tokens = css_style_value_tokenize(inherited_value)
+                if not css_contains_guaranteed_invalid_value(inherited_value_tokens):
+                    return inherited_value_tokens
+
+    # 3. Otherwise, if a second <declaration-value>? was passed in arguments, substitute arbitrary substitution
+    #    functions in that argument, and return the result.
+    if let second = second_argument:
+        return css_substitute_arbitrary_substitution_functions(element, guarded_contexts, second)
+
+    # 4. Otherwise, return the guaranteed-invalid value.
+    return css_guaranteed_invalid_component_values()
+
+## `is_a_custom_property_name_string(name_token.token().ident())`.
+func css_is_custom_property_name_token(name_token: const css_syntax.ComponentValue*) -> bool:
+    let ident = css_component_value_ident(name_token)
+    return css_data.is_a_custom_property_name_string(ak.fly_string_bytes_as_string_view(&ident))
+
+## Ported from Libraries/LibWeb/CSS/Parser/ArbitrarySubstitutionFunctions.cpp:408 Web::CSS::Parser::replace_a_var_function.
+# https://drafts.csswg.org/css-variables-1/#replace-a-var-function
+func css_replace_a_var_function(element: DomAbstractElement*, guarded_contexts: CssGuardedSubstitutionContexts*, arguments: CssArbitrarySubstitutionFunctionArguments) -> ak.Vector[css_syntax.ComponentValue]:
+    # 1. Let el be the element that the style containing the var() function is being applied to.
+    #    Let first arg be the first <declaration-value> in arguments.
+    #    Let second arg be the <declaration-value>? passed after the comma, or null if there was no comma.
+    let declaration_value_list = css_arbitrary_substitution_function_arguments_declaration_value_list(arguments)
+
+    let first_argument = *ak.vector_first_const(&declaration_value_list)
+    let second_argument = css_declaration_value_list_second(&declaration_value_list)
+
+    # 2. Substitute arbitrary substitution functions in first arg, then parse it as a <custom-property-name>.
+    #    If parsing returned a <custom-property-name>, let result be the computed value of the corresponding custom
+    #    property on el. Otherwise, let result be the guaranteed-invalid value.
+    let substituted_first_argument = css_substitute_arbitrary_substitution_functions(element, guarded_contexts, first_argument)
+    var name_tokens = css_syntax.token_stream_create(substituted_first_argument)
+    css_syntax.token_stream_discard_whitespace(&name_tokens)
+    let name_token = css_syntax.token_stream_consume_a_token(&name_tokens)
+    css_syntax.token_stream_discard_whitespace(&name_tokens)
+
+    var result: ak.Vector[css_syntax.ComponentValue]
+    if css_syntax.token_stream_has_next_token(&name_tokens) or not css_syntax.component_value_is(&name_token, .ident) or not css_is_custom_property_name_token(&name_token):
+        result = css_guaranteed_invalid_component_values()
+    else:
+        # Look up the value of the custom property
+        let custom_property_name = css_component_value_ident(&name_token)
+        let custom_property_value = css_style_computer_compute_value_of_custom_property(*element, custom_property_name, guarded_contexts)
+        result = css_style_value_tokenize(custom_property_value)
+
+    # FIXME: 3. If the custom property named by the var()’s first argument is animation-tainted, and the var() is being used
+    #    in a property that is not animatable, set result to the guaranteed-invalid value.
+
+    # 4. If result contains the guaranteed-invalid value, and second arg was provided, set result to the result of substitute arbitrary substitution functions on second arg.
+    if css_contains_guaranteed_invalid_value(result):
+        if let second = second_argument:
+            result = css_substitute_arbitrary_substitution_functions(element, guarded_contexts, second)
+
+    # 5. Return result.
+    return result
+
+# mark: substitute arbitrary substitution functions =============================================
+
+## Ported from Libraries/LibWeb/CSS/Parser/ArbitrarySubstitutionFunctions.cpp:448 Web::CSS::Parser::substitute_arbitrary_substitution_functions_step_2.
+func css_substitute_arbitrary_substitution_functions_step_2(element: DomAbstractElement*, guarded_contexts: CssGuardedSubstitutionContexts*, source: css_syntax.TokenStream[css_syntax.ComponentValue]*,
+                                                            dest: ak.Vector[css_syntax.ComponentValue]*) -> !:
+    # Step 2 of https://drafts.csswg.org/css-values-5/#substitute-arbitrary-substitution-function
+    # 2. For each arbitrary substitution function func in values (ordered via a depth-first pre-order traversal) that
+    #    is not nested in the contents of another arbitrary substitution function:
+    while css_syntax.token_stream_has_next_token(source):
+        let value = css_syntax.token_stream_consume_a_token(source)
+        if css_syntax.component_value_is_function(&value):
+            let source_function = css_syntax.component_value_function(&value)
+            if let function_id = css_to_arbitrary_substitution_function(source_function.name):
+                # FIXME: 1. Substitute early-invoked functions in func’s contents, and let early result be the result.
+                let early_result = source_function.value
+
+                # 2. If early result contains the guaranteed-invalid value, replace func in values with the guaranteed-invalid
+                #    value and continue.
+                if css_contains_guaranteed_invalid_value(early_result):
+                    ak.vector_append_t(dest, css_syntax.component_value_from_guaranteed_invalid_value(css_syntax.GuaranteedInvalidValue()))
+                    continue
+
+                # 3. Parse early result according to func’s argument grammar. If this returns failure, replace func in values
+                #    with the guaranteed-invalid value and continue; otherwise, let arguments be the result.
+                let maybe_arguments = css_parse_according_to_argument_grammar(function_id, early_result)
+                if maybe_arguments == none:
+                    ak.vector_append_t(dest, css_syntax.component_value_from_guaranteed_invalid_value(css_syntax.GuaranteedInvalidValue()))
+                    continue
+                let arguments = maybe_arguments else trap("unreachable")
+
+                # 4. Replace an arbitrary substitution function for func, given arguments, as defined by that function.
+                #    Let result be the returned list of component values.
+                let result = css_replace_an_arbitrary_substitution_function(element, guarded_contexts, function_id, arguments)
+
+                # 5. If result contains the guaranteed-invalid value, replace func in values with the guaranteed-invalid value.
+                #    Otherwise, replace func in values with result.
+                if css_contains_guaranteed_invalid_value(result):
+                    ak.vector_append_t(dest, css_syntax.component_value_from_guaranteed_invalid_value(css_syntax.GuaranteedInvalidValue()))
+                else:
+                    # NB: Because we're doing this in one pass recursively, we now need to substitute any ASFs in result.
+                    var result_stream = css_syntax.token_stream_create(result)
+                    var result_after_processing = ak.Vector[css_syntax.ComponentValue]()
+                    try css_substitute_arbitrary_substitution_functions_step_2(element, guarded_contexts, &result_stream, &result_after_processing)
+
+                    # NB: Protect against the billion-laughs attack by limiting to an arbitrary large number of tokens.
+                    # https://drafts.csswg.org/css-values-5/#long-substitution
+                    if css_syntax.token_stream_remaining_token_count(source) + ak.vector_size(&result_after_processing) > 16384:
+                        ak.vector_clear(dest)
+                        ak.vector_append_t(dest, css_syntax.component_value_from_guaranteed_invalid_value(css_syntax.GuaranteedInvalidValue()))
+                        error(ak.ak_error, "Stopped expanding arbitrary substitution functions: maximum length reached.")
+
+                    ak.vector_extend_2(dest, &result_after_processing)
+                continue
+
+            var function_values = ak.Vector[css_syntax.ComponentValue]()
+            var source_function_contents = css_syntax.token_stream_create(source_function.value)
+            try css_substitute_arbitrary_substitution_functions_step_2(element, guarded_contexts, &source_function_contents, &function_values)
+            ak.vector_append_t(dest, css_syntax.component_value_from_function(css_syntax.Function(name = source_function.name, value = function_values,
+                                                                                                  name_token = css_syntax.token_new(), end_token = css_syntax.token_new())))
+            continue
+        if css_syntax.component_value_is_block(&value):
+            let source_block = css_syntax.component_value_block(&value)
+            var source_block_values = css_syntax.token_stream_create(source_block.value)
+            var block_values = ak.Vector[css_syntax.ComponentValue]()
+            try css_substitute_arbitrary_substitution_functions_step_2(element, guarded_contexts, &source_block_values, &block_values)
+            ak.vector_append_t(dest, css_syntax.component_value_from_simple_block(css_syntax.SimpleBlock(token = source_block.token, value = block_values, end_token = css_syntax.token_new())))
+            continue
+        ak.vector_append_t(dest, value)
+
+## Ported from Libraries/LibWeb/CSS/Parser/ArbitrarySubstitutionFunctions.cpp:527 Web::CSS::Parser::substitute_arbitrary_substitution_functions.
+# https://drafts.csswg.org/css-values-5/#substitute-arbitrary-substitution-function
+pub func css_substitute_arbitrary_substitution_functions(element: DomAbstractElement*, guarded_contexts: CssGuardedSubstitutionContexts*, values: ak.Vector[css_syntax.ComponentValue],
+                                                         context: CssSubstitutionContext? = none) -> ak.Vector[css_syntax.ComponentValue]:
+    # To substitute arbitrary substitution functions in a sequence of component values values, given an optional
+    # substitution context context:
+
+    # 1. Guard context for the remainder of this algorithm. If context is marked as a cyclic substitution context,
+    #    return the guaranteed-invalid value.
+    # NB: The guarded context lives in this frame; the guard holds a pointer to it until the deferred unguard.
+    var guarded_context = context else return css_substitute_arbitrary_substitution_functions_without_context(element, guarded_contexts, values)
+    css_guarded_substitution_contexts_guard(guarded_contexts, &guarded_context)
+    if guarded_context.is_cyclic:
+        # NB: The C++ ScopeGuard is constructed after this return, so this path does not unguard.
+        return css_guaranteed_invalid_component_values()
+    defer css_guarded_substitution_contexts_unguard(guarded_contexts, guarded_context)
+
+    # 2. For each arbitrary substitution function func in values (ordered via a depth-first pre-order traversal) that
+    #    is not nested in the contents of another arbitrary substitution function:
+    var new_values = ak.Vector[css_syntax.ComponentValue]()
+    var source = css_syntax.token_stream_create(values)
+    css_substitute_arbitrary_substitution_functions_step_2(element, guarded_contexts, &source, &new_values) catch:
+        return css_guaranteed_invalid_component_values()
+
+    # 3. If context is marked as a cyclic substitution context, return the guaranteed-invalid value.
+    # NOTE: Nested arbitrary substitution functions may have marked context as cyclic in step 2.
+    if guarded_context.is_cyclic:
+        return css_guaranteed_invalid_component_values()
+
+    # 4. Return values.
+    return new_values
+
+## Steps 2 and 4 of substitute_arbitrary_substitution_functions when no context is given (nothing is guarded).
+func css_substitute_arbitrary_substitution_functions_without_context(element: DomAbstractElement*, guarded_contexts: CssGuardedSubstitutionContexts*,
+                                                                     values: ak.Vector[css_syntax.ComponentValue]) -> ak.Vector[css_syntax.ComponentValue]:
+    var new_values = ak.Vector[css_syntax.ComponentValue]()
+    var source = css_syntax.token_stream_create(values)
+    css_substitute_arbitrary_substitution_functions_step_2(element, guarded_contexts, &source, &new_values) catch:
+        return css_guaranteed_invalid_component_values()
+    return new_values
+
+# mark: Argument grammars =======================================================================
+
+## The `parse_declaration_value_then_optional_declaration_value` lambda of parse_according_to_argument_grammar:
+## equivalent to `<declaration-value> , <declaration-value>?`, used by multiple argument grammars.
+func css_parse_declaration_value_then_optional_declaration_value(tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*, separator: css_syntax.TokenType) -> ak.Vector[ak.Vector[css_syntax.ComponentValue]]?:
+    let first_argument = css_parser_parse_declaration_value(tokens, separator) else return none
+
+    var list = ak.Vector[ak.Vector[css_syntax.ComponentValue]]()
+    ak.vector_append_t(&list, first_argument)
+    if not css_syntax.token_stream_has_next_token(tokens):
+        return list
+
+    let next = css_syntax.token_stream_next_token(tokens)
+    if not css_syntax.component_value_is(&next, separator):
+        return none
+
+    css_syntax.token_stream_discard_a_token(tokens)  # separator
+
+    let second_argument = css_parser_parse_declaration_value(tokens)
+
+    ak.vector_append_t(&list, second_argument else ak.Vector[css_syntax.ComponentValue]())
+    return list
+
+## The `return_if_no_remaining_tokens` lambda of parse_according_to_argument_grammar.
+func css_return_if_no_remaining_tokens(tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*, value: CssArbitrarySubstitutionFunctionArguments?) -> CssArbitrarySubstitutionFunctionArguments?:
+    if css_syntax.token_stream_has_next_token(tokens):
+        return none
+    return value
+
+## `parse_declaration_value_then_optional_declaration_value(tokens, Comma).map(...)` as the arguments variant.
+func css_parse_comma_separated_declaration_value_list_arguments(tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssArbitrarySubstitutionFunctionArguments?:
+    let list = css_parse_declaration_value_then_optional_declaration_value(tokens, .comma) else return none
+    return CssArbitrarySubstitutionFunctionArguments.vector_vector_component_value(value = list)
+
+## Ported from Libraries/LibWeb/CSS/Parser/ArbitrarySubstitutionFunctions.cpp:561 Web::CSS::Parser::parse_according_to_argument_grammar.
+pub func css_parse_according_to_argument_grammar(function: CssArbitrarySubstitutionFunction, values: ak.Vector[css_syntax.ComponentValue]) -> CssArbitrarySubstitutionFunctionArguments?:
+    # NB: The `parse_declaration_value_then_optional_declaration_value` lambda is
+    #     css_parse_declaration_value_then_optional_declaration_value.
+
+    var tokens = css_syntax.token_stream_create(values)
+
+    match function:
+        .attr:
+            # https://drafts.csswg.org/css-values-5/#attr-notation
+            # <attr-args> = attr( <declaration-value> , <declaration-value>? )
+            # FIXME: It would be nice if we had a nice way to create an Optional<Variant<T>> from Optional<T> without these maps.
+            return css_return_if_no_remaining_tokens(&tokens, css_parse_comma_separated_declaration_value_list_arguments(&tokens))
+        .env:
+            # https://drafts.csswg.org/css-env/#env-function
+            # AD-HOC: This doesn't have an argument-grammar definition.
+            #         However, it follows the same format of "some CVs, then an optional comma and a fallback".
+            return css_return_if_no_remaining_tokens(&tokens, css_parse_comma_separated_declaration_value_list_arguments(&tokens))
+        .if_:
+            # https://drafts.csswg.org/css-values-5/#if-notation
+            # <if-args> = if( [ <if-args-branch> ; ]* <if-args-branch> ;? )
+            # <if-args-branch> = <declaration-value> : <declaration-value>?
+            var args = ak.Vector[CssIfArgsBranch]()
+
+            while css_syntax.token_stream_has_next_token(&tokens):
+                let if_args_branch = css_parse_declaration_value_then_optional_declaration_value(&tokens, .colon) else break
+
+                ak.vector_append_t(&args, CssIfArgsBranch(condition = *ak.vector_first_const(&if_args_branch), value = css_declaration_value_list_second(&if_args_branch)))
+
+                let next = css_syntax.token_stream_next_token(&tokens)
+                if not css_syntax.component_value_is(&next, .semicolon):
+                    break
+
+                css_syntax.token_stream_discard_a_token(&tokens)  # ;
+
+            if ak.vector_is_empty(&args):
+                return none
+
+            return css_return_if_no_remaining_tokens(&tokens, CssArbitrarySubstitutionFunctionArguments.vector_css_if_args_branch(value = args))
+        .inherit:
+            # https://drafts.csswg.org/css-values-5/#inherit-notation
+            # <inherit-args> = inherit( <declaration-value>, <declaration-value>? )
+            return css_return_if_no_remaining_tokens(&tokens, css_parse_comma_separated_declaration_value_list_arguments(&tokens))
+        .var_:
+            # https://drafts.csswg.org/css-variables/#funcdef-var
+            # <var-args> = var( <declaration-value> , <declaration-value>? )
+            return css_return_if_no_remaining_tokens(&tokens, css_parse_comma_separated_declaration_value_list_arguments(&tokens))
+        _:
+            trap("VERIFY_NOT_REACHED")
+
+## Ported from Libraries/LibWeb/CSS/Parser/ArbitrarySubstitutionFunctions.cpp:639 Web::CSS::Parser::replace_an_arbitrary_substitution_function.
+# https://drafts.csswg.org/css-values-5/#replace-an-arbitrary-substitution-function
+pub func css_replace_an_arbitrary_substitution_function(element: DomAbstractElement*, guarded_contexts: CssGuardedSubstitutionContexts*, function: CssArbitrarySubstitutionFunction,
+                                                        arguments: CssArbitrarySubstitutionFunctionArguments) -> ak.Vector[css_syntax.ComponentValue]:
+    match function:
+        .attr:
+            return css_replace_an_attr_function(element, guarded_contexts, arguments)
+        .env:
+            return css_replace_an_env_function(element, guarded_contexts, arguments)
+        .if_:
+            return css_replace_an_if_function(element, guarded_contexts, arguments)
+        .inherit:
+            return css_replace_an_inherit_function(element, guarded_contexts, arguments)
+        .var_:
+            return css_replace_a_var_function(element, guarded_contexts, arguments)
+        _:
+            trap("VERIFY_NOT_REACHED")

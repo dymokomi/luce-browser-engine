@@ -1,0 +1,451 @@
+#==============================================================================================
+#
+#   property_parsing_2 - parsing a property's value: parse_css_value and positional lists
+#
+#   DESCRIPTION:
+#       Port of LibWeb/CSS/Parser/PropertyParsing.cpp (lines 370-778): Parser::parse_css_value
+#       (arbitrary substitution functions, CSS-wide keywords, the properties with parsers of
+#       their own, coordinating lists, positional shorthands, space-separated multiple values
+#       and the generic shorthand expansion) and parse_positional_value_list_shorthand.
+#
+#       C++'s `parse_all_as(tokens, callback)` lambda is css_parse_all_as(tokens,
+#       callback(css_parse_all_as_start(tokens))): whitespace is discarded before and after the
+#       callback, and the value is the whole value or a syntax error. The blocks of
+#       parse_css_value that own a TokenStream transaction are functions of their own, so that
+#       the transaction ends where the C++ block ends.
+#
+#==============================================================================================
+
+# mark: parse_all_as ============================================================================
+
+## The first step of parse_css_value's `parse_all_as` lambda: discard whitespace, then answer `tokens` for the
+## callback.
+func css_parse_all_as_start(tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> css_syntax.TokenStream[css_syntax.ComponentValue]*:
+    css_syntax.token_stream_discard_whitespace(tokens)
+    return tokens
+
+## The rest of parse_css_value's `parse_all_as` lambda, given what the callback parsed: the value if it is the
+## whole value, otherwise a syntax error.
+func css_parse_all_as(tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*, parsed_value: CssStyleValue*?) -> CssStyleValue*!:
+    css_syntax.token_stream_discard_whitespace(tokens)
+    if let value = parsed_value:
+        if not css_syntax.token_stream_has_next_token(tokens):
+            return value
+    error(css_parser_parse_error_syntax_error, "")
+
+# mark: The blocks of parse_css_value ===========================================================
+
+## parse_css_value's first block: whether any token is a semicolon (a syntax error), and which arbitrary
+## substitution functions the value contains.
+func css_collect_value_substitution_presence(tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*, substitution_presence: css_syntax.SubstitutionFunctionsPresence*) -> !:
+    # NB: This transaction is intentionally never committed. This loop just examines the tokens and doesn't want
+    #     to permanently consume anything.
+    var transaction = css_syntax.token_stream_begin_transaction(tokens)
+    defer css_syntax.state_transaction_destroy(&transaction)
+    while css_syntax.token_stream_has_next_token(tokens):
+        let token = css_syntax.token_stream_consume_a_token(tokens)
+
+        if css_syntax.component_value_is(&token, .semicolon):
+            error(css_parser_parse_error_syntax_error, "")
+
+        # https://drafts.csswg.org/css-values-5/#resolve-property
+        # If a property value contains one or more arbitrary substitution functions, and all of those functions are
+        # themselves syntactically valid according to their argument grammars, the entire value’s grammar must be
+        # assumed to be valid at parse time.
+        css_parser_collect_arbitrary_substitution_function_presence_component_value(&token, substitution_presence) catch:
+            error(css_parser_parse_error_syntax_error, "")
+
+## parse_css_value's second block: a CSS-wide keyword (or other builtin value) as the whole value.
+func css_parser_parse_css_value_builtin(this: CssParser*, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssStyleValue*?:
+    var builtin_transaction = css_syntax.token_stream_begin_transaction(tokens)
+    defer css_syntax.state_transaction_destroy(&builtin_transaction)
+    let builtin: CssStyleValue*? = css_parse_all_as(tokens, css_parser_parse_builtin_value(this, css_parse_all_as_start(tokens))) catch: recover none
+    if let value = builtin:
+        css_syntax.state_transaction_commit(&builtin_transaction)
+        return value
+    return none
+
+## The callback of parse_css_value's `parse_all_as` for custom properties and values with arbitrary substitution
+## functions: the value, unresolved.
+func css_parse_unresolved_value(tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*, substitution_presence: css_syntax.SubstitutionFunctionsPresence,
+                                original_source_text: ak.String?) -> CssStyleValue*?:
+    if css_syntax.token_stream_is_empty(tokens):
+        return css_unresolved_style_value_create(ak.Vector[css_syntax.ComponentValue](), substitution_presence, original_source_text).css_style_value()
+
+    if let component_values = css_parser_parse_declaration_value(tokens):
+        return css_unresolved_style_value_create(component_values, substitution_presence, original_source_text).css_style_value()
+
+    return none
+
+## parse_css_value's third block: one value of the property, or several up to its maximum value count as a
+## space-separated list, if they are the whole value.
+func css_parser_parse_css_value_as_list(this: CssParser*, property_id: css_data.PropertyId, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssStyleValue*?:
+    var transaction = css_syntax.token_stream_begin_transaction(tokens)
+    defer css_syntax.state_transaction_destroy(&transaction)
+    var parsed_values = ak.Vector[CssStyleValue*]()
+    while let parsed_value = css_parser_parse_css_value_for_property(this, property_id, tokens):
+        ak.vector_append_t(&parsed_values, parsed_value)
+        css_syntax.token_stream_discard_whitespace(tokens)
+        if not css_syntax.token_stream_has_next_token(tokens):
+            break
+
+    css_syntax.token_stream_discard_whitespace(tokens)
+    if not css_syntax.token_stream_has_next_token(tokens):
+        if ak.vector_size(&parsed_values) == 1:
+            css_syntax.state_transaction_commit(&transaction)
+            return ak.vector_take_first(&parsed_values)
+
+        if not ak.vector_is_empty(&parsed_values) and ak.vector_size(&parsed_values) <= css_data.property_maximum_value_count(property_id):
+            css_syntax.state_transaction_commit(&transaction)
+            return css_style_value_list_of(parsed_values, CssStyleValueListSeparator.space)
+    return none
+
+# mark: The per-value lambdas of parse_css_value ================================================
+
+## `[this, property_id](auto& tokens) { return parse_single_background_position_x_or_y_value(tokens, property_id); }`.
+func css_parser_parse_single_background_position_x_or_y_callback(context: void*?, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssStyleValue*?:
+    let captures = (CssParserPropertyCaptures*)(context else trap("no captures"))
+    return css_parser_parse_single_background_position_x_or_y_value(captures.this, tokens, captures.property_id)
+
+## `[this, property_id](auto& tokens) { return parse_single_repeat_style_value(property_id, tokens); }`.
+func css_parser_parse_single_repeat_style_callback(context: void*?, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssStyleValue*?:
+    let captures = (CssParserPropertyCaptures*)(context else trap("no captures"))
+    return css_parser_parse_single_repeat_style_value(captures.this, captures.property_id, tokens)
+
+## `[this, property_id](auto& tokens) { return parse_single_background_size_value(property_id, tokens); }`.
+func css_parser_parse_single_background_size_callback(context: void*?, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssStyleValue*?:
+    let captures = (CssParserPropertyCaptures*)(context else trap("no captures"))
+    return css_parser_parse_single_background_size_value(captures.this, captures.property_id, tokens)
+
+## `[this](auto& tokens) { return parse_position_value(tokens); }`.
+func css_parser_parse_position_callback(context: void*?, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssStyleValue*?:
+    let captures = (CssParserPropertyCaptures*)(context else trap("no captures"))
+    return (CssStyleValue*?)css_parser_parse_position_value(captures.this, tokens)
+
+## `parse_comma_separated_value_list(tokens, <callback>)` with a property-capturing callback, as a StyleValue.
+func css_parser_parse_comma_separated_property_value_list(this: CssParser*, property_id: css_data.PropertyId, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*,
+                                                          callback: func(void*?, css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssStyleValue*?) -> CssStyleValue*?:
+    var captures = CssParserPropertyCaptures(this = this, property_id = property_id)
+    return (CssStyleValue*?)css_parser_parse_comma_separated_value_list(this, tokens, ak.Function1[css_syntax.TokenStream[css_syntax.ComponentValue]*, CssStyleValue*?](
+        call = callback, context = &captures))
+
+# mark: parse_css_value =========================================================================
+
+## Ported from Libraries/LibWeb/CSS/Parser/PropertyParsing.cpp:370 Web::CSS::Parser::Parser::parse_css_value.
+pub func css_parser_parse_css_value(this: CssParser*, property_id: css_data.PropertyId, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*, original_source_text: ak.String? = none) -> CssStyleValue*!:
+    css_parser_push_temporary_value_parsing_context(this, CssValueParsingContext.property_id(value = property_id))
+    defer css_parser_pop_temporary_value_parsing_context(this)
+
+    var substitution_presence = css_syntax.SubstitutionFunctionsPresence()
+    try css_collect_value_substitution_presence(tokens, &substitution_presence)
+
+    # NB: The `parse_all_as` lambda is css_parse_all_as_start and css_parse_all_as.
+
+    if let builtin = css_parser_parse_css_value_builtin(this, tokens):
+        return builtin
+
+    if property_id == css_data.PropertyId.custom or css_syntax.substitution_functions_presence_has_any(&substitution_presence):
+        return try css_parse_all_as(tokens, css_parse_unresolved_value(css_parse_all_as_start(tokens), substitution_presence, original_source_text))
+
+    css_syntax.token_stream_discard_whitespace(tokens)
+    if not css_syntax.token_stream_has_next_token(tokens):
+        error(css_parser_parse_error_syntax_error, "")
+
+    # Special-case property handling
+    match property_id:
+        .all:
+            # NOTE: The 'all' property, unlike some other shorthands, doesn't support directly listing sub-property
+            #       values, only the CSS-wide keywords - this is handled above, and thus, if we have gotten to here, there
+            #       is an invalid value which is a syntax error.
+            error(css_parser_parse_error_syntax_error, "")
+        .anchor_name:
+            return try css_parse_all_as(tokens, css_parser_parse_anchor_name_value(this, css_parse_all_as_start(tokens)))
+        .anchor_scope:
+            return try css_parse_all_as(tokens, css_parser_parse_anchor_scope_value(this, css_parse_all_as_start(tokens)))
+        .aspect_ratio:
+            return try css_parse_all_as(tokens, css_parser_parse_aspect_ratio_value(this, css_parse_all_as_start(tokens)))
+        .animation:
+            return try css_parse_all_as(tokens, css_parser_parse_animation_value(this, css_parse_all_as_start(tokens)))
+        .backdrop_filter, .filter:
+            return try css_parse_all_as(tokens, css_parser_parse_filter_value_list_value(this, css_parse_all_as_start(tokens)))
+        .background:
+            return try css_parse_all_as(tokens, css_parser_parse_background_value(this, css_parse_all_as_start(tokens)))
+        .background_position:
+            return try css_parse_all_as(tokens, css_parser_parse_background_position_value(this, css_parse_all_as_start(tokens)))
+        .background_position_x, .background_position_y:
+            return try css_parse_all_as(tokens, css_parser_parse_comma_separated_property_value_list(this, property_id, css_parse_all_as_start(tokens),
+                                                                                                     css_parser_parse_single_background_position_x_or_y_callback))
+        .background_repeat:
+            return try css_parse_all_as(tokens, css_parser_parse_comma_separated_property_value_list(this, property_id, css_parse_all_as_start(tokens),
+                                                                                                     css_parser_parse_single_repeat_style_callback))
+        .background_size:
+            return try css_parse_all_as(tokens, css_parser_parse_comma_separated_property_value_list(this, property_id, css_parse_all_as_start(tokens),
+                                                                                                     css_parser_parse_single_background_size_callback))
+        .border, .border_block, .border_inline:
+            return try css_parse_all_as(tokens, css_parser_parse_border_value(this, property_id, css_parse_all_as_start(tokens)))
+        .border_image:
+            return try css_parse_all_as(tokens, css_parser_parse_border_image_value(this, css_parse_all_as_start(tokens)))
+        .border_image_slice:
+            return try css_parse_all_as(tokens, css_parser_parse_border_image_slice_value(this, css_parse_all_as_start(tokens)))
+        .border_top_left_radius, .border_top_right_radius, .border_bottom_right_radius, .border_bottom_left_radius, .border_end_end_radius, .border_end_start_radius, .border_start_end_radius, .border_start_start_radius:
+            return try css_parse_all_as(tokens, css_parser_parse_border_radius_value(this, css_parse_all_as_start(tokens)))
+        .border_radius:
+            return try css_parse_all_as(tokens, css_parser_parse_border_radius_shorthand_value(this, css_parse_all_as_start(tokens)))
+        .box_shadow:
+            return try css_parse_all_as(tokens, css_parser_parse_shadow_value(this, css_parse_all_as_start(tokens), CssShadowStyleValueShadowType.normal))
+        .color_scheme:
+            return try css_parse_all_as(tokens, css_parser_parse_color_scheme_value(this, css_parse_all_as_start(tokens)))
+        .columns:
+            return try css_parse_all_as(tokens, css_parser_parse_columns_value(this, css_parse_all_as_start(tokens)))
+        .contain:
+            return try css_parse_all_as(tokens, css_parser_parse_contain_value(this, css_parse_all_as_start(tokens)))
+        .container_type:
+            return try css_parse_all_as(tokens, css_parser_parse_container_type_value(this, css_parse_all_as_start(tokens)))
+        .content:
+            return try css_parse_all_as(tokens, css_parser_parse_content_value(this, css_parse_all_as_start(tokens)))
+        .counter_increment:
+            return try css_parse_all_as(tokens, css_parser_parse_counter_increment_value(this, css_parse_all_as_start(tokens)))
+        .counter_reset:
+            return try css_parse_all_as(tokens, css_parser_parse_counter_reset_value(this, css_parse_all_as_start(tokens)))
+        .counter_set:
+            return try css_parse_all_as(tokens, css_parser_parse_counter_set_value(this, css_parse_all_as_start(tokens)))
+        .cursor:
+            return try css_parse_all_as(tokens, css_parser_parse_cursor_value(this, css_parse_all_as_start(tokens)))
+        .display:
+            return try css_parse_all_as(tokens, css_parser_parse_display_value(this, css_parse_all_as_start(tokens)))
+        .flex:
+            return try css_parse_all_as(tokens, css_parser_parse_flex_shorthand_value(this, css_parse_all_as_start(tokens)))
+        .flex_flow:
+            return try css_parse_all_as(tokens, css_parser_parse_flex_flow_value(this, css_parse_all_as_start(tokens)))
+        .font:
+            return try css_parse_all_as(tokens, css_parser_parse_font_value(this, css_parse_all_as_start(tokens)))
+        .font_family:
+            return try css_parse_all_as(tokens, css_parser_parse_font_family_value(this, css_parse_all_as_start(tokens)))
+        .font_feature_settings:
+            return try css_parse_all_as(tokens, css_parser_parse_font_feature_settings_value(this, css_parse_all_as_start(tokens)))
+        .font_language_override:
+            return try css_parse_all_as(tokens, css_parser_parse_font_language_override_value(this, css_parse_all_as_start(tokens)))
+        .font_variation_settings:
+            return try css_parse_all_as(tokens, css_parser_parse_font_variation_settings_value(this, css_parse_all_as_start(tokens)))
+        .font_variant:
+            return try css_parse_all_as(tokens, css_parser_parse_font_variant(this, css_parse_all_as_start(tokens)))
+        .grid_area:
+            return try css_parse_all_as(tokens, css_parser_parse_grid_area_shorthand_value(this, css_parse_all_as_start(tokens)))
+        .grid_auto_flow:
+            return try css_parse_all_as(tokens, (CssStyleValue*?)css_parser_parse_grid_auto_flow_value(this, css_parse_all_as_start(tokens)))
+        .grid_column, .grid_row:
+            return try css_parse_all_as(tokens, css_parser_parse_grid_track_placement_shorthand_value(this, property_id, css_parse_all_as_start(tokens)))
+        .grid_column_end:
+            return try css_parse_all_as(tokens, (CssStyleValue*?)css_parser_parse_grid_track_placement(this, css_parse_all_as_start(tokens)))
+        .grid_column_start:
+            return try css_parse_all_as(tokens, (CssStyleValue*?)css_parser_parse_grid_track_placement(this, css_parse_all_as_start(tokens)))
+        .grid_row_end:
+            return try css_parse_all_as(tokens, (CssStyleValue*?)css_parser_parse_grid_track_placement(this, css_parse_all_as_start(tokens)))
+        .grid_row_start:
+            return try css_parse_all_as(tokens, (CssStyleValue*?)css_parser_parse_grid_track_placement(this, css_parse_all_as_start(tokens)))
+        .grid:
+            return try css_parse_all_as(tokens, css_parser_parse_grid_shorthand_value(this, css_parse_all_as_start(tokens)))
+        .grid_template:
+            return try css_parse_all_as(tokens, css_parser_parse_grid_track_size_list_shorthand_value(this, css_data.PropertyId.grid_template, css_parse_all_as_start(tokens)))
+        .grid_template_areas:
+            return try css_parse_all_as(tokens, css_parser_parse_grid_template_areas_value(this, css_parse_all_as_start(tokens)))
+        .grid_template_columns:
+            return try css_parse_all_as(tokens, css_parser_parse_grid_track_size_list(this, css_parse_all_as_start(tokens)))
+        .grid_template_rows:
+            return try css_parse_all_as(tokens, css_parser_parse_grid_track_size_list(this, css_parse_all_as_start(tokens)))
+        .grid_auto_columns:
+            return try css_parse_all_as(tokens, css_parser_parse_grid_auto_track_sizes(this, css_parse_all_as_start(tokens)))
+        .grid_auto_rows:
+            return try css_parse_all_as(tokens, css_parser_parse_grid_auto_track_sizes(this, css_parse_all_as_start(tokens)))
+        .list_style:
+            return try css_parse_all_as(tokens, css_parser_parse_list_style_value(this, css_parse_all_as_start(tokens)))
+        .math_depth:
+            return try css_parse_all_as(tokens, css_parser_parse_math_depth_value(this, css_parse_all_as_start(tokens)))
+        .mask:
+            return try css_parse_all_as(tokens, css_parser_parse_mask_value(this, css_parse_all_as_start(tokens)))
+        .mask_position:
+            return try css_parse_all_as(tokens, css_parser_parse_comma_separated_property_value_list(this, property_id, css_parse_all_as_start(tokens),
+                                                                                                     css_parser_parse_position_callback))
+        .mask_repeat:
+            return try css_parse_all_as(tokens, css_parser_parse_comma_separated_property_value_list(this, css_data.PropertyId.mask_repeat, css_parse_all_as_start(tokens),
+                                                                                                     css_parser_parse_single_repeat_style_callback))
+        .mask_size:
+            return try css_parse_all_as(tokens, css_parser_parse_comma_separated_property_value_list(this, css_data.PropertyId.mask_size, css_parse_all_as_start(tokens),
+                                                                                                     css_parser_parse_single_background_size_callback))
+        .overflow_clip_margin_block_end, .overflow_clip_margin_block_start, .overflow_clip_margin_bottom, .overflow_clip_margin_inline_end, .overflow_clip_margin_inline_start, .overflow_clip_margin_left, .overflow_clip_margin_right, .overflow_clip_margin_top:
+            return try css_parse_all_as(tokens, css_parser_parse_overflow_clip_margin_value(this, css_parse_all_as_start(tokens)))
+        .overflow_clip_margin, .overflow_clip_margin_block, .overflow_clip_margin_inline:
+            return try css_parse_all_as(tokens, css_parser_parse_overflow_clip_margin_shorthand(this, property_id, css_parse_all_as_start(tokens)))
+        .paint_order:
+            return try css_parse_all_as(tokens, css_parser_parse_paint_order_value(this, css_parse_all_as_start(tokens)))
+        .place_content:
+            return try css_parse_all_as(tokens, css_parser_parse_place_content_value(this, css_parse_all_as_start(tokens)))
+        .place_items:
+            return try css_parse_all_as(tokens, css_parser_parse_place_items_value(this, css_parse_all_as_start(tokens)))
+        .place_self:
+            return try css_parse_all_as(tokens, css_parser_parse_place_self_value(this, css_parse_all_as_start(tokens)))
+        .position_anchor:
+            return try css_parse_all_as(tokens, css_parser_parse_position_anchor_value(this, css_parse_all_as_start(tokens)))
+        .position_area:
+            return try css_parse_all_as(tokens, css_parser_parse_position_area_value(this, css_parse_all_as_start(tokens)))
+        .position_try_fallbacks:
+            return try css_parse_all_as(tokens, css_parser_parse_position_try_fallbacks_value(this, css_parse_all_as_start(tokens)))
+        .position_visibility:
+            return try css_parse_all_as(tokens, css_parser_parse_position_visibility_value(this, css_parse_all_as_start(tokens)))
+        .quotes:
+            return try css_parse_all_as(tokens, css_parser_parse_quotes_value(this, css_parse_all_as_start(tokens)))
+        .rotate:
+            return try css_parse_all_as(tokens, css_parser_parse_rotate_value(this, css_parse_all_as_start(tokens)))
+        .scrollbar_color:
+            return try css_parse_all_as(tokens, css_parser_parse_scrollbar_color_value(this, css_parse_all_as_start(tokens)))
+        .scrollbar_gutter:
+            return try css_parse_all_as(tokens, css_parser_parse_scrollbar_gutter_value(this, css_parse_all_as_start(tokens)))
+        .shape_outside:
+            return try css_parse_all_as(tokens, css_parser_parse_shape_outside_value(this, css_parse_all_as_start(tokens)))
+        .stroke_dasharray:
+            return try css_parse_all_as(tokens, css_parser_parse_stroke_dasharray_value(this, css_parse_all_as_start(tokens)))
+        .text_decoration:
+            return try css_parse_all_as(tokens, css_parser_parse_text_decoration_value(this, css_parse_all_as_start(tokens)))
+        .text_decoration_line:
+            return try css_parse_all_as(tokens, css_parser_parse_text_decoration_line_value(this, css_parse_all_as_start(tokens)))
+        .text_indent:
+            return try css_parse_all_as(tokens, css_parser_parse_text_indent_value(this, css_parse_all_as_start(tokens)))
+        .text_shadow:
+            return try css_parse_all_as(tokens, css_parser_parse_shadow_value(this, css_parse_all_as_start(tokens), CssShadowStyleValueShadowType.text))
+        .text_underline_position:
+            return try css_parse_all_as(tokens, css_parser_parse_text_underline_position_value(this, css_parse_all_as_start(tokens)))
+        .timeline_scope:
+            return try css_parse_all_as(tokens, css_parser_parse_timeline_scope_value(this, css_parse_all_as_start(tokens)))
+        .touch_action:
+            return try css_parse_all_as(tokens, css_parser_parse_touch_action_value(this, css_parse_all_as_start(tokens)))
+        .transform_origin:
+            return try css_parse_all_as(tokens, css_parser_parse_transform_origin_value(this, css_parse_all_as_start(tokens)))
+        .transition:
+            return try css_parse_all_as(tokens, css_parser_parse_transition_value(this, css_parse_all_as_start(tokens)))
+        .transition_property:
+            return try css_parse_all_as(tokens, css_parser_parse_transition_property_value(this, css_parse_all_as_start(tokens)))
+        .translate:
+            return try css_parse_all_as(tokens, css_parser_parse_translate_value(this, css_parse_all_as_start(tokens)))
+        .scale:
+            return try css_parse_all_as(tokens, css_parser_parse_scale_value(this, css_parse_all_as_start(tokens)))
+        .scroll_timeline:
+            return try css_parse_all_as(tokens, css_parser_parse_scroll_timeline_value(this, css_parse_all_as_start(tokens)))
+        .view_timeline:
+            return try css_parse_all_as(tokens, css_parser_parse_view_timeline_value(this, css_parse_all_as_start(tokens)))
+        .white_space:
+            return try css_parse_all_as(tokens, css_parser_parse_white_space_shorthand(this, css_parse_all_as_start(tokens)))
+        .white_space_trim:
+            return try css_parse_all_as(tokens, css_parser_parse_white_space_trim_value(this, css_parse_all_as_start(tokens)))
+        .will_change:
+            return try css_parse_all_as(tokens, css_parser_parse_will_change_value(this, css_parse_all_as_start(tokens)))
+        _:
+            return try css_parser_parse_css_value_after_special_cases(this, property_id, tokens)
+
+## The rest of parse_css_value, after its `switch (property_id)` (whose `default:` breaks): coordinating lists,
+## positional shorthands, one or several values, and the expansion of other shorthands.
+func css_parser_parse_css_value_after_special_cases(this: CssParser*, property_id: css_data.PropertyId, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssStyleValue*!:
+    if css_data.property_multiplicity(property_id) == css_data.PropertyMultiplicity.coordinating_list and not css_data.property_is_shorthand(property_id):
+        return try css_parse_all_as(tokens, (CssStyleValue*?)css_parser_parse_simple_comma_separated_value_list(this, property_id, css_parse_all_as_start(tokens)))
+
+    if css_data.property_is_positional_value_list_shorthand(property_id):
+        return try css_parse_all_as(tokens, css_parser_parse_positional_value_list_shorthand(this, property_id, css_parse_all_as_start(tokens)))
+
+    if let value = css_parser_parse_css_value_as_list(this, property_id, tokens):
+        return value
+
+    # We have more values than the property claims to allow. Check if it's a shorthand.
+    # NB: longhands_for_shorthand() answers css_data's shared vector, which this function changes: copy it (DESIGN §3.3).
+    let shared_longhands = css_data.longhands_for_shorthand(property_id)
+    var unassigned_properties = ak.vector_clone(&shared_longhands)
+    if ak.vector_is_empty(&unassigned_properties):
+        error(css_parser_parse_error_syntax_error, "")
+
+    var assigned_values = ak.OrderedHashMap[css_data.PropertyId, ak.Vector[CssStyleValue*], css_data.PropertyIdTraits]()
+
+    while css_syntax.token_stream_has_next_token(tokens) and not ak.vector_is_empty(&unassigned_properties):
+        if let property_and_value = css_parser_parse_css_value_for_properties(this, ak.vector_span_const(&unassigned_properties), tokens):
+            let property = property_and_value.property
+            let value = property_and_value.style_value
+            let values = ak.ordered_hash_map_ensure(&assigned_values, property)
+            if ak.vector_size(values) + 1 == css_data.property_maximum_value_count(property):
+                # We're done with this property, move on to the next one.
+                css_remove_property(&unassigned_properties, property)
+
+            ak.vector_append_t(values, value else trap("release_nonnull"))
+            continue
+
+        # No property matched, so we're done.
+        if css_parser_debug:
+            let next = css_syntax.token_stream_next_token(tokens)
+            let next_debug_string = css_syntax.component_value_to_debug_string(&next)
+            let message = css_string_formatted("No property (from {} properties) matched {}", [ak.arg_u64((u64)ak.vector_size(&unassigned_properties)), css_arg_string(&next_debug_string)])
+            ak.dbgln(ak.string_view_text(ak.string_bytes_as_string_view(&message)))
+            for id in ak.vector_span_const(&unassigned_properties):
+                let name = css_data.string_from_property_id(id)
+                ak.dbgln(f"    {ak.string_view_text(ak.fly_string_bytes_as_string_view(&name))}")
+        break
+
+    for property in ak.vector_span_const(&unassigned_properties):
+        ak.vector_append_t(ak.ordered_hash_map_ensure(&assigned_values, property), css_property_initial_value(property))
+
+    css_syntax.token_stream_discard_whitespace(tokens)
+    if css_syntax.token_stream_has_next_token(tokens):
+        error(css_parser_parse_error_syntax_error, "")
+
+    var longhand_properties = ak.Vector[css_data.PropertyId]()
+    ak.vector_ensure_capacity(&longhand_properties, ak.ordered_hash_map_size(&assigned_values))
+    for it in ak.ordered_hash_map_begin(&assigned_values):
+        ak.vector_unchecked_append_u(&longhand_properties, it.key)
+
+    var longhand_values = ak.Vector[CssStyleValue*]()
+    ak.vector_ensure_capacity(&longhand_values, ak.ordered_hash_map_size(&assigned_values))
+    for it in ak.ordered_hash_map_begin(&assigned_values):
+        var values = it.value
+        if ak.vector_size(&values) == 1:
+            ak.vector_unchecked_append_u(&longhand_values, ak.vector_take_first(&values))
+        else:
+            ak.vector_unchecked_append_u(&longhand_values, css_style_value_list_of(values, CssStyleValueListSeparator.space))
+
+    return css_shorthand_of(property_id, longhand_properties, longhand_values)
+
+# mark: Positional value lists ==================================================================
+
+## Ported from Libraries/LibWeb/CSS/Parser/PropertyParsing.cpp:738 Web::CSS::Parser::Parser::parse_positional_value_list_shorthand.
+pub func css_parser_parse_positional_value_list_shorthand(this: CssParser*, property_id: css_data.PropertyId, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssStyleValue*?:
+    let longhands = css_data.longhands_for_shorthand(property_id)
+
+    var parsed_values = ak.Vector[CssStyleValue*]()
+
+    while let parsed_value = css_parser_parse_css_value_for_property(this, property_id, tokens):
+        ak.vector_append_t(&parsed_values, parsed_value)
+
+    if ak.vector_size(&parsed_values) == 0 or ak.vector_size(&parsed_values) > ak.vector_size(&longhands):
+        return none
+
+    let first = *ak.vector_at(&parsed_values, 0)
+    match ak.vector_size(&longhands):
+        2:
+            match ak.vector_size(&parsed_values):
+                1:
+                    return css_shorthand_of(property_id, longhands, css_style_values_of([first, first]))
+                2:
+                    return css_shorthand_of(property_id, longhands, parsed_values)
+                _:
+                    trap("VERIFY_NOT_REACHED")
+        4:
+            match ak.vector_size(&parsed_values):
+                1:
+                    return css_shorthand_of(property_id, longhands, css_style_values_of([first, first, first, first]))
+                2:
+                    let second = *ak.vector_at(&parsed_values, 1)
+                    return css_shorthand_of(property_id, longhands, css_style_values_of([first, second, first, second]))
+                3:
+                    let second = *ak.vector_at(&parsed_values, 1)
+                    let third = *ak.vector_at(&parsed_values, 2)
+                    return css_shorthand_of(property_id, longhands, css_style_values_of([first, second, third, second]))
+                4:
+                    return css_shorthand_of(property_id, longhands, parsed_values)
+                _:
+                    trap("VERIFY_NOT_REACHED")
+        _:
+            trap("TODO")
