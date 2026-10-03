@@ -11,7 +11,7 @@ for file in $(git ls-files '*.lucb' | grep -v -e '/types_' -e '/stubs/' -e '/gen
     luce-base fmt "$file" --check > /dev/null || { echo "$file is not formatted (luce-base fmt $file --write)"; exit 1; }
 done
 
-for module in src/web tools/gen_css_values tools/embed_css tools/gen_dom_tree tests/web_test; do
+for module in src/web tools/gen_css_values tools/embed_css tools/gen_dom_tree tools/gen_aria_roles tests/web_test; do
     echo "== luce-base check $module -W"
     # -W reports warnings without failing, so any output at all fails the run.
     output=$(luce-base check "$module" -W 2>&1) || { echo "$output"; exit 1; }
@@ -51,6 +51,14 @@ mkdir -p "$generated/html"
 luce-base build tools/gen_dom_tree -o build/gen_dom_tree
 build/gen_dom_tree data/html src/web "$generated/html"
 cmp "$generated/html/media_controls_dom.lucb" src/web/generated/html/media_controls_dom.lucb
+
+# The ARIA role classes' functions (web/generated/aria/aria_roles.lucb) are written by
+# tools/gen_aria_roles from data/aria/AriaRoles.json.
+echo "== tools/gen_aria_roles: regenerate web/generated/aria/aria_roles.lucb and compare"
+mkdir -p "$generated/aria"
+luce-base build tools/gen_aria_roles -o build/gen_aria_roles
+build/gen_aria_roles data/aria "$generated/aria"
+cmp "$generated/aria/aria_roles.lucb" src/web/generated/aria/aria_roles.lucb
 
 # Ladybird's Layout, Ref and Crash tests (the copy in tests/libweb) through the headless runner,
 # one worker process per test, against tests/expected_failures: an unexpected failure or an

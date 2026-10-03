@@ -1,0 +1,235 @@
+#==============================================================================================
+#
+#   json - the JSON reader of the generator (copied from tools/gen_css_values)
+#
+#   DESCRIPTION:
+#       Ladybird's generators read their inputs with Python's `json.load`, whose objects keep
+#       their members in file order; every emitter iterates them in that order. This reader
+#       does the same: an object is its member names and values in file order, an array its
+#       elements, and a number keeps its text (the emitters print numbers as the Python
+#       generators do, from the text). Values are allocated with the current allocator and
+#       live for the whole run; the inputs are trusted, so malformed JSON traps.
+#
+#==============================================================================================
+
+## The kind of a JSON value.
+enum JsonKind as u8:
+    null_ = 0
+    boolean = 1
+    number = 2
+    string = 3
+    array = 4
+    object = 5
+
+## A JSON value: the text of a string, number or boolean, the elements of an array, or the
+## members of an object (`keys[i]` names `items[i]`), in file order.
+struct Json:
+    var kind: JsonKind
+    var text: str
+    var keys: str[]
+    var items: (Json*?)[]
+    var count: usize
+
+    ## The member `name` of an object, or none (Python's `dict.get`).
+    func get(name: str) -> Json*?:
+        if self.kind != JsonKind.object:
+            return none
+        for index in 0..<self.count:
+            if self.keys[index] == name:
+                return self.items[index]
+        return none
+
+    ## Whether the object has the member `name` (Python's `name in dict`).
+    func has(name: str) -> bool:
+        return self.get(name) != none
+
+    ## The name of the object's member at `index`.
+    func key(index: usize) -> str:
+        assert(index < self.count)
+        return self.keys[index]
+
+    ## The object's member or the array's element at `index`.
+    func at(index: usize) -> Json*:
+        assert(index < self.count)
+        return self.items[index] else trap("a JSON slot without a value")
+
+    ## The text of a string (traps on anything else).
+    func string() -> str:
+        if self.kind != JsonKind.string:
+            trap(f"expected a JSON string")
+        return self.text
+
+    ## The value of a boolean (traps on anything else).
+    func boolean() -> bool:
+        if self.kind != JsonKind.boolean:
+            trap("expected a JSON boolean")
+        return self.text == "true"
+
+    ## Python's truthiness of the value (`if value:`): false for null, false, 0, "", [] and {}.
+    func truthy() -> bool:
+        match self.kind:
+            .null_: return false
+            .boolean: return self.text == "true"
+            .number: return not (self.text == "0" or self.text == "0.0")
+            .string: return self.text.length > 0
+            .array, .object: return self.count > 0
+            _: trap("a JSON value of no kind")
+
+## A new JSON value of `kind`.
+func json_new(kind: JsonKind, text: str) -> Json*!:
+    return try new Json(kind = kind, text = text, count = 0)
+
+## Append `value` to an array, or the member `name` to an object (Python's `list.append` and
+## assignment of a new key).
+func json_append(this: Json*, name: str, value: Json*) -> !:
+    if this.count == this.items.length:
+        let capacity = 8 if this.items.length == 0 else this.items.length * 2
+        let items = try new (Json*?)[capacity]
+        let keys = try new str[capacity]
+        for index in 0..<this.count:
+            items[index] = this.items[index]
+            keys[index] = this.keys[index]
+        this.items = items
+        this.keys = keys
+    this.items[this.count] = value
+    this.keys[this.count] = name
+    this.count += 1
+
+## Set the member `name` of an object to `value`: in place when it exists, as Python's
+## `dict[name] = value` keeps the key's position; appended otherwise.
+func json_set(this: Json*, name: str, value: Json*) -> !:
+    assert(this.kind == JsonKind.object)
+    for index in 0..<this.count:
+        if this.keys[index] == name:
+            this.items[index] = value
+            return
+    try json_append(this, name, value)
+
+## A deep copy of `value` (Python's `copy.deepcopy`).
+func json_clone(value: const Json*) -> Json*!:
+    let copy = try json_new(value.kind, value.text)
+    for index in 0..<value.count:
+        let item = value.items[index] else trap("a JSON slot without a value")
+        try json_append(copy, value.keys[index], try json_clone(item))
+    return copy
+
+# mark: Parsing =================================================================================
+
+## A cursor over JSON text.
+struct JsonParser:
+    var data: const u8[]
+    var offset: usize
+
+    mutating func skip_whitespace():
+        while self.offset < self.data.length:
+            let byte = self.data[self.offset]
+            if byte != ' ' and byte != '\t' and byte != '\n' and byte != '\r':
+                return
+            self.offset += 1
+
+    func peek() -> u8:
+        if self.offset >= self.data.length:
+            trap("unexpected end of JSON")
+        return self.data[self.offset]
+
+    mutating func expect(byte: u8):
+        if self.peek() != byte:
+            trap(f"malformed JSON at byte {self.offset}")
+        self.offset += 1
+
+    mutating func expect_word(word: str):
+        for byte in word.bytes:
+            self.expect(byte)
+
+## Parse the JSON document `data`.
+func json_parse(data: const u8[]) -> Json*!:
+    var parser = JsonParser(data = data, offset = 0)
+    let value = try json_parse_value(&parser)
+    parser.skip_whitespace()
+    if parser.offset != data.length:
+        trap("trailing text after the JSON value")
+    return value
+
+func json_parse_value(parser: JsonParser*) -> Json*!:
+    parser.skip_whitespace()
+    let byte = parser.peek()
+    if byte == '{':
+        parser.offset += 1
+        let object = try json_new(.object, "")
+        parser.skip_whitespace()
+        if parser.peek() == '}':
+            parser.offset += 1
+            return object
+        while true:
+            parser.skip_whitespace()
+            let name = try json_parse_string(parser)
+            parser.skip_whitespace()
+            parser.expect(':')
+            let value = try json_parse_value(parser)
+            # Python keeps the last of repeated keys, in the first key's position.
+            try json_set(object, name, value)
+            parser.skip_whitespace()
+            if parser.peek() == ',':
+                parser.offset += 1
+                continue
+            parser.expect('}')
+            return object
+    if byte == '[':
+        parser.offset += 1
+        let array = try json_new(.array, "")
+        parser.skip_whitespace()
+        if parser.peek() == ']':
+            parser.offset += 1
+            return array
+        while true:
+            try json_append(array, "", try json_parse_value(parser))
+            parser.skip_whitespace()
+            if parser.peek() == ',':
+                parser.offset += 1
+                continue
+            parser.expect(']')
+            return array
+    if byte == '"':
+        return try json_new(.string, try json_parse_string(parser))
+    if byte == 't':
+        parser.expect_word("true")
+        return try json_new(.boolean, "true")
+    if byte == 'f':
+        parser.expect_word("false")
+        return try json_new(.boolean, "false")
+    if byte == 'n':
+        parser.expect_word("null")
+        return try json_new(.null_, "null")
+    let start = parser.offset
+    while parser.offset < parser.data.length:
+        let digit = parser.data[parser.offset]
+        if not ((digit >= '0' and digit <= '9') or digit == '-' or digit == '+' or digit == '.' or digit == 'e' or digit == 'E'):
+            break
+        parser.offset += 1
+    if parser.offset == start:
+        trap(f"malformed JSON at byte {start}")
+    return try json_new(.number, (str)parser.data[start..<parser.offset])
+
+# The escapes of a JSON string, decoded; the other bytes are copied (the inputs are UTF-8).
+func json_parse_string(parser: JsonParser*) -> str!:
+    parser.expect('"')
+    var text = try strings.Builder.create()
+    while true:
+        let byte = parser.peek()
+        parser.offset += 1
+        if byte == '"':
+            break
+        if byte != '\\':
+            discard(try text.write(parser.data[parser.offset - 1..<parser.offset]))
+            continue
+        let escape = parser.peek()
+        parser.offset += 1
+        match escape:
+            '"': try text.put("\"")
+            '\\': try text.put("\\")
+            '/': try text.put("/")
+            'n': try text.put("\n")
+            't': try text.put("\t")
+            'r': try text.put("\r")
+            _: trap("an unsupported JSON escape")
+    return text.view()
