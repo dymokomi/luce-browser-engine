@@ -1,0 +1,433 @@
+#==============================================================================================
+#
+#   traversable_navigable_1 - HTML::TraversableNavigable: construction, top-level traversables,
+#   and the queries over session history steps
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibWeb/HTML/TraversableNavigable.cpp lines 1-375 (the constructor,
+#       visit_edges, the user agent's top-level traversable set, creating a new top-level browsing
+#       context and document, creating a new and a fresh top-level traversable,
+#       is_top_level_traversable, the used history steps, the history object's length and index,
+#       the used step, and the three navigable sets of a traversal), with the inline functions of
+#       TraversableNavigable.h.
+#
+#       Copyright (c) 2022, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2025, Jelle Raaijmakers <jelle@ladybird.org>
+#       Copyright (c) 2023-2025, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Construction ============================================================================
+
+## Ported from TraversableNavigable.cpp:37 Web::HTML::TraversableNavigable::TraversableNavigable, with
+## the default member initializers.
+pub func html_traversable_navigable_construct(this: HtmlTraversableNavigable*, page: Page*):
+    html_navigable_construct(this.html_navigable(), page, page_client_is_svg_page_client(page_client(page)))
+    this.m_system_visibility_state = HtmlVisibilityState.hidden
+    this.m_emulated_position_data = GeolocationEmulatedPositionData.empty
+    this.m_storage_shed = storage_api_storage_shed_create(gc.cell_heap(page.cell()))
+    this.m_session_history_traversal_queue = heap_allocate_html_session_history_traversal_queue(vm_heap(js_cell_vm(this.js_cell())))
+
+## `vm.heap().allocate<TraversableNavigable>(page)`: a traversable navigable constructed under
+## DeferGC.
+func heap_allocate_html_traversable_navigable(heap: gc.Heap*, page: Page*) -> HtmlTraversableNavigable*:
+    let traversable = (HtmlTraversableNavigable*)web_heap_allocate_cell(heap, &html_traversable_navigable_class)
+    gc.heap_defer_gc(heap)
+    html_traversable_navigable_construct(traversable, page)
+    gc.heap_undefer_gc(heap)
+    return traversable
+
+## Ported from TraversableNavigable.cpp:46 Web::HTML::TraversableNavigable::visit_edges (override).
+pub func html_traversable_navigable_visit_edges_impl(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (HtmlTraversableNavigable*)base
+    html_navigable_visit_edges_impl(base, visitor)
+    match this.m_emulated_position_data:
+        .geolocation_coordinates(coordinates):
+            gc.cell_visitor_visit_cell(visitor, (gc.Cell*)coordinates)  # opaque in phase 1
+        _:
+            discard(0)
+    gc.cell_visitor_visit_t_2(visitor, this.m_session_history_traversal_queue)
+    gc.cell_visitor_visit_t_2(visitor, this.m_storage_shed)
+    gc.cell_visitor_visit_t(visitor, this.m_apply_history_step_state)
+    gc.cell_visitor_visit_t(visitor, this.m_paused_apply_history_step_state)
+
+## The static set of user_agent_top_level_traversable_set: raw pointers in the C heap, as C++'s
+## static OrderedHashTable of TraversableNavigable* (it keeps nothing alive).
+var html_user_agent_top_level_traversable_set_storage: ak.OrderedHashTable[HtmlTraversableNavigable*?, ak.PtrTraits[HtmlTraversableNavigable]]
+
+## Ported from TraversableNavigable.cpp:57 Web::HTML::user_agent_top_level_traversable_set.
+func html_user_agent_top_level_traversable_set() -> ak.OrderedHashTable[HtmlTraversableNavigable*?, ak.PtrTraits[HtmlTraversableNavigable]]*:
+    return &html_user_agent_top_level_traversable_set_storage
+
+## Not in the donor (whose TraversableNavigable has no finalize): a collected traversable leaves
+## the user agent's top-level traversable set, so the C-heap set never keeps a pointer to a dead
+## cell (DESIGN §3.3 rule 7; the donor's set only loses a traversable when it is destroyed).
+pub func html_traversable_navigable_finalize_impl(base: gc.Cell*):
+    with memory.heap:
+        discard(ak.ordered_hash_table_remove_t(html_user_agent_top_level_traversable_set(), (HtmlTraversableNavigable*)base))
+    html_navigable_finalize_impl(base)
+
+# mark: Creating top-level traversables =========================================================
+
+## Ported from TraversableNavigable.cpp:64 Web::HTML::create_a_new_top_level_browsing_context_and_document.
+# https://html.spec.whatwg.org/multipage/document-sequences.html#creating-a-new-top-level-browsing-context
+pub func html_create_a_new_top_level_browsing_context_and_document(page: Page*) -> HtmlBrowsingContextAndDocument:
+    # 1. Let group and document be the result of creating a new browsing context group and document.
+    let created = html_browsing_context_group_create_a_new_browsing_context_group_and_document(page)
+    let group = created.browsing_context
+
+    # 2. Return group's browsing context set[0] and document.
+    var first = ak.ordered_hash_table_begin(html_browsing_context_group_browsing_context_set(group))
+    let browsing_context = *(first.next() else trap("the group has no browsing context"))
+    return HtmlBrowsingContextAndDocument(browsing_context = browsing_context, document = created.document)
+
+## Ported from TraversableNavigable.cpp:74 Web::HTML::TraversableNavigable::create_a_new_top_level_traversable.
+# https://html.spec.whatwg.org/multipage/document-sequences.html#creating-a-new-top-level-traversable
+pub func html_traversable_navigable_create_a_new_top_level_traversable(page: Page*, opener: HtmlBrowsingContext*?, target_name: ak.String) -> HtmlTraversableNavigable*:
+    let vm = bind_main_thread_vm()
+
+    # 1. Let document be null.
+    var document: DomDocument*? = none
+
+    # 2. If opener is null, then set document to the second return value of creating a new top-level browsing context and document.
+    if let opener_browsing_context = opener:
+        # 3. Otherwise, set document to the second return value of creating a new auxiliary browsing context and document given opener.
+        document = html_browsing_context_create_a_new_auxiliary_browsing_context_and_document(page, opener_browsing_context).document
+    else:
+        document = html_create_a_new_top_level_browsing_context_and_document(page).document
+    let the_document = document else trap("unreachable: set above")
+
+    # 4. Let documentState be a new document state, with
+    let document_state = html_document_state_create()
+
+    # document: document (now owned by Navigable::m_active_document, not DocumentState)
+
+    # initiator origin: null if opener is null; otherwise, document's origin
+    if opener != none:
+        html_document_state_set_initiator_origin(document_state, dom_document_origin(the_document))
+    else:
+        html_document_state_set_initiator_origin(document_state, none)
+
+    # origin: document's origin
+    html_document_state_set_origin(document_state, dom_document_origin(the_document))
+
+    # navigable target name: targetName
+    html_document_state_set_navigable_target_name(document_state, target_name)
+
+    # about base URL: document's about base URL
+    html_document_state_set_about_base_url(document_state, dom_document_about_base_url(the_document))
+
+    # 5. Let traversable be a new traversable navigable.
+    let traversable = heap_allocate_html_traversable_navigable(vm_heap(vm), page)
+
+    # 6. Initialize the navigable traversable given documentState.
+    html_navigable_initialize_navigable(traversable.html_navigable(), document_state, none, the_document)
+
+    # 7. Let initialHistoryEntry be traversable's active session history entry.
+    let initial_history_entry = html_navigable_active_session_history_entry(traversable.html_navigable()) else trap("VERIFY: initial_history_entry")
+
+    # 8. Set initialHistoryEntry's step to 0.
+    html_session_history_entry_set_step(initial_history_entry, I32OrHtmlSessionHistoryEntryPending.i32_(0))
+
+    # 9. Append initialHistoryEntry to traversable's session history entries.
+    ak.vector_append_t(&traversable.m_session_history_entries, initial_history_entry)
+    html_navigable_set_has_session_history_entry_and_ready_for_navigation(traversable.html_navigable())
+
+    # FIXME: 10. If opener is non-null, then legacy-clone a traversable storage shed given opener's top-level traversable and traversable. [STORAGE]
+
+    # 11. Append traversable to the user agent's top-level traversable set.
+    with memory.heap:
+        discard(ak.ordered_hash_table_set(html_user_agent_top_level_traversable_set(), traversable))
+
+    # 12. Return traversable.
+    return traversable
+
+## The captures of create_a_fresh_top_level_traversable's deferred end of parsing.
+struct HtmlTraversableNavigableFreshTheEnd:
+    var traversable: HtmlTraversableNavigable*
+    var initial_navigation_url: web_url.Url
+
+## create_a_fresh_top_level_traversable's deferred invocation: the end of the about:blank parse.
+func html_traversable_navigable_fresh_the_end(context: void*?):
+    let captures = (HtmlTraversableNavigableFreshTheEnd*)(context else trap("no captures"))
+    # FIXME: We do this other places too when creating a new about:blank document. Perhaps it's worth a spec issue?
+    html_parser_the_end(html_navigable_active_document(captures.traversable.html_navigable()) else trap("no active document"))
+
+    # FIXME: If we perform the URL and history update steps here, we start hanging tests and the UI process will
+    #        try to load() the initial URLs passed on the command line before we finish processing the events here.
+    #        However, because we call this before the PageClient is fully initialized... that gets awkward.
+    discard(captures.initial_navigation_url)
+
+## Ported from TraversableNavigable.cpp:135 Web::HTML::TraversableNavigable::create_a_fresh_top_level_traversable.
+# https://html.spec.whatwg.org/multipage/document-sequences.html#create-a-fresh-top-level-traversable
+pub func html_traversable_navigable_create_a_fresh_top_level_traversable(page: Page*, initial_navigation_url: web_url.Url, initial_navigation_post_resource: EmptyOrStringOrHtmlPostResource) -> HtmlTraversableNavigable*:
+    # 1. Let traversable be the result of creating a new top-level traversable given null and the empty string.
+    let traversable = html_traversable_navigable_create_a_new_top_level_traversable(page, none, ak.string_new())
+    page_set_top_level_traversable(page, traversable)
+
+    # AD-HOC: Set the default top-level emulated position data for the traversable, which points to Market St. SF.
+    # FIXME: We should not emulate by default, but ask the user what to do. E.g. disable Geolocation, set an emulated
+    #        position, or allow Ladybird to engage with the system's geolocation services. This is completely separate
+    #        from the permission model for "powerful features" such as Geolocation.
+    let active_document = html_navigable_active_document(traversable.html_navigable()) else trap("no active document")
+    let realm = bind_platform_object_realm(active_document.bind_platform_object())
+    let emulated_position_coordinates = realm_create_geolocation_coordinates(realm, realm, 100.0, 37.7647658, -122.4345892, 60.0, 10.0, 0.0, 0.0)
+    html_traversable_navigable_set_emulated_position_data(traversable, GeolocationEmulatedPositionData.geolocation_coordinates(emulated_position_coordinates))
+
+    # AD-HOC: Mark the about:blank document as finished parsing if we're only going to about:blank
+    #         Skip the initial navigation as well. This matches the behavior of the window open steps.
+
+    if html_url_matches_about_blank(initial_navigation_url):
+        let captures = new HtmlTraversableNavigableFreshTheEnd(traversable = traversable, initial_navigation_url = initial_navigation_url) else trap("out of memory")
+        platform_event_loop_plugin_deferred_invoke(platform_event_loop_plugin_the(), gc.create_function0(gc.cell_heap(traversable.cell()), ak.Function0[unit](call = html_traversable_navigable_fresh_the_end, context = captures)))
+    else:
+        # 2. Navigate traversable to initialNavigationURL using traversable's active document, with documentResource set to initialNavigationPostResource.
+        html_navigable_navigate(traversable.html_navigable(), HtmlNavigableNavigateParams(url = initial_navigation_url, source_document = active_document, document_resource = initial_navigation_post_resource)) else trap("MUST: Navigable::navigate")
+
+    # 3. Return traversable.
+    return traversable
+
+## Ported from TraversableNavigable.cpp:185 Web::HTML::TraversableNavigable::is_top_level_traversable (override).
+# https://html.spec.whatwg.org/multipage/document-sequences.html#top-level-traversable
+pub func html_traversable_navigable_is_top_level_traversable_impl(base: HtmlNavigable*) -> bool:
+    # A top-level traversable is a traversable navigable with a null parent.
+    return html_navigable_parent(base) == none
+
+# mark: History steps ===========================================================================
+
+## `entry->step().get<int>()` of a session history entry whose step is known.
+func html_traversable_entry_step(entry: HtmlSessionHistoryEntry*) -> i32:
+    match html_session_history_entry_step(entry):
+        .i32_(step):
+            return step
+        .html_session_history_entry_pending(_):
+            trap("Variant::get<int>() on a pending step")
+
+## Ported from TraversableNavigable.cpp:192 Web::HTML::TraversableNavigable::get_all_used_history_steps.
+# https://html.spec.whatwg.org/multipage/browsing-the-web.html#getting-all-used-history-steps
+pub func html_traversable_navigable_get_all_used_history_steps(this: HtmlTraversableNavigable*) -> ak.Vector[i32]:
+    # FIXME: 1. Assert: this is running within traversable's session history traversal queue.
+
+    # 2. Let steps be an empty ordered set of non-negative integers.
+    var steps = ak.OrderedHashTable[i32, ak.I32Traits]()
+
+    # 3. Let entryLists be the ordered set « traversable's session history entries ».
+    var entry_lists = ak.Vector[ak.Vector[HtmlSessionHistoryEntry*]]()
+    ak.vector_append_t(&entry_lists, html_traversable_navigable_session_history_entries_const(this))
+
+    # 4. For each entryList of entryLists:
+    while not ak.vector_is_empty(&entry_lists):
+        var entry_list = ak.vector_take_first(&entry_lists)
+
+        # 1. For each entry of entryList:
+        for entry in ak.vector_span(&entry_list):
+            # 1. Append entry's step to steps.
+            discard(ak.ordered_hash_table_set(&steps, html_traversable_entry_step(entry)))
+
+            # 2. For each nestedHistory of entry's document state's nested histories, append nestedHistory's entries list to entryLists.
+            for nested_history in ak.vector_span(html_document_state_nested_histories(html_session_history_entry_document_state(entry) else trap("no document state"))):
+                ak.vector_append_t(&entry_lists, nested_history.entries)
+
+    # 5. Return steps, sorted.
+    var sorted_steps = ak.ordered_hash_table_values(&steps)
+    ak.quick_sort_t_collection(ak.vector_span(&sorted_steps))
+    return sorted_steps
+
+## Ported from TraversableNavigable.cpp:224 Web::HTML::TraversableNavigable::get_the_history_object_length_and_index.
+# https://html.spec.whatwg.org/multipage/browsing-the-web.html#getting-the-history-object-length-and-index
+pub func html_traversable_navigable_get_the_history_object_length_and_index(this: HtmlTraversableNavigable*, step: i32) -> HtmlTraversableNavigableHistoryObjectLengthAndIndex:
+    # 1. Let steps be the result of getting all used history steps within traversable.
+    var steps = html_traversable_navigable_get_all_used_history_steps(this)
+
+    # 2. Let scriptHistoryLength be the size of steps.
+    let script_history_length = ak.vector_size(&steps)
+
+    # 3. Assert: steps contains step.
+    assert(ak.vector_contains_slow[i32, ak.I32Traits](&steps, step))
+
+    # 4. Let scriptHistoryIndex be the index of step in steps.
+    let script_history_index = ak.vector_find_first_index(&steps, step) else trap("unreachable: asserted above")
+
+    # 5. Return (scriptHistoryLength, scriptHistoryIndex).
+    return HtmlTraversableNavigableHistoryObjectLengthAndIndex(script_history_length = (u64)script_history_length, script_history_index = (u64)script_history_index)
+
+## Ported from TraversableNavigable.cpp:246 Web::HTML::TraversableNavigable::get_the_used_step.
+# https://html.spec.whatwg.org/multipage/browsing-the-web.html#getting-the-used-step
+pub func html_traversable_navigable_get_the_used_step(this: HtmlTraversableNavigable*, step: i32) -> i32:
+    # 1. Let steps be the result of getting all used history steps within traversable.
+    var steps = html_traversable_navigable_get_all_used_history_steps(this)
+
+    # 2. Return the greatest item in steps that is less than or equal to step.
+    assert(not ak.vector_is_empty(&steps))
+    var result: i32? = none
+    for item in ak.vector_span(&steps):
+        if item <= step:
+            if result == none or (result else trap("unreachable: checked above")) < item:
+                result = item
+    return result else trap("Optional::value() on an empty optional")
+
+## Ported from TraversableNavigable.cpp:265 Web::HTML::TraversableNavigable::get_all_navigables_whose_current_session_history_entry_will_change_or_reload.
+# https://html.spec.whatwg.org/multipage/browsing-the-web.html#get-all-navigables-whose-current-session-history-entry-will-change-or-reload
+pub func html_traversable_navigable_get_all_navigables_whose_current_session_history_entry_will_change_or_reload(this: HtmlTraversableNavigable*, target_step: i32) -> ak.Vector[HtmlNavigable*?]:
+    # 1. Let results be an empty list.
+    var results = ak.Vector[HtmlNavigable*?]()
+
+    # 2. Let navigablesToCheck be « traversable ».
+    var navigables_to_check = ak.Vector[HtmlNavigable*?]()
+    ak.vector_append_t(&navigables_to_check, this.html_navigable())
+
+    # 3. For each navigable of navigablesToCheck:
+    while not ak.vector_is_empty(&navigables_to_check):
+        let navigable = ak.vector_take_first(&navigables_to_check) else trap("no navigable")
+
+        # 1. Let targetEntry be the result of getting the target history entry given navigable and targetStep.
+        let target_entry = html_navigable_get_the_target_history_entry(navigable, target_step) else trap("no target entry")
+        let target_state = html_session_history_entry_document_state(target_entry) else trap("no document state")
+
+        # 2. If targetEntry is not navigable's current session history entry or targetEntry's document state's reload
+        #    pending is true, then append navigable to results.
+        # AD-HOC: We don't want to choose a navigable that has ongoing traversal.
+        if (target_entry != html_navigable_current_session_history_entry(navigable) or html_document_state_reload_pending(target_state)) and not html_ongoing_navigation_is_traversal(html_navigable_ongoing_navigation(navigable)):
+            ak.vector_append_t(&results, navigable)
+
+        # 3. If targetEntry's document is navigable's document, and targetEntry's document state's reload pending is
+        #    false, then extend navigablesToCheck with the child navigables of navigable.
+        if html_document_state_document_id(target_state) == html_navigable_active_document_id(navigable) and not html_document_state_reload_pending(target_state):
+            var children = html_navigable_child_navigables(navigable)
+            ak.vector_extend(&navigables_to_check, &children)
+
+    # 4. Return results.
+    return results
+
+## Ported from TraversableNavigable.cpp:300 Web::HTML::TraversableNavigable::get_all_navigables_that_only_need_history_object_length_index_update.
+# https://html.spec.whatwg.org/multipage/browsing-the-web.html#getting-all-navigables-that-only-need-history-object-length/index-update
+pub func html_traversable_navigable_get_all_navigables_that_only_need_history_object_length_index_update(this: HtmlTraversableNavigable*, target_step: i32) -> ak.Vector[HtmlNavigable*?]:
+    # NOTE: Other navigables might not be impacted by the traversal. For example, if the response is a 204, the currently active document will remain.
+    #       Additionally, going 'back' after a 204 will change the current session history entry, but the active session history entry will already be correct.
+
+    # 1. Let results be an empty list.
+    var results = ak.Vector[HtmlNavigable*?]()
+
+    # 2. Let navigablesToCheck be « traversable ».
+    var navigables_to_check = ak.Vector[HtmlNavigable*?]()
+    ak.vector_append_t(&navigables_to_check, this.html_navigable())
+
+    # 3. For each navigable of navigablesToCheck:
+    while not ak.vector_is_empty(&navigables_to_check):
+        let navigable = ak.vector_take_first(&navigables_to_check) else trap("no navigable")
+
+        # 1. Let targetEntry be the result of getting the target history entry given navigable and targetStep.
+        let target_entry = html_navigable_get_the_target_history_entry(navigable, target_step) else trap("no target entry")
+
+        # 2. If targetEntry is navigable's current session history entry and targetEntry's document state's reload pending is false, then:
+        if target_entry == html_navigable_current_session_history_entry(navigable) and not html_document_state_reload_pending(html_session_history_entry_document_state(target_entry) else trap("no document state")):
+            # 1.  Append navigable to results.
+            ak.vector_append_t(&results, navigable)
+
+            # 2. Extend navigablesToCheck with navigable's child navigables.
+            var children = html_navigable_child_navigables(navigable)
+            ak.vector_extend(&navigables_to_check, &children)
+
+    # 4. Return results.
+    return results
+
+## Ported from TraversableNavigable.cpp:334 Web::HTML::TraversableNavigable::get_all_navigables_that_might_experience_a_cross_document_traversal.
+# https://html.spec.whatwg.org/multipage/browsing-the-web.html#getting-all-navigables-that-might-experience-a-cross-document-traversal
+pub func html_traversable_navigable_get_all_navigables_that_might_experience_a_cross_document_traversal(this: HtmlTraversableNavigable*, target_step: i32) -> ak.Vector[HtmlNavigable*?]:
+    # NOTE: From traversable's session history traversal queue's perspective, these documents are candidates for going cross-document during the
+    #       traversal described by targetStep. They will not experience a cross-document traversal if the status code for their target document is
+    #       HTTP 204 No Content.
+    #       Note that if a given navigable might experience a cross-document traversal, this algorithm will return navigable but not its child navigables.
+    #       Those would end up unloaded, not traversed.
+
+    # 1. Let results be an empty list.
+    var results = ak.Vector[HtmlNavigable*?]()
+
+    # 2. Let navigablesToCheck be « traversable ».
+    var navigables_to_check = ak.Vector[HtmlNavigable*?]()
+    ak.vector_append_t(&navigables_to_check, this.html_navigable())
+
+    # 3. For each navigable of navigablesToCheck:
+    while not ak.vector_is_empty(&navigables_to_check):
+        let navigable = ak.vector_take_first(&navigables_to_check) else trap("no navigable")
+
+        # 1. Let targetEntry be the result of getting the target history entry given navigable and targetStep.
+        let target_entry = html_navigable_get_the_target_history_entry(navigable, target_step) else trap("no target entry")
+        let target_state = html_session_history_entry_document_state(target_entry) else trap("no document state")
+
+        # 2. If targetEntry's document is not navigable's document or targetEntry's document state's reload pending is true, then append navigable to results.
+        # NOTE: Although navigable's active history entry can change synchronously, the new entry will always have the same Document,
+        #       so accessing navigable's document is reliable.
+        if html_document_state_document_id(target_state) != html_navigable_active_document_id(navigable) or html_document_state_reload_pending(target_state):
+            ak.vector_append_t(&results, navigable)
+
+        # 3. Otherwise, extend navigablesToCheck with navigable's child navigables.
+        #    Adding child navigables to navigablesToCheck means those navigables will also be checked by this loop.
+        #    Child navigables are only checked if the navigable's active document will not change as part of this traversal.
+        else:
+            var children = html_navigable_child_navigables(navigable)
+            ak.vector_extend(&navigables_to_check, &children)
+
+    # 4. Return results.
+    return results
+
+# mark: TraversableNavigable.h ==================================================================
+
+## Ported from TraversableNavigable.h:46 Web::HTML::TraversableNavigable::current_session_history_step.
+pub func html_traversable_navigable_current_session_history_step(this: HtmlTraversableNavigable*) -> i32:
+    return this.m_current_session_history_step
+
+## Ported from TraversableNavigable.h:47 Web::HTML::TraversableNavigable::session_history_entries.
+pub func html_traversable_navigable_session_history_entries(this: HtmlTraversableNavigable*) -> ak.Vector[HtmlSessionHistoryEntry*]*:
+    return &this.m_session_history_entries
+
+## Ported from TraversableNavigable.h:48 Web::HTML::TraversableNavigable::session_history_entries (const).
+pub func html_traversable_navigable_session_history_entries_const(this: HtmlTraversableNavigable*) -> ak.Vector[HtmlSessionHistoryEntry*]:
+    return this.m_session_history_entries
+
+## Ported from TraversableNavigable.h:50 Web::HTML::TraversableNavigable::system_visibility_state.
+pub func html_traversable_navigable_system_visibility_state(this: HtmlTraversableNavigable*) -> HtmlVisibilityState:
+    return this.m_system_visibility_state
+
+## Ported from TraversableNavigable.h:53 Web::HTML::TraversableNavigable::is_created_by_web_content.
+pub func html_traversable_navigable_is_created_by_web_content(this: HtmlTraversableNavigable*) -> bool:
+    return this.m_is_created_by_web_content
+
+## Ported from TraversableNavigable.h:54 Web::HTML::TraversableNavigable::set_is_created_by_web_content.
+pub func html_traversable_navigable_set_is_created_by_web_content(this: HtmlTraversableNavigable*, value: bool):
+    this.m_is_created_by_web_content = value
+
+## Ported from TraversableNavigable.h:84 Web::HTML::TraversableNavigable::append_session_history_traversal_steps.
+pub func html_traversable_navigable_append_session_history_traversal_steps(this: HtmlTraversableNavigable*, steps: gc.Function1[CorePromise[ak.Empty, ak.AkError]*, unit]*):
+    html_session_history_traversal_queue_append(this.m_session_history_traversal_queue, steps)
+
+## Ported from TraversableNavigable.h:89 Web::HTML::TraversableNavigable::append_session_history_synchronous_navigation_steps.
+pub func html_traversable_navigable_append_session_history_synchronous_navigation_steps(this: HtmlTraversableNavigable*, target_navigable: HtmlNavigable*, steps: gc.Function1[CorePromise[ak.Empty, ak.AkError]*, unit]*):
+    html_session_history_traversal_queue_append_sync(this.m_session_history_traversal_queue, steps, target_navigable)
+
+## Ported from TraversableNavigable.h:94 Web::HTML::TraversableNavigable::window_handle.
+pub func html_traversable_navigable_window_handle(this: HtmlTraversableNavigable*) -> ak.String:
+    return this.m_window_handle
+
+## Ported from TraversableNavigable.h:95 Web::HTML::TraversableNavigable::set_window_handle.
+pub func html_traversable_navigable_set_window_handle(this: HtmlTraversableNavigable*, window_handle: ak.String):
+    this.m_window_handle = window_handle
+
+## Ported from TraversableNavigable.h:106 Web::HTML::TraversableNavigable::storage_shed.
+pub func html_traversable_navigable_storage_shed(this: HtmlTraversableNavigable*) -> StorageApiStorageShed*:
+    return this.m_storage_shed
+
+## Ported from TraversableNavigable.h:107 Web::HTML::TraversableNavigable::storage_shed (const).
+pub func html_traversable_navigable_storage_shed_const(this: HtmlTraversableNavigable*) -> StorageApiStorageShed*:
+    return this.m_storage_shed
+
+## Ported from TraversableNavigable.h:114 Web::HTML::TraversableNavigable::queue_screenshot_task.
+pub func html_traversable_navigable_queue_screenshot_task(this: HtmlTraversableNavigable*, node_id: i64?):
+    ak.queue_enqueue(&this.m_screenshot_tasks, HtmlTraversableNavigableScreenshotTask(node_id = node_id))
+    html_navigable_set_needs_repaint(this.html_navigable())
+    page_client_request_frame(page_client(html_navigable_page(this.html_navigable())))
+
+## Ported from TraversableNavigable.h:126 Web::HTML::TraversableNavigable::is_traversable (override).
+pub func html_traversable_navigable_is_traversable_impl(base: HtmlNavigable*) -> bool:
+    return true
