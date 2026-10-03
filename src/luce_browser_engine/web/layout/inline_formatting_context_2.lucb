@@ -1,0 +1,398 @@
+#==============================================================================================
+#
+#   inline_formatting_context_2 - Layout::InlineFormattingContext: generating line boxes,
+#                                 justification, text-overflow and static positions
+#
+#   DESCRIPTION:
+#       Port of LibWeb/Layout/InlineFormattingContext.cpp (lines 201-597): justifying the
+#       fragments of a line, the text-overflow ellipsis, generate_line_boxes (the items of an
+#       InlineLevelIterator placed by a LineBuilder: collapsible whitespace at line starts,
+#       forced breaks and clearance, atomic inlines, floats, and wrapping text before and at
+#       whitespace), whether floats intrude at a block offset and whether a line fits beside
+#       them, the vertical float clearance, and the static position of an absolutely
+#       positioned box among inline content.
+#
+#       Copyright (c) 2020-2024, Andreas Kling <andreas@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Justification and text-overflow =========================================================
+
+## Ported from Libraries/LibWeb/Layout/InlineFormattingContext.cpp:201 Web::Layout::InlineFormattingContext::apply_justification_to_fragments.
+func layout_inline_formatting_context_apply_justification_to_fragments(this: LayoutInlineFormattingContext*, text_justify: css_data.TextJustify, line_box: LayoutLineBox*, is_last_line: bool):
+    match text_justify:
+        .none_:
+            return
+        # FIXME: These two cases currently fall back to auto, handle them as well.
+        .inter_character, .inter_word, .auto:
+            discard(0)
+        _:
+            discard(0)
+
+    # https://www.w3.org/TR/css-text-3/#text-align-property
+    # Unless otherwise specified by text-align-last, the last line before a forced break or the end of the block is start-aligned.
+    # FIXME: Support text-align-last.
+    if is_last_line or line_box.m_has_forced_break:
+        return
+
+    let original_available_width = layout_line_box_original_available_width(line_box)
+    let excess_horizontal_space = layout_available_size_to_px_or_zero(&original_available_width).sub(layout_line_box_inline_length(line_box))
+    var excess_horizontal_space_including_whitespace = excess_horizontal_space
+    var whitespace_count: usize = 0
+    let fragments = layout_line_box_fragments(line_box)
+    for i in 0..<ak.vector_size(fragments):
+        let fragment = ak.vector_at(fragments, i)
+        if layout_line_box_fragment_is_justifiable_whitespace(fragment):
+            whitespace_count += 1
+            excess_horizontal_space_including_whitespace = excess_horizontal_space_including_whitespace.add(layout_line_box_fragment_inline_length(fragment))
+
+    var justified_space_width = layout_zero_px()
+    if whitespace_count > 0:
+        justified_space_width = layout_div_int(excess_horizontal_space_including_whitespace, (i64)whitespace_count)
+
+    # This is the amount that each fragment will be offset by. If a whitespace
+    # fragment is shorter than the justified space width, it increases to push
+    # subsequent fragments, and decreases to pull them back otherwise.
+    var running_diff = layout_zero_px()
+    for i in 0..<ak.vector_size(fragments):
+        let fragment = ak.vector_at(fragments, i)
+        layout_line_box_fragment_set_inline_offset(fragment, layout_line_box_fragment_inline_offset(fragment).add(running_diff))
+
+        if layout_line_box_fragment_is_justifiable_whitespace(fragment) and layout_line_box_fragment_inline_length(fragment) != justified_space_width:
+            running_diff = running_diff.add(justified_space_width.sub(layout_line_box_fragment_inline_length(fragment)))
+            layout_line_box_fragment_set_inline_length(fragment, justified_space_width)
+
+## Ported from Libraries/LibWeb/Layout/InlineFormattingContext.cpp:248 Web::Layout::InlineFormattingContext::apply_text_overflow_ellipsis.
+# https://drafts.csswg.org/css-overflow-4/#text-overflow
+func layout_inline_formatting_context_apply_text_overflow_ellipsis(this: LayoutInlineFormattingContext*, line_boxes: ak.Vector[LayoutLineBox]*):
+    # This property specifies rendering when inline content overflows its line box edge in the inline progression
+    # direction of its block container element ("the block") that has overflow other than visible.
+
+    # NB: When inline children are wrapped in anonymous blocks (e.g. due to floats), we look past the anonymous
+    #     wrapper to the actual element that has text-overflow and overflow set.
+    var block = layout_inline_formatting_context_containing_block(this).layout_box()
+    if layout_node_is_anonymous(block.layout_node()):
+        block = layout_node_non_anonymous_containing_block(block.layout_node()) else trap("an anonymous box without a non-anonymous containing block")
+
+    # FIXME: Support the <string>, fade, and fade() values, as well as the two-value syntax.
+    let block_values = layout_box_computed(block)
+    if css_computed_values_text_overflow(block_values) != css_data.TextOverflow.ellipsis:
+        return
+    if css_computed_values_overflow_x(block_values) == css_data.Overflow.visible:
+        return
+
+    # Render an ellipsis character (U+2026) to represent clipped inline content.
+    let ellipsis_codepoint: u32 = 0x2026
+
+    for line_index in 0..<ak.vector_size(line_boxes):
+        let line_box = ak.vector_at(line_boxes, line_index)
+        # NB: Use the line box's original available width rather than the IFC's available space, since the line's
+        #     usable width may be reduced by float intrusions.
+        let original_available_width = layout_line_box_original_available_width(line_box)
+        if not layout_available_size_is_definite(&original_available_width):
+            continue
+        let available_width = layout_available_size_to_px_or_zero(&original_available_width)
+        if layout_line_box_inline_length(line_box).le(available_width):
+            continue
+
+        let fragments = layout_line_box_fragments(line_box)
+        if ak.vector_is_empty(fragments):
+            continue
+
+        # For the ellipsis and string values, implementations must hide characters and atomic inline-level elements at
+        # the applicable edge(s) of the line as necessary to fit the ellipsis/string, and place the ellipsis/string
+        # immediately adjacent to the applicable edge(s) of the remaining inline content.
+        var line_has_visible_content = false
+        for i in 0..<ak.vector_size(fragments):
+            let fragment = ak.vector_at(fragments, i)
+            let fragment_start = layout_line_box_fragment_inline_offset(fragment)
+            let fragment_end = fragment_start.add(layout_line_box_fragment_inline_length(fragment))
+
+            if fragment_end.le(available_width):
+                line_has_visible_content = true
+                continue
+
+            # NB: We skip non-text fragments (atomic inlines) for now. Hiding them entirely to make room for the
+            #     ellipsis is not yet implemented.
+            let glyph_run = layout_line_box_fragment_glyph_run(fragment) else continue
+
+            let font = web_fonts.glyph_run_font(glyph_run)
+            let ellipsis_width = web_fonts.font_glyph_width(font, ellipsis_codepoint)
+            let available_in_fragment = available_width.sub(fragment_start).to_float()
+            let max_text_width = available_in_fragment - ellipsis_width
+
+            let glyphs = web_fonts.glyph_run_glyphs(glyph_run)
+            var keep_count: usize = 0
+            var last_kept_end: f32 = 0.0
+            var y_position: f32 = 0.0
+
+            # https://drafts.csswg.org/css-overflow-4/#auto-ellipsis
+            # The first character or atomic inline-level element on a line must be clipped rather than ellipsed.
+            for glyph in ak.vector_span(glyphs):
+                let glyph_end = glyph.position.m_x + glyph.glyph_width
+                if glyph_end > max_text_width and (keep_count > 0 or line_has_visible_content):
+                    break
+                keep_count += 1
+                last_kept_end = glyph_end
+                y_position = glyph.position.m_y
+
+            if keep_count < ak.vector_size(glyphs):
+                ak.vector_remove_usize(glyphs, keep_count, ak.vector_size(glyphs) - keep_count)
+
+            ak.vector_append_t(glyphs, web_fonts.DrawGlyph(
+                position = gfx.FloatPoint(m_x = last_kept_end, m_y = y_position),
+                length_in_code_units = ak.unicode_utils_code_unit_length_for_code_point(ellipsis_codepoint),
+                glyph_width = ellipsis_width,
+                glyph_id = web_fonts.font_glyph_id_for_code_point(font, ellipsis_codepoint)))
+
+            layout_line_box_fragment_set_inline_length(fragment, gfx.css_pixels_nearest_value_for_f32(last_kept_end + ellipsis_width))
+
+            for j in i + 1..<ak.vector_size(fragments):
+                layout_line_box_fragment_set_fully_truncated(ak.vector_at(fragments, j), true)
+
+            line_box.m_inline_length = available_width
+            break
+
+# mark: Generating line boxes ===================================================================
+
+## The text case of InlineFormattingContext::generate_line_boxes: wraps before the chunk when it does not fit, and
+## appends it to the line unless whitespace made the line break (that whitespace goes on neither line).
+func layout_inline_formatting_context_place_text_item(this: LayoutInlineFormattingContext*, iterator: LayoutInlineLevelIterator*, line_builder: LayoutLineBuilder*, item: const LayoutInlineLevelIteratorItem*):
+    let line_boxes = &this.m_containing_block_used_values.line_boxes
+    let text_node = as_layout_text_node(item.node else trap("a text item without a node"))
+    let text_values = &layout_node_computed_values(text_node.layout_node()).computed_values
+
+    if css_computed_values_text_wrap_mode(text_values) == css_data.TextWrapMode.wrap:
+        var is_whitespace = false
+        var next_width = layout_zero_px()
+        # If we're in a whitespace-collapsing context, we can simply check the flag.
+        if item.is_collapsible_whitespace:
+            is_whitespace = true
+            next_width = layout_inline_level_iterator_next_non_whitespace_sequence_width(iterator)
+        else:
+            # In whitespace-preserving contexts (white-space: pre*), we have to check manually.
+            let text_for_rendering = layout_text_node_text_for_rendering(text_node)
+            let text = ak.utf16_string_base_utf16_view(&text_for_rendering.utf16_string_base)
+            let view = ak.utf16_view_substring_view_usize(&text, item.offset_in_node, item.length_in_node)
+            is_whitespace = ak.utf16_view_is_ascii_whitespace(&view)
+            if is_whitespace:
+                next_width = layout_inline_level_iterator_next_non_whitespace_sequence_width(iterator)
+
+        # If whitespace caused us to break, don't put it on the next line.
+        if is_whitespace and next_width.gt(layout_zero_px()) and layout_line_builder_break_if_needed(line_builder, layout_inline_level_iterator_item_border_box_width(item).add(next_width)):
+            # Record that the previous line has trailing whitespace for text selection.
+            layout_line_builder_set_trailing_whitespace_on_previous_line(line_builder)
+            return
+
+        # https://drafts.csswg.org/css2/#floats
+        # If a shortened line box is too small to contain any content, then the line box is shifted downward
+        # (and its width recomputed) until either some content fits or there are no more floats present.
+        if not is_whitespace and (item.can_break_before or layout_line_box_is_empty(ak.vector_last(line_boxes))):
+            discard(layout_line_builder_break_if_needed(line_builder, layout_inline_level_iterator_item_border_box_width(item)))
+    layout_line_builder_append_text_chunk(
+        line_builder,
+        text_node,
+        item.offset_in_node,
+        item.length_in_node,
+        item.border_start.add(item.padding_start),
+        item.padding_end.add(item.border_end),
+        item.margin_start,
+        item.margin_end,
+        item.width,
+        css_computed_values_line_height(text_values),
+        item.glyph_run)
+
+## Ported from Libraries/LibWeb/Layout/InlineFormattingContext.cpp:343 Web::Layout::InlineFormattingContext::generate_line_boxes.
+func layout_inline_formatting_context_generate_line_boxes(this: LayoutInlineFormattingContext*):
+    let base = this.layout_formatting_context()
+    let parent = layout_inline_formatting_context_parent(this)
+    let line_boxes = &this.m_containing_block_used_values.line_boxes
+    ak.vector_clear_with_capacity(line_boxes)
+
+    let context_box_values = layout_box_computed(base.m_context_box)
+    let direction = css_computed_values_direction(context_box_values)
+    let writing_mode = css_computed_values_writing_mode(context_box_values)
+
+    var iterator: LayoutInlineLevelIterator = ---
+    layout_inline_level_iterator_construct(&iterator, this, base.m_state, layout_inline_formatting_context_containing_block(this), this.m_containing_block_used_values, base.m_layout_mode)
+    var line_builder: LayoutLineBuilder = ---
+    layout_line_builder_construct(&line_builder, this, base.m_state, this.m_containing_block_used_values, direction, writing_mode)
+
+    # NOTE: When we ignore collapsible whitespace chunks at the start of a line,
+    #       we have to remember how much start margin, border and padding that chunk had
+    #       in the inline axis, so that we can add it to the first non-whitespace chunk.
+    var leading_margin_from_collapsible_whitespace = layout_zero_px()
+    var leading_border_from_collapsible_whitespace = layout_zero_px()
+    var leading_padding_from_collapsible_whitespace = layout_zero_px()
+
+    var absolute_boxes = ak.Vector[LayoutBox*]()
+
+    while true:
+        var item = layout_inline_level_iterator_next(&iterator) else break
+
+        # Ignore collapsible whitespace chunks at the start of line, and if the last fragment already ends in whitespace.
+        if item.is_collapsible_whitespace and (ak.vector_is_empty(line_boxes) or layout_line_box_is_empty_or_ends_in_whitespace(ak.vector_last(line_boxes))):
+            let item_node = item.node else trap("a whitespace item without a node")
+            if css_computed_values_text_wrap_mode(&layout_node_computed_values(item_node).computed_values) == css_data.TextWrapMode.wrap:
+                let next_width = layout_inline_level_iterator_next_non_whitespace_sequence_width(&iterator)
+                if next_width.gt(layout_zero_px()):
+                    discard(layout_line_builder_break_if_needed(&line_builder, next_width))
+            leading_margin_from_collapsible_whitespace = leading_margin_from_collapsible_whitespace.add(item.margin_start)
+            leading_border_from_collapsible_whitespace = leading_border_from_collapsible_whitespace.add(item.border_start)
+            leading_padding_from_collapsible_whitespace = leading_padding_from_collapsible_whitespace.add(item.padding_start)
+            continue
+
+        item.margin_start = item.margin_start.add(leading_margin_from_collapsible_whitespace)
+        leading_margin_from_collapsible_whitespace = layout_zero_px()
+        item.border_start = item.border_start.add(leading_border_from_collapsible_whitespace)
+        leading_border_from_collapsible_whitespace = layout_zero_px()
+        item.padding_start = item.padding_start.add(leading_padding_from_collapsible_whitespace)
+        leading_padding_from_collapsible_whitespace = layout_zero_px()
+
+        match item.type_:
+            .forced_break:
+                layout_line_builder_break_line(&line_builder, LayoutLineBuilderForcedBreak.yes)
+                if let item_node = item.node:
+                    let introduce_clearance = layout_block_formatting_context_clear_floating_boxes(parent, item_node, this)
+                    if introduce_clearance == LayoutBlockFormattingContextDidIntroduceClearance.yes:
+                        layout_line_builder_did_introduce_clearance(&line_builder, layout_inline_formatting_context_vertical_float_clearance(this))
+                        layout_block_formatting_context_reset_margin_state(parent)
+            .element:
+                let box = as_layout_box(item.node else trap("an element item without a node"))
+                let content_box_rect = layout_formatting_context_content_box_rect_layout_state_used_values(base, this.m_containing_block_used_values)
+                layout_formatting_context_compute_inset(base, box.layout_node_with_style_and_box_model_metrics(), gfx.css_pixel_rect_size(&content_box_rect))
+                let containing_block_values = layout_box_computed(layout_inline_formatting_context_containing_block(this).layout_box())
+                if css_computed_values_text_wrap_mode(containing_block_values) == css_data.TextWrapMode.wrap:
+                    var minimum_space_needed_on_line = layout_inline_level_iterator_item_border_box_width(&item)
+                    if item.margin_start.lt(layout_zero_px()):
+                        minimum_space_needed_on_line = minimum_space_needed_on_line.add(item.margin_start)
+                    if item.margin_end.lt(layout_zero_px()):
+                        minimum_space_needed_on_line = minimum_space_needed_on_line.add(item.margin_end)
+                    discard(layout_line_builder_break_if_needed(&line_builder, minimum_space_needed_on_line))
+                layout_line_builder_append_box(&line_builder, box, item.border_start.add(item.padding_start), item.padding_end.add(item.border_end), item.margin_start, item.margin_end)
+            .absolutely_positioned_element:
+                if let box = as_if_layout_box(item.node else trap("an absolutely positioned item without a node")):
+                    # Calculation of static position for absolute boxes is delayed until trailing whitespaces are removed.
+                    ak.vector_append_t(&absolute_boxes, box)
+            .floating_element:
+                let item_node = item.node else trap("a floating item without a node")
+                if let box = as_if_layout_box(item_node):
+                    discard(layout_block_formatting_context_clear_floating_boxes(parent, item_node, this))
+                    # Even if this introduces clearance, we do NOT reset the margin state, because that is clearance
+                    # between floats and does not contribute to the height of the Inline Formatting Context.
+                    layout_block_formatting_context_layout_floating_box(parent, box, layout_inline_formatting_context_containing_block(this), layout_inline_formatting_context_available_space(this), layout_zero_px(), &line_builder)
+            .text:
+                layout_inline_formatting_context_place_text_item(this, &iterator, &line_builder, &item)
+            _:
+                discard(0)
+
+    for line_index in 0..<ak.vector_size(line_boxes):
+        layout_line_box_trim_trailing_whitespace(ak.vector_at(line_boxes, line_index))
+
+    layout_inline_formatting_context_apply_text_overflow_ellipsis(this, line_boxes)
+
+    layout_line_builder_remove_last_line_if_empty(&line_builder)
+
+    let containing_block_values = layout_box_computed(layout_inline_formatting_context_containing_block(this).layout_box())
+    let text_align = css_computed_values_text_align(containing_block_values)
+    let text_justify = css_computed_values_text_justify(containing_block_values)
+    if text_align == css_data.TextAlign.justify:
+        for i in 0..<ak.vector_size(line_boxes):
+            let line_box = ak.vector_at(line_boxes, i)
+            let is_last_line = i == ak.vector_size(line_boxes) - 1
+            layout_inline_formatting_context_apply_justification_to_fragments(this, text_justify, line_box, is_last_line)
+
+    for line_index in 0..<ak.vector_size(line_boxes):
+        let fragments = layout_line_box_fragments(ak.vector_at(line_boxes, line_index))
+        for fragment_index in 0..<ak.vector_size(fragments):
+            let fragment = ak.vector_at(fragments, fragment_index)
+            if layout_node_is_inline_block(layout_line_box_fragment_layout_node(fragment)):
+                let box = as_layout_box(layout_line_box_fragment_layout_node(fragment))
+                let box_state = layout_state_get_mutable(base.m_state, box.layout_node_with_style())
+                layout_state_used_values_set_content_offset(box_state, layout_line_box_fragment_offset(fragment))
+
+    layout_line_builder_update_last_line(&line_builder)
+
+    if base.m_layout_mode == LayoutMode.normal:
+        for box in ak.vector_span(&absolute_boxes):
+            let box_state = layout_state_get_mutable(base.m_state, box.layout_node_with_style())
+            layout_state_used_values_set_static_position_rect(box_state, layout_inline_formatting_context_calculate_static_position_rect(this, box))
+
+# mark: Floats and clearance ====================================================================
+
+## Ported from Libraries/LibWeb/Layout/InlineFormattingContext.cpp:516 Web::Layout::InlineFormattingContext::any_floats_intrude_at_block_offset.
+pub func layout_inline_formatting_context_any_floats_intrude_at_block_offset(this: LayoutInlineFormattingContext*, block_offset: gfx.CssPixels) -> bool:
+    let parent = layout_inline_formatting_context_parent_const(this)
+    let box_in_root_rect = layout_formatting_context_content_box_rect_in_ancestor_coordinate_space(this.layout_formatting_context(), this.m_containing_block_used_values, layout_block_formatting_context_root(parent).layout_box())
+    # FIXME: Respect inline direction.
+    let y_in_root = gfx.css_pixel_rect_y(&box_in_root_rect).add(block_offset)
+    let space_and_containing_margin = layout_block_formatting_context_space_used_and_containing_margin_for_floats(parent, y_in_root)
+    return space_and_containing_margin.left_used_space.gt(layout_zero_px()) or space_and_containing_margin.right_used_space.gt(layout_zero_px())
+
+## Ported from Libraries/LibWeb/Layout/InlineFormattingContext.cpp:525 Web::Layout::InlineFormattingContext::can_fit_new_line_at_block_offset.
+pub func layout_inline_formatting_context_can_fit_new_line_at_block_offset(this: LayoutInlineFormattingContext*, block_offset: gfx.CssPixels) -> bool:
+    # FIXME: Respect inline direction.
+
+    let parent = layout_inline_formatting_context_parent_const(this)
+    let line_height = css_computed_values_line_height(layout_box_computed(layout_inline_formatting_context_containing_block(this).layout_box()))
+    let top_intrusions = layout_block_formatting_context_intrusion_by_floats_into_box_layout_state_used_values(parent, this.m_containing_block_used_values, block_offset)
+    let bottom_intrusions = layout_block_formatting_context_intrusion_by_floats_into_box_layout_state_used_values(parent, this.m_containing_block_used_values, block_offset.add(line_height).sub(gfx.CssPixels.from_int(1)))
+
+    # The `left_edge` and `right_edge` lambdas.
+    let available_space = layout_inline_formatting_context_available_space(this)
+    let available_width = layout_available_size_to_px_or_zero(&available_space.width)
+    let top_left_edge = top_intrusions.left
+    let top_right_edge = available_width.sub(top_intrusions.right)
+    let bottom_left_edge = bottom_intrusions.left
+    let bottom_right_edge = available_width.sub(bottom_intrusions.right)
+
+    if top_left_edge.gt(bottom_right_edge):
+        return false
+    if bottom_left_edge.gt(top_right_edge):
+        return false
+    return true
+
+## Ported from Libraries/LibWeb/Layout/InlineFormattingContext.cpp:552 Web::Layout::InlineFormattingContext::vertical_float_clearance.
+pub func layout_inline_formatting_context_vertical_float_clearance(this: LayoutInlineFormattingContext*) -> gfx.CssPixels:
+    return this.m_vertical_float_clearance
+
+## Ported from Libraries/LibWeb/Layout/InlineFormattingContext.cpp:557 Web::Layout::InlineFormattingContext::set_vertical_float_clearance.
+pub func layout_inline_formatting_context_set_vertical_float_clearance(this: LayoutInlineFormattingContext*, vertical_float_clearance: gfx.CssPixels):
+    this.m_vertical_float_clearance = vertical_float_clearance
+
+# mark: Static positions ========================================================================
+
+## Ported from Libraries/LibWeb/Layout/InlineFormattingContext.cpp:562 Web::Layout::InlineFormattingContext::calculate_static_position_rect.
+pub func layout_inline_formatting_context_calculate_static_position_rect(this: LayoutInlineFormattingContext*, box: LayoutBox*) -> LayoutStaticPositionRect:
+    let box_parent = layout_node_parent(box.layout_node()) else trap("VERIFY: an absolutely positioned box without a parent")
+    assert(layout_node_children_are_inline(box_parent.layout_node()))
+
+    var position = gfx.CssPixelPoint()
+    if let sibling = tree_node_previous_sibling(box.layout_node()):
+        # We're calculating the position for an absolutely positioned box with a previous sibling in an IFC.
+        # We need to position the box...
+        # ...below the last fragment of this sibling, if the display-outside value (before box type transformation) is block.
+        # ...at the top right corner of the last fragment of this sibling otherwise.
+        var last_fragment: const LayoutLineBoxFragment*? = none
+        let sibling_containing_block = layout_node_containing_block(sibling) else trap("a sibling without a containing block")
+        let cb_state = layout_state_get(this.layout_formatting_context().m_state, sibling_containing_block.layout_node_with_style())
+        for line_index in 0..<ak.vector_size(&cb_state.line_boxes):
+            let fragments = layout_line_box_fragments_const(ak.vector_at_const(&cb_state.line_boxes, line_index))
+            for fragment_index in 0..<ak.vector_size(fragments):
+                let fragment = ak.vector_at_const(fragments, fragment_index)
+                if layout_line_box_fragment_layout_node(fragment) == sibling:
+                    last_fragment = fragment
+        if let fragment = last_fragment:
+            let display_before_box_type_transformation = layout_node_display_before_box_type_transformation(box.layout_node())
+            let fragment_offset = layout_line_box_fragment_offset(fragment)
+            if css_display_is_block_outside(&display_before_box_type_transformation):
+                # Display-outside value is block => position below
+                gfx.css_pixel_point_set_x(&position, layout_zero_px())
+                gfx.css_pixel_point_set_y(&position, fragment_offset.m_y.add(layout_line_box_fragment_height(fragment)))
+            else:
+                # Display-outside value is not block => position to the right
+                gfx.css_pixel_point_set_x(&position, fragment_offset.m_x.add(layout_line_box_fragment_width(fragment)))
+                gfx.css_pixel_point_set_y(&position, fragment_offset.m_y)
+
+    return LayoutStaticPositionRect(rect = gfx.CssPixelRect(position, gfx.CssPixelSize()))

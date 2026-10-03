@@ -1,0 +1,468 @@
+#==============================================================================================
+#
+#   line_builder - Layout::LineBuilder: filling line boxes and aligning their fragments
+#
+#   DESCRIPTION:
+#       Port of LibWeb/Layout/LineBuilder.cpp (lines 1-457) and LineBuilder.h: breaking lines
+#       (and moving a new line down past floats that leave no room for it), text-indent,
+#       appending atomic inline boxes and text chunks to the current line, finding where a
+#       float met on the line can be placed, deciding whether the next item still fits, and
+#       finishing a line: text-align, the strut, every fragment's baseline and vertical-align,
+#       and the line box's height, bottom and baseline.
+#
+#       Copyright (c) 2022, Andreas Kling <andreas@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Construction ============================================================================
+
+## Ported from Libraries/LibWeb/Layout/LineBuilder.cpp:13 Web::Layout::LineBuilder::LineBuilder.
+pub func layout_line_builder_construct(this: LayoutLineBuilder*, context: LayoutInlineFormattingContext*, layout_state: LayoutState*, containing_block_used_values: LayoutStateUsedValues*, direction: css_data.Direction, writing_mode: css_data.WritingMode):
+    this.m_context = context
+    this.m_layout_state = layout_state
+    this.m_containing_block_used_values = containing_block_used_values
+    layout_line_builder_init_fields(this)
+    this.m_current_block_offset = layout_zero_px()
+    this.m_max_height_on_current_line = layout_zero_px()
+    this.m_text_indent = layout_zero_px()
+    this.m_text_indent_hanging = false
+    this.m_text_indent_each_line = false
+    this.m_direction = direction
+    this.m_writing_mode = writing_mode
+    this.m_last_line_needs_update = false
+
+    let containing_block = layout_inline_formatting_context_containing_block(this.m_context)
+    let text_indent = css_computed_values_text_indent(&layout_node_computed_values(containing_block.layout_node()).computed_values)
+    this.m_text_indent = css_percentage_or_to_px(&text_indent.length_percentage.percentage_or, containing_block.layout_node(), layout_state_used_values_content_width(this.m_containing_block_used_values))
+    this.m_text_indent_each_line = text_indent.each_line
+    this.m_text_indent_hanging = text_indent.hanging
+    layout_line_builder_begin_new_line(this, false)
+
+## The `line-height` of the containing block of the line builder's inline formatting context.
+func layout_line_builder_containing_block_line_height(this: LayoutLineBuilder*) -> gfx.CssPixels:
+    let containing_block = layout_inline_formatting_context_containing_block(this.m_context)
+    return css_computed_values_line_height(&layout_node_computed_values(containing_block.layout_node()).computed_values)
+
+# mark: Breaking lines ==========================================================================
+
+## Ported from Libraries/LibWeb/Layout/LineBuilder.cpp:27 Web::Layout::LineBuilder::break_line.
+pub func layout_line_builder_break_line(this: LayoutLineBuilder*, forced_break: LayoutLineBuilderForcedBreak, next_item_width: gfx.CssPixels? = none):
+    # FIXME: Respect inline direction.
+
+    let last_line_box = layout_line_builder_ensure_last_line_box(this)
+    last_line_box.m_has_break = true
+    last_line_box.m_has_forced_break = forced_break == LayoutLineBuilderForcedBreak.yes
+
+    this.m_last_line_needs_update = true
+    layout_line_builder_update_last_line(this)
+
+    var break_count: usize = 0
+    var floats_intrude_at_current_y = false
+    while true:
+        ak.vector_append_t(&this.m_containing_block_used_values.line_boxes, layout_line_box_new(this.m_direction, this.m_writing_mode))
+        layout_line_builder_begin_new_line(this, true, break_count == 0, forced_break)
+        break_count += 1
+        floats_intrude_at_current_y = layout_inline_formatting_context_any_floats_intrude_at_block_offset(this.m_context, this.m_current_block_offset)
+        if not (floats_intrude_at_current_y and (not layout_inline_formatting_context_can_fit_new_line_at_block_offset(this.m_context, this.m_current_block_offset) or layout_gt(next_item_width else layout_zero_px(), this.m_available_width_for_current_line))):
+            break
+
+## Ported from Libraries/LibWeb/Layout/LineBuilder.cpp:50 Web::Layout::LineBuilder::begin_new_line.
+func layout_line_builder_begin_new_line(this: LayoutLineBuilder*, increment_y: bool, is_first_break_in_sequence: bool = true, forced_break: LayoutLineBuilderForcedBreak = LayoutLineBuilderForcedBreak.no):
+    if increment_y:
+        if is_first_break_in_sequence:
+            # First break is simple, just go to the start of the next line.
+            this.m_current_block_offset = this.m_current_block_offset.add(ak.max(this.m_max_height_on_current_line, layout_line_builder_containing_block_line_height(this)))
+        else:
+            # We're doing more than one break in a row.
+            # This means we're trying to squeeze past intruding floats.
+            # Scan 1px at a time until we find a Y value where a new line can fit.
+            # FIXME: This is super dumb and inefficient.
+            var candidate_block_offset = this.m_current_block_offset.add(gfx.CssPixels.from_int(1))
+            while true:
+                if layout_inline_formatting_context_can_fit_new_line_at_block_offset(this.m_context, candidate_block_offset):
+                    break
+                candidate_block_offset = candidate_block_offset.add(gfx.CssPixels.from_int(1))
+            this.m_current_block_offset = candidate_block_offset
+    layout_line_builder_recalculate_available_space(this)
+    let line_box = layout_line_builder_ensure_last_line_box(this)
+    line_box.m_original_available_width = this.m_available_width_for_current_line
+    this.m_max_height_on_current_line = layout_zero_px()
+    this.m_last_line_needs_update = true
+
+    var should_indent = ak.vector_size(&this.m_containing_block_used_values.line_boxes) <= 1 or (this.m_text_indent_each_line and forced_break == LayoutLineBuilderForcedBreak.yes)
+
+    if this.m_text_indent_hanging:
+        should_indent = not should_indent
+
+    if should_indent:
+        line_box.m_inline_length = line_box.m_inline_length.add(this.m_text_indent)
+
+## Ported from Libraries/LibWeb/Layout/LineBuilder.cpp:86 Web::Layout::LineBuilder::ensure_last_line_box.
+func layout_line_builder_ensure_last_line_box(this: LayoutLineBuilder*) -> LayoutLineBox*:
+    let line_boxes = &this.m_containing_block_used_values.line_boxes
+    if ak.vector_is_empty(line_boxes):
+        ak.vector_append_t(line_boxes, layout_line_box_new(this.m_direction, this.m_writing_mode))
+    return ak.vector_last(line_boxes)
+
+# mark: Appending to the line ===================================================================
+
+## Ported from Libraries/LibWeb/Layout/LineBuilder.cpp:94 Web::Layout::LineBuilder::append_box.
+pub func layout_line_builder_append_box(this: LayoutLineBuilder*, box: LayoutBox*, leading_size: gfx.CssPixels, trailing_size: gfx.CssPixels, leading_margin: gfx.CssPixels, trailing_margin: gfx.CssPixels):
+    let box_state = layout_state_get_mutable(this.m_layout_state, box.layout_node_with_style())
+    let line_box = layout_line_builder_ensure_last_line_box(this)
+    layout_line_box_add_fragment(line_box, box.layout_node(), 0, 0, leading_size, trailing_size, leading_margin, trailing_margin,
+                                 layout_state_used_values_content_width(box_state), layout_state_used_values_content_height(box_state), layout_state_used_values_border_box_top(box_state), layout_state_used_values_border_box_bottom(box_state))
+    this.m_max_height_on_current_line = ak.max(this.m_max_height_on_current_line, layout_state_used_values_margin_box_height(box_state))
+
+    box_state.containing_line_box_fragment = LayoutLineBoxFragmentCoordinate(
+        line_box_index = ak.vector_size(&this.m_containing_block_used_values.line_boxes) - 1,
+        fragment_index = ak.vector_size(layout_line_box_fragments(line_box)) - 1)
+
+## Ported from Libraries/LibWeb/Layout/LineBuilder.cpp:108 Web::Layout::LineBuilder::append_text_chunk.
+pub func layout_line_builder_append_text_chunk(this: LayoutLineBuilder*, text_node: LayoutTextNode*, offset_in_node: usize, length_in_node: usize, leading_size: gfx.CssPixels, trailing_size: gfx.CssPixels, leading_margin: gfx.CssPixels, trailing_margin: gfx.CssPixels, content_width: gfx.CssPixels, content_height: gfx.CssPixels, glyph_run: web_fonts.GlyphRun*?):
+    let line_box = layout_line_builder_ensure_last_line_box(this)
+    layout_line_box_add_fragment(line_box, text_node.layout_node(), offset_in_node, length_in_node, leading_size, trailing_size, leading_margin,
+                                 trailing_margin, content_width, content_height, layout_zero_px(), layout_zero_px(), glyph_run)
+
+    this.m_max_height_on_current_line = ak.max(this.m_max_height_on_current_line, layout_line_box_block_length(line_box))
+
+# mark: Floats on the line ======================================================================
+
+## The `intersection_test` lambda of LineBuilder::y_for_float_to_be_inserted_here: lowers `highest_intersection_bottom`
+## to the float's bottom when `y_coordinate` lies in [top, bottom] and the float being placed is wider than the line there.
+func layout_line_builder_intersection_test(this: LayoutLineBuilder*, available_space_cache: ak.HashMap[gfx.CssPixels, LayoutAvailableSize, gfx.CssPixelsTraits]*, width: gfx.CssPixels, float_box_bottom: gfx.CssPixels, highest_intersection_bottom: (gfx.CssPixels?)*, y_coordinate: gfx.CssPixels, top: gfx.CssPixels, bottom: gfx.CssPixels):
+    if y_coordinate.lt(top) or y_coordinate.gt(bottom):
+        return
+    var available_space = layout_available_size_make_indefinite()
+    if let cached = ak.hash_map_get_k(available_space_cache, y_coordinate):
+        available_space = *cached
+    else:
+        available_space = layout_inline_formatting_context_available_space_for_line(this.m_context, y_coordinate)
+        discard(ak.hash_map_set(available_space_cache, y_coordinate, available_space))
+    if layout_gt(width, available_space):
+        *highest_intersection_bottom = ak.min((*highest_intersection_bottom else float_box_bottom), float_box_bottom)
+
+## Ported from Libraries/LibWeb/Layout/LineBuilder.cpp:117 Web::Layout::LineBuilder::y_for_float_to_be_inserted_here.
+pub func layout_line_builder_y_for_float_to_be_inserted_here(this: LayoutLineBuilder*, box: LayoutBox*) -> gfx.CssPixels:
+    let box_state = layout_state_get(this.m_layout_state, box.layout_node_with_style())
+    let width = layout_state_used_values_margin_box_width(box_state)
+    let height = layout_state_used_values_margin_box_height(box_state)
+
+    var candidate_block_offset = this.m_current_block_offset
+
+    # Determine the current line width and subtract trailing whitespace, since those have not yet been removed while
+    # placing floating boxes.
+    let current_line = layout_line_builder_ensure_last_line_box(this)
+    let current_line_width = layout_line_box_width(current_line).sub(layout_line_box_get_trailing_whitespace_width(current_line))
+
+    # If there's already inline content on the current line, check if the new float can fit
+    # alongside the content. If not, place it on the next line.
+    if current_line_width.gt(layout_zero_px()) and layout_gt(current_line_width.add(width), this.m_available_width_for_current_line):
+        candidate_block_offset = candidate_block_offset.add(layout_line_box_height(current_line))
+
+    # Then, look for the next Y position where we can fit the new float.
+    let parent = layout_inline_formatting_context_parent(this.m_context)
+    let box_in_root_rect = layout_formatting_context_content_box_rect_in_ancestor_coordinate_space(parent.layout_formatting_context(), box_state, layout_block_formatting_context_root(parent).layout_box())
+
+    # New floats will always be placed vertically at or below the lowest float.
+    # This applies to all floats, so the last inserted float will always be the lowest.
+    if let last_float = layout_block_formatting_context_last_inserted_float(parent):
+        let float_box_top = gfx.css_pixel_rect_top(&last_float.margin_box_rect_in_root_coordinate_space).sub(gfx.css_pixel_rect_y(&box_in_root_rect))
+        candidate_block_offset = ak.max(candidate_block_offset, float_box_top)
+
+    var available_space_cache: ak.HashMap[gfx.CssPixels, LayoutAvailableSize, gfx.CssPixelsTraits]
+    while true:
+        var highest_intersection_bottom: gfx.CssPixels? = none
+        let candidate_block_bottom = candidate_block_offset.add(height)
+
+        for float_box in layout_block_formatting_context_for_each_floating_box(parent):
+            let float_box_top = gfx.css_pixel_rect_top(&float_box.margin_box_rect_in_root_coordinate_space).sub(gfx.css_pixel_rect_y(&box_in_root_rect))
+            let float_box_bottom = gfx.css_pixel_rect_bottom(&float_box.margin_box_rect_in_root_coordinate_space).sub(gfx.css_pixel_rect_y(&box_in_root_rect))
+            if float_box_bottom.le(candidate_block_offset):
+                continue
+
+            layout_line_builder_intersection_test(this, &available_space_cache, width, float_box_bottom, &highest_intersection_bottom, float_box_top, candidate_block_offset, candidate_block_bottom)
+            layout_line_builder_intersection_test(this, &available_space_cache, width, float_box_bottom, &highest_intersection_bottom, float_box_bottom, candidate_block_offset, candidate_block_bottom)
+            layout_line_builder_intersection_test(this, &available_space_cache, width, float_box_bottom, &highest_intersection_bottom, candidate_block_offset, float_box_top, float_box_bottom)
+            layout_line_builder_intersection_test(this, &available_space_cache, width, float_box_bottom, &highest_intersection_bottom, candidate_block_bottom, float_box_top, float_box_bottom)
+        let highest = highest_intersection_bottom else break
+        if highest == candidate_block_offset:
+            break
+        candidate_block_offset = highest
+
+    return ak.max(candidate_block_offset, layout_inline_formatting_context_vertical_float_clearance(this.m_context))
+
+# mark: Fitting the next item ===================================================================
+
+## Ported from Libraries/LibWeb/Layout/LineBuilder.cpp:182 Web::Layout::LineBuilder::should_break.
+func layout_line_builder_should_break(this: LayoutLineBuilder*, next_item_width: gfx.CssPixels) -> bool:
+    if layout_available_size_is_max_content(&this.m_available_width_for_current_line):
+        return false
+
+    let line_boxes = &this.m_containing_block_used_values.line_boxes
+    if ak.vector_is_empty(line_boxes) or layout_line_box_is_empty(ak.vector_last(line_boxes)):
+        # If we don't have a single line box yet *and* there are no floats intruding
+        # at this Y coordinate, we don't need to break before inserting anything.
+        if not layout_inline_formatting_context_any_floats_intrude_at_block_offset(this.m_context, this.m_current_block_offset):
+            return false
+        if not layout_inline_formatting_context_any_floats_intrude_at_block_offset(this.m_context, this.m_current_block_offset.add(layout_line_builder_containing_block_line_height(this))):
+            return false
+    let current_line_width = layout_line_box_width(layout_line_builder_ensure_last_line_box(this))
+    return layout_gt(current_line_width.add(next_item_width), this.m_available_width_for_current_line)
+
+## Ported from Libraries/LibWeb/Layout/LineBuilder.h:30 Web::Layout::LineBuilder::break_if_needed.
+# Returns whether a line break occurred.
+pub func layout_line_builder_break_if_needed(this: LayoutLineBuilder*, next_item_width: gfx.CssPixels) -> bool:
+    if layout_line_builder_should_break(this, next_item_width):
+        layout_line_builder_break_line(this, LayoutLineBuilderForcedBreak.no, next_item_width)
+        return true
+    return false
+
+# mark: Finishing a line ========================================================================
+
+## A font's `CSSPixels::nearest_value_for(ascent + descent)` and the half-leading of `line_height` around it (the
+## typographic height and leading the strut, the baselines and the inline boxes of LineBuilder::update_last_line use).
+func layout_line_builder_half_leading(font_metrics: web_fonts.FontPixelMetrics, line_height: gfx.CssPixels) -> gfx.CssPixels:
+    let typographic_height = gfx.css_pixels_nearest_value_for_f32(font_metrics.ascent + font_metrics.descent)
+    let leading = line_height.sub(typographic_height)
+    return layout_div_int(leading, 2)
+
+## The `block_offset_value_for_alignment` lambda of LineBuilder::update_last_line.
+func layout_line_builder_block_offset_value_for_alignment(this: LayoutLineBuilder*, fragment: const LayoutLineBoxFragment*, line_box_baseline: gfx.CssPixels, vertical_align: css_data.VerticalAlign) -> gfx.CssPixels:
+    var effective_box_top_offset = layout_line_box_fragment_border_box_top(fragment)
+    var effective_box_bottom_offset = layout_line_box_fragment_border_box_top(fragment)
+    if layout_line_box_fragment_is_atomic_inline(fragment):
+        let fragment_box_state = layout_state_get(this.m_layout_state, ((LayoutBox*)layout_line_box_fragment_layout_node(fragment)).layout_node_with_style())
+        effective_box_top_offset = layout_state_used_values_margin_box_top(fragment_box_state)
+        effective_box_bottom_offset = layout_state_used_values_margin_box_bottom(fragment_box_state)
+
+    let alphabetic_baseline = this.m_current_block_offset.add(line_box_baseline).sub(layout_line_box_fragment_baseline(fragment)).add(effective_box_top_offset)
+
+    let containing_block = layout_inline_formatting_context_containing_block(this.m_context)
+    match vertical_align:
+        .baseline:
+            return alphabetic_baseline
+        .top:
+            return this.m_current_block_offset.add(effective_box_top_offset)
+        .middle:
+            # Align the vertical midpoint of the box with the baseline of the parent box
+            # plus half the x-height of the parent.
+            let x_height = gfx.css_pixels_nearest_value_for_f32(web_fonts.font_pixel_metrics(layout_node_first_available_font(containing_block.layout_node())).x_height)
+            return this.m_current_block_offset.add(line_box_baseline).add(layout_div_int(effective_box_top_offset.sub(effective_box_bottom_offset).sub(x_height).sub(layout_line_box_fragment_height(fragment)), 2))
+        .sub:
+            # https://drafts.csswg.org/css-inline/#valdef-baseline-shift-sub
+            # Lower by the offset appropriate for subscripts of the parent’s box.
+            # The UA may use the parent’s font metrics to find this offset; otherwise it defaults to dropping by one fifth of the parent’s used font-size.
+            # FIXME: Use font metrics to find a more appropriate offset, if possible
+            return alphabetic_baseline.add(layout_div_int(css_computed_values_font_size(&layout_node_computed_values(containing_block.layout_node()).computed_values), 5))
+        .super:
+            # https://drafts.csswg.org/css-inline/#valdef-baseline-shift-super
+            # Raise by the offset appropriate for superscripts of the parent’s box.
+            # The UA may use the parent’s font metrics to find this offset; otherwise it defaults to raising by one third of the parent’s used font-size.
+            # FIXME: Use font metrics to find a more appropriate offset, if possible
+            return alphabetic_baseline.sub(layout_div_int(css_computed_values_font_size(&layout_node_computed_values(containing_block.layout_node()).computed_values), 3))
+        .bottom, .text_bottom, .text_top:
+            # FIXME: These are all 'baseline'
+            return alphabetic_baseline
+        _:
+            trap("VERIFY_NOT_REACHED")
+
+## The `<length-percentage>` of a fragment's `vertical-align`, if it has one.
+func layout_line_builder_vertical_align_length_percentage(node: LayoutNode*) -> CssLengthPercentage?:
+    match css_computed_values_vertical_align(&layout_node_computed_values(node).computed_values):
+        .vertical_align(_):
+            return none
+        .css_length_percentage(length_percentage):
+            return length_percentage
+
+## Ported from Libraries/LibWeb/Layout/LineBuilder.cpp:200 Web::Layout::LineBuilder::update_last_line.
+pub func layout_line_builder_update_last_line(this: LayoutLineBuilder*):
+    if not this.m_last_line_needs_update:
+        return
+    this.m_last_line_needs_update = false
+
+    let line_boxes = &this.m_containing_block_used_values.line_boxes
+    if ak.vector_is_empty(line_boxes):
+        return
+
+    let line_box = ak.vector_last(line_boxes)
+
+    let containing_block = layout_inline_formatting_context_containing_block(this.m_context)
+    let containing_block_values = &layout_node_computed_values(containing_block.layout_node()).computed_values
+    let text_align = css_computed_values_text_align(containing_block_values)
+    let direction = css_computed_values_direction(containing_block_values)
+
+    let current_line_height = ak.max(this.m_max_height_on_current_line, css_computed_values_line_height(containing_block_values))
+    let inline_offset_top = layout_inline_formatting_context_leftmost_inline_offset_at(this.m_context, this.m_current_block_offset)
+    let inline_offset_bottom = layout_inline_formatting_context_leftmost_inline_offset_at(this.m_context, this.m_current_block_offset.add(current_line_height).sub(gfx.CssPixels.from_int(1)))
+    var inline_offset = ak.max(inline_offset_top, inline_offset_bottom)
+    var block_offset = layout_zero_px()
+
+    # FIXME: Respect inline direction.
+    let excess_inline_space = layout_available_size_to_px_or_zero(&this.m_available_width_for_current_line).sub(layout_line_box_inline_length(line_box))
+
+    if this.m_writing_mode != css_data.WritingMode.horizontal_tb:
+        block_offset = layout_available_size_to_px_or_zero(&this.m_available_width_for_current_line).sub(layout_line_box_block_length(line_box))
+
+    # If (after justification, if any) the inline contents of a line box are too long to fit within it,
+    # then the contents are start-aligned: any content that doesn't fit overflows the line box’s end edge.
+    if excess_inline_space.gt(layout_zero_px()):
+        match text_align:
+            .center, .libweb_center, .libweb_inherit_or_center:
+                inline_offset = inline_offset.add(layout_div_int(excess_inline_space, 2))
+            .start:
+                if direction == css_data.Direction.rtl:
+                    inline_offset = inline_offset.add(excess_inline_space)
+            .end:
+                if direction == css_data.Direction.ltr:
+                    inline_offset = inline_offset.add(excess_inline_space)
+            .right, .libweb_right:
+                inline_offset = inline_offset.add(excess_inline_space)
+            .match_parent:
+                # This should have been replaced before this point.
+                trap("VERIFY_NOT_REACHED")
+            _:
+                # Left, LibwebLeft, Justify and anything else.
+                discard(0)
+
+    # The strut's baseline.
+    let strut_line_height = css_computed_values_line_height(containing_block_values)
+    let strut_font_metrics = web_fonts.font_pixel_metrics(layout_node_first_available_font(containing_block.layout_node()))
+    let strut_baseline = gfx.css_pixels_nearest_value_for_f32(strut_font_metrics.ascent).add(layout_line_builder_half_leading(strut_font_metrics, strut_line_height))
+
+    let fragments = ak.vector_span(layout_line_box_fragments(line_box))
+
+    # The line box's baseline.
+    var line_box_baseline = strut_baseline
+    for fragment in &fragments:
+        let node = layout_line_box_fragment_layout_node(fragment)
+        let font = layout_node_first_available_font(node)
+        let line_height = css_computed_values_line_height(&layout_node_computed_values(node).computed_values)
+        let font_metrics = web_fonts.font_pixel_metrics(font)
+        let half_leading = layout_line_builder_half_leading(font_metrics, line_height)
+
+        # The CSS specification calls this AD (A+D, Ascent + Descent).
+
+        var fragment_baseline = layout_zero_px()
+        if layout_node_is_text_node(node):
+            fragment_baseline = gfx.css_pixels_nearest_value_for_f32(font_metrics.ascent).add(half_leading)
+        else:
+            let box = as_layout_box(node)
+            fragment_baseline = layout_formatting_context_box_baseline(this.m_context.layout_formatting_context(), box)
+
+        # Remember the baseline used for this fragment. This will be used when painting the fragment.
+        layout_line_box_fragment_set_baseline(fragment, fragment_baseline)
+
+        # NOTE: For fragments with a <length-percentage> vertical-align, shift the line box baseline down by the resolved amount.
+        #       This ensures that we make enough vertical space on the line for any manually-aligned fragments.
+        if let length_percentage = layout_line_builder_vertical_align_length_percentage(node):
+            fragment_baseline = fragment_baseline.add(css_percentage_or_to_px(&length_percentage.percentage_or, node, line_height))
+
+        line_box_baseline = ak.max(line_box_baseline, fragment_baseline)
+
+    # Start with the "strut", an imaginary zero-width box at the start of each line box.
+    let strut_top = this.m_current_block_offset
+    let strut_bottom = this.m_current_block_offset.add(strut_line_height)
+
+    var uppermost_box_top = strut_top
+    var lowermost_box_bottom = strut_bottom
+
+    for fragment in &fragments:
+        let node = layout_line_box_fragment_layout_node(fragment)
+        let line_height = css_computed_values_line_height(&layout_node_computed_values(node).computed_values)
+        let new_fragment_inline_offset = inline_offset.add(layout_line_box_fragment_inline_offset(fragment))
+        var new_fragment_block_offset = layout_zero_px()
+
+        match css_computed_values_vertical_align(&layout_node_computed_values(node).computed_values):
+            .vertical_align(vertical_align):
+                new_fragment_block_offset = layout_line_builder_block_offset_value_for_alignment(this, fragment, line_box_baseline, vertical_align)
+            .css_length_percentage(length_percentage):
+                let vertical_align_amount = css_percentage_or_to_px(&length_percentage.percentage_or, node, line_height)
+                new_fragment_block_offset = layout_line_builder_block_offset_value_for_alignment(this, fragment, line_box_baseline, css_data.VerticalAlign.baseline).sub(vertical_align_amount)
+
+        layout_line_box_fragment_set_inline_offset(fragment, new_fragment_inline_offset)
+        layout_line_box_fragment_set_block_offset(fragment, gfx.floor(new_fragment_block_offset).add(block_offset))
+
+        var top_of_inline_box = layout_zero_px()
+        var bottom_of_inline_box = layout_zero_px()
+        # FIXME: Support inline-table elements.
+        if layout_line_box_fragment_is_atomic_inline(fragment):
+            let fragment_box_state = layout_state_get(this.m_layout_state, ((LayoutBox*)node).layout_node_with_style())
+            top_of_inline_box = layout_line_box_fragment_block_offset(fragment).sub(layout_state_used_values_margin_box_top(fragment_box_state))
+            bottom_of_inline_box = layout_line_box_fragment_block_offset(fragment).add(layout_state_used_values_content_height(fragment_box_state)).add(layout_state_used_values_margin_box_bottom(fragment_box_state))
+        else:
+            let font_metrics = web_fonts.font_pixel_metrics(layout_node_first_available_font(node))
+            let half_leading = layout_line_builder_half_leading(font_metrics, line_height)
+            top_of_inline_box = layout_line_box_fragment_block_offset(fragment).add(layout_line_box_fragment_baseline(fragment)).sub(gfx.css_pixels_nearest_value_for_f32(font_metrics.ascent)).sub(half_leading)
+            bottom_of_inline_box = layout_line_box_fragment_block_offset(fragment).add(layout_line_box_fragment_baseline(fragment)).add(gfx.css_pixels_nearest_value_for_f32(font_metrics.descent)).add(half_leading)
+        if let length_percentage = layout_line_builder_vertical_align_length_percentage(node):
+            bottom_of_inline_box = bottom_of_inline_box.add(css_percentage_or_to_px(&length_percentage.percentage_or, node, line_height))
+
+        uppermost_box_top = ak.min(uppermost_box_top, top_of_inline_box)
+        lowermost_box_bottom = ak.max(lowermost_box_bottom, bottom_of_inline_box)
+
+    # 3. The line box height is the distance between the uppermost box top and the lowermost box bottom.
+    line_box.m_block_length = lowermost_box_bottom.sub(uppermost_box_top)
+
+    line_box.m_bottom = this.m_current_block_offset.add(line_box.m_block_length)
+    line_box.m_baseline = line_box_baseline
+
+## Ported from Libraries/LibWeb/Layout/LineBuilder.cpp:403 Web::Layout::LineBuilder::remove_last_line_if_empty.
+pub func layout_line_builder_remove_last_line_if_empty(this: LayoutLineBuilder*):
+    # If there's an empty line box at the bottom, just remove it instead of giving it height.
+    let line_boxes = &this.m_containing_block_used_values.line_boxes
+    if not ak.vector_is_empty(line_boxes) and layout_line_box_is_empty(ak.vector_last(line_boxes)):
+        discard(ak.vector_take_last(line_boxes))
+        this.m_last_line_needs_update = false
+
+# mark: Available space and clearance ===========================================================
+
+## Ported from Libraries/LibWeb/Layout/LineBuilder.cpp:413 Web::Layout::LineBuilder::recalculate_available_space.
+pub func layout_line_builder_recalculate_available_space(this: LayoutLineBuilder*):
+    let current_line_height = ak.max(this.m_max_height_on_current_line, layout_line_builder_containing_block_line_height(this))
+    let available_at_top_of_line_box = layout_inline_formatting_context_available_space_for_line(this.m_context, this.m_current_block_offset)
+    let available_at_bottom_of_line_box = layout_inline_formatting_context_available_space_for_line(this.m_context, this.m_current_block_offset.add(current_line_height).sub(gfx.CssPixels.from_int(1)))
+    # min(available_at_bottom_of_line_box, available_at_top_of_line_box)
+    if layout_available_size_lt(&available_at_top_of_line_box, available_at_bottom_of_line_box):
+        this.m_available_width_for_current_line = available_at_top_of_line_box
+    else:
+        this.m_available_width_for_current_line = available_at_bottom_of_line_box
+    let line_boxes = &this.m_containing_block_used_values.line_boxes
+    if not ak.vector_is_empty(line_boxes):
+        ak.vector_last(line_boxes).m_original_available_width = this.m_available_width_for_current_line
+
+## Ported from Libraries/LibWeb/Layout/LineBuilder.cpp:423 Web::Layout::LineBuilder::did_introduce_clearance.
+pub func layout_line_builder_did_introduce_clearance(this: LayoutLineBuilder*, clearance: gfx.CssPixels):
+    # If clearance was introduced but our current line box starts beyond it, we don't need to do anything.
+    if clearance.le(this.m_current_block_offset):
+        return
+
+    # Increase the height of the previous line box so it matches the clearance, because the element's height is first
+    # determined by the bottom of the last line box (after trimming empty/whitespace boxes).
+    let line_boxes = &this.m_containing_block_used_values.line_boxes
+    if ak.vector_size(line_boxes) > 1:
+        let previous_line_box = ak.vector_at(line_boxes, ak.vector_size(line_boxes) - 2)
+        previous_line_box.m_bottom = clearance
+
+    # The current line box will start directly after any cleared floats.
+    this.m_current_block_offset = clearance
+
+## Ported from Libraries/LibWeb/Layout/LineBuilder.cpp:441 Web::Layout::LineBuilder::set_trailing_whitespace_on_previous_line.
+pub func layout_line_builder_set_trailing_whitespace_on_previous_line(this: LayoutLineBuilder*):
+    # When a line breaks at whitespace, that whitespace is not added to any line. For text
+    # selection purposes, we record this on the last fragment of the previous line.
+    let line_boxes = &this.m_containing_block_used_values.line_boxes
+    if ak.vector_size(line_boxes) < 2:
+        return
+
+    let previous_line_box = ak.vector_at(line_boxes, ak.vector_size(line_boxes) - 2)
+    if ak.vector_is_empty(&previous_line_box.m_fragments):
+        return
+
+    let last_fragment = ak.vector_last(&previous_line_box.m_fragments)
+    layout_line_box_fragment_set_has_trailing_whitespace(last_fragment, true)
+
+## Ported from Libraries/LibWeb/Layout/LineBuilder.h:45 Web::Layout::LineBuilder::current_block_offset.
+pub func layout_line_builder_current_block_offset(this: const LayoutLineBuilder*) -> gfx.CssPixels:
+    return this.m_current_block_offset

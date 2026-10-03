@@ -1,0 +1,335 @@
+#==============================================================================================
+#
+#   tests_layout_paint_emulation - the geometry LayoutState::commit would give the paintables,
+#                                  for the layout dumps of the layout tests
+#
+#   DESCRIPTION:
+#       LayoutState::commit makes paintables (region r50), so the layout harness
+#       (tests_layout_geometry) dumps the unpainted tree and puts in each line what commit
+#       would have given the paintables, read from the used values: a box's offset (an atomic
+#       inline's from its line box fragment) plus its relative inset; the line box fragments
+#       of a block container, those inside an inline node moved to that node's paintable for
+#       their line; the paintable each inline node with a DOM node gets when it has no
+#       fragment; the relative offsets of inline ancestors applied to moved fragments
+#       (resolve_relative_positions); and the size and offset commit measures for each inline
+#       node's paintables from the paint tree build_paint_tree makes. Positions are absolute as
+#       PaintableBox::absolute_rect and PaintableFragment::absolute_rect compute them.
+#
+#==============================================================================================
+
+# mark: The emulated paintables =================================================================
+
+## What commit would make for one layout node: a box's paintable, a text node's TextPaintable, or an inline node's
+## PaintableWithLines for one line (with the fragments moved into it, and its measured offset and size).
+struct TestEmulatedPaintable:
+    var node: LayoutNode*
+    var is_inline_line: bool
+    var is_box: bool
+    var line_index: usize
+    var fragments: ak.Vector[LayoutLineBoxFragment]
+    var offset: gfx.CssPixelPoint
+    var size: gfx.CssPixelSize
+
+## Every node's emulated paintables, in the order commit adds them to the node.
+struct TestPaintEmulation:
+    var state: const LayoutState*
+    var paintables: ak.HashMap[LayoutNode*, ak.Vector[TestEmulatedPaintable*], ak.PtrTraits[LayoutNode]]
+    var inline_lines: ak.Vector[TestEmulatedPaintable*]
+
+## The emulated paintables of `node` (none when commit makes none).
+func test_paint_emulation_paintables_of(this: TestPaintEmulation*, node: LayoutNode*) -> ak.Vector[TestEmulatedPaintable*]*?:
+    return ak.hash_map_get_k(&this.paintables, node)
+
+## The first emulated paintable of `node`, if any.
+func test_paint_emulation_first_paintable(this: TestPaintEmulation*, node: LayoutNode*) -> TestEmulatedPaintable*?:
+    let paintables = test_paint_emulation_paintables_of(this, node) else return none
+    if ak.vector_is_empty(paintables):
+        return none
+    return *ak.vector_at(paintables, 0)
+
+## Adds a paintable for `node` (Node::add_paintable).
+func test_paint_emulation_add(this: TestPaintEmulation*, node: LayoutNode*, is_inline_line: bool, is_box: bool, line_index: usize) -> TestEmulatedPaintable*:
+    let paintable = (new TestEmulatedPaintable(node = node, is_inline_line = is_inline_line, is_box = is_box, line_index = line_index)) else trap("out of memory")
+    ak.vector_append_t(ak.hash_map_ensure(&this.paintables, node), paintable)
+    if is_inline_line:
+        ak.vector_append_t(&this.inline_lines, paintable)
+    return paintable
+
+## InlineNode::create_paintable_for_line_with_index: the inline node's paintable for a line, made when it has none.
+func test_paint_emulation_line_paintable(this: TestPaintEmulation*, inline_node: LayoutNode*, line_index: usize) -> TestEmulatedPaintable*:
+    if let paintables = test_paint_emulation_paintables_of(this, inline_node):
+        for paintable in ak.vector_span(paintables):
+            if paintable.is_inline_line and paintable.line_index == line_index:
+                return paintable
+    return test_paint_emulation_add(this, inline_node, true, false, line_index)
+
+# mark: commit ==================================================================================
+
+## commit's try_to_relocate_fragment_in_inline_node: the inline node (below any atomic inline) that takes the fragment.
+func test_paint_emulation_relocation_target(fragment: const LayoutLineBoxFragment*) -> LayoutNode*?:
+    var parent_or_none = layout_node_parent(layout_line_box_fragment_layout_node(fragment))
+    while let parent = parent_or_none:
+        if layout_node_is_atomic_inline(parent.layout_node()):
+            break
+        if is_layout_inline_node(parent):
+            return parent.layout_node()
+        parent_or_none = layout_node_parent(parent.layout_node())
+    return none
+
+## The paintables commit makes, with the fragments of the line boxes, before the paint tree is measured.
+func test_paint_emulation_commit(this: TestPaintEmulation*, root: LayoutNode*):
+    var text_nodes: ak.HashTable[LayoutNode*, ak.PtrTraits[LayoutNode]]
+    var inline_nodes: ak.Vector[LayoutNode*]
+    for node in layout_node_inclusive_subtree(root):
+        if is_layout_inline_node(node) and layout_node_dom_node(node) != none:
+            # Inline nodes might have a continuation chain; add all inline nodes that are part of it.
+            var inline_node_or_none: LayoutNodeWithStyleAndBoxModelMetrics*? = (LayoutNodeWithStyleAndBoxModelMetrics*)node
+            while let inline_node = inline_node_or_none:
+                if is_layout_inline_node(inline_node):
+                    ak.vector_append_t(&inline_nodes, inline_node.layout_node())
+                inline_node_or_none = layout_node_with_style_and_box_model_metrics_continuation_of_node(inline_node)
+
+    # The used values in layout index order: the tree's pre-order.
+    for node in layout_node_inclusive_subtree(root):
+        let node_with_style = as_if_layout_node_with_style(node) else continue
+        let used_values = layout_state_try_get_layout_node_with_style(this.state, node_with_style) else continue
+        if not is_layout_box(node):
+            continue
+        let paintable = test_paint_emulation_add(this, node, false, true, 0)
+        if not is_layout_block_container(node):
+            continue
+        for line_index in 0..<ak.vector_size(&used_values.line_boxes):
+            let line_box = ak.vector_at_const(&used_values.line_boxes, line_index)
+            for fragment_index in 0..<ak.vector_size(&line_box.m_fragments):
+                let fragment = ak.vector_at_const(&line_box.m_fragments, fragment_index)
+                if layout_line_box_fragment_is_fully_truncated(fragment):
+                    continue
+                if is_layout_text_node(layout_line_box_fragment_layout_node(fragment)):
+                    discard(ak.hash_table_set(&text_nodes, layout_line_box_fragment_layout_node(fragment)))
+                if let inline_node = test_paint_emulation_relocation_target(fragment):
+                    let line_paintable = test_paint_emulation_line_paintable(this, inline_node, line_index)
+                    ak.vector_append_t(&line_paintable.fragments, *fragment)
+                else:
+                    ak.vector_append_t(&paintable.fragments, *fragment)
+
+    # Create paintables for inline nodes without fragments to make possible querying their geometry.
+    for inline_node in ak.vector_span(&inline_nodes):
+        if test_paint_emulation_first_paintable(this, inline_node) == none:
+            discard(test_paint_emulation_line_paintable(this, inline_node, 0))
+
+    for node in layout_node_inclusive_subtree(root):
+        if ak.hash_table_contains_t(&text_nodes, node):
+            discard(test_paint_emulation_add(this, node, false, false, 0))
+
+## LayoutState::resolve_relative_positions: the fragments moved into inline nodes' paintables move with their
+## relatively positioned inline ancestors.
+func test_paint_emulation_resolve_relative_positions(this: TestPaintEmulation*):
+    for paintable in ak.vector_span(&this.inline_lines):
+        let node_with_style = as_if_layout_node_with_style(paintable.node) else continue
+        if layout_state_try_get_layout_node_with_style(this.state, node_with_style) == none:
+            continue
+        for fragment in &ak.vector_span(&paintable.fragments):
+            let fragment_node = layout_line_box_fragment_layout_node(fragment)
+            let fragment_parent = layout_node_parent(fragment_node) else continue
+            if not is_layout_node_with_style_and_box_model_metrics(fragment_parent):
+                continue
+            # Collect effective relative position offset from inline-flow parent chain.
+            var offset = gfx.CssPixelPoint()
+            var ancestor_or_none: LayoutNodeWithStyle*? = fragment_parent
+            while let ancestor = ancestor_or_none:
+                if not is_layout_node_with_style_and_box_model_metrics(ancestor):
+                    break
+                let display = layout_node_display(ancestor.layout_node())
+                if not css_display_is_inline_outside(&display) or not css_display_is_flow_inside(&display):
+                    break
+                if css_computed_values_position(&layout_node_computed_values(ancestor.layout_node()).computed_values) == css_data.Positioning.relative:
+                    if let ancestor_values = layout_state_try_get_layout_node_with_style(this.state, ancestor):
+                        gfx.css_pixel_point_translate_by_css_pixels_css_pixels(&offset, ancestor_values.inset_left, ancestor_values.inset_top)
+                ancestor_or_none = layout_node_parent(ancestor.layout_node())
+            var moved = layout_line_box_fragment_offset(fragment)
+            gfx.css_pixel_point_translate_by_css_pixel_point(&moved, offset)
+            if layout_line_box_fragment_writing_mode(fragment) != css_data.WritingMode.horizontal_tb:
+                layout_line_box_fragment_set_block_offset(fragment, moved.m_x)
+                layout_line_box_fragment_set_inline_offset(fragment, moved.m_y)
+            else:
+                layout_line_box_fragment_set_inline_offset(fragment, moved.m_x)
+                layout_line_box_fragment_set_block_offset(fragment, moved.m_y)
+
+# mark: Measuring inline nodes' paintables ======================================================
+
+## The state of commit's measuring of one inline node's paintable (the for_each_in_inclusive_subtree_of_type lambda).
+struct TestPaintEmulationMeasure:
+    var line: TestEmulatedPaintable*
+    var first_child: TestEmulatedPaintable*?
+    var offset: gfx.CssPixelPoint?
+    var size: gfx.CssPixelSize
+
+## The measuring lambda for one PaintableWithLines of the paint subtree.
+func test_paint_emulation_measure_one(this: TestPaintEmulation*, measure: TestPaintEmulationMeasure*, paintable: TestEmulatedPaintable*):
+    # Only PaintableWithLines: inline nodes' line paintables and block containers' paintables (which are skipped).
+    if not paintable.is_inline_line:
+        return
+    if paintable.line_index != measure.line.line_index:
+        return
+
+    let used_values = layout_state_try_get_layout_node_with_style(this.state, as_layout_node_with_style(paintable.node))
+    if paintable != measure.line:
+        if let values = used_values:
+            gfx.css_pixel_size_set_width(&measure.size, measure.size.m_width.add(layout_state_used_values_margin_box_left(values)).add(layout_state_used_values_margin_box_right(values)))
+
+    if not ak.vector_is_empty(&paintable.fragments):
+        let first_fragment_offset = layout_line_box_fragment_offset(ak.vector_at(&paintable.fragments, 0))
+        if measure.offset == none or first_fragment_offset.m_x.lt((measure.offset else trap("unreachable")).m_x):
+            measure.offset = first_fragment_offset
+        if (TestEmulatedPaintable*?)paintable == measure.first_child:
+            if let values = used_values:
+                var moved = measure.offset else trap("unreachable: the offset was just set")
+                gfx.css_pixel_point_translate_by_css_pixels_css_pixels(&moved, layout_state_used_values_margin_box_left(values).neg(), layout_zero_px())
+                measure.offset = moved
+    for fragment in &ak.vector_span(&paintable.fragments):
+        gfx.css_pixel_size_set_width(&measure.size, measure.size.m_width.add(layout_line_box_fragment_width(fragment)))
+
+## The paint tree below `node`'s first paintable (build_paint_tree appends the paintables of a node's children to its
+## first paintable), measured in pre-order.
+func test_paint_emulation_measure_children(this: TestPaintEmulation*, measure: TestPaintEmulationMeasure*, node: LayoutNode*):
+    for child in layout_node_children(node):
+        let paintables = test_paint_emulation_paintables_of(this, child) else continue
+        for index in 0..<ak.vector_size(paintables):
+            let paintable = *ak.vector_at(paintables, index)
+            test_paint_emulation_measure_one(this, measure, paintable)
+            if index == 0:
+                test_paint_emulation_measure_children(this, measure, child)
+
+## The first child of a paintable in the paint tree: the first paintable of the node's first child that has one
+## (only a node's first paintable has children).
+func test_paint_emulation_first_child(this: TestPaintEmulation*, paintable: TestEmulatedPaintable*) -> TestEmulatedPaintable*?:
+    if test_paint_emulation_first_paintable(this, paintable.node) != (TestEmulatedPaintable*?)paintable:
+        return none
+    for child in layout_node_children(paintable.node):
+        if let first = test_paint_emulation_first_paintable(this, child):
+            return first
+    return none
+
+## commit's "Measure size of paintables created for inline nodes".
+func test_paint_emulation_measure(this: TestPaintEmulation*):
+    for line in ak.vector_span(&this.inline_lines):
+        var measure = TestPaintEmulationMeasure(line = line, first_child = test_paint_emulation_first_child(this, line))
+        test_paint_emulation_measure_one(this, &measure, line)
+        if test_paint_emulation_first_paintable(this, line.node) == (TestEmulatedPaintable*?)line:
+            test_paint_emulation_measure_children(this, &measure, line.node)
+
+        if let found_offset = measure.offset:
+            var offset = found_offset
+            if not ak.vector_is_empty(&line.fragments):
+                gfx.css_pixel_point_set_y(&offset, layout_line_box_fragment_offset(ak.vector_at(&line.fragments, 0)).m_y)
+            line.offset = offset
+
+        if not ak.vector_is_empty(&line.fragments):
+            for fragment in &ak.vector_span(&line.fragments):
+                gfx.css_pixel_size_set_height(&measure.size, ak.max(measure.size.m_height, layout_line_box_fragment_height(fragment)))
+        else:
+            gfx.css_pixel_size_set_height(&measure.size, css_computed_values_line_height(&layout_node_computed_values(line.node).computed_values))
+        line.size = measure.size
+
+## The emulated paintables of a laid-out tree.
+func test_paint_emulation_new(state: const LayoutState*, root: LayoutNode*) -> TestPaintEmulation*:
+    let this = (new TestPaintEmulation(state = state)) else trap("out of memory")
+    test_paint_emulation_commit(this, root)
+    test_paint_emulation_resolve_relative_positions(this)
+    test_paint_emulation_measure(this)
+    return this
+
+# mark: Absolute positions ======================================================================
+
+## The offset commit gives a box's PaintableBox: an atomic inline's from its line box fragment, any other box's used
+## offset, plus the inset of a relatively positioned box (none when the box was not laid out).
+func test_paint_emulation_box_offset(this: TestPaintEmulation*, box: LayoutBox*) -> gfx.CssPixelPoint?:
+    let used_values = layout_state_try_get_layout_node_with_style(this.state, box.layout_node_with_style()) else return none
+    var offset = used_values.offset
+    if let coordinate = used_values.containing_line_box_fragment:
+        let containing_block = layout_node_containing_block(box.layout_node()) else trap("an atomic inline without a containing block")
+        let containing_block_used_values = layout_state_get(this.state, containing_block.layout_node_with_style())
+        let line_box = ak.vector_at_const(&containing_block_used_values.line_boxes, coordinate.line_box_index)
+        offset = layout_line_box_fragment_offset(ak.vector_at_const(&line_box.m_fragments, coordinate.fragment_index))
+    if css_computed_values_position(&layout_node_computed_values(box.layout_node()).computed_values) == css_data.Positioning.relative:
+        gfx.css_pixel_point_translate_by_css_pixels_css_pixels(&offset, used_values.inset_left, used_values.inset_top)
+    return offset
+
+## PaintableBox::absolute_rect's location: the paintable offsets of the box and of its containing blocks.
+func test_paint_emulation_absolute_position(this: TestPaintEmulation*, box: LayoutBox*) -> gfx.CssPixelPoint?:
+    var position = test_paint_emulation_box_offset(this, box) else return none
+    var block_or_none = layout_node_containing_block(box.layout_node())
+    while let block = block_or_none:
+        let block_offset = test_paint_emulation_box_offset(this, block) else break
+        gfx.css_pixel_point_translate_by_css_pixel_point(&position, block_offset)
+        block_or_none = layout_node_containing_block(block.layout_node())
+    return position
+
+## The absolute position of the containing block of `node`'s paintables (zero when it has none).
+func test_paint_emulation_containing_block_position(this: TestPaintEmulation*, node: LayoutNode*) -> gfx.CssPixelPoint:
+    let containing_block = layout_node_containing_block(node) else return gfx.CssPixelPoint()
+    return test_paint_emulation_absolute_position(this, containing_block) else gfx.CssPixelPoint()
+
+# mark: Dump lines ==============================================================================
+
+## Dump's `dump_fragment` of an emulated paintable fragment (PaintableFragment::absolute_rect), indented as `indent`.
+func test_paint_emulation_dump_fragment(this: TestPaintEmulation*, out: ak.StringBuilder*, indent: const u8[], fragment: const LayoutLineBoxFragment*, fragment_index: usize):
+    let layout_node = layout_line_box_fragment_layout_node(fragment)
+    ak.string_builder_append(out, (str)indent)
+    dump_appendff(out, "  frag {} from {} ", [ak.arg_u64((u64)fragment_index), ak.arg_string_view(dump_class_name(layout_node.cell()))])
+    dump_appendff(out, "start: {}, length: {}, rect: ", [
+        ak.arg_u64((u64)layout_line_box_fragment_start(fragment)),
+        ak.arg_u64((u64)layout_line_box_fragment_length_in_code_units(fragment)),
+    ])
+    var rect = gfx.CssPixelRect(layout_line_box_fragment_offset(fragment), layout_line_box_fragment_size(fragment))
+    gfx.css_pixel_rect_translate_by_css_pixel_point(&rect, test_paint_emulation_containing_block_position(this, layout_node))
+    dump_append_css_pixel_rect(out, rect)
+    dump_appendff(out, " baseline: {}\n", [dump_arg_css_pixels(layout_line_box_fragment_baseline(fragment))])
+    if layout_line_box_fragment_length_in_code_units(fragment) > 0:
+        ak.string_builder_append(out, (str)indent)
+        ak.string_builder_append(out, "      \"")
+        ak.string_builder_append_utf16_view(out, layout_line_box_fragment_text(fragment))
+        ak.string_builder_append(out, "\"\n")
+
+## The fragment lines Dump writes after a node's line: a block container's own fragments, or the fragments of each of
+## an inline node's paintables.
+func test_paint_emulation_dump_fragments(this: TestPaintEmulation*, out: ak.StringBuilder*, indent: const u8[], node: LayoutNode*):
+    let paintables = test_paint_emulation_paintables_of(this, node) else return
+    if is_layout_block_container(node) and layout_node_children_are_inline(node):
+        let paintable = *ak.vector_at(paintables, 0)
+        for index in 0..<ak.vector_size(&paintable.fragments):
+            test_paint_emulation_dump_fragment(this, out, indent, ak.vector_at(&paintable.fragments, index), index)
+    if is_layout_inline_node(node):
+        for paintable in ak.vector_span(paintables):
+            for index in 0..<ak.vector_size(&paintable.fragments):
+                test_paint_emulation_dump_fragment(this, out, indent, ak.vector_at(&paintable.fragments, index), index)
+
+## An inline node's position and box model as Dump writes them from its first paintable, if it has one.
+func test_paint_emulation_inline_node_geometry(this: TestPaintEmulation*, out: ak.StringBuilder*, node: LayoutNode*) -> bool:
+    let paintable = test_paint_emulation_first_paintable(this, node) else return false
+    var position = paintable.offset
+    gfx.css_pixel_point_translate_by_css_pixel_point(&position, test_paint_emulation_containing_block_position(this, node))
+    ak.string_builder_append(out, "at ")
+    dump_append_css_pixel_point(out, position)
+    var values = LayoutStateUsedValues()
+    if let used_values = layout_state_try_get_layout_node_with_style(this.state, as_layout_node_with_style(node)):
+        values = *used_values
+    dump_appendff(out, " [{}+{}+{} {} {}+{}+{}]", [
+        dump_arg_css_pixels(values.margin_left),
+        dump_arg_css_pixels(values.border_left),
+        dump_arg_css_pixels(values.padding_left),
+        dump_arg_css_pixels(paintable.size.m_width),
+        dump_arg_css_pixels(values.padding_right),
+        dump_arg_css_pixels(values.border_right),
+        dump_arg_css_pixels(values.margin_right),
+    ])
+    dump_appendff(out, " [{}+{}+{} {} {}+{}+{}]", [
+        dump_arg_css_pixels(values.margin_top),
+        dump_arg_css_pixels(values.border_top),
+        dump_arg_css_pixels(values.padding_top),
+        dump_arg_css_pixels(paintable.size.m_height),
+        dump_arg_css_pixels(values.padding_bottom),
+        dump_arg_css_pixels(values.border_bottom),
+        dump_arg_css_pixels(values.margin_bottom),
+    ])
+    return true
