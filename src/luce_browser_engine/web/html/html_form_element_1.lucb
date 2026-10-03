@@ -1,0 +1,520 @@
+#==============================================================================================
+#
+#   html_form_element_1 - HTML::HTMLFormElement: construction, submission, reset and the
+#                         form's attributes
+#
+#   DESCRIPTION:
+#       Port of LibWeb/HTML/HTMLFormElement.cpp (lines 1-553) and the inline functions of
+#       HTMLFormElement.h: construction (which moves the mixin tables to HTMLFormElement's, as
+#       C++'s vptrs move), initialize, visit_edges, implicit submission, submitting the form
+#       (constraint validation, the submit event, the entry list, then the navigation chosen by
+#       the action's scheme and the method), resetting, submit() / requestSubmit() / reset(), the
+#       associated elements, the submitter's action, method and enctype, and the elements
+#       collection.
+#
+#==============================================================================================
+
+# mark: Construction ============================================================================
+
+## Ported from HTMLFormElement.cpp:44 Web::HTML::HTMLFormElement::HTMLFormElement.
+pub func html_form_element_construct(this: HtmlFormElement*, document: DomDocument*, qualified_name: DomQualifiedName):
+    html_element_construct(this.html_element(), document, qualified_name)
+    # The vptrs of the mixin bases move to HTMLFormElement's tables.
+    let element = this.html_element()
+    element.element.slottable_mixin.vtable = &html_form_element_slottable_mixin_vtable
+    element.element.aria_mixin.vtable = &html_form_element_aria_mixin_vtable
+    element.element.animatable.vtable = &html_form_element_animatable_vtable
+    element.global_event_handlers.vtable = &html_form_element_global_event_handlers_vtable
+    element.form_associated_element.vtable = &html_form_element_form_associated_element_vtable
+
+    this.html_element_base.element.parent_node.node.event_target.platform_object.m_legacy_platform_object_flags = BindPlatformObjectLegacyPlatformObjectFlags(
+        supports_indexed_properties = 1,
+        supports_named_properties = 1,
+        has_legacy_unenumerable_named_properties_interface_extended_attribute = 1,
+        has_legacy_override_built_ins_interface_extended_attribute = 1,
+    )
+
+## Ported from HTMLFormElement.cpp:57 Web::HTML::HTMLFormElement::initialize (override).
+pub func html_form_element_initialize_impl(base: JsCell*, realm: Realm*):
+    web_set_prototype_for_interface(base, realm, BindInterfaceName.html_form_element)
+    html_element_initialize_impl(base, realm)
+
+## Ported from HTMLFormElement.cpp:63 Web::HTML::HTMLFormElement::visit_edges (override).
+pub func html_form_element_visit_edges_impl(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (HtmlFormElement*)base
+    html_element_visit_edges_impl(base, visitor)
+    gc.cell_visitor_visit_t[HtmlFormControlsCollection](visitor, this.m_elements)
+    gc.cell_visitor_visit_vector[HtmlElement](visitor, &this.m_associated_elements)
+    gc.cell_visitor_visit_t[HtmlTask](visitor, this.m_planned_navigation)
+    gc.cell_visitor_visit_t[DomTokenList](visitor, this.m_rel_list)
+    for entry in ak.hash_map_begin(&this.m_past_names_map):
+        html_form_element_past_name_entry_visit_edges(&entry.value, visitor)
+
+## Ported from HTMLFormElement.h:147 Web::HTML::HTMLFormElement::PastNameEntry::visit_edges.
+pub func html_form_element_past_name_entry_visit_edges(this: HtmlFormElementPastNameEntry*, visitor: gc.CellVisitor*):
+    gc.cell_visitor_visit_t[DomNode](visitor, this.node)
+
+# mark: Submission ==============================================================================
+
+## Ported from HTMLFormElement.cpp:74 Web::HTML::HTMLFormElement::implicitly_submit_form.
+# https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#implicit-submission
+pub func html_form_element_implicitly_submit_form(this: HtmlFormElement*) -> !:
+    # If the user agent supports letting the user submit a form implicitly (for example, on some platforms hitting the
+    # "enter" key while a text control is focused implicitly submits the form), then doing so for a form, whose default
+    # button has activation behavior and is not disabled, must cause the user agent to fire a click event at that
+    # default button.
+    if let default_button = html_form_element_default_button(this):
+        let default_button_element = html_form_associated_element_form_associated_element_to_html_element(default_button)
+
+        if dom_event_target_has_activation_behavior(default_button_element.dom_event_target()) and html_form_associated_element_enabled(default_button):
+            html_element_click(default_button_element)
+
+        return
+
+    # If the form has no submit button, then the implicit submission mechanism must perform the following steps:
+
+    # 1. If the form has more than one field that blocks implicit submission, then return.
+    if html_form_element_number_of_fields_blocking_implicit_submission(this) > 1:
+        return
+
+    # 2. Submit the form element from the form element itself with userInvolvement set to "activation".
+    try html_form_element_submit_form(this, this.html_element(), HtmlFormElementSubmitFormOptions(user_involvement = HtmlUserNavigationInvolvement.activation))
+
+## Ported from HTMLFormElement.cpp:102 Web::HTML::HTMLFormElement::submit_form.
+# https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-form-submit
+pub func html_form_element_submit_form(this: HtmlFormElement*, submitter: HtmlElement*, options: HtmlFormElementSubmitFormOptions) -> !:
+    let realm = html_element_realm(this.html_element())
+
+    # 1. If form cannot navigate, then return.
+    if dom_element_cannot_navigate(this.dom_element()):
+        return
+
+    # 2. If form's constructing entry list is true, then return.
+    if this.m_constructing_entry_list:
+        return
+
+    # 3. Let form document be form's node document.
+    let form_document = dom_node_document(this.dom_node())
+
+    # 4. If form document's active sandboxing flag set has its sandboxed forms browsing context flag set, then return.
+    if html_has_flag(dom_document_active_sandboxing_flag_set(form_document), HtmlSandboxingFlagSet.sandboxed_forms):
+        return
+
+    # 5. If the submitted from submit() method flag is not set, then:
+    if not options.from_submit_binding:
+        # 1. If form's firing submission events is true, then return.
+        if this.m_firing_submission_events:
+            return
+
+        # 2. Set form's firing submission events to true.
+        this.m_firing_submission_events = true
+
+        # 3. For each element field in the list of submittable elements whose form owner is form, set field's user validity to true.
+        var submittable_elements = html_form_element_get_submittable_elements(this)
+        for element in ak.vector_span(&submittable_elements):
+            # NOTE: Only input, select and textarea elements have a user validity flag.
+            #       See https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#user-validity
+            if is_html_input_element(element):
+                html_input_element_set_user_validity(as_html_input_element(element), true)
+            elif is_html_select_element(element):
+                html_select_element_set_user_validity(as_html_select_element(element), true)
+            elif is_html_text_area_element(element):
+                html_text_area_element_set_user_validity(as_html_text_area_element(element), true)
+
+        # 4. If the submitter element's no-validate state is false, then interactively validate the constraints
+        #    of form and examine the result. If the result is negative (i.e., the constraint validation concluded
+        #    that there were invalid fields and probably informed the user of this), then:
+        if not html_form_associated_element_novalidate_state(&submitter.form_associated_element):
+            let validation_result = html_form_element_interactively_validate_constraints(this)
+            if not validation_result:
+                # 1. Set form's firing submission events to false.
+                this.m_firing_submission_events = false
+
+                # 2. Return.
+                return
+
+        # 5. Let submitterButton be null if submitter is form. Otherwise, let submitterButton be submitter.
+        var submitter_button: HtmlElement*? = none
+        if submitter != this.html_element():
+            submitter_button = submitter
+
+        # 6. Let shouldContinue be the result of firing an event named submit at form using SubmitEvent, with the
+        #    submitter attribute initialized to submitterButton, the bubbles attribute initialized to true, and the
+        #    cancelable attribute initialized to true.
+        let event_init = HtmlSubmitEventInit(event_init = DomEventInit(), submitter = submitter_button)
+        let submit_event = html_submit_event_create(realm, html_event_names_submit, event_init)
+        dom_event_set_bubbles(submit_event, true)
+        dom_event_set_cancelable(submit_event, true)
+        let should_continue = dom_event_target_dispatch_event(this.dom_event_target(), submit_event)
+
+        # 7. Set form's firing submission events to false.
+        this.m_firing_submission_events = false
+
+        # 8. If shouldContinue is false, then return.
+        if not should_continue:
+            return
+
+        # 9. If form cannot navigate, then return.
+        # Spec Note: Cannot navigate is run again as dispatching the submit event could have changed the outcome.
+        if dom_element_cannot_navigate(this.dom_element()):
+            return
+
+    # 6. Let encoding be the result of picking an encoding for the form.
+    # (TRY_OR_THROW_OOM: picking fails only when out of memory.)
+    let encoding = try html_form_element_pick_an_encoding(this)
+
+    # 7. Let entry list be the result of constructing the entry list with form, submitter, and encoding.
+    let entry_list_or_null = try html_construct_entry_list(realm, this, submitter, encoding)
+
+    # 8. Assert: entry list is not null.
+    let entry_list = entry_list_or_null else trap("VERIFY: entry list is not null")
+
+    # 9. If form cannot navigate, then return.
+    # Spec Note: Cannot navigate is run again as dispatching the formdata event in constructing the entry list could
+    #            have changed the outcome.
+    if dom_element_cannot_navigate(this.dom_element()):
+        return
+
+    # 10. Let method be the submitter element's method.
+    let method = html_form_element_method_state_from_form_element(this, submitter)
+
+    # 11. If method is dialog, then:
+    if method == HtmlFormElementMethodAttributeState.dialog:
+        # 1. If form does not have an ancestor dialog element, then return.
+        # 2. Let subject be form's nearest ancestor dialog element.
+        let subject = (HtmlDialogElement*?)tree_node_first_ancestor_of_type(this.dom_node(), &html_dialog_element_class) else return
+
+        # 3. Let result be null.
+        var result: ak.String? = none
+
+        # 4. If submitter is an input element whose type attribute is in the Image Button state, then:
+        if is_html_input_element(submitter):
+            let input_element = as_html_input_element(submitter)
+
+            if html_input_element_type_state(input_element) == HtmlInputElementTypeAttributeState.image_button:
+                # 1. Let (x, y) be the selected coordinate.
+                let coordinate = html_input_element_selected_coordinate(input_element)
+
+                # 2. Set result to the concatenation of x, ",", and y.
+                var builder = ak.string_builder_new()
+                let x = ak.string_number_i64((i64)coordinate.x)
+                let y = ak.string_number_i64((i64)coordinate.y)
+                ak.string_builder_append_string_view(&builder, ak.string_bytes_as_string_view(&x))
+                ak.string_builder_append_u8(&builder, ',')
+                ak.string_builder_append_string_view(&builder, ak.string_bytes_as_string_view(&y))
+                result = ak.string_builder_to_string(&builder) else trap("MUST: String::formatted")
+
+        # 5. Otherwise, if submitter is a submit button, then set result to submitter's optional value.
+        elif html_form_associated_element_is_submit_button(&submitter.form_associated_element):
+            result = html_form_associated_element_optional_value(&submitter.form_associated_element)
+
+        # 6. Close the dialog subject with result and null.
+        html_dialog_element_close_the_dialog(subject, result, none)
+
+        # 7. Return.
+        return
+
+    # 12. Let action be the submitter element's action.
+    var action = html_form_element_action_from_form_element(this, submitter)
+
+    # 13. If action is the empty string, let action be the URL of the form document.
+    if ak.string_is_empty(&action):
+        action = dom_document_url_string(form_document)
+
+    # 14. Let parsed action be the result of encoding-parsing a URL given action, relative to submitter's node document.
+    # 15. If parsed action is failure, then return.
+    let maybe_parsed_action = dom_document_encoding_parse_url(dom_node_document(submitter.dom_node()), ak.string_bytes_as_string_view(&action))
+    if maybe_parsed_action == none:
+        ak.dbgln(f"Failed to submit form: Invalid URL: {(str)ak.string_base_bytes(&action.string_base)}")
+        return
+    let parsed_action = maybe_parsed_action else trap("unreachable")
+
+    # 16. Let scheme be the scheme of parsed action.
+    let scheme = web_url.url_scheme(&parsed_action)
+
+    # 17. Let enctype be the submitter element's enctype.
+    let encoding_type = html_form_element_encoding_type_state_from_form_element(this, submitter)
+
+    # 18. Let formTarget be null.
+    var form_target: ak.String? = none
+
+    # 19. If the submitter element is a submit button and it has a formtarget attribute, then set formTarget to the
+    #     formtarget attribute value.
+    if html_form_associated_element_is_submit_button(&submitter.form_associated_element):
+        if let formtarget_attribute = dom_element_attribute(submitter.dom_element(), html_attribute_names_formtarget):
+            form_target = formtarget_attribute
+
+    # 20. Let target be the result of getting an element's target given submitter's form owner and formTarget.
+    let target = dom_element_get_an_elements_target(this.dom_element(), form_target)
+
+    # 21. Let noopener be the result of getting an element's noopener with form, parsed action, and target.
+    let no_opener = dom_element_get_an_elements_noopener(this.dom_element(), parsed_action, ak.string_bytes_as_string_view(&target))
+
+    # 22. Let targetNavigable be the first return value of applying the rules for choosing a navigable given target,
+    #     form's node navigable, and noopener.
+    let form_navigable = dom_document_navigable(form_document) else trap("Optional::operator-> of an empty value")
+
+    # 23. If targetNavigable is null, then return.
+    let maybe_target_navigable = html_navigable_choose_a_navigable(form_navigable, ak.string_bytes_as_string_view(&target), no_opener).navigable
+    if maybe_target_navigable == none:
+        ak.dbgln("Failed to submit form: choose_a_browsing_context returning a null browsing context")
+        return
+    let target_navigable = maybe_target_navigable else trap("unreachable")
+
+    # 24. Let historyHandling be "auto".
+    var history_handling = BindNavigationHistoryBehavior.auto
+
+    # 25. If form document equals targetNavigable's active document, and form document has not yet completely loaded,
+    #     then set historyHandling to "replace".
+    if html_navigable_active_document(target_navigable) == form_document and not dom_document_is_completely_loaded(form_document):
+        history_handling = BindNavigationHistoryBehavior.replace
+
+    # 25. Select the appropriate row in the table below based on scheme as given by the first cell of each row.
+    #     Then, select the appropriate cell on that row based on method as given in the first cell of each column.
+    #     Then, jump to the steps named in that cell and defined below the table.
+
+    #            | GET               | POST
+    # ------------------------------------------------------
+    # http       | Mutate action URL | Submit as entity body
+    # https      | Mutate action URL | Submit as entity body
+    # ftp        | Get action URL    | Get action URL
+    # javascript | Get action URL    | Get action URL
+    # data       | Mutate action URL | Get action URL
+    # mailto     | Mail with headers | Mail as body
+
+    # If scheme is not one of those listed in this table, then the behavior is not defined by this specification.
+    # User agents should, in the absence of another specification defining this, act in a manner analogous to that defined
+    # in this specification for similar schemes.
+
+    # AD-HOC: In accordance with the above paragraph, we implement file:// submission URLs the same as data: URLs.
+
+    # This should have been handled above.
+    assert(method != HtmlFormElementMethodAttributeState.dialog)
+
+    if html_form_scheme_is(&scheme, "http") or html_form_scheme_is(&scheme, "https"):
+        if method == HtmlFormElementMethodAttributeState.get:
+            try html_form_element_mutate_action_url(this, parsed_action, entry_list, encoding, target_navigable, history_handling, options.user_involvement)
+        else:
+            try html_form_element_submit_as_entity_body(this, parsed_action, entry_list, encoding_type, encoding, target_navigable, history_handling, options.user_involvement)
+    elif html_form_scheme_is(&scheme, "ftp") or html_form_scheme_is(&scheme, "javascript"):
+        html_form_element_get_action_url(this, parsed_action, entry_list, target_navigable, history_handling, options.user_involvement)
+    elif html_form_scheme_is(&scheme, "data") or html_form_scheme_is(&scheme, "file"):
+        if method == HtmlFormElementMethodAttributeState.get:
+            try html_form_element_mutate_action_url(this, parsed_action, entry_list, encoding, target_navigable, history_handling, options.user_involvement)
+        else:
+            html_form_element_get_action_url(this, parsed_action, entry_list, target_navigable, history_handling, options.user_involvement)
+    elif html_form_scheme_is(&scheme, "mailto"):
+        if method == HtmlFormElementMethodAttributeState.get:
+            try html_form_element_mail_with_headers(this, parsed_action, entry_list, encoding, target_navigable, history_handling, options.user_involvement)
+        else:
+            try html_form_element_mail_as_body(this, parsed_action, entry_list, encoding_type, encoding, target_navigable, history_handling, options.user_involvement)
+    else:
+        ak.dbgln(f"Failed to submit form: Unknown scheme: {(str)ak.string_base_bytes(&scheme.string_base)}")
+        return
+
+## `scheme == "…"sv`.
+func html_form_scheme_is(scheme: const ak.String*, name: str) -> bool:
+    return ak.string_eq_string_view(scheme, ak.sv(name))
+
+# mark: Reset, submit() and requestSubmit() =====================================================
+
+## Ported from HTMLFormElement.cpp:346 Web::HTML::HTMLFormElement::reset_form.
+# https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#resetting-a-form
+pub func html_form_element_reset_form(this: HtmlFormElement*):
+    # 1. Let reset be the result of firing an event named reset at form, with the bubbles and cancelable attributes initialized to true.
+    let reset_event = dom_event_create(html_element_realm(this.html_element()), html_event_names_reset)
+    dom_event_set_bubbles(reset_event, true)
+    dom_event_set_cancelable(reset_event, true)
+
+    let reset = dom_event_target_dispatch_event(this.dom_event_target(), reset_event)
+
+    # 2. If reset is true, then invoke the reset algorithm of each resettable element whose form owner is form.
+    if reset:
+        var associated_elements_copy = ak.vector_clone(&this.m_associated_elements)
+        for element in ak.vector_span(&associated_elements_copy):
+            let form_associated_element = as_if_form_associated_element(element) else trap("as<FormAssociatedElement> failed")
+            if html_form_associated_element_is_resettable(form_associated_element):
+                html_form_associated_element_reset_algorithm(form_associated_element)
+
+## Ported from HTMLFormElement.cpp:366 Web::HTML::HTMLFormElement::submit.
+pub func html_form_element_submit(this: HtmlFormElement*) -> !:
+    try html_form_element_submit_form(this, this.html_element(), HtmlFormElementSubmitFormOptions(from_submit_binding = true))
+
+## Ported from HTMLFormElement.cpp:372 Web::HTML::HTMLFormElement::request_submit.
+# https://html.spec.whatwg.org/multipage/forms.html#dom-form-requestsubmit
+pub func html_form_element_request_submit(this: HtmlFormElement*, submitter: DomElement*?) -> !:
+    var the_submitter = submitter
+    # 1. If submitter is not null, then:
+    if let given_submitter = submitter:
+        # 1. If submitter is not a submit button, then throw a TypeError.
+        let form_associated_element = as_if_form_associated_element(given_submitter)
+        if form_associated_element == none or not html_form_associated_element_is_submit_button(form_associated_element else trap("unreachable")):
+            try idl_throw_simple(IdlSimpleExceptionType.type_error, .string_view(ak.sv("The submitter is not a submit button")))
+
+        # 2. If submitter's form owner is not this form element, then throw a "NotFoundError" DOMException.
+        if html_form_associated_element_form(form_associated_element else trap("unreachable")) != this:
+            try idl_throw(.idl_dom_exception(idl_not_found_error_create(html_element_realm(this.html_element()), ak.utf16_string_from_str("The submitter is not owned by this form element"))))
+    # 2. Otherwise, set submitter to this form element.
+    else:
+        the_submitter = this.dom_element()
+
+    # 3. Submit this form element, from submitter.
+    try html_form_element_submit_form(this, (HtmlElement*)(the_submitter else trap("unreachable")), HtmlFormElementSubmitFormOptions())
+
+## Ported from HTMLFormElement.cpp:395 Web::HTML::HTMLFormElement::reset.
+# https://html.spec.whatwg.org/multipage/forms.html#dom-form-reset
+pub func html_form_element_reset(this: HtmlFormElement*):
+    # 1. If the form element is marked as locked for reset, then return.
+    if this.m_locked_for_reset:
+        return
+
+    # 2. Mark the form element as locked for reset.
+    this.m_locked_for_reset = true
+
+    # 3. Reset the form element.
+    html_form_element_reset_form(this)
+
+    # 4. Unmark the form element as locked for reset.
+    this.m_locked_for_reset = false
+
+# mark: Associated elements =====================================================================
+
+## Ported from HTMLFormElement.cpp:411 Web::HTML::HTMLFormElement::add_associated_element.
+pub func html_form_element_add_associated_element(this: HtmlFormElement*, element: HtmlElement*):
+    ak.vector_append_t(&this.m_associated_elements, element)
+
+## The `[&](auto& entry) { return entry.ptr() == &element; }` predicate of remove_associated_element.
+func html_form_element_is_element(context: void*?, entry: const (HtmlElement*)*) -> bool:
+    return *entry == (HtmlElement*)(context else trap("no element"))
+
+## The `[&](auto&, auto const& entry) { return entry.node == &element; }` predicate of remove_associated_element.
+func html_form_element_past_name_is_element(context: void*?, name: const ak.FlyString*, entry: const HtmlFormElementPastNameEntry*) -> bool:
+    return entry.node == (DomNode*?)context
+
+## Ported from HTMLFormElement.cpp:416 Web::HTML::HTMLFormElement::remove_associated_element.
+pub func html_form_element_remove_associated_element(this: HtmlFormElement*, element: HtmlElement*):
+    discard(ak.vector_remove_first_matching(&this.m_associated_elements, ak.Function1[const (HtmlElement*)*, bool](call = html_form_element_is_element, context = element)))
+
+    # If an element listed in a form element's past names map changes form owner, then its entries must be removed from that map.
+    discard(ak.hash_map_remove_all_matching(&this.m_past_names_map, ak.Function2[const ak.FlyString*, const HtmlFormElementPastNameEntry*, bool](call = html_form_element_past_name_is_element, context = element)))
+
+# mark: The submitter's action, method and enctype ==============================================
+
+## Ported from HTMLFormElement.cpp:425 Web::HTML::HTMLFormElement::action_from_form_element.
+# https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-fs-action
+pub func html_form_element_action_from_form_element(this: HtmlFormElement*, element: HtmlElement*) -> ak.String:
+    # The action of an element is the value of the element's formaction attribute, if the element is a submit button
+    # and has such an attribute, or the value of its form owner's action attribute, if it has one, or else the empty
+    # string.
+    if let form_associated_element = as_if_form_associated_element(element):
+        if html_form_associated_element_is_submit_button(form_associated_element):
+            if let maybe_attribute = dom_element_attribute(element.dom_element(), html_attribute_names_formaction):
+                return maybe_attribute
+
+    if let maybe_attribute = dom_element_attribute(this.dom_element(), html_attribute_names_action):
+        return maybe_attribute
+
+    return ak.string_new()
+
+## Ported from HTMLFormElement.cpp:443 Web::HTML::method_attribute_to_method_state.
+# https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#form-submission-attributes:attr-fs-method-2
+func html_method_attribute_to_method_state(method: ak.StringView) -> HtmlFormElementMethodAttributeState:
+    # ENUMERATE_FORM_METHOD_ATTRIBUTES:
+    if ak.string_utils_equals_ignoring_ascii_case(ak.sv("get"), method):
+        return HtmlFormElementMethodAttributeState.get
+    if ak.string_utils_equals_ignoring_ascii_case(ak.sv("post"), method):
+        return HtmlFormElementMethodAttributeState.post
+    if ak.string_utils_equals_ignoring_ascii_case(ak.sv("dialog"), method):
+        return HtmlFormElementMethodAttributeState.dialog
+
+    # The method attribute's invalid value default and missing value default are both the GET state.
+    return HtmlFormElementMethodAttributeState.get
+
+## Ported from HTMLFormElement.cpp:456 Web::HTML::HTMLFormElement::method_state_from_form_element.
+# https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-fs-method
+pub func html_form_element_method_state_from_form_element(this: HtmlFormElement*, element: HtmlElement*) -> HtmlFormElementMethodAttributeState:
+    # If the element is a submit button and has a formmethod attribute, then the element's method is that attribute's state;
+    # otherwise, it is the form owner's method attribute's state.
+    if let form_associated_element = as_if_form_associated_element(element):
+        if html_form_associated_element_is_submit_button(form_associated_element):
+            if let maybe_formmethod = dom_element_attribute(element.dom_element(), html_attribute_names_formmethod):
+                # NOTE: `formmethod` is the same as `method`, except that it has no missing value default.
+                #       This is handled by not calling `method_attribute_to_method_state` in the first place if there is no `formmethod` attribute.
+                return html_method_attribute_to_method_state(ak.string_bytes_as_string_view(&maybe_formmethod))
+
+    if let maybe_method = dom_element_attribute(this.dom_element(), html_attribute_names_method):
+        return html_method_attribute_to_method_state(ak.string_bytes_as_string_view(&maybe_method))
+
+    return HtmlFormElementMethodAttributeState.get
+
+## Ported from HTMLFormElement.cpp:477 Web::HTML::encoding_type_attribute_to_encoding_type_state.
+# https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#form-submission-attributes:attr-fs-enctype-2
+func html_encoding_type_attribute_to_encoding_type_state(encoding_type: ak.StringView) -> HtmlFormElementEncodingTypeAttributeState:
+    # ENUMERATE_FORM_METHOD_ENCODING_TYPES:
+    if ak.string_utils_equals_ignoring_ascii_case(ak.sv("application/x-www-form-urlencoded"), encoding_type):
+        return HtmlFormElementEncodingTypeAttributeState.form_url_encoded
+    if ak.string_utils_equals_ignoring_ascii_case(ak.sv("multipart/form-data"), encoding_type):
+        return HtmlFormElementEncodingTypeAttributeState.form_data
+    if ak.string_utils_equals_ignoring_ascii_case(ak.sv("text/plain"), encoding_type):
+        return HtmlFormElementEncodingTypeAttributeState.plain_text
+
+    # The enctype attribute's invalid value default and missing value default are both the application/x-www-form-urlencoded state.
+    return HtmlFormElementEncodingTypeAttributeState.form_url_encoded
+
+## Ported from HTMLFormElement.cpp:490 Web::HTML::HTMLFormElement::encoding_type_state_from_form_element.
+# https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-fs-enctype
+pub func html_form_element_encoding_type_state_from_form_element(this: HtmlFormElement*, element: HtmlElement*) -> HtmlFormElementEncodingTypeAttributeState:
+    # If the element is a submit button and has a formenctype attribute, then the element's enctype is that attribute's state;
+    # otherwise, it is the form owner's enctype attribute's state.
+    if let form_associated_element = as_if_form_associated_element(element):
+        if html_form_associated_element_is_submit_button(form_associated_element):
+            if let formenctype = dom_element_attribute(element.dom_element(), html_attribute_names_formenctype):
+                # NOTE: `formenctype` is the same as `enctype`, except that it has nomissing value default.
+                #       This is handled by not calling `encoding_type_attribute_to_encoding_type_state` in the first place if there is no
+                #       `formenctype` attribute.
+                return html_encoding_type_attribute_to_encoding_type_state(ak.string_bytes_as_string_view(&formenctype))
+
+    if let maybe_enctype = dom_element_attribute(this.dom_element(), html_attribute_names_enctype):
+        return html_encoding_type_attribute_to_encoding_type_state(ak.string_bytes_as_string_view(&maybe_enctype))
+
+    return HtmlFormElementEncodingTypeAttributeState.form_url_encoded
+
+# mark: The elements collection =================================================================
+
+## Ported from HTMLFormElement.cpp:510 Web::HTML::is_form_control.
+func html_is_form_control(element: DomElement*, form: HtmlFormElement*) -> bool:
+    # The elements IDL attribute must return an HTMLFormControlsCollection rooted at the form element's root,
+    # whose filter matches listed elements whose form owner is the form element,
+    # with the exception of input elements whose type attribute is in the Image Button state, which must,
+    # for historical reasons, be excluded from this particular collection.
+
+    if is_html_input_element(element) and html_input_element_type_state(as_html_input_element(element)) == HtmlInputElementTypeAttributeState.image_button:
+        return false
+
+    let form_associated_element = as_if_form_associated_element(element) else return false
+
+    if html_form_associated_element_form(form_associated_element) != form:
+        return false
+
+    if not html_form_associated_element_is_listed(form_associated_element):
+        return false
+
+    return true
+
+## The `[this](Element const& element)` filter of elements(): its form.
+func html_form_element_elements_filter(context: void*?, element: DomElement*) -> bool:
+    return html_is_form_control(element, (HtmlFormElement*)(context else trap("elements filter: no form")))
+
+## Ported from HTMLFormElement.cpp:536 Web::HTML::HTMLFormElement::elements.
+# https://html.spec.whatwg.org/multipage/forms.html#dom-form-elements
+pub func html_form_element_elements(this: HtmlFormElement*) -> HtmlFormControlsCollection*:
+    if this.m_elements == none:
+        let root = as_dom_parent_node(tree_node_root(this.dom_node()))
+        this.m_elements = html_form_controls_collection_create(root, DomHtmlCollectionScope.descendants, ak.Function1[DomElement*, bool](call = html_form_element_elements_filter, context = this))
+    return this.m_elements else trap("unreachable")
+
+## Ported from HTMLFormElement.cpp:548 Web::HTML::HTMLFormElement::length.
+# https://html.spec.whatwg.org/multipage/forms.html#dom-form-length
+pub func html_form_element_length(this: HtmlFormElement*) -> u32:
+    # The length IDL attribute must return the number of nodes represented by the elements collection.
+    return (u32)dom_html_collection_length(&html_form_element_elements(this).html_collection)

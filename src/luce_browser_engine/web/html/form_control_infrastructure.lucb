@@ -1,0 +1,368 @@
+#==============================================================================================
+#
+#   form_control_infrastructure - HTML form submission's entry lists and encodings
+#
+#   DESCRIPTION:
+#       Port of LibWeb/HTML/FormControlInfrastructure.cpp (lines 1-356): creating an entry, the
+#       entry construction algorithm of a form-associated custom element, constructing the
+#       entry list of a form (firing formdata), normalizing line breaks and the
+#       multipart/form-data encoding algorithm.
+#
+#       Entries may hold FileAPI::File objects, and constructing the list makes an XHR::FormData
+#       and a FormDataEvent; those classes are outside phase 1 (closure stubs, phases 2-3), so
+#       only entry lists of strings run before then.
+#
+#==============================================================================================
+
+# mark: Helpers =================================================================================
+
+## `MUST(String::formatted("{}{}", first, second))` of two strings.
+func html_form_concatenate(first: ak.StringView, second: ak.StringView) -> ak.String:
+    var builder = ak.string_builder_new()
+    ak.string_builder_append_string_view(&builder, first)
+    ak.string_builder_append_string_view(&builder, second)
+    return ak.string_builder_to_string(&builder) else trap("MUST: String::formatted")
+
+# mark: Entries =================================================================================
+
+## Ported from FormControlInfrastructure.cpp:22 Web::HTML::create_entry.
+# https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#create-an-entry
+pub func html_create_entry(realm: Realm*, name: ak.String, value: FileApiBlobOrString, filename: ak.String? = none) -> XhrFormDataEntry!:
+    # 1. Set name to the result of converting name into a scalar value string.
+    # (TRY_OR_THROW_OOM: the conversion fails only when out of memory.)
+    let entry_name = try web_infra.convert_to_scalar_value_string(ak.string_bytes_as_string_view(&name))
+
+    var entry_value: XhrFormDataEntryValue = ---
+    match value:
+        # 2. If value is a string, then set value to the result of converting value into a scalar value string.
+        .string(string):
+            entry_value = XhrFormDataEntryValue.string(try web_infra.convert_to_scalar_value_string(ak.string_bytes_as_string_view(&string)))
+        # 3. Otherwise:
+        .file_api_blob(blob_value):
+            var blob = blob_value
+            # 1. If value is not a File object, then set value to a new File object, representing the same bytes, whose
+            #    name attribute value is "blob".
+            if not is_file_api_file(blob):
+                let options = FileApiFilePropertyBag(type_ = file_api_blob_type(blob), last_modified = none)
+
+                var blob_parts: ak.Vector[FileApiBlob*]
+                ak.vector_append_t(&blob_parts, blob)
+                blob = (FileApiBlob*)(try file_api_file_create(realm, blob_parts, ak.string_from_str("blob"), options))
+
+            # 2. If filename is given, then set value to a new File object, representing the same bytes, whose name
+            #    attribute is filename.
+            if let given_filename = filename:
+                let options = FileApiFilePropertyBag(type_ = file_api_blob_type(blob), last_modified = file_api_file_last_modified((FileApiFile*)blob))
+
+                var blob_parts: ak.Vector[FileApiBlob*]
+                ak.vector_append_t(&blob_parts, blob)
+                blob = (FileApiBlob*)(try file_api_file_create(realm, blob_parts, given_filename, options))
+
+            # (as<FileAPI::File>: File derives from Blob first.)
+            entry_value = XhrFormDataEntryValue.file_api_file((FileApiFile*)blob)
+
+    # 4. Return an entry whose name is name and whose value is value.
+    return XhrFormDataEntry(name = entry_name, value = entry_value)
+
+## `submission_value.get_pointer<GC::ConservativeVector<XHR::FormDataEntry>>()`.
+func html_face_submission_value_entries(value: HtmlFormAssociatedElementFaceSubmissionValue) -> ak.Vector[XhrFormDataEntry]?:
+    return match value:
+        .vector_xhr_form_data_entry(entries) => entries
+        _ => none
+
+## Ported from FormControlInfrastructure.cpp:66 Web::HTML::construct_face_entry.
+# https://html.spec.whatwg.org/multipage/custom-elements.html#face-entry-construction
+func html_construct_face_entry(realm: Realm*, form_associated_custom_element: HtmlElement*, entry_list: ak.Vector[XhrFormDataEntry]*) -> !:
+    # 1. If element's submission value is a list of entries, then append each item of element's submission value to
+    #    entry list, and return.
+    # NOTE: In this case, user agent does not refer to the name content attribute value. An implementation of
+    #       form-associated custom element is responsible to decide names of entries. They can be the name
+    #       content attribute value, they can be strings based on the name content attribute value, or they
+    #       can be unrelated to the name content attribute.
+    let submission_value = html_form_associated_element_face_submission_value(&form_associated_custom_element.form_associated_element)
+    if let form_data_entries = html_face_submission_value_entries(submission_value):
+        ak.vector_extend_2(entry_list, &form_data_entries)
+        return
+
+    # 2. If the element does not have a name attribute specified, or its name attribute's value is the empty string, then return.
+    let element_name = dom_element_name(form_associated_custom_element.dom_element()) else return
+    if ak.fly_string_is_empty(&element_name):
+        return
+
+    # 3. If the element's submission value is not null, create an entry with the name attribute value and the submission value, and append it to entry list.
+    var entry_submission_value: FileApiBlobOrString = ---
+    match submission_value:
+        .empty:
+            return
+        .file_api_file(file):
+            entry_submission_value = FileApiBlobOrString.file_api_blob((FileApiBlob*)file)
+        .string(string):
+            entry_submission_value = FileApiBlobOrString.string(string)
+        .vector_xhr_form_data_entry(_):
+            # The other types were handled above.
+            trap("VERIFY_NOT_REACHED")
+
+    let entry = try html_create_entry(realm, ak.fly_string_to_string_const(&element_name), entry_submission_value)
+    ak.vector_append_t(entry_list, entry)
+
+# mark: Constructing the entry list =============================================================
+
+## Ported from FormControlInfrastructure.cpp:107 Web::HTML::construct_entry_list.
+# https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#constructing-the-form-data-set
+pub func html_construct_entry_list(realm: Realm*, form: HtmlFormElement*, submitter: HtmlElement*? = none, encoding: ak.String? = none) -> (ak.Vector[XhrFormDataEntry]?)!:
+    # 1. If form's constructing entry list is true, then return null.
+    if html_form_element_constructing_entry_list(form):
+        return none
+
+    # 2. Set form's constructing entry list to true.
+    html_form_element_set_constructing_entry_list(form, true)
+
+    # 3. Let controls be a list of all the submittable elements whose form owner is form, in tree order.
+    var controls = html_form_element_get_submittable_elements(form)
+
+    # 4. Let entry list be a new empty entry list.
+    var entry_list: ak.Vector[XhrFormDataEntry]
+
+    # 5. For each element field in controls, in tree order:
+    for control in ak.vector_span(&controls):
+        let control_as_form_associated_element = as_if_form_associated_element(control) else trap("as<FormAssociatedElement> failed")
+
+        # 1. If any of the following is true, then continue:
+        # - The field element has a datalist element ancestor.
+        if tree_node_first_ancestor_of_type(control.dom_node(), &html_data_list_element_class) != none:
+            continue
+        # - The field element is disabled.
+        if dom_element_is_actually_disabled(control):
+            continue
+        # - The field element is a button but it is not submitter.
+        if html_form_associated_element_is_button(control_as_form_associated_element) and (DomElement*?)control != (DomElement*?)submitter:
+            continue
+        # - The field element is an input element whose type attribute is in the Checkbox state and whose checkedness is false.
+        # - The field element is an input element whose type attribute is in the Radio Button state and whose checkedness is false.
+        if let input_element = as_if_html_input_element(control):
+            if (html_input_element_type_state(input_element) == HtmlInputElementTypeAttributeState.checkbox or html_input_element_type_state(input_element) == HtmlInputElementTypeAttributeState.radio_button) and not html_input_element_checked(input_element):
+                continue
+
+        # 2. If the field element is an input element whose type attribute is in the Image Button state, then:
+        if let input_element = as_if_html_input_element(control):
+            if html_input_element_type_state(input_element) == HtmlInputElementTypeAttributeState.image_button:
+                # 1. If the field element is not submitter, then continue.
+                if (HtmlElement*?)input_element.html_element() != submitter:
+                    continue
+
+                # 2. If the field element has a name attribute specified and its value is not the empty string, let name be
+                #    that value followed by U+002E (.). Otherwise, let name be the empty string.
+                var name = ak.string_new()
+                if let value = dom_element_get_attribute(input_element.dom_element(), html_attribute_names_name):
+                    if not ak.string_is_empty(&value):
+                        name = html_form_concatenate(ak.string_bytes_as_string_view(&value), ak.sv("."))
+
+                # 3. Let namex be the concatenation of name and U+0078 (x).
+                let name_x = html_form_concatenate(ak.string_bytes_as_string_view(&name), ak.sv("x"))
+
+                # 4. Let namey be the concatenation of name and U+0079 (y).
+                let name_y = html_form_concatenate(ak.string_bytes_as_string_view(&name), ak.sv("y"))
+
+                # 5. Let (x, y) be the selected coordinate.
+                let coordinate = html_input_element_selected_coordinate(input_element)
+
+                # 6. Create an entry with namex and x, and append it to entry list.
+                ak.vector_append_t(&entry_list, try html_create_entry(realm, name_x, .string(ak.string_number_i64((i64)coordinate.x))))
+
+                # 7. Create an entry with namey and y, and append it to entry list.
+                ak.vector_append_t(&entry_list, try html_create_entry(realm, name_y, .string(ak.string_number_i64((i64)coordinate.y))))
+
+                # 8. Continue.
+                continue
+
+        # 3. If the field is a form-associated custom element, then perform the entry construction algorithm given field and entry list, then continue.
+        if html_element_is_form_associated_custom_element(html_form_associated_element_form_associated_element_to_html_element_const(control_as_form_associated_element)):
+            try html_construct_face_entry(realm, html_form_associated_element_form_associated_element_to_html_element_const(control_as_form_associated_element), &entry_list)
+            continue
+
+        # 4. If either the field element does not have a name attribute specified, or its name attribute's value is the empty string, then continue.
+        let control_name = dom_element_name(control) else continue
+        if ak.fly_string_is_empty(&control_name):
+            continue
+
+        # 5. Let name be the value of the field element's name attribute.
+        let name = control_name
+
+        # 6. If the field element is a select element, then for each option element in the select element's list of options whose selectedness is true and that is not disabled, create an entry with name and the value of the option element, and append it to entry list.
+        if let select_element = as_if_html_select_element(control):
+            var options = html_select_element_list_of_options(select_element)
+            for maybe_option_element in ak.vector_span(&options):
+                let option_element = maybe_option_element else trap("GC::Ref<HTMLOptionElement> is null")
+                if html_option_element_selected(option_element) and not html_option_element_disabled(option_element):
+                    let option_value = html_option_element_value(option_element)
+                    ak.vector_append_t(&entry_list, try html_create_entry(realm, ak.fly_string_to_string_const(&name), .string(ak.utf16_string_base_to_utf8_but_should_be_ported_to_utf16(&option_value.utf16_string_base))))
+        # 7. Otherwise, if the field element is an input element whose type attribute is in the Checkbox state or the Radio Button state, then:
+        elif html_form_is_checked_checkbox_or_radio(control):
+            let checkbox_or_radio_element = as_html_input_element(control)
+            #  1. If the field element has a value attribute specified, then let value be the value of that attribute; otherwise, let value be the string "on".
+            var value = html_input_element_value(checkbox_or_radio_element)
+            if ak.utf16_string_base_is_empty(&value.utf16_string_base):
+                value = ak.utf16_string_from_str("on")
+
+            # 2. Create an entry with name and value, and append it to entry list.
+            let checkbox_or_radio_element_name = dom_element_name(checkbox_or_radio_element.dom_element()) else trap("Optional::operator-> of an empty value")
+            ak.vector_append_t(&entry_list, try html_create_entry(realm, ak.fly_string_to_string_const(&checkbox_or_radio_element_name), .string(ak.utf16_string_base_to_utf8_but_should_be_ported_to_utf16(&value.utf16_string_base))))
+        # 8. Otherwise, if the field element is an input element whose type attribute is in the File Upload state, then:
+        elif html_form_is_input_in_state(control, HtmlInputElementTypeAttributeState.file_upload):
+            let file_element = as_html_input_element(control)
+            let files = html_input_element_files(file_element) else trap("files() is null")
+            # 1. If there are no selected files, then create an entry with name and a new File object with an empty name, application/octet-stream as type, and an empty body, and append it to entry list.
+            if file_api_file_list_length(files) == 0:
+                let options = FileApiFilePropertyBag(type_ = ak.string_from_str("application/octet-stream"), last_modified = none)
+                let file = try file_api_file_create(realm, ak.Vector[FileApiBlob*](), ak.string_new(), options)
+                ak.vector_append_t(&entry_list, try html_create_entry(realm, ak.fly_string_to_string_const(&name), .file_api_blob((FileApiBlob*)file)))
+            # 2. Otherwise, for each file in selected files, create an entry with name and a File object representing the file, and append it to entry list.
+            else:
+                var i: usize = 0
+                while i < (usize)file_api_file_list_length(files):
+                    let file = file_api_file_list_item(files, i) else trap("GC::Ref<FileAPI::File> is null")
+                    ak.vector_append_t(&entry_list, try html_create_entry(realm, ak.fly_string_to_string_const(&name), .file_api_blob((FileApiBlob*)file)))
+                    i += 1
+        # 9. Otherwise, if the field element is an input element whose type attribute is in the Hidden state and name is an ASCII case-insensitive match for "_charset_":
+        elif html_form_is_input_in_state(control, HtmlInputElementTypeAttributeState.hidden) and ak.fly_string_equals_ignoring_ascii_case_string_view(&name, ak.sv("_charset_")):
+            # 1. Let charset be the name of encoding if encoding is given, and "UTF-8" otherwise.
+            let charset = encoding else ak.string_from_str("UTF-8")
+
+            # 2. Create an entry with name and charset, and append it to entry list.
+            ak.vector_append_t(&entry_list, try html_create_entry(realm, ak.fly_string_to_string_const(&name), .string(charset)))
+        # 10. Otherwise, create an entry with name and the value of the field element, and append it to entry list.
+        else:
+            let form_value = html_form_associated_element_form_value(control_as_form_associated_element)
+            ak.vector_append_t(&entry_list, try html_create_entry(realm, ak.fly_string_to_string_const(&name), .string(ak.utf16_string_base_to_utf8_but_should_be_ported_to_utf16(&form_value.utf16_string_base))))
+
+        # 11. If the element has a dirname attribute, that attribute's value is not the empty string, and the element is an auto-directionality form-associated element:
+        if let dirname = dom_element_get_attribute(control, html_attribute_names_dirname):
+            if not ak.string_is_empty(&dirname) and dom_element_is_auto_directionality_form_associated_element(control):
+                # 1. Let dirname be the value of the element's dirname attribute.
+
+                # 2. Let dir be the string "ltr" if the directionality of the element is 'ltr', and "rtl" otherwise (i.e., when the directionality of the element is 'rtl').
+                let dir = ak.string_from_utf8(ak.sv("ltr") if dom_element_directionality(control) == DomElementDirectionality.ltr else ak.sv("rtl")) else trap("MUST: String::from_utf8")
+
+                # 3. Create an entry with dirname and dir, and append it to entry list.
+                ak.vector_append_t(&entry_list, try html_create_entry(realm, dirname, .string(dir)))
+
+    # 6. Let form data be a new FormData object associated with entry list.
+    let form_data = try xhr_form_data_construct_impl(realm, entry_list)
+
+    # 7. Fire an event named formdata at form using FormDataEvent, with the formData attribute initialized to form data and the bubbles attribute initialized to true.
+    let init = HtmlFormDataEventInit(event_init = DomEventInit(), form_data = form_data)
+    let form_data_event = try html_form_data_event_construct_impl(realm, html_event_names_formdata, init)
+    dom_event_set_bubbles(form_data_event, true)
+    discard(dom_event_target_dispatch_event(form.dom_event_target(), form_data_event))
+
+    # 8. Set form's constructing entry list to false.
+    html_form_element_set_constructing_entry_list(form, false)
+
+    # 9. Return a clone of entry list.
+    return xhr_form_data_entry_list(form_data)
+
+## `as_if<HTMLInputElement>(*control)` in the Checkbox or Radio Button state with its checkedness
+## true (the condition of step 5.7).
+func html_form_is_checked_checkbox_or_radio(control: DomElement*) -> bool:
+    let input_element = as_if_html_input_element(control) else return false
+    return (html_input_element_type_state(input_element) == HtmlInputElementTypeAttributeState.checkbox or html_input_element_type_state(input_element) == HtmlInputElementTypeAttributeState.radio_button) and html_input_element_checked(input_element)
+
+## `as_if<HTMLInputElement>(*control)` whose type attribute is in `state`.
+func html_form_is_input_in_state(control: DomElement*, state: HtmlInputElementTypeAttributeState) -> bool:
+    let input_element = as_if_html_input_element(control) else return false
+    return html_input_element_type_state(input_element) == state
+
+# mark: Encodings ===============================================================================
+
+## Ported from FormControlInfrastructure.cpp:265 Web::HTML::normalize_line_breaks.
+pub func html_normalize_line_breaks(value: ak.StringView) -> ak.String!:
+    # Replace every occurrence of U+000D (CR) not followed by U+000A (LF), and every occurrence of U+000A (LF) not
+    # preceded by U+000D (CR) by a string consisting of a U+000D (CR) and U+000A (LF).
+    var builder = ak.string_builder_new()
+    var lexer = ak.generic_lexer_new(value)
+    let carriage_return_or_line_feed = ak.is_any_of(ak.sv("\r\n"))
+    while not ak.generic_lexer_is_eof(&lexer):
+        try ak.string_builder_try_append_string_view(&builder, ak.generic_lexer_consume_until_tt_predicate(&lexer, &carriage_return_or_line_feed))
+        if (ak.generic_lexer_peek(&lexer) == '\r' and ak.generic_lexer_peek(&lexer, 1) != '\n') or ak.generic_lexer_peek(&lexer) == '\n':
+            try ak.string_builder_try_append_string_view(&builder, ak.sv("\r\n"))
+            ak.generic_lexer_ignore(&lexer, 1)
+        else:
+            ak.generic_lexer_ignore(&lexer, 2)
+    return try ak.string_builder_to_string(&builder)
+
+## The `escape_line_feed_carriage_return_double_quote` lambda of serialize_to_multipart_form_data.
+func html_escape_line_feed_carriage_return_double_quote(value: ak.StringView) -> ak.String!:
+    var builder = ak.string_builder_new()
+    var lexer = ak.generic_lexer_new(value)
+    let to_escape = ak.is_any_of(ak.sv("\r\n\""))
+    while not ak.generic_lexer_is_eof(&lexer):
+        try ak.string_builder_try_append_string_view(&builder, ak.generic_lexer_consume_until_tt_predicate(&lexer, &to_escape))
+        # switch (lexer.peek()) with no default:
+        let next = ak.generic_lexer_peek(&lexer)
+        if next == '\r':
+            try ak.string_builder_try_append_string_view(&builder, ak.sv("%0D"))
+        elif next == '\n':
+            try ak.string_builder_try_append_string_view(&builder, ak.sv("%0A"))
+        elif next == '"':
+            try ak.string_builder_try_append_string_view(&builder, ak.sv("%22"))
+        ak.generic_lexer_ignore(&lexer, 1)
+    return try ak.string_builder_to_string(&builder)
+
+## Ported from FormControlInfrastructure.cpp:284 Web::HTML::serialize_to_multipart_form_data.
+# https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#multipart/form-data-encoding-algorithm
+pub func html_serialize_to_multipart_form_data(entry_list: ak.Vector[XhrFormDataEntry]) -> HtmlSerializedFormData!:
+    # The boundary used by the user agent in generating the return value of this algorithm is the multipart/form-data boundary string.
+    let random_number = ak.string_number_u64(ak.get_random[u64]())
+    let boundary = html_form_concatenate(ak.sv("---------------------------"), ak.string_bytes_as_string_view(&random_number))
+    let boundary_view = ak.string_bytes_as_string_view(&boundary)
+    var builder = ak.string_builder_new()
+    # 1. For each entry of entry list:
+    for entry in ak.vector_span_const(&entry_list):
+        try ak.string_builder_try_append_string_view(&builder, ak.sv("--"))
+        try ak.string_builder_try_append_string_view(&builder, boundary_view)
+        try ak.string_builder_try_append_string_view(&builder, ak.sv("\r\n"))
+
+        # Replace every occurrence of U+000D (CR) not followed by U+000A (LF), and every occurrence of U+000A (LF) not preceded by U+000D (CR) by a string consisting of a U+000D (CR) and U+000A (LF).
+        let normalized_name = try html_normalize_line_breaks(ak.string_bytes_as_string_view(&entry.name))
+        # For field names replace any 0x0A (LF) bytes with the byte sequence `%0A`, 0x0D (CR) with `%0D` and 0x22 (") with `%22`
+        let escaped_name = try html_escape_line_feed_carriage_return_double_quote(ak.string_bytes_as_string_view(&normalized_name))
+
+        match entry.value:
+            .file_api_file(file):
+                # For filenames replace any 0x0A (LF) bytes with the byte sequence `%0A`, 0x0D (CR) with `%0D` and 0x22 (") with `%22`
+                let file_name = file_api_file_name(file)
+                let escaped_filename = try html_escape_line_feed_carriage_return_double_quote(ak.string_bytes_as_string_view(&file_name))
+                # Add a `Content-Disposition` header with a `name` set to entry's name and `filename` set to entry's filename.
+                try ak.string_builder_try_append_string_view(&builder, ak.sv("Content-Disposition: form-data; name=\""))
+                try ak.string_builder_try_append_string_view(&builder, ak.string_bytes_as_string_view(&escaped_name))
+                try ak.string_builder_try_append_string_view(&builder, ak.sv("\"; filename=\""))
+                try ak.string_builder_try_append_string_view(&builder, ak.string_bytes_as_string_view(&escaped_filename))
+                try ak.string_builder_try_append_string_view(&builder, ak.sv("\"\r\n"))
+                # The parts of the generated multipart/form-data resource that correspond to file fields must have a `Content-Type` header specified.
+                # RFC7578: If the contents of a file are to be sent, the file data SHOULD be labeled with an appropriate media type, if known, or
+                #          "application/octet-stream".
+                let file_type = file_api_blob_type((FileApiBlob*)file)
+                if not ak.string_is_empty(&file_type):
+                    try ak.string_builder_try_append_string_view(&builder, ak.sv("Content-Type: "))
+                    try ak.string_builder_try_append_string_view(&builder, ak.string_bytes_as_string_view(&file_type))
+                    try ak.string_builder_try_append_string_view(&builder, ak.sv("\r\n\r\n"))
+                else:
+                    try ak.string_builder_try_append_string_view(&builder, ak.sv("Content-Type: application/octet-stream\r\n\r\n"))
+                try ak.string_builder_try_append_string_view(&builder, ak.string_view_from_bytes(file_api_blob_raw_bytes((FileApiBlob*)file)))
+                try ak.string_builder_try_append_string_view(&builder, ak.sv("\r\n"))
+            .string(string):
+                # Replace every occurrence of U+000D (CR) not followed by U+000A (LF), and every occurrence of U+000A (LF) not preceded by U+000D (CR) by a string consisting of a U+000D (CR) and U+000A (LF).
+                let normalized_value = try html_normalize_line_breaks(ak.string_bytes_as_string_view(&string))
+                # Add a `Content-Disposition` header with a `name` set to entry's name.
+                try ak.string_builder_try_append_string_view(&builder, ak.sv("Content-Disposition: form-data; name=\""))
+                try ak.string_builder_try_append_string_view(&builder, ak.string_bytes_as_string_view(&escaped_name))
+                try ak.string_builder_try_append_string_view(&builder, ak.sv("\"\r\n\r\n"))
+                try ak.string_builder_try_append_string_view(&builder, ak.string_bytes_as_string_view(&normalized_value))
+                try ak.string_builder_try_append_string_view(&builder, ak.sv("\r\n"))
+    try ak.string_builder_try_append_string_view(&builder, ak.sv("--"))
+    try ak.string_builder_try_append_string_view(&builder, boundary_view)
+    try ak.string_builder_try_append_string_view(&builder, ak.sv("--\r\n"))
+
+    # 2. Return the byte sequence resulting from encoding the entry list using the rules described by RFC 7578, Returning Values from Forms: multipart/form-data, given the following conditions: [RFC7578]
+    let serialized_data = try ak.string_builder_to_byte_buffer(&builder)
+    return HtmlSerializedFormData(boundary = boundary, serialized_data = serialized_data)
