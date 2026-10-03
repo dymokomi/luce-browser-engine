@@ -1,0 +1,427 @@
+#==============================================================================================
+#
+#   tests_style_computer_2 - tests of StyleComputer's computed values and the cascade's data
+#                            structures (region r39)
+#
+#   DESCRIPTION:
+#       The oracle cases of tests_style_computer_values_cases run StyleComputer's per-property
+#       computations (font-width, font-style, line-height, corner shapes, position-area,
+#       font feature and variation settings, animation-name, border widths) on values parsed
+#       by the port's CSS parser, and serialize shorthands (ShorthandStyleValue's serialization
+#       expands them with for_each_property_expanding_shorthands). The focused tests pin what the oracles cannot reach: the
+#       font-size keyword tables (values from the same oracle's font-size cases),
+#       CascadedProperties, CustomPropertyData, CustomPropertyRegistration's equality, the
+#       counting Bloom filter, CountersSet, shorthand expansion, the selector insights, the
+#       rule cache buckets and the user-agent @keyframes sets.
+#
+#==============================================================================================
+
+# mark: The computed-value oracle cases =========================================================
+
+## Runs one computed-value case: parses its value for its property in `realm` and serializes the result.
+func test_style_computer_run_value_case(realm: Realm*, test_case: const TestStyleComputerValueCase*) -> ak.String:
+    var params: CssParsingParams = ---
+    css_parsing_params_construct_realm_css_parsing_mode(&params, realm)
+    let property_id = css_data.property_id_from_string(ak.sv(test_case.property)) else trap("a known property")
+    let value = parse_css_value(params, ak.sv(test_case.value), property_id) else return ak.string_from_str("parse error")
+    let function = test_case.function
+    var result: CssStyleValue* = value
+    if function == "font_width":
+        result = css_style_computer_compute_font_width(value)
+    elif function == "font_style":
+        result = css_style_computer_compute_font_style(value)
+    elif function == "line_height":
+        result = css_style_computer_compute_line_height(value, gfx.css_pixels_nearest_value_for_f64(test_case.argument))
+    elif function == "corner_shape":
+        result = css_style_computer_compute_corner_shape(value)
+    elif function == "position_area":
+        result = css_style_computer_compute_position_area(value)
+    elif function == "font_feature":
+        result = css_style_computer_compute_font_feature_tag_value_list(value)
+    elif function == "animation_name":
+        result = css_style_computer_compute_animation_name(value)
+    elif function == "serialize":
+        result = value
+    elif function == "border_width":
+        result = css_style_computer_compute_border_or_outline_width(value, test_case.argument)
+    else:
+        trap("unknown function")
+    return css_style_value_to_string(result, css_syntax.SerializationMode.normal)
+
+test "StyleComputer's computed values match the reference build on the oracle cases":
+    web_initialize_strings()
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        var failures = 0
+        for test_case in &test_style_computer_value_cases:
+            let actual = test_style_computer_run_value_case(realm, test_case)
+            if not ak.string_eq_string_view(&actual, ak.sv(test_case.expected)):
+                let view = ak.string_bytes_as_string_view(&actual)
+                print(f"{test_case.function} {test_case.property}: {test_case.value} ({test_case.argument}): expected {test_case.expected}, got {(str)ak.string_view_bytes(&view)}")
+                failures += 1
+        assert(failures == 0, "computed-value oracle cases differ")
+
+## Whether `pixels` is `expected` (in raw 1/64 units, as the oracle's serialization gives them).
+func test_style_computer_pixels_are(pixels: gfx.CssPixels, expected: f64) -> bool:
+    return gfx.css_pixels_to_double_const(&pixels) == expected
+
+test "the font-size keyword tables: absolute and relative sizes (StyleComputer.cpp:1409, 1436)":
+    let sixteen = gfx.css_pixels_from_int(16)
+    # The reference build's font-size of each keyword with the 16px default (oracle font_size cases).
+    assert(test_style_computer_pixels_are(css_style_computer_absolute_size_mapping(css_data.AbsoluteSize.xx_small, sixteen), 9.59375))
+    assert(test_style_computer_pixels_are(css_style_computer_absolute_size_mapping(css_data.AbsoluteSize.x_small, sixteen), 12.0))
+    assert(test_style_computer_pixels_are(css_style_computer_absolute_size_mapping(css_data.AbsoluteSize.small, sixteen), 14.21875))
+    assert(test_style_computer_pixels_are(css_style_computer_absolute_size_mapping(css_data.AbsoluteSize.medium, sixteen), 16.0))
+    assert(test_style_computer_pixels_are(css_style_computer_absolute_size_mapping(css_data.AbsoluteSize.large, sixteen), 19.1875))
+    assert(test_style_computer_pixels_are(css_style_computer_absolute_size_mapping(css_data.AbsoluteSize.x_large, sixteen), 24.0))
+    assert(test_style_computer_pixels_are(css_style_computer_absolute_size_mapping(css_data.AbsoluteSize.xx_large, sixteen), 32.0))
+    assert(test_style_computer_pixels_are(css_style_computer_absolute_size_mapping(css_data.AbsoluteSize.xxx_large, sixteen), 48.0))
+    assert(test_style_computer_pixels_are(css_style_computer_relative_size_mapping(css_data.RelativeSize.smaller, sixteen), 12.796875))
+    assert(test_style_computer_pixels_are(css_style_computer_relative_size_mapping(css_data.RelativeSize.larger, sixteen), 20.0))
+    assert(test_style_computer_pixels_are(css_style_computer_default_user_font_size(), 16.0))
+
+# mark: CascadedProperties ======================================================================
+
+## A keyword style value.
+func test_keyword(keyword: css_data.Keyword) -> CssStyleValue*:
+    return css_keyword_style_value_create(keyword).css_style_value()
+
+## The keyword of `value` (a KeywordStyleValue).
+func test_keyword_of(value: CssStyleValue*?) -> css_data.Keyword:
+    return css_style_value_to_keyword(value else trap("a value"))
+
+test "CascadedProperties: one entry per origin and layer, !important holds, and the cascade index orders pairs":
+    web_initialize_strings()
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        let cascaded = heap_allocate_css_cascaded_properties(realm_heap(realm))
+        let display = css_data.PropertyId.display
+        assert(css_cascaded_properties_property(cascaded, display) == none)
+        assert(css_cascaded_properties_style_property(cascaded, display) == none)
+
+        css_cascaded_properties_set_property(cascaded, display, test_keyword(css_data.Keyword.block), css_syntax.Important.no, CssCascadeOrigin.user_agent, none, none, none)
+        css_cascaded_properties_set_property(cascaded, display, test_keyword(css_data.Keyword.inline), css_syntax.Important.no, CssCascadeOrigin.author, none, none, none)
+        assert(test_keyword_of(css_cascaded_properties_property(cascaded, display)) == css_data.Keyword.inline)
+
+        # The same origin and layer: the entry is replaced, unless it is !important and the new one is not.
+        css_cascaded_properties_set_property(cascaded, display, test_keyword(css_data.Keyword.flex), css_syntax.Important.yes, CssCascadeOrigin.author, none, none, none)
+        css_cascaded_properties_set_property(cascaded, display, test_keyword(css_data.Keyword.grid), css_syntax.Important.no, CssCascadeOrigin.author, none, none, none)
+        assert(test_keyword_of(css_cascaded_properties_property(cascaded, display)) == css_data.Keyword.flex)
+        let property = css_cascaded_properties_style_property(cascaded, display) else trap("a style property")
+        assert(property.important == css_syntax.Important.yes)
+
+        # A layer is an entry of its own; reverting the layer removes only it.
+        css_cascaded_properties_set_property(cascaded, display, test_keyword(css_data.Keyword.none_), css_syntax.Important.yes, CssCascadeOrigin.author, ak.fly_string_from_str("one"), none, none)
+        assert(test_keyword_of(css_cascaded_properties_property(cascaded, display)) == css_data.Keyword.none_)
+        css_cascaded_properties_revert_layer_property(cascaded, display, css_syntax.Important.yes, ak.fly_string_from_str("one"))
+        assert(test_keyword_of(css_cascaded_properties_property(cascaded, display)) == css_data.Keyword.flex)
+
+        # revert of the author origin also removes the presentational hints; the user agent's entry stays.
+        css_cascaded_properties_set_property(cascaded, display, test_keyword(css_data.Keyword.table), css_syntax.Important.yes, CssCascadeOrigin.author_presentational_hint, none, none, none)
+        css_cascaded_properties_revert_property(cascaded, display, css_syntax.Important.yes, CssCascadeOrigin.author)
+        assert(test_keyword_of(css_cascaded_properties_property(cascaded, display)) == css_data.Keyword.block)
+        css_cascaded_properties_revert_property(cascaded, display, css_syntax.Important.no, CssCascadeOrigin.user_agent)
+        assert(css_cascaded_properties_property(cascaded, display) == none)
+
+        # The pair's winner is the one set last.
+        let margin_left = css_data.PropertyId.margin_left
+        let margin_inline_start = css_data.PropertyId.margin_inline_start
+        assert(css_cascaded_properties_property_with_higher_priority(cascaded, margin_left, margin_inline_start) == margin_inline_start)
+        css_cascaded_properties_set_property(cascaded, margin_left, test_keyword(css_data.Keyword.auto), css_syntax.Important.no, CssCascadeOrigin.author, none, none, none)
+        assert(css_cascaded_properties_property_with_higher_priority(cascaded, margin_left, margin_inline_start) == margin_left)
+        assert(css_cascaded_properties_property_with_higher_priority(cascaded, margin_inline_start, margin_left) == margin_left)
+        css_cascaded_properties_set_property(cascaded, margin_inline_start, test_keyword(css_data.Keyword.auto), css_syntax.Important.no, CssCascadeOrigin.author, none, none, none)
+        assert(css_cascaded_properties_property_with_higher_priority(cascaded, margin_left, margin_inline_start) == margin_inline_start)
+        assert(css_cascaded_properties_property_source(cascaded, margin_left) == none)
+        assert(css_cascaded_properties_property_source_shadow_root(cascaded, margin_left) == none)
+
+# mark: CustomPropertyData ======================================================================
+
+## A map with `count` custom properties "--<prefix><i>" of keyword values.
+func test_custom_properties(prefix: str, count: usize) -> ak.OrderedHashMap[ak.FlyString, CssStyleProperty, ak.FlyStringTraits]:
+    var map: ak.OrderedHashMap[ak.FlyString, CssStyleProperty, ak.FlyStringTraits]
+    for i in 0..<count:
+        var builder = ak.string_builder_new()
+        ak.string_builder_append(&builder, "--")
+        ak.string_builder_append(&builder, prefix)
+        css_appendff(&builder, "{}", [ak.arg_u64((u64)i)])
+        let name = ak.fly_string_from_string(ak.string_builder_to_string_without_validation(&builder))
+        discard(ak.ordered_hash_map_set(&map, name, CssStyleProperty(important = css_syntax.Important.no, property_id = css_data.PropertyId.custom, value = test_keyword(css_data.Keyword.auto))))
+    return map
+
+## The captures of test_count_properties' callback.
+struct TestCustomPropertyCount:
+    var count: usize
+
+## for_each_property's callback counting its calls.
+func test_count_property(context: void*?, name: const ak.FlyString*, property: const CssStyleProperty*):
+    let captures = (TestCustomPropertyCount*)(context else trap("no captures"))
+    captures.count += 1
+
+## How many times for_each_property calls back on `data`.
+func test_count_properties(data: const CssCustomPropertyData*) -> usize:
+    var captures = TestCustomPropertyCount(count = 0)
+    css_custom_property_data_for_each_property(data, ak.Function2[const ak.FlyString*, const CssStyleProperty*, unit](call = test_count_property, context = &captures))
+    return captures.count
+
+test "CustomPropertyData: chains, absorbing small parents, flattening deep chains (CustomPropertyData.cpp:23)":
+    web_initialize_strings()
+    let root = css_custom_property_data_create(test_custom_properties("a", 10), none)
+    assert(css_custom_property_data_parent(root) == none)
+    assert(root.m_ancestor_count == 0)
+
+    # A parent with more than absorb_threshold (8) own values is linked.
+    let child = css_custom_property_data_create(test_custom_properties("b", 2), root)
+    assert(css_custom_property_data_parent(child) == root)
+    assert(child.m_ancestor_count == 1)
+    assert(css_custom_property_data_get(child, ak.fly_string_from_str("--a3")) != none)
+    assert(css_custom_property_data_get(child, ak.fly_string_from_str("--b1")) != none)
+    assert(css_custom_property_data_get(child, ak.fly_string_from_str("--c0")) == none)
+
+    # A parent with few own values is absorbed: its values are copied and its parent becomes the parent.
+    let grandchild = css_custom_property_data_create(test_custom_properties("c", 1), child)
+    assert(css_custom_property_data_parent(grandchild) == root)
+    assert(grandchild.m_ancestor_count == 1)
+    assert(ak.ordered_hash_map_size(&grandchild.m_own_values) == 3)
+    assert(css_custom_property_data_get(grandchild, ak.fly_string_from_str("--b0")) != none)
+
+    # A chain of max_ancestor_count - 1 ancestors is flattened into one map without a parent.
+    var node: const CssCustomPropertyData*? = root
+    for i in 0..<40:
+        node = css_custom_property_data_create(test_custom_properties("d", 9), node)
+        let current = node else trap("a node")
+        assert(current.m_ancestor_count <= css_max_ancestor_count - 1)
+        if current.m_ancestor_count == 0:
+            assert(css_custom_property_data_parent(current) == none)
+            assert(ak.ordered_hash_map_size(&current.m_own_values) == 19)
+            assert(i == 31)
+            break
+
+    # Donor quirk: HashTable::set never answers KeptExistingEntry, so for_each_property also visits the
+    # names a nearer node shadows: 2 own values and the parent's 10.
+    assert(test_count_properties(child) == 12)
+    let shadowing = css_custom_property_data_create(test_custom_properties("a", 9), root)
+    assert(test_count_properties(shadowing) == 19)
+
+    var empty_map: ak.OrderedHashMap[ak.FlyString, CssStyleProperty, ak.FlyStringTraits]
+    let empty = css_custom_property_data_create(empty_map, none)
+    assert(css_custom_property_data_is_empty(empty))
+    assert(not css_custom_property_data_is_empty(child))
+    assert(css_custom_property_data_is_empty(css_custom_property_data_create(empty_map, empty)))
+
+test "CustomPropertyData::inheritable leaves out registered properties that do not inherit, and caches the answer":
+    web_initialize_strings()
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        let document = test_html_heap_document(realm)
+        let data = css_custom_property_data_create(test_custom_properties("a", 3), none)
+        assert(css_custom_property_data_inheritable(data, document) == data)
+        assert(data.m_cached_inheritable_is_self)
+
+        # Registering --a1 as not inherited: the cache is per registration generation.
+        let name = ak.fly_string_from_str("--a1")
+        discard(ak.hash_map_set(&document.m_registered_property_set, name, CssCustomPropertyRegistration(property_name = name, syntax = ak.string_from_str("*"), inherit = false, initial_value = none)))
+        assert(css_custom_property_data_inheritable(data, document) == data)
+        document.m_custom_property_registration_generation += 1
+        let inheritable = css_custom_property_data_inheritable(data, document) else trap("inheritable data")
+        assert(inheritable != data)
+        assert(ak.ordered_hash_map_size(&inheritable.m_own_values) == 2)
+        assert(css_custom_property_data_get(inheritable, name) == none)
+        assert(css_custom_property_data_inheritable(data, document) == inheritable)
+
+        # Only non-inherited values: nothing is inherited.
+        var only = test_custom_properties("a", 2)
+        discard(ak.ordered_hash_map_remove_k(&only, ak.fly_string_from_str("--a0")))
+        let only_data = css_custom_property_data_create(only, none)
+        assert(css_custom_property_data_inheritable(only_data, document) == none)
+
+test "CustomPropertyRegistration's operator== compares names, syntax, inherit and initial values (CustomPropertyRegistration.h:35)":
+    web_initialize_strings()
+    let name = ak.fly_string_from_str("--x")
+    let a = CssCustomPropertyRegistration(property_name = name, syntax = ak.string_from_str("<length>"), inherit = true, initial_value = none)
+    assert(css_eq_css_custom_property_registrati(a, a))
+    assert(not css_eq_css_custom_property_registrati(a, CssCustomPropertyRegistration(property_name = ak.fly_string_from_str("--y"), syntax = a.syntax, inherit = true, initial_value = none)))
+    assert(not css_eq_css_custom_property_registrati(a, CssCustomPropertyRegistration(property_name = name, syntax = ak.string_from_str("*"), inherit = true, initial_value = none)))
+    assert(not css_eq_css_custom_property_registrati(a, CssCustomPropertyRegistration(property_name = name, syntax = a.syntax, inherit = false, initial_value = none)))
+    let with_value = CssCustomPropertyRegistration(property_name = name, syntax = a.syntax, inherit = true, initial_value = test_keyword(css_data.Keyword.auto))
+    assert(not css_eq_css_custom_property_registrati(a, with_value))
+    assert(css_eq_css_custom_property_registrati(with_value, CssCustomPropertyRegistration(property_name = name, syntax = a.syntax, inherit = true, initial_value = test_keyword(css_data.Keyword.auto))))
+    assert(not css_eq_css_custom_property_registrati(with_value, CssCustomPropertyRegistration(property_name = name, syntax = a.syntax, inherit = true, initial_value = test_keyword(css_data.Keyword.none_))))
+
+# mark: The ancestor filter =====================================================================
+
+test "CountingBloomFilter<u8, 14>: two buckets per key, saturating counters (StyleComputer.h:31)":
+    let filter = new CssCountingBloomFilter[u8] else trap("out of memory")
+    css_counting_bloom_filter_clear(filter)
+    let key: u32 = 0x00050003
+    assert(not css_counting_bloom_filter_may_contain(filter, key))
+    css_counting_bloom_filter_increment(filter, key)
+    assert(css_counting_bloom_filter_may_contain(filter, key))
+    assert(css_counting_bloom_filter_hash1(filter, key) == 3)
+    assert(css_counting_bloom_filter_hash2(filter, key) == 5)
+    # Another key sharing only one bucket is not contained.
+    assert(not css_counting_bloom_filter_may_contain(filter, 0x00070003))
+    css_counting_bloom_filter_decrement(filter, key)
+    assert(not css_counting_bloom_filter_may_contain(filter, key))
+    # A saturated counter stays at its maximum: decrementing it changes nothing.
+    for i in 0..<300:
+        css_counting_bloom_filter_increment(filter, key)
+    assert(css_counting_bloom_filter_bucket1_const(filter, key) == 255)
+    css_counting_bloom_filter_decrement(filter, key)
+    assert(css_counting_bloom_filter_bucket1_const(filter, key) == 255)
+    css_counting_bloom_filter_clear(filter)
+    assert(not css_counting_bloom_filter_may_contain(filter, key))
+
+# mark: CountersSet =============================================================================
+
+test "CountersSet: instantiating, incrementing and setting counters, and the dump (CountersSet.cpp:23-104, 208)":
+    let world = test_style_computer_world()
+    defer web_test_destroy_vm(world.vm)
+    let allocator: memory.Allocator = vm_heap(world.vm)
+    with allocator:
+        test_selector_engine_build(world.realm, world.document, world.root.dom_node(), "<ol id=o><li id=a></li><li id=b></li></ol>")
+        let o = dom_element_abstract_element(test_style_computer_element(&world, ak.sv("o")))
+        let a = dom_element_abstract_element(test_style_computer_element(&world, ak.sv("a")))
+        let b = dom_element_abstract_element(test_style_computer_element(&world, ak.sv("b")))
+        var counters: CssCountersSet
+        assert(css_counters_set_is_empty(&counters))
+        let item = ak.fly_string_from_str("item")
+        discard(css_counters_set_instantiate_a_counter(&counters, item, o, false, 0))
+        css_counters_set_increment_a_counter(&counters, item, a, 2)
+        let counter = css_counters_set_last_counter_with_name(&counters, item) else trap("a counter")
+        assert((counter.value else 0) == 2)
+        assert(counter.originating_element == o)
+
+        # Instantiating again at the same element replaces its counter. (A previous sibling's is replaced
+        # too, but AbstractElement::is_before compares layout nodes, which these elements do not have.)
+        discard(css_counters_set_instantiate_a_counter(&counters, item, a, true, 5))
+        discard(css_counters_set_instantiate_a_counter(&counters, item, b, false, 7))
+        assert(ak.vector_size(&counters.m_counters) == 3)
+        discard(css_counters_set_instantiate_a_counter(&counters, item, b, false, none))
+        assert(ak.vector_size(&counters.m_counters) == 3)
+        let last = css_counters_set_last_counter_with_name(&counters, item) else trap("a counter")
+        assert(last.originating_element == b)
+        assert(last.value == none)
+
+        # Setting a counter of another name instantiates it at 0 first; incrementing saturates.
+        let other = ak.fly_string_from_str("other")
+        css_counters_set_set_a_counter(&counters, other, a, ak.i32_max)
+        css_counters_set_increment_a_counter(&counters, other, a, 1)
+        let saturated = css_counters_set_counter_with_same_name_and_creator(&counters, other, a) else trap("a counter")
+        assert((saturated.value else 0) == ak.i32_max)
+        assert(css_counters_set_counter_with_same_name_and_creator(&counters, other, b) == none)
+
+        let dump = css_counters_set_dump(&counters)
+        assert(test_string_shows(dump, "{\n    item (ol#o) = 2\n    item (li#a) = 5\n    item (li#b) = None\n    other (li#a) = 2147483647\n}"))
+
+# mark: Shorthands, insights and buckets ========================================================
+
+## The captures of test_expand's callback: the longhands and values, as "name: value" lines.
+struct TestExpandLonghands:
+    var builder: ak.StringBuilder
+
+## for_each_property_expanding_shorthands' callback of test_expand.
+func test_expand_longhand(context: void*?, property_id: css_data.PropertyId, value: CssStyleValue*):
+    let captures = (TestExpandLonghands*)(context else trap("no captures"))
+    let name = css_data.string_from_property_id(property_id)
+    ak.string_builder_append_string_view(&captures.builder, ak.fly_string_bytes_as_string_view(&name))
+    ak.string_builder_append(&captures.builder, ": ")
+    let text = css_style_value_to_string(value, css_syntax.SerializationMode.normal)
+    ak.string_builder_append_string_view(&captures.builder, ak.string_bytes_as_string_view(&text))
+    ak.string_builder_append(&captures.builder, "\n")
+
+## The longhands for_each_property_expanding_shorthands gives for `value` of `property`.
+func test_expand(realm: Realm*, property: str, value: str) -> ak.String:
+    var params: CssParsingParams = ---
+    css_parsing_params_construct_realm_css_parsing_mode(&params, realm)
+    let property_id = css_data.property_id_from_string(ak.sv(property)) else trap("a known property")
+    let parsed = parse_css_value(params, ak.sv(value), property_id) else trap("the value parses")
+    var captures = TestExpandLonghands(builder = ak.string_builder_new())
+    css_style_computer_for_each_property_expanding_shorthands(property_id, parsed, ak.Function2[css_data.PropertyId, CssStyleValue*, unit](call = test_expand_longhand, context = &captures))
+    return ak.string_builder_to_string_without_validation(&captures.builder)
+
+## Whether `string` is `text`, printing it when not.
+func test_string_shows(string: ak.String, text: str) -> bool:
+    if ak.string_eq_string_view(&string, ak.sv(text)):
+        return true
+    let view = ak.string_bytes_as_string_view(&string)
+    print(f"got:\n{(str)ak.string_view_bytes(&view)}")
+    return false
+
+test "for_each_property_expanding_shorthands: shorthands, nested shorthands, CSS-wide keywords and pending substitution (StyleComputer.cpp:439)":
+    web_initialize_strings()
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        assert(test_string_shows(test_expand(realm, "display", "block"), "display: block\n"))
+        assert(test_string_shows(test_expand(realm, "overflow", "hidden scroll"), "overflow-x: hidden\noverflow-y: scroll\n"))
+        assert(test_string_shows(test_expand(realm, "margin", "inherit"), "margin-top: inherit\nmargin-right: inherit\nmargin-bottom: inherit\nmargin-left: inherit\n"))
+        assert(test_string_shows(test_expand(realm, "place-self", "start end"), "align-self: start\njustify-self: end\n"))
+        # A shorthand with var(): the shorthand itself, then each longhand's pending-substitution value.
+        let pending = test_expand(realm, "overflow", "var(--o)")
+        assert(test_string_shows(pending, "overflow: var(--o)\noverflow-x: \noverflow-y: \n"))
+
+test "StyleScope::collect_selector_insights finds :has() and its sibling combinators, also nested (StyleScope.cpp:391)":
+    web_initialize_strings()
+    var insights = CssSelectorInsights(has_has_selectors = false, has_has_selectors_with_relative_selector_that_has_sibling_combinator = false)
+    css_style_scope_collect_selector_insights(test_selector_engine_selector("div > p.k"), &insights)
+    assert(not insights.has_has_selectors)
+    css_style_scope_collect_selector_insights(test_selector_engine_selector("div:has(> p)"), &insights)
+    assert(insights.has_has_selectors)
+    assert(not insights.has_has_selectors_with_relative_selector_that_has_sibling_combinator)
+    css_style_scope_collect_selector_insights(test_selector_engine_selector(":is(a, b:has(+ i))"), &insights)
+    assert(insights.has_has_selectors_with_relative_selector_that_has_sibling_combinator)
+
+test "RuleCache::add_rule buckets by the rightmost id, class, tag, :is() simplification, :root and attribute (StyleComputer.cpp:2963)":
+    let world = test_style_computer_world()
+    defer web_test_destroy_vm(world.vm)
+    let allocator: memory.Allocator = vm_heap(world.vm)
+    with allocator:
+        test_style_computer_install_user_agent_sheets(world.realm)
+        defer test_style_computer_release_user_agent_sheets()
+        var params: CssParsingParams = ---
+        css_parsing_params_construct_dom_document(&params, world.document)
+        let sheet = parse_css_stylesheet(params, ak.sv("div.k {} p#i {} span {} :is(.c) {} :where(em) {} :root {} [title] {} * {} ::before {} li:hover {}"))
+        let sheets = css_style_sheet_list_create(world.document.dom_node())
+        ak.vector_append_t(&sheets.m_sheets, sheet)
+        world.document.m_style_sheets = sheets
+        let scope = &world.document.m_style_scope
+        test_style_computer_build_rule_cache(scope)
+        let cache = &(scope.m_rule_cache else trap("a rule cache")).author_rule_cache.main
+        assert(ak.hash_map_contains_k(&cache.rules_by_class, ak.fly_string_from_str("k")))
+        assert(ak.hash_map_contains_k(&cache.rules_by_id, ak.fly_string_from_str("i")))
+        assert(ak.hash_map_contains_k(&cache.rules_by_tag_name, ak.fly_string_from_str("span")))
+        assert(ak.hash_map_contains_k(&cache.rules_by_class, ak.fly_string_from_str("c")))
+        assert(ak.hash_map_contains_k(&cache.rules_by_tag_name, ak.fly_string_from_str("em")))
+        assert(ak.vector_size(&cache.root_rules) == 1)
+        assert(ak.hash_map_contains_k(&cache.rules_by_attribute_name, ak.fly_string_from_str("TITLE")))
+        assert(ak.vector_size(&cache.rules_by_pseudo_element[(usize)css_data.PseudoElement.before]) == 1)
+        assert(ak.vector_size(&cache.other_rules) == 1)
+        let hover_cache = css_style_scope_get_pseudo_class_rule_cache(scope, css_data.PseudoClass.hover)
+        assert(ak.hash_map_contains_k(&hover_cache.rules_by_tag_name, ak.fly_string_from_str("li")))
+
+        # The user-agent sheet's @keyframes: each set completed with its 0% and 100% keyframes.
+        let user_agent = &(scope.m_rule_cache else trap("a rule cache")).user_agent_rule_cache.main
+        let fade_out = ak.hash_map_get_k_const(&user_agent.rules_by_animation_keyframes, ak.fly_string_from_str("-ua-view-transition-fade-out")) else trap("the fade-out keyframes")
+        assert(ak.base_red_black_tree_size(&(*fade_out).keyframes_by_key.base) == 2)
+        let first = ak.red_black_tree_find(&(*fade_out).keyframes_by_key, 0) else trap("the 0% keyframe")
+        let opacity = ak.hash_map_get_k_const(&first.properties, css_data.PropertyId.opacity) else trap("opacity at 0%")
+        let is_use_initial = match *opacity:
+            .use_initial(_) => true
+            _ => false
+        assert(is_use_initial)
+
+test "user_agent_style_sheet_source answers the four embedded sheets (StyleComputer.cpp:149)":
+    assert(css_style_computer_user_agent_style_sheet_source(ak.sv("CSS/Default.css")) != none)
+    assert(css_style_computer_user_agent_style_sheet_source(ak.sv("CSS/QuirksMode.css")) != none)
+    let mathml = css_style_computer_user_agent_style_sheet_source(ak.sv("MathML/Default.css")) else trap("the MathML sheet")
+    assert(ak.string_eq_string_view(&mathml, ak.sv(css_mathml_stylesheet_source)))
+    assert(css_style_computer_user_agent_style_sheet_source(ak.sv("SVG/Default.css")) != none)
+    assert(css_style_computer_user_agent_style_sheet_source(ak.sv("CSS/Nope.css")) == none)

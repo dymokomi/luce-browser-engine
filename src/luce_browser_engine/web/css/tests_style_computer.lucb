@@ -1,0 +1,358 @@
+#==============================================================================================
+#
+#   tests_style_computer - tests of the cascade on DOM trees (region r39)
+#
+#   DESCRIPTION:
+#       Ladybird has no unit tests for StyleComputer, StyleScope or CascadedProperties (they are
+#       tested through Tests/LibWeb, which needs layout or scripting). The oracle cases
+#       (tests_style_computer_cases) are style sheets, trees and getComputedStyle() queries
+#       that the reference build's test-web ran, chosen so that the computed value is the
+#       cascaded value serialized as written (keywords, integers, numbers) or the initial or
+#       inherited value where nothing cascades; each tree is built here as the selector engine
+#       tests build theirs (tests_selector_engine), its style computed by the port's
+#       cascade, and every query answered from the cascaded values.
+#
+#       Two steps of the real path stop in other regions, so the tests take their place:
+#       - StyleScope::make_rule_cache_for_cascade_origin builds the :has() and invalidation sets
+#         of every selector first (StyleInvalidationData::build_invalidation_sets_for_selector,
+#         region r42); test_style_computer_build_rule_cache builds the rule caches as it does,
+#         without those sets.
+#       - compute_style_impl ends in compute_properties (ComputedProperties, region r40);
+#         test_style_computer_cascade runs its steps up to the cascaded values.
+#
+#==============================================================================================
+
+# mark: The test document =======================================================================
+
+## The test document (tests_selector_engine's) with its style scope, a style computer and the case's sheet.
+struct TestStyleComputerWorld:
+    var vm: Vm*
+    var realm: Realm*
+    var document: DomDocument*
+    var root: HtmlElement*
+    var style_computer: CssStyleComputer*
+
+## A StyleComputer cell for `document` with the state the cascade reads. Its constructor's font metrics need
+## InitialValues::line_height() (region r40) and a font plugin; the cascade reads neither.
+func test_style_computer_create(realm: Realm*, document: DomDocument*) -> CssStyleComputer*:
+    let this = (CssStyleComputer*)web_heap_allocate_cell(realm_heap(realm), &css_style_computer_class)
+    this.m_document = document
+    let ancestor_filter = new CssCountingBloomFilter[u8] else trap("out of memory")
+    this.m_ancestor_filter = ancestor_filter
+    css_style_computer_reset_has_result_cache(this)
+    css_style_computer_reset_ancestor_filter(this)
+    return this
+
+## An HTMLElement named `local_name` appended to `parent` (HTMLElement's constructor, as
+## test_selector_engine_create makes elements, whatever the name).
+func test_style_computer_append_plain(realm: Realm*, document: DomDocument*, parent: DomNode*, local_name: str, id: str = "") -> HtmlElement*:
+    let element = (HtmlElement*)web_allocate_cell(realm, &html_element_class)
+    html_element_construct(element, document, test_html_qualified_name(local_name))
+    html_element_initialize_impl(element.js_cell(), realm)
+    element.dom_element().m_custom_element_state = DomCustomElementState.uncustomized
+    if id.length != 0:
+        test_selector_engine_set_attribute(element, "id", id)
+    tree_node_append_child(parent, element.dom_node())
+    return element
+
+## The test document, shaped as the reference's (html(head(script script) body(div#root pre#out))), its
+## style scope and style computer. <body> is an HTMLElement: HTMLBodyElement's presentational hints are
+## region r27's (the reference's body has no attributes, so it gives none).
+func test_style_computer_world() -> TestStyleComputerWorld:
+    let (vm, realm, document) = test_html_setup()
+    let html = test_selector_engine_append(realm, document, document.dom_node(), "html")
+    let head = test_selector_engine_append(realm, document, html.dom_node(), "head")
+    discard(test_selector_engine_append(realm, document, head.dom_node(), "script"))
+    discard(test_selector_engine_append(realm, document, head.dom_node(), "script"))
+    let body = test_style_computer_append_plain(realm, document, html.dom_node(), "body")
+    let root = test_selector_engine_append(realm, document, body.dom_node(), "div", "root")
+    discard(test_selector_engine_append(realm, document, body.dom_node(), "pre", "out"))
+    css_style_scope_construct(&document.m_style_scope, document.dom_node())
+    let style_computer = test_style_computer_create(realm, document)
+    document.m_style_computer = style_computer
+    return TestStyleComputerWorld(vm = vm, realm = realm, document = document, root = root, style_computer = style_computer)
+
+## A user-agent style sheet parsed as default_stylesheet() parses it, in `realm` (internal_css_realm()
+## creates a Window, region r28). The @media blocks are left out: MediaQuery is region r42's. (Default.css has two, `(scripting)` for
+## <noscript> and `(inverted-colors)` for images; neither reaches the tests' elements.)
+func test_style_computer_user_agent_sheet(realm: Realm*, source: str) -> gc.Root[CssCssStyleSheet]:
+    var params: CssParsingParams = ---
+    css_parsing_params_construct_realm_css_is_ua_style_sheet(&params, realm, CssIsUaStyleSheet.yes)
+    let text = test_style_computer_without_media_rules(source)
+    return gc.root_create(parse_css_stylesheet(params, ak.string_bytes_as_string_view(&text)))
+
+## `source` without its @media blocks (to the matching closing brace).
+func test_style_computer_without_media_rules(source: str) -> ak.String:
+    let bytes = source.bytes
+    var builder = ak.string_builder_new()
+    var i: usize = 0
+    while i < bytes.length:
+        if i + 6 <= bytes.length and (str)bytes[i..<i + 6] == "@media":
+            while bytes[i] != '{':
+                i += 1
+            var depth = 0
+            while true:
+                if bytes[i] == '{':
+                    depth += 1
+                elif bytes[i] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        break
+                i += 1
+            i += 1
+            continue
+        ak.string_builder_append_u8(&builder, bytes[i])
+        i += 1
+    return ak.string_builder_to_string_without_validation(&builder)
+
+## Installs the four user-agent style sheets (the statics of default_stylesheet() and its siblings),
+## parsed in `realm`.
+func test_style_computer_install_user_agent_sheets(realm: Realm*):
+    css_default_stylesheet_sheet = test_style_computer_user_agent_sheet(realm, css_default_stylesheet_source)
+    css_quirks_mode_stylesheet_sheet = test_style_computer_user_agent_sheet(realm, css_quirks_mode_stylesheet_source)
+    css_mathml_stylesheet_sheet = test_style_computer_user_agent_sheet(realm, css_mathml_stylesheet_source)
+    css_svg_stylesheet_sheet = test_style_computer_user_agent_sheet(realm, css_svg_stylesheet_source)
+
+## Releases the user-agent style sheets of test_style_computer_install_user_agent_sheets before the heap goes.
+func test_style_computer_release_user_agent_sheets():
+    gc.root_release(&css_default_stylesheet_sheet)
+    gc.root_release(&css_quirks_mode_stylesheet_sheet)
+    gc.root_release(&css_mathml_stylesheet_sheet)
+    gc.root_release(&css_svg_stylesheet_sheet)
+
+## The rule-cache builder's lambda over a sheet's effective style-producing rules: what
+## css_style_scope_make_rule_cache_for_rule does, without the invalidation sets.
+func test_style_computer_build_rule(context: void*?, rule: CssRule*):
+    let captures = (CssStyleScopeMakeRuleCacheForCascadeOriginRule*)(context else trap("no captures"))
+    let style_cache = captures.outer.style_cache
+    let absolutized_selectors = css_style_scope_absolutized_selectors_of(rule)
+    for selector in ak.vector_span_const(&absolutized_selectors):
+        let target_pseudo_element = css_selector_target_pseudo_element(selector)
+        let matching_rule = CssMatchingRule(rule = rule, sheet = captures.sheet, default_namespace = css_css_style_sheet_default_namespace(captures.sheet), selector = selector, style_sheet_index = captures.outer.style_sheet_index, rule_index = captures.rule_index, specificity = css_selector_specificity(selector), cascade_origin = captures.outer.cascade_origin, contains_pseudo_element = target_pseudo_element != none, slotted = css_selector_is_slotted(selector), contains_part_pseudo_element = css_selector_has_part_pseudo_element(selector))
+        let qualified_layer_name = css_matching_rule_qualified_layer_name(&matching_rule)
+        var rule_cache: CssRuleCache* = &captures.rule_caches.main
+        if not ak.fly_string_is_empty(&qualified_layer_name):
+            if let existing = ak.hash_map_get_k(&captures.rule_caches.by_layer, qualified_layer_name):
+                rule_cache = *existing
+            else:
+                let layer_rule_cache = new CssRuleCache else trap("out of memory")
+                discard(ak.hash_map_set(&captures.rule_caches.by_layer, qualified_layer_name, layer_rule_cache))
+                rule_cache = layer_rule_cache
+        css_style_scope_collect_selector_insights(selector, &style_cache.selector_insights)
+        var contains_root_pseudo_class = false
+        let compound_selectors = css_selector_compound_selectors(selector)
+        let last_compound_selector = ak.vector_last_const(&compound_selectors)
+        for simple_selector in ak.vector_span_const(&last_compound_selector.simple_selectors):
+            if simple_selector.type_ == CssSelectorSimpleSelectorType.pseudo_class and css_selector_simple_selector_pseudo_class(&simple_selector).type_ == css_data.PseudoClass.root:
+                contains_root_pseudo_class = true
+        for i in 0..<(usize)css_data.PseudoClass.count:
+            let pseudo_class_rule_cache = style_cache.pseudo_class_rule_cache[i] else continue
+            if css_selector_contains_pseudo_class(selector, (css_data.PseudoClass)i):
+                css_rule_cache_add_rule(pseudo_class_rule_cache, &matching_rule, none, contains_root_pseudo_class)
+        var pseudo_element_type: css_data.PseudoElement? = none
+        if let pseudo_element = target_pseudo_element:
+            pseudo_element_type = css_selector_pseudo_element_selector_type(&pseudo_element)
+        css_rule_cache_add_rule(rule_cache, &matching_rule, pseudo_element_type, contains_root_pseudo_class)
+    captures.rule_index += 1
+
+## The rule-cache builder's lambda over the style sheets of an origin.
+func test_style_computer_build_sheet(context: void*?, sheet: CssCssStyleSheet*):
+    let captures = (CssStyleScopeMakeRuleCacheForCascadeOrigin*)(context else trap("no captures"))
+    let style_cache = captures.style_cache
+    var rule_caches: CssRuleCaches* = &style_cache.author_rule_cache
+    if captures.cascade_origin == CssCascadeOrigin.user:
+        rule_caches = &style_cache.user_rule_cache
+    elif captures.cascade_origin == CssCascadeOrigin.user_agent:
+        rule_caches = &style_cache.user_agent_rule_cache
+    var rule_captures = CssStyleScopeMakeRuleCacheForCascadeOriginRule(outer = captures, rule_caches = rule_caches, sheet = sheet, rule_index = 0)
+    css_css_style_sheet_for_each_effective_style_producing_rule(sheet, ak.Function1[CssRule*, unit](call = test_style_computer_build_rule, context = &rule_captures))
+    var keyframes_captures = CssStyleScopeMakeRuleCacheForCascadeOriginKeyframes(rule_caches = rule_caches)
+    css_css_style_sheet_for_each_effective_keyframes_at_rule(sheet, ak.Function1[CssKeyframesRule*, unit](call = css_style_scope_make_rule_cache_for_keyframes, context = &keyframes_captures))
+    captures.style_sheet_index += 1
+
+## Builds `scope`'s rule cache as StyleScope::build_rule_cache does (populate_rule_cache), without the
+## invalidation sets of region r42. The user style sheet is an empty sheet (Page::user_style is region r28's).
+func test_style_computer_build_rule_cache(scope: CssStyleScope*):
+    var params: CssParsingParams = ---
+    css_parsing_params_construct_dom_document(&params, css_style_scope_document(scope))
+    scope.m_user_style_sheet = parse_css_stylesheet(params, ak.sv(""))
+    let style_cache = css_style_cache_create()
+    scope.m_rule_cache = style_cache
+    css_style_scope_build_qualified_layer_names_cache(scope, style_cache)
+    style_cache.pseudo_class_rule_cache[(usize)css_data.PseudoClass.hover] = new CssRuleCache else trap("out of memory")
+    style_cache.pseudo_class_rule_cache[(usize)css_data.PseudoClass.active] = new CssRuleCache else trap("out of memory")
+    style_cache.pseudo_class_rule_cache[(usize)css_data.PseudoClass.focus] = new CssRuleCache else trap("out of memory")
+    style_cache.pseudo_class_rule_cache[(usize)css_data.PseudoClass.focus_within] = new CssRuleCache else trap("out of memory")
+    style_cache.pseudo_class_rule_cache[(usize)css_data.PseudoClass.focus_visible] = new CssRuleCache else trap("out of memory")
+    style_cache.pseudo_class_rule_cache[(usize)css_data.PseudoClass.has] = new CssRuleCache else trap("out of memory")
+    style_cache.pseudo_class_rule_cache[(usize)css_data.PseudoClass.target] = new CssRuleCache else trap("out of memory")
+    for origin in [CssCascadeOrigin.author, CssCascadeOrigin.user, CssCascadeOrigin.user_agent]:
+        var captures = CssStyleScopeMakeRuleCacheForCascadeOrigin(cascade_origin = origin, style_cache = style_cache, style_sheet_index = 0)
+        css_style_scope_for_each_stylesheet(scope, origin, ak.Function1[CssCssStyleSheet*, unit](call = test_style_computer_build_sheet, context = &captures))
+
+## compute_style_impl's steps up to the cascaded values, and compute_properties' computation of the custom
+## properties (build_matching_rule_set, the custom properties, the
+## cascade), with `element`'s ancestors in the ancestor filter as update_style puts them.
+func test_style_computer_cascade(this: CssStyleComputer*, element: DomElement*) -> CssCascadedProperties*:
+    var abstract_element = dom_element_abstract_element(element)
+    let style_scope = dom_abstract_element_style_scope(&abstract_element)
+    var did_match_any_pseudo_element_rules = false
+    var attempted_pseudo_class_matches: CssPseudoClassBitmap
+    let mode = CssStyleComputerComputeStyleMode.normal
+    let matching_rule_set = css_style_computer_build_matching_rule_set(this, abstract_element, &attempted_pseudo_class_matches, &did_match_any_pseudo_element_rules, mode, style_scope)
+
+    var cascaded_all: ak.OrderedHashMap[ak.FlyString, CssStyleProperty, ak.FlyStringTraits]
+    for layer in ak.vector_span_const(&matching_rule_set.author_rules):
+        css_cascade_custom_properties(abstract_element, &layer.rules, &cascaded_all)
+    var parent_data: const CssCustomPropertyData*? = none
+    if let inherit_from = dom_abstract_element_element_to_inherit_style_from(&abstract_element):
+        parent_data = css_inheritable_custom_property_data(inherit_from)
+    var cascaded_own: ak.OrderedHashMap[ak.FlyString, CssStyleProperty, ak.FlyStringTraits]
+    for entry in ak.ordered_hash_map_begin_const(&cascaded_all):
+        if let parent = parent_data:
+            if let parent_property = css_custom_property_data_get(parent, entry.key):
+                if parent_property.value == entry.value.value:
+                    continue
+        discard(ak.ordered_hash_map_set(&cascaded_own, entry.key, entry.value))
+    if ak.ordered_hash_map_is_empty(&cascaded_own) and parent_data != none:
+        dom_abstract_element_set_custom_property_data(&abstract_element, parent_data)
+    elif ak.ordered_hash_map_is_empty(&cascaded_own) and parent_data == none:
+        dom_abstract_element_set_custom_property_data(&abstract_element, none)
+    else:
+        dom_abstract_element_set_custom_property_data(&abstract_element, css_custom_property_data_create(cascaded_own, parent_data))
+
+    let cascaded_properties = css_style_computer_compute_cascaded_values(this, abstract_element, did_match_any_pseudo_element_rules, mode, &matching_rule_set)
+    dom_abstract_element_set_cascaded_properties(&abstract_element, cascaded_properties)
+
+    # compute_properties computes the custom properties' values next. compute_custom_properties does not use its
+    # ComputedProperties parameter (unnamed in C++), and none can be made before region r40: any cell stands in.
+    let computed_style = (CssComputedProperties*)this
+    css_style_computer_compute_custom_properties(this, computed_style, abstract_element)
+    return cascaded_properties
+
+# mark: The oracle cases ========================================================================
+
+## Gives `element` the inline style of its `style` attribute, as Element::attribute_changed does (without
+## the style invalidation of region r42).
+func test_style_computer_apply_style_attribute(element: DomElement*):
+    let value = dom_element_attribute(element, html_attribute_names_style) else return
+    var properties: ak.Vector[CssStyleProperty]
+    var custom_properties: ak.OrderedHashMap[ak.FlyString, CssStyleProperty, ak.FlyStringTraits]
+    let inline_style = css_style_properties_create_element_inline_style(dom_element_abstract_element(element), properties, custom_properties)
+    element.m_inline_style = inline_style
+    css_style_properties_set_declarations_from_text(inline_style, ak.string_bytes_as_string_view(&value))
+
+## Computes the cascade of `element` and its descendants in tree order, with the ancestors in the ancestor
+## filter as update_style_recursively puts them.
+func test_style_computer_cascade_subtree(this: CssStyleComputer*, element: DomElement*):
+    css_style_computer_push_ancestor(this, element)
+    discard(test_style_computer_cascade(this, element))
+    for child in dom_node_children(element.dom_node()):
+        if let child_element = as_if_dom_element(child):
+            test_style_computer_cascade_subtree(this, child_element)
+    css_style_computer_pop_ancestor(this, element)
+
+## The value getComputedStyle() answers for `property_id` of `element` where that is the cascaded value as
+## written: the cascaded value, or for inherit, unset and no value of an inherited property the parent's,
+## and for initial, unset and no value of the others the initial value.
+func test_style_computer_effective_value(element: DomElement*, property_id: css_data.PropertyId) -> CssStyleValue*:
+    var abstract_element = dom_element_abstract_element(element)
+    let parent = dom_node_parent_element(element.dom_node())
+    let inherited = css_data.is_inherited_property(property_id)
+    var value: CssStyleValue*? = none
+    if let cascaded_properties = dom_abstract_element_cascaded_properties(&abstract_element):
+        value = css_cascaded_properties_property(cascaded_properties, property_id)
+    var inherit = value == none and inherited
+    var initial = value == none and not inherited
+    if let cascaded = value:
+        inherit = css_style_value_is_inherit(cascaded) or (css_style_value_is_unset(cascaded) and inherited)
+        initial = css_style_value_is_initial(cascaded) or (css_style_value_is_unset(cascaded) and not inherited)
+    if inherit:
+        let parent_element = parent else return css_property_initial_value(property_id)
+        return test_style_computer_effective_value(parent_element, property_id)
+    if initial:
+        return css_property_initial_value(property_id)
+    return value else trap("unreachable: a cascaded value")
+
+## The element of the test document named `id` ("html", "body", "root" or an id in div#root).
+func test_style_computer_element(world: const TestStyleComputerWorld*, id: ak.StringView) -> DomElement*:
+    let html = dom_document_document_element(world.document) else trap("the document has a root")
+    if ak.string_view_equals(&id, "html"):
+        return html
+    if ak.string_view_equals(&id, "root"):
+        return world.root.dom_element()
+    for node in dom_node_subtree(html.dom_node()):
+        let element = as_if_dom_element(node) else continue
+        if ak.string_view_equals(&id, "body") and ak.fly_string_eq_string_view(&element.m_qualified_name.m_impl.local_name, ak.sv("body")):
+            return element
+        if let element_id = dom_element_id(element):
+            if ak.fly_string_eq_string_view(&element_id, id):
+                return element
+    trap("no element with that id")
+
+## The serialized value of `property` (a property or custom property name) of `element`.
+func test_style_computer_value(element: DomElement*, property: ak.StringView) -> ak.String:
+    if ak.string_view_starts_with_string_view(&property, ak.sv("--")):
+        let name = ak.fly_string_from_utf8(property) else trap("a custom property name")
+        let value = css_style_computer_compute_value_of_custom_property(dom_element_abstract_element(element), name)
+        return css_style_value_to_string(value, css_syntax.SerializationMode.normal)
+    let property_id = css_data.property_id_from_string(property) else trap("a known property")
+    return css_style_value_to_string(test_style_computer_effective_value(element, property_id), css_syntax.SerializationMode.normal)
+
+## Runs one oracle case and answers its queries, one "<id> <property>: <value>" line each.
+func test_style_computer_run_case(world: const TestStyleComputerWorld*, test_case: const TestStyleComputerCase*) -> ak.String:
+    let root = world.root.dom_node()
+    while let child = tree_node_first_child(root):
+        tree_node_remove_child(root, child)
+    test_selector_engine_build(world.realm, world.document, root, test_case.markup)
+    for node in dom_node_subtree(root):
+        if let element = as_if_dom_element(node):
+            test_style_computer_apply_style_attribute(element)
+
+    var params: CssParsingParams = ---
+    css_parsing_params_construct_dom_document(&params, world.document)
+    let sheet = parse_css_stylesheet(params, ak.sv(test_case.css))
+    let sheets = css_style_sheet_list_create(world.document.dom_node())
+    ak.vector_append_t(&sheets.m_sheets, sheet)
+    world.document.m_style_sheets = sheets
+
+    let scope = &world.document.m_style_scope
+    scope.m_rule_cache = none
+    test_style_computer_build_rule_cache(scope)
+    css_style_computer_reset_ancestor_filter(world.style_computer)
+    css_style_computer_reset_has_result_cache(world.style_computer)
+    test_style_computer_cascade_subtree(world.style_computer, dom_document_document_element(world.document) else trap("the document has a root"))
+
+    var out = ak.string_builder_new()
+    let queries_view = ak.sv(test_case.queries)
+    let queries = ak.string_view_split_view_u8(&queries_view, '\n')
+    for query in ak.vector_span_const(&queries):
+        let words = ak.string_view_split_view_u8(&query, ' ')
+        let id = *ak.vector_at_const(&words, 0)
+        let element = test_style_computer_element(world, id)
+        for i in 1..<ak.vector_size(&words):
+            let property = *ak.vector_at_const(&words, i)
+            let value = test_style_computer_value(element, property)
+            ak.string_builder_append_string_view(&out, id)
+            ak.string_builder_append_u8(&out, ' ')
+            ak.string_builder_append_string_view(&out, property)
+            ak.string_builder_append(&out, ": ")
+            ak.string_builder_append_string_view(&out, ak.string_bytes_as_string_view(&value))
+            ak.string_builder_append_u8(&out, '\n')
+    return ak.string_builder_to_string_without_validation(&out)
+
+test "the cascade matches the reference build on the oracle cases":
+    let world = test_style_computer_world()
+    defer web_test_destroy_vm(world.vm)
+    let allocator: memory.Allocator = vm_heap(world.vm)
+    with allocator:
+        test_style_computer_install_user_agent_sheets(world.realm)
+        defer test_style_computer_release_user_agent_sheets()
+        var failures = 0
+        for test_case in &test_style_computer_cases:
+            let actual = test_style_computer_run_case(&world, test_case)
+            if not ak.string_eq_string_view(&actual, ak.sv(test_case.expected)):
+                let actual_view = ak.string_bytes_as_string_view(&actual)
+                print(f"css {test_case.css}\ntree {test_case.markup}\nexpected:\n{test_case.expected}actual:\n{(str)ak.string_view_bytes(&actual_view)}")
+                failures += 1
+        assert(failures == 0, "cascade oracle cases differ")
