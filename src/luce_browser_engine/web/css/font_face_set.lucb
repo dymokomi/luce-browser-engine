@@ -1,0 +1,524 @@
+#==============================================================================================
+#
+#   font_face_set - CSS::FontFaceSet: document.fonts, the set of a document's font faces and
+#                   its loading status
+#
+#   DESCRIPTION:
+#       Port of LibWeb/CSS/FontFaceSet.cpp (lines 1-465) and the inline members of
+#       FontFaceSet.h (lines 19-81): creation, the set entries (a JS::Set), add, delete and
+#       clear, the event handler attributes, finding the matching font faces of a font
+#       shorthand, load() and check(), the font load events and the loading status (pending on
+#       the environment, switching to loading and loaded). The set entries and the ready promise
+#       are JS objects: creating a FontFaceSet traps in JS::Set::create until phase 3.
+#
+#       Copyright (c) 2024, Andrew Kaster <akaster@serenityos.org>
+#       Copyright (c) 2024, Jamie Mansfield <jmansfield@cadixdev.org>
+#       Copyright (c) 2026, Sam Atkins <sam@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: FontFaceSet.h ===========================================================================
+
+## Ported from Libraries/LibWeb/CSS/FontFaceSet.h:27 Web::CSS::FontFaceSet::set_entries.
+pub func css_font_face_set_set_entries(this: CssFontFaceSet*) -> JsSet*:
+    return this.m_set_entries
+
+## Ported from Libraries/LibWeb/CSS/FontFaceSet.h:45 Web::CSS::FontFaceSet::loading_fonts.
+pub func css_font_face_set_loading_fonts(this: CssFontFaceSet*) -> ak.Vector[CssFontFace*]*:
+    return &this.m_loading_fonts
+
+## Ported from Libraries/LibWeb/CSS/FontFaceSet.h:46 Web::CSS::FontFaceSet::loaded_fonts.
+pub func css_font_face_set_loaded_fonts(this: CssFontFaceSet*) -> ak.Vector[CssFontFace*]*:
+    return &this.m_loaded_fonts
+
+## Ported from Libraries/LibWeb/CSS/FontFaceSet.h:47 Web::CSS::FontFaceSet::failed_fonts.
+pub func css_font_face_set_failed_fonts(this: CssFontFaceSet*) -> ak.Vector[CssFontFace*]*:
+    return &this.m_failed_fonts
+
+## Ported from Libraries/LibWeb/CSS/FontFaceSet.h:50 Web::CSS::FontFaceSet::status.
+pub func css_font_face_set_status(this: CssFontFaceSet*) -> BindFontFaceSetLoadStatus:
+    return this.m_status
+
+## Ported from Libraries/LibWeb/CSS/FontFaceSet.h:52 Web::CSS::FontFaceSet::on_set_modified_from_js.
+pub func css_font_face_set_on_set_modified_from_js(this: CssFontFaceSet*):
+    return
+
+# mark: Creation ================================================================================
+
+## Ported from Libraries/LibWeb/CSS/FontFaceSet.cpp:35 Web::CSS::FontFaceSet::create.
+pub func css_font_face_set_create(realm: Realm*) -> CssFontFaceSet*:
+    var temporary_execution_context: HtmlTemporaryExecutionContext = ---
+    html_temporary_execution_context_construct_realm(&temporary_execution_context, realm)
+    defer html_temporary_execution_context_destruct(&temporary_execution_context)
+    return realm_create_css_font_face_set(realm, realm)
+
+## Ported from Libraries/LibWeb/CSS/FontFaceSet.cpp:41 Web::CSS::FontFaceSet::FontFaceSet.
+pub func css_font_face_set_construct(this: CssFontFaceSet*, realm: Realm*):
+    dom_event_target_construct(this.dom_event_target(), realm)
+    css_font_face_set_init_fields(this)
+    this.m_set_entries = js_set_create(realm)
+    this.m_ready_promise = idl_create_promise(realm)
+
+## Ported from Libraries/LibWeb/CSS/FontFaceSet.cpp:48 Web::CSS::FontFaceSet::initialize (override).
+pub func css_font_face_set_initialize_impl(base: JsCell*, realm: Realm*):
+    web_set_prototype_for_interface(base, realm, BindInterfaceName.font_face_set)
+    dom_event_target_initialize_impl(base, realm)
+
+## Ported from Libraries/LibWeb/CSS/FontFaceSet.cpp:54 Web::CSS::FontFaceSet::visit_edges (override).
+pub func css_font_face_set_visit_edges_impl(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (CssFontFaceSet*)base
+    dom_event_target_visit_edges_impl(base, visitor)
+    # visitor.visit(m_set_entries), visitor.visit(m_ready_promise): JS::Set and WebIDL::Promise are opaque until
+    # phase 3 (cells in the donor).
+    gc.cell_visitor_visit_cell(visitor, (gc.Cell*?)this.m_set_entries)
+    gc.cell_visitor_visit_cell(visitor, (gc.Cell*?)this.m_ready_promise)
+    gc.cell_visitor_visit_vector(visitor, &this.m_loading_fonts)
+    gc.cell_visitor_visit_vector(visitor, &this.m_loaded_fonts)
+    gc.cell_visitor_visit_vector(visitor, &this.m_failed_fonts)
+
+# mark: The set entries =========================================================================
+
+## The JS value of a FontFace (the platform object as a JS::Value).
+func css_font_face_value(face: CssFontFace*) -> JsValue:
+    return bind_platform_object_wrapper(face.bind_platform_object())
+
+## The FontFace of a set entry: `as<FontFace>(value.as_object())`.
+func css_font_face_from_value(value: JsValue) -> CssFontFace*:
+    return as_css_font_face((gc.Cell*)js_value_as_object(value))
+
+## Ported from Libraries/LibWeb/CSS/FontFaceSet.cpp:65 Web::CSS::FontFaceSet::add.
+# https://drafts.csswg.org/css-font-loading/#dom-fontfaceset-add
+pub func css_font_face_set_add(this: CssFontFaceSet*, face: CssFontFace*?) -> CssFontFaceSet*!:
+    let font_face = face else trap("VERIFY: GC::Root<FontFace>")
+    # 1. If font is already in the FontFaceSet’s set entries, skip to the last step of this algorithm immediately.
+    if js_set_set_has(this.m_set_entries, css_font_face_value(font_face)):
+        return this
+
+    # 2. If font is CSS-connected, throw an InvalidModificationError exception and exit this algorithm immediately.
+    if css_font_face_is_css_connected(font_face):
+        try idl_throw(.idl_dom_exception(idl_invalid_modification_error_create(bind_platform_object_realm(this.bind_platform_object()), ak.utf16_string_from_str("Cannot add a CSS-connected FontFace to a FontFaceSet"))))
+
+    # NB: This method implements steps 3 and 4.
+    css_font_face_set_add_css_connected_font(this, font_face)
+
+    # 5. Return the FontFaceSet.
+    return this
+
+## Ported from Libraries/LibWeb/CSS/FontFaceSet.cpp:84 Web::CSS::FontFaceSet::add_css_connected_font.
+# https://drafts.csswg.org/css-font-loading/#dom-fontfaceset-add
+pub func css_font_face_set_add_css_connected_font(this: CssFontFaceSet*, face: CssFontFace*):
+    # 3. Add the font argument to the FontFaceSet’s set entries.
+    js_set_set_add(this.m_set_entries, css_font_face_value(face))
+    css_font_face_add_to_set(face, this)
+
+    if css_font_face_should_be_registered_with_font_computer(face):
+        let global = html_relevant_global_object((JsObject*)this)
+        if let window = as_if_html_window((gc.Cell*)global):
+            css_font_computer_register_font_face(dom_document_font_computer(html_window_associated_document(window)), face)
+
+    # 4. If font’s status attribute is "loading"
+    if css_font_face_status(face) == BindFontFaceLoadStatus.loading:
+
+        # 1. If the FontFaceSet’s [[LoadingFonts]] list is empty, switch the FontFaceSet to loading.
+        if ak.vector_is_empty(&this.m_loading_fonts):
+            css_font_face_set_switch_to_loading(this)
+
+        # 2. Append font to the FontFaceSet’s [[LoadingFonts]] list.
+        ak.vector_append_t(&this.m_loading_fonts, face)
+
+## Ported from Libraries/LibWeb/CSS/FontFaceSet.cpp:109 Web::CSS::FontFaceSet::delete_.
+# https://drafts.csswg.org/css-font-loading/#dom-fontfaceset-delete
+pub func css_font_face_set_delete(this: CssFontFaceSet*, face: CssFontFace*?) -> bool:
+    let font_face = face else trap("VERIFY: GC::Root<FontFace>")
+    # 1. If font is CSS-connected, return false and exit this algorithm immediately.
+    if css_font_face_is_css_connected(font_face):
+        return false
+
+    if css_font_face_should_be_registered_with_font_computer(font_face):
+        let global = html_relevant_global_object((JsObject*)this)
+        if let window = as_if_html_window((gc.Cell*)global):
+            css_font_computer_unregister_font_face(dom_document_font_computer(html_window_associated_document(window)), font_face)
+
+    # 2. Let deleted be the result of removing font from the FontFaceSet’s set entries.
+    let deleted = js_set_set_remove(this.m_set_entries, css_font_face_value(font_face))
+    css_font_face_remove_from_set(font_face, this)
+
+    # 3. If font is present in the FontFaceSet’s [[LoadedFonts]], or [[FailedFonts]] lists, remove it.
+    let is_face = ak.Function1[const (CssFontFace*)*, bool](call = css_font_computer_is_face, context = font_face)
+    discard(ak.vector_remove_all_matching(&this.m_loaded_fonts, is_face))
+    discard(ak.vector_remove_all_matching(&this.m_failed_fonts, is_face))
+
+    # 4. If font is present in the FontFaceSet’s [[LoadingFonts]] list, remove it.
+    #    If font was the last item in that list (and so the list is now empty), switch the FontFaceSet to loaded.
+    let was_in_loading_fonts = ak.vector_remove_all_matching(&this.m_loading_fonts, is_face)
+    if was_in_loading_fonts and ak.vector_is_empty(&this.m_loading_fonts):
+        css_font_face_set_switch_to_loaded(this)
+
+    return deleted
+
+## The predicate of clear()'s `remove_all_matching([](auto const& font) { return !font->is_css_connected(); })`.
+func css_font_face_is_not_css_connected(context: void*?, font: const (CssFontFace*)*) -> bool:
+    return not css_font_face_is_css_connected(*font)
+
+## Ported from Libraries/LibWeb/CSS/FontFaceSet.cpp:140 Web::CSS::FontFaceSet::clear.
+# https://drafts.csswg.org/css-font-loading/#dom-fontfaceset-clear
+pub func css_font_face_set_clear(this: CssFontFaceSet*):
+    # 1. Remove all non-CSS-connected items from the FontFaceSet's set entries,
+    #    its [[LoadedFonts]] list, and its [[FailedFonts]] list.
+    let window = as_if_html_window((gc.Cell*)html_relevant_global_object((JsObject*)this))
+    var to_remove: ak.Vector[JsValue]
+    let entries = js_set_values(this.m_set_entries)
+    for font_face_value in ak.vector_span_const(&entries):
+        let font_face = css_font_face_from_value(font_face_value)
+        if not css_font_face_is_css_connected(font_face):
+            if window != none and css_font_face_should_be_registered_with_font_computer(font_face):
+                css_font_computer_unregister_font_face(dom_document_font_computer(html_window_associated_document(window else trap("window"))), font_face)
+            ak.vector_append_t(&to_remove, font_face_value)
+            css_font_face_remove_from_set(font_face, this)
+    for value in ak.vector_span_const(&to_remove):
+        discard(js_set_set_remove(this.m_set_entries, value))
+
+    let is_not_css_connected = ak.Function1[const (CssFontFace*)*, bool](call = css_font_face_is_not_css_connected, context = none)
+    discard(ak.vector_remove_all_matching(&this.m_loaded_fonts, is_not_css_connected))
+    discard(ak.vector_remove_all_matching(&this.m_failed_fonts, is_not_css_connected))
+
+    # 2. If the FontFaceSet's [[LoadingFonts]] list is non-empty, remove all items from it,
+    #    then switch the FontFaceSet to loaded.
+    if not ak.vector_is_empty(&this.m_loading_fonts):
+        ak.vector_clear(&this.m_loading_fonts)
+        css_font_face_set_switch_to_loaded(this)
+
+# mark: Event handlers ==========================================================================
+
+## Ported from Libraries/LibWeb/CSS/FontFaceSet.cpp:170 Web::CSS::FontFaceSet::set_onloading.
+# https://drafts.csswg.org/css-font-loading/#dom-fontfaceset-onloading
+pub func css_font_face_set_set_onloading(this: CssFontFaceSet*, event_handler: IdlCallbackType*?):
+    dom_event_target_set_event_handler_attribute(this.dom_event_target(), html_event_names_loading, event_handler)
+
+## Ported from Libraries/LibWeb/CSS/FontFaceSet.cpp:176 Web::CSS::FontFaceSet::onloading.
+# https://drafts.csswg.org/css-font-loading/#dom-fontfaceset-onloading
+pub func css_font_face_set_onloading(this: CssFontFaceSet*) -> IdlCallbackType*?:
+    return dom_event_target_event_handler_attribute(this.dom_event_target(), html_event_names_loading)
+
+## Ported from Libraries/LibWeb/CSS/FontFaceSet.cpp:182 Web::CSS::FontFaceSet::set_onloadingdone.
+# https://drafts.csswg.org/css-font-loading/#dom-fontfaceset-onloadingdone
+pub func css_font_face_set_set_onloadingdone(this: CssFontFaceSet*, event_handler: IdlCallbackType*?):
+    dom_event_target_set_event_handler_attribute(this.dom_event_target(), html_event_names_loadingdone, event_handler)
+
+## Ported from Libraries/LibWeb/CSS/FontFaceSet.cpp:188 Web::CSS::FontFaceSet::onloadingdone.
+# https://drafts.csswg.org/css-font-loading/#dom-fontfaceset-onloadingdone
+pub func css_font_face_set_onloadingdone(this: CssFontFaceSet*) -> IdlCallbackType*?:
+    return dom_event_target_event_handler_attribute(this.dom_event_target(), html_event_names_loadingdone)
+
+## Ported from Libraries/LibWeb/CSS/FontFaceSet.cpp:194 Web::CSS::FontFaceSet::set_onloadingerror.
+# https://drafts.csswg.org/css-font-loading/#dom-fontfaceset-onloadingerror
+pub func css_font_face_set_set_onloadingerror(this: CssFontFaceSet*, event_handler: IdlCallbackType*?):
+    dom_event_target_set_event_handler_attribute(this.dom_event_target(), html_event_names_loadingerror, event_handler)
+
+## Ported from Libraries/LibWeb/CSS/FontFaceSet.cpp:200 Web::CSS::FontFaceSet::onloadingerror.
+# https://drafts.csswg.org/css-font-loading/#dom-fontfaceset-onloadingerror
+pub func css_font_face_set_onloadingerror(this: CssFontFaceSet*) -> IdlCallbackType*?:
+    return dom_event_target_event_handler_attribute(this.dom_event_target(), html_event_names_loadingerror)
+
+# mark: Matching, load() and check() ============================================================
+
+## Ported from Libraries/LibWeb/CSS/FontFaceSet.cpp:206 Web::CSS::find_matching_font_faces.
+# https://drafts.csswg.org/css-font-loading/#find-the-matching-font-faces
+func css_find_matching_font_faces(realm: Realm*, font_face_set: CssFontFaceSet*, font: ak.String, text: ak.String) -> JsSet*!:
+    # 1. Parse font using the CSS value syntax of the font property. If a syntax error occurs, return a syntax error.
+    var parsing_params: CssParsingParams = ---
+    css_parsing_params_construct_css_parsing_mode(&parsing_params)
+    let property = parse_css_value(parsing_params, ak.string_bytes_as_string_view(&font), css_data.PropertyId.font)
+    if property == none or not css_style_value_is_shorthand(property else trap("property")):
+        try idl_throw(.idl_dom_exception(idl_syntax_error_create(realm, ak.utf16_string_from_str("Unable to parse font"))))
+    let shorthand = css_style_value_as_shorthand(property else trap("property"))
+
+    # If the parsed value is a CSS-wide keyword, return a syntax error.
+    # Note: This case is already caught by the is_shorthand check.
+
+    # FIXME: Absolutize all relative lengths against the initial values of the corresponding properties. (For example, a
+    #        relative font weight like bolder is evaluated against the initial value normal.)
+
+    # FIXME: 2. If text was not explicitly provided, let it be a string containing a single space character (U+0020 SPACE).
+
+    # 3. Let font family list be the list of font families parsed from font, and font style be the other font style
+    #    attributes parsed from font.
+    let font_family_list = css_style_value_as_value_list(css_shorthand_style_value_longhand(shorthand, css_data.PropertyId.font_family) else trap("VERIFY: the font-family longhand"))
+
+    # 4. Let available font faces be the available font faces within source. If the allow system fonts flag is specified,
+    #    add all system fonts to available font faces.
+    let available_font_faces = css_font_face_set_set_entries(font_face_set)
+
+    # 5. Let matched font faces initially be an empty list.
+    let matched_font_faces = js_set_create(realm)
+
+    # 6. For each family in font family list, use the font matching rules to select the font faces from available font
+    #    faces that match the font style, and add them to matched font faces. The use of the unicodeRange attribute means
+    #    that this may be more than just a single font face.
+    let families = css_style_value_list_values(font_family_list)
+    for font_family in ak.vector_span_const(&families):
+        # NB: Skip generic font family keywords
+        if css_style_value_is_keyword(font_family):
+            continue
+
+        # FIXME: The matching below is super basic. We currently just match font family names by their string value.
+        let font_family_name = css_string_from_style_value(font_family)
+
+        let available = js_set_values(available_font_faces)
+        for font_face_value in ak.vector_span_const(&available):
+            let font_face = css_font_face_from_value(font_face_value)
+            if not ak.fly_string_eq_string(&font_family_name, &font_face.m_family):
+                continue
+
+            js_set_set_add(matched_font_faces, font_face_value)
+
+    # FIXME: 7. If matched font faces is empty, set the found faces flag to false. Otherwise, set it to true.
+
+    # 8. For each font face in matched font faces, if its defined unicode-range does not include the codepoint of at
+    #    least one character in text, remove it from the list.
+    var faces_to_remove: ak.Vector[JsValue]
+    let matched = js_set_values(matched_font_faces)
+    for entry in ak.vector_span_const(&matched):
+        let font_face = css_font_face_from_value(entry)
+        var includes_at_least_one_text_code_point = false
+        let code_points = ak.string_code_points(&text)
+        var it = ak.utf8_view_begin(&code_points)
+        while not ak.utf8_code_point_iterator_done(&it):
+            let code_point = ak.utf8_code_point_iterator_deref(&it)
+            for range in ak.vector_span_const(&font_face.m_unicode_ranges):
+                if web_fonts.unicode_range_contains(&range, code_point):
+                    includes_at_least_one_text_code_point = true
+                    break
+            if includes_at_least_one_text_code_point:
+                break
+            discard(ak.utf8_code_point_iterator_inc(&it))
+        if not includes_at_least_one_text_code_point:
+            ak.vector_append_t(&faces_to_remove, entry)
+    for key in ak.vector_span_const(&faces_to_remove):
+        discard(js_set_set_remove(matched_font_faces, key))
+
+    # 9. Return matched font faces and the found faces flag.
+    return matched_font_faces
+
+## The captures of load()'s deferred steps and of the task they queue.
+struct CssFontFaceSetLoad:
+    var realm: Realm*
+    var font_face_set: CssFontFaceSet*
+    var promise: JsPromiseCapability*
+    var font: ak.String
+    var text: ak.String
+    var matched_font_faces: JsSet*?
+
+## load()'s wait_for_all success steps: resolve the promise with the fonts.
+func css_font_face_set_load_all_loaded(context: void*?, fonts: const ak.Vector[JsValue]*):
+    let captures = (CssFontFaceSetLoad*)(context else trap("no captures"))
+    let realm = captures.realm
+    var execution_context: HtmlTemporaryExecutionContext = ---
+    html_temporary_execution_context_construct_realm(&execution_context, realm, HtmlTemporaryExecutionContextCallbacksEnabled.yes)
+    defer html_temporary_execution_context_destruct(&execution_context)
+    let fonts_array = js_array_create_from(realm, ak.vector_span_const(fonts))
+    idl_resolve_promise(realm, captures.promise, js_value_from_object((JsObject*)fonts_array))
+
+## load()'s wait_for_all failure steps: reject the promise.
+func css_font_face_set_load_failed(context: void*?, error_: JsValue):
+    let captures = (CssFontFaceSetLoad*)(context else trap("no captures"))
+    let realm = captures.realm
+    var execution_context: HtmlTemporaryExecutionContext = ---
+    html_temporary_execution_context_construct_realm(&execution_context, realm, HtmlTemporaryExecutionContextCallbacksEnabled.yes)
+    defer html_temporary_execution_context_destruct(&execution_context)
+    idl_reject_promise(realm, captures.promise, error_)
+
+## load()'s step 4: the task that loads the matched font faces.
+func css_font_face_set_load_matched_faces(context: void*?):
+    let captures = (CssFontFaceSetLoad*)(context else trap("no captures"))
+    let realm = captures.realm
+    var promises: ak.Vector[const JsPromiseCapability*]
+
+    # 1. For all of the font faces in the font face list, call their load() method.
+    let matched = js_set_values(captures.matched_font_faces else trap("no matched font faces"))
+    for font_face_value in ak.vector_span_const(&matched):
+        let font_face = css_font_face_from_value(font_face_value)
+        discard(css_font_face_load(font_face))
+
+        ak.vector_append_t(&promises, css_font_face_font_status_promise(font_face))
+
+    # 2. Resolve promise with the result of waiting for all of the [[FontStatusPromise]]s of each font face in
+    #    the font face list, in order.
+    var execution_context: HtmlTemporaryExecutionContext = ---
+    html_temporary_execution_context_construct_realm(&execution_context, realm, HtmlTemporaryExecutionContextCallbacksEnabled.yes)
+    defer html_temporary_execution_context_destruct(&execution_context)
+
+    idl_wait_for_all(
+        realm,
+        ak.vector_span(&promises),
+        ak.Function1[const ak.Vector[JsValue]*, unit](call = css_font_face_set_load_all_loaded, context = captures),
+        ak.Function1[JsValue, unit](call = css_font_face_set_load_failed, context = captures),
+    )
+
+## load()'s steps 3 and 4, run after load() returns.
+func css_font_face_set_load_deferred(context: void*?):
+    let captures = (CssFontFaceSetLoad*)(context else trap("no captures"))
+    let realm = captures.realm
+    # 3. Find the matching font faces from font face set using the font and text arguments passed to the function,
+    #    and let font face list be the return value (ignoring the found faces flag). If a syntax error was returned,
+    #    reject promise with a SyntaxError exception and terminate these steps.
+    let matched_font_faces = css_find_matching_font_faces(realm, captures.font_face_set, captures.font, captures.text) catch:
+        var execution_context: HtmlTemporaryExecutionContext = ---
+        html_temporary_execution_context_construct_realm(&execution_context, realm, HtmlTemporaryExecutionContextCallbacksEnabled.yes)
+        defer html_temporary_execution_context_destruct(&execution_context)
+        let completion = bind_exception_to_throw_completion(realm_vm(realm), idl_take_pending_exception())
+        idl_reject_promise(realm, captures.promise, js_completion_value(&completion))
+        return
+
+    captures.matched_font_faces = matched_font_faces
+
+    # 4. Queue a task to run the following steps synchronously:
+    discard(html_queue_a_task(HtmlTaskSource.font_loading, none, none, gc.create_function0(realm_heap(realm), ak.Function0[unit](call = css_font_face_set_load_matched_faces, context = captures))))
+
+## Ported from Libraries/LibWeb/CSS/FontFaceSet.cpp:281 Web::CSS::FontFaceSet::load.
+# https://drafts.csswg.org/css-font-loading/#dom-fontfaceset-load
+pub func css_font_face_set_load(this: CssFontFaceSet*, font: ak.String, text: ak.String) -> JsPromiseCapability*!:
+    let realm = bind_platform_object_realm(this.bind_platform_object())
+
+    # 1. Let font face set be the FontFaceSet object this method was called on. Let promise be a newly-created promise object.
+    let font_face_set = this
+    let promise = idl_create_promise(realm)
+
+    let captures = new CssFontFaceSetLoad(realm = realm, font_face_set = font_face_set, promise = promise, font = font, text = text, matched_font_faces = none) else trap("out of memory")
+    platform_event_loop_plugin_deferred_invoke(platform_event_loop_plugin_the(), gc.create_function0(realm_heap(realm), ak.Function0[unit](call = css_font_face_set_load_deferred, context = captures)))
+
+    # 2. Return promise. Complete the rest of these steps asynchronously.
+    return promise
+
+## Ported from Libraries/LibWeb/CSS/FontFaceSet.cpp:337 Web::CSS::FontFaceSet::check.
+# https://drafts.csswg.org/css-font-loading/#dom-fontfaceset-check
+pub func css_font_face_set_check(this: CssFontFaceSet*, font: ak.String, text: ak.String) -> bool!:
+    # 1. Let font face set be the FontFaceSet object this method was called on.
+    let font_face_set = this
+
+    let realm = bind_platform_object_realm(this.bind_platform_object())
+
+    # 2. Find the matching font faces from font face set using the font and text arguments passed to the function, and
+    #    including system fonts, and let font face list be the returned list of font faces, and found faces be the
+    #    returned found faces flag. If a syntax error was returned, throw a SyntaxError exception and terminate these
+    #    steps.
+    let result = try css_find_matching_font_faces(realm, font_face_set, font, text)
+
+    # 3. If font face list is empty, or all fonts in the font face list either have a status attribute of "loaded" or
+    #    are system fonts, return true. Otherwise, return false.
+    if js_set_set_size(result) == 0:
+        return true
+
+    let entries = js_set_values(result)
+    for font_face_value in ak.vector_span_const(&entries):
+        let font_face = css_font_face_from_value(font_face_value)
+        # FIXME: We should check if the font face is a system font here.
+        if css_font_face_status(font_face) != BindFontFaceLoadStatus.loaded:
+            return false
+
+    return true
+
+## Ported from Libraries/LibWeb/CSS/FontFaceSet.cpp:366 Web::CSS::FontFaceSet::ready.
+# https://drafts.csswg.org/css-font-loading/#font-face-set-ready
+pub func css_font_face_set_ready(this: CssFontFaceSet*) -> JsPromiseCapability*:
+    return this.m_ready_promise
+
+# mark: Font load events and the loading status =================================================
+
+## Ported from Libraries/LibWeb/CSS/FontFaceSet.cpp:372 Web::CSS::FontFaceSet::fire_a_font_load_event.
+# https://drafts.csswg.org/css-font-loading/#fire-a-font-load-event
+pub func css_font_face_set_fire_a_font_load_event(this: CssFontFaceSet*, name: ak.FlyString, font_faces: ak.Vector[CssFontFace*]):
+    # To fire a font load event named e at a FontFaceSet target with optional font faces means to fire a simple
+    # event named e using the FontFaceSetLoadEvent interface that also meets these conditions:
+    # 1. The fontfaces attribute is initialized to the result of filtering font faces to only contain FontFace
+    #    objects contained in target.
+    var load_event_init = CssFontFaceSetLoadEventInit(event_init = DomEventInit(), fontfaces = ak.Vector[CssFontFace*]())
+    for font_face in ak.vector_span_const(&font_faces):
+        if js_set_set_has(css_font_face_set_set_entries(this), css_font_face_value(font_face)):
+            ak.vector_append_t(&load_event_init.fontfaces, font_face)
+    discard(dom_event_target_dispatch_event(this.dom_event_target(), css_font_face_set_load_event_create(bind_platform_object_realm(this.bind_platform_object()), name, load_event_init)))
+
+## Ported from Libraries/LibWeb/CSS/FontFaceSet.cpp:387 Web::CSS::FontFaceSet::set_is_pending_on_the_environment.
+# https://drafts.csswg.org/css-font-loading/#ref-for-fontfaceset-pending-on-the-environment%E2%91%A1
+pub func css_font_face_set_set_is_pending_on_the_environment(this: CssFontFaceSet*, is_pending_on_the_environment: bool):
+    if is_pending_on_the_environment == this.m_is_pending_on_the_environment:
+        return
+    this.m_is_pending_on_the_environment = is_pending_on_the_environment
+
+    # Whenever a FontFaceSet goes from pending on the environment to not pending on the environment, the user agent
+    # must run the following steps:
+    if not is_pending_on_the_environment:
+        # 1. If the FontFaceSet is stuck on the environment and its [[LoadingFonts]] list is empty, switch the
+        #    FontFaceSet to loaded.
+        # FIXME: We also need to mark empty FontFaceSets as loaded, so that the [[ReadyPromise]] gets resolved.
+        #        Spec issue: https://github.com/w3c/csswg-drafts/issues/13538#issuecomment-3933951987
+        if js_set_set_size(this.m_set_entries) == 0 or (this.m_is_stuck_on_the_environment and ak.vector_is_empty(&this.m_loading_fonts)):
+            css_font_face_set_switch_to_loaded(this)
+        # AD-HOC: Also switch when nothing has ever entered the LoadingFonts list — an empty set, or a set whose
+        #         entries all have deferred unicode-ranges that no rendered codepoint matched. Without this the
+        #         ready promise stays pending forever.
+        elif ak.vector_is_empty(&this.m_loading_fonts):
+            css_font_face_set_switch_to_loaded(this)
+
+        # 2. If the FontFaceSet is stuck on the environment, unmark it as such.
+        this.m_is_stuck_on_the_environment = false
+
+## switch_to_loading's task: fire a font load event named loading.
+func css_font_face_set_fire_loading(context: void*?):
+    let this = (CssFontFaceSet*)(context else trap("no set"))
+    css_font_face_set_fire_a_font_load_event(this, ak.fly_string_from_str("loading"), ak.Vector[CssFontFace*]())
+
+## Ported from Libraries/LibWeb/CSS/FontFaceSet.cpp:414 Web::CSS::FontFaceSet::switch_to_loading.
+# https://drafts.csswg.org/css-font-loading/#switch-the-fontfaceset-to-loading
+pub func css_font_face_set_switch_to_loading(this: CssFontFaceSet*):
+    let realm = bind_platform_object_realm(this.bind_platform_object())
+    # 1. Let font face set be the given FontFaceSet.
+    # 2. Set the status attribute of font face set to "loading".
+    this.m_status = BindFontFaceSetLoadStatus.loading
+
+    # 3. If font face set’s [[ReadyPromise]] slot currently holds a fulfilled promise, replace it with a fresh pending
+    #    promise.
+    if idl_is_promise_fulfilled(this.m_ready_promise):
+        this.m_ready_promise = idl_create_promise(realm)
+
+    # 4. Queue a task to fire a font load event named loading at font face set.
+    discard(html_queue_a_task(HtmlTaskSource.font_loading, none, none, gc.create_function0(realm_heap(realm), ak.Function0[unit](call = css_font_face_set_fire_loading, context = this))))
+
+## switch_to_loaded's step 5: the task that fires loadingdone and loadingerror.
+func css_font_face_set_fire_loaded(context: void*?):
+    let this = (CssFontFaceSet*)(context else trap("no set"))
+    # 1. Let loaded fonts be the (possibly empty) contents of font face set’s [[LoadedFonts]] slot.
+    # 2. Let failed fonts be the (possibly empty) contents of font face set’s [[FailedFonts]] slot.
+    # 3. Reset the [[LoadedFonts]] and [[FailedFonts]] slots to empty lists.
+    let loaded_fonts = this.m_loaded_fonts
+    let failed_fonts = this.m_failed_fonts
+    this.m_loaded_fonts = ak.Vector[CssFontFace*]()
+    this.m_failed_fonts = ak.Vector[CssFontFace*]()
+
+    # 4. Fire a font load event named loadingdone at font face set with loaded fonts.
+    css_font_face_set_fire_a_font_load_event(this, ak.fly_string_from_str("loadingdone"), loaded_fonts)
+
+    # 5. If font face set’s failed fonts is non-empty, fire a font load event named loadingerror at font face set
+    #    with failed fonts.
+    if not ak.vector_is_empty(&failed_fonts):
+        css_font_face_set_fire_a_font_load_event(this, ak.fly_string_from_str("loadingerror"), failed_fonts)
+
+## Ported from Libraries/LibWeb/CSS/FontFaceSet.cpp:432 Web::CSS::FontFaceSet::switch_to_loaded.
+# https://drafts.csswg.org/css-font-loading/#switch-the-fontfaceset-to-loaded
+pub func css_font_face_set_switch_to_loaded(this: CssFontFaceSet*):
+    let realm = bind_platform_object_realm(this.bind_platform_object())
+    # 1. Let font face set be the given FontFaceSet.
+    # 2. If font face set is pending on the environment, mark it as stuck on the environment, and exit this algorithm.
+    if this.m_is_pending_on_the_environment:
+        this.m_is_stuck_on_the_environment = true
+        return
+
+    # 3. Set font face set’s status attribute to "loaded".
+    this.m_status = BindFontFaceSetLoadStatus.loaded
+
+    # 4. Fulfill font face set’s [[ReadyPromise]] attribute’s value with font face set.
+    idl_resolve_promise(realm, this.m_ready_promise, bind_platform_object_wrapper(this.bind_platform_object()))
+
+    # 5. Queue a task to perform the following steps synchronously:
+    discard(html_queue_a_task(HtmlTaskSource.font_loading, none, none, gc.create_function0(realm_heap(realm), ak.Function0[unit](call = css_font_face_set_fire_loaded, context = this))))

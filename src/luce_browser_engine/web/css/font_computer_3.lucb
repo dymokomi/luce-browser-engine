@@ -1,0 +1,385 @@
+#==============================================================================================
+#
+#   font_computer_3 - CSS::FontComputer: the font cascade list of a font-family list, the
+#                     initial font, cache invalidation and the font faces of style sheets
+#
+#   DESCRIPTION:
+#       Port of LibWeb/CSS/FontComputer.cpp (lines 475-840): compute_font_for_style_values and
+#       its cache, compute_font_for_style_values_impl (the families, the generic families, the
+#       default, symbol and last-resort fonts), the initial font, clearing the computed font
+#       cache (its entries and the elements that use a family), and registering, loading and
+#       unloading the @font-face rules of a style sheet.
+#
+#       Copyright (c) 2018-2025, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2021, the SerenityOS developers.
+#       Copyright (c) 2021-2025, Sam Atkins <sam@ladybird.org>
+#       Copyright (c) 2024, Matthew Olsson <mattco@serenityos.org>
+#       Copyright (c) 2025, Callum Law <callumlaw1709@outlook.com>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Computing a font list ===================================================================
+
+## The captures of the initialization callback compute_font_for_style_values gives HashMap::ensure.
+struct CssFontComputerComputeFontForStyleValues:
+    var this: CssFontComputer*
+    var font_family: CssStyleValue*
+    var font_size: gfx.CssPixels
+    var font_slope: i32
+    var font_weight: f64
+    var font_width: CssPercentage
+    var font_optical_sizing: css_data.FontOpticalSizing
+    var font_variation_settings: const ak.HashMap[ak.FlyString, f64, ak.FlyStringTraits]*
+    var font_feature_data: const CssFontFeatureData*
+
+    static func call(context: void*?) -> const web_fonts.FontCascadeList*:
+        let captures = (CssFontComputerComputeFontForStyleValues*)(context else trap("no captures"))
+        return css_font_computer_compute_font_for_style_values_impl(captures.this, captures.font_family, captures.font_size, captures.font_slope, captures.font_weight, captures.font_width, captures.font_optical_sizing, *captures.font_variation_settings, *captures.font_feature_data)
+
+## Ported from Libraries/LibWeb/CSS/FontComputer.cpp:475 Web::CSS::FontComputer::compute_font_for_style_values.
+pub func css_font_computer_compute_font_for_style_values(this: CssFontComputer*, font_family: CssStyleValue*, font_size: gfx.CssPixels, font_slope: i32, font_weight: f64, font_width: CssPercentage, font_optical_sizing: css_data.FontOpticalSizing, font_variation_settings: ak.HashMap[ak.FlyString, f64, ak.FlyStringTraits], font_feature_data: CssFontFeatureData) -> const web_fonts.FontCascadeList*:
+    let cache_key = CssComputedFontCacheKey(
+        font_family = font_family,
+        font_optical_sizing = font_optical_sizing,
+        font_size = font_size,
+        font_slope = font_slope,
+        font_weight = font_weight,
+        font_width = font_width,
+        font_variation_settings = font_variation_settings,
+        font_feature_data = font_feature_data,
+    )
+
+    var captures = CssFontComputerComputeFontForStyleValues(this = this, font_family = font_family, font_size = font_size, font_slope = font_slope, font_weight = font_weight, font_width = font_width, font_optical_sizing = font_optical_sizing, font_variation_settings = &font_variation_settings, font_feature_data = &font_feature_data)
+    return *ak.hash_map_ensure_t_callback(&this.m_computed_font_cache, cache_key, ak.Function0[const web_fonts.FontCascadeList*](call = CssFontComputerComputeFontForStyleValues.call, context = &captures))
+
+## The captures of compute_font_for_style_values_impl's find_font and find_generic_font lambdas.
+struct CssFontComputerComputeFontForStyleValuesImplFindFont:
+    var this: CssFontComputer*
+    var weight: i32
+    var slope: i32
+    var font_width: CssPercentage
+    var font_size_in_pt: f32
+    var variation: const web_fonts.FontVariationSettings*
+    var font_feature_data: const CssFontFeatureData*
+
+## compute_font_for_style_values_impl's find_font lambda.
+func css_font_computer_find_font(captures: const CssFontComputerComputeFontForStyleValuesImplFindFont*, family: ak.FlyString) -> const web_fonts.FontCascadeList*?:
+    let this = captures.this
+    let font_feature_values = css_font_computer_font_feature_values_for_family(this, family)
+
+    # OPTIMIZATION: Look for an exact match in loaded fonts first.
+    # FIXME: Respect the other font-* descriptors
+    let lookup_key = css_font_face_key_new(family, CssFontWeightRange(min = captures.weight, max = captures.weight), captures.slope, (i32)css_percentage_value(&captures.font_width))
+    if let faces = ak.hash_map_get_k_const(&this.m_font_faces, lookup_key):
+        let shape_features = css_font_feature_data_to_shape_features(captures.font_feature_data, font_feature_values)
+        let result = web_fonts.font_cascade_list_create()
+        for font_face in ak.vector_span_const(faces):
+            if let face_fonts = css_font_face_font_with_point_size(font_face, captures.font_size_in_pt, *captures.variation, shape_features):
+                web_fonts.font_cascade_list_extend(result, face_fonts)
+        if not web_fonts.font_cascade_list_is_empty(result):
+            return result
+
+    if let found_font = css_font_computer_font_matching_algorithm(this, family, captures.weight, captures.font_width, captures.slope, captures.font_size_in_pt, captures.variation, captures.font_feature_data, font_feature_values):
+        if not web_fonts.font_cascade_list_is_empty(found_font):
+            return found_font
+
+    return none
+
+## compute_font_for_style_values_impl's find_generic_font lambda.
+func css_font_computer_find_generic_font(captures: const CssFontComputerComputeFontForStyleValuesImplFindFont*, font_id: css_data.Keyword) -> const web_fonts.FontCascadeList*?:
+    var generic_font: PlatformGenericFont
+    match font_id:
+        .monospace, .ui_monospace:
+            generic_font = PlatformGenericFont.monospace
+        .serif:
+            generic_font = PlatformGenericFont.serif
+        .fantasy:
+            generic_font = PlatformGenericFont.fantasy
+        .sans_serif:
+            generic_font = PlatformGenericFont.sans_serif
+        .cursive:
+            generic_font = PlatformGenericFont.cursive
+        .ui_serif:
+            generic_font = PlatformGenericFont.ui_serif
+        .ui_sans_serif:
+            generic_font = PlatformGenericFont.ui_sans_serif
+        .ui_rounded:
+            generic_font = PlatformGenericFont.ui_rounded
+        _:
+            return none
+    return css_font_computer_find_font(captures, platform_font_plugin_generic_font_name(platform_font_plugin_the(), generic_font, captures.weight, captures.slope))
+
+## The system font fallback compute_font_for_style_values_impl gives the font list outside layout
+## test mode.
+func css_font_computer_system_font_fallback(context: void*?, code_point: u32, reference_font: const web_fonts.Font*) -> const web_fonts.Font*?:
+    return web_fonts.font_database_get_font_for_code_point(web_fonts.font_database_the(), code_point, web_fonts.font_point_size(reference_font), web_fonts.font_weight(reference_font), web_fonts.typeface_width(web_fonts.font_typeface(reference_font)), web_fonts.font_slope(reference_font))
+
+## Ported from Libraries/LibWeb/CSS/FontComputer.cpp:493 Web::CSS::FontComputer::compute_font_for_style_values_impl.
+func css_font_computer_compute_font_for_style_values_impl(this: CssFontComputer*, font_family: CssStyleValue*, font_size: gfx.CssPixels, slope: i32, font_weight: f64, font_width: CssPercentage, font_optical_sizing: css_data.FontOpticalSizing, font_variation_settings: ak.HashMap[ak.FlyString, f64, ak.FlyStringTraits], font_feature_data: CssFontFeatureData) -> const web_fonts.FontCascadeList*:
+    # FIXME: We round to int here as that is what is expected by our font infrastructure below
+    let weight = ak.rounding_round_to_f64_i32(font_weight)
+
+    # FIXME: We need to respect `font-size-adjust` once that is implemented.
+    let font_size_used_value = gfx.css_pixels_to_float_const(&font_size)
+
+    var variation: web_fonts.FontVariationSettings
+    web_fonts.font_variation_settings_set_weight(&variation, (f32)font_weight)
+    web_fonts.font_variation_settings_set_width(&variation, (f32)css_percentage_value(&font_width))
+
+    # NB: The spec recommends that we use the 'used value' of font-size for 'opsz' when font-optical-sizing is 'auto'.
+    # FIXME: User agents must not select a value for the "opsz" axis which is not supported by the font used for
+    #        rendering the text. This can be accomplished by clamping a chosen value to the range supported by the
+    #        font. https://drafts.csswg.org/css-fonts/#font-optical-sizing-def
+    if font_optical_sizing == css_data.FontOpticalSizing.auto:
+        web_fonts.font_variation_settings_set_optical_sizing(&variation, font_size_used_value)
+
+    for entry in ak.hash_map_begin_const(&font_variation_settings):
+        let string_view = ak.fly_string_bytes(&entry.key)
+        if string_view.length != 4:
+            continue
+
+        let tag = gfx.FourCc(cc = [string_view[0], string_view[1], string_view[2], string_view[3]])
+
+        discard(ak.hash_map_set(&variation.axes, tag, (f32)entry.value))
+
+    # FIXME: Implement the full font-matching algorithm: https://www.w3.org/TR/css-fonts-4/#font-matching-algorithm
+    let font_size_in_pt: f32 = font_size_used_value * 0.75
+
+    let captures = CssFontComputerComputeFontForStyleValuesImplFindFont(this = this, weight = weight, slope = slope, font_width = font_width, font_size_in_pt = font_size_in_pt, variation = &variation, font_feature_data = &font_feature_data)
+
+    let font_list = web_fonts.font_cascade_list_create()
+
+    let families = css_style_value_list_values(css_style_value_as_value_list(font_family))
+    for family in ak.vector_span_const(&families):
+        var other_font_list: const web_fonts.FontCascadeList*?
+        if css_style_value_is_keyword(family):
+            other_font_list = css_font_computer_find_generic_font(&captures, css_style_value_to_keyword(family))
+        else:
+            other_font_list = css_font_computer_find_font(&captures, css_string_from_style_value(family))
+
+        if let other = other_font_list:
+            web_fonts.font_cascade_list_extend(font_list, other)
+
+    # NB: @font-feature-values can't apply to the default font since it's not loaded from CSS
+    var no_font_feature_values: ak.HashMap[CssFontFeatureValueKey, ak.Vector[u32], CssFontFeatureValueKeyTraits]
+    let default_font = platform_font_plugin_default_font(platform_font_plugin_the(), font_size_in_pt, variation, css_font_feature_data_to_shape_features(&font_feature_data, &no_font_feature_values)) else trap("VERIFY: RefPtr::operator*() on a null default font")
+    if web_fonts.font_cascade_list_is_empty(font_list):
+        # This is needed to make sure we check default font before reaching to emojis.
+        web_fonts.font_cascade_list_add(font_list, default_font)
+
+    # Add emoji and symbol fonts
+    let symbol_font_names = platform_font_plugin_symbol_font_names(platform_font_plugin_the())
+    for font_name in ak.vector_span_const(&symbol_font_names):
+        if let other_font_list = css_font_computer_find_font(&captures, font_name):
+            web_fonts.font_cascade_list_extend(font_list, other_font_list)
+
+    # The default font is already included in the font list, but we explicitly set it
+    # as the last-resort font. This ensures that if none of the specified fonts contain
+    # the requested code point, there is still a font available to provide a fallback glyph.
+    web_fonts.font_cascade_list_set_last_resort_font(font_list, default_font)
+
+    if not platform_font_plugin_is_layout_test_mode(platform_font_plugin_the()):
+        web_fonts.font_cascade_list_set_system_font_fallback_callback(font_list, ak.Function2[u32, const web_fonts.Font*, const web_fonts.Font*?](call = css_font_computer_system_font_fallback, context = none))
+
+    return font_list
+
+## FontComputer::initial_font's `static auto font`: the font of the first call.
+var css_font_computer_initial_font_font: const web_fonts.Font*?
+
+## Ported from Libraries/LibWeb/CSS/FontComputer.cpp:634 Web::CSS::FontComputer::initial_font.
+pub func css_font_computer_initial_font(this: CssFontComputer*) -> const web_fonts.Font*:
+    # FIXME: This is not correct.
+    if css_font_computer_initial_font_font == none:
+        css_font_computer_initial_font_font = css_computed_properties_font_fallback(false, false, 12.0)
+    return css_font_computer_initial_font_font else trap("VERIFY: the initial font")
+
+# mark: Cache invalidation and font faces =======================================================
+
+## Ported from Libraries/LibWeb/CSS/FontComputer.cpp:641 Web::CSS::style_value_references_font_family.
+func css_style_value_references_font_family(font_family_value: CssStyleValue*, family_name: ak.FlyString) -> bool:
+    if not css_style_value_is_value_list(font_family_value):
+        return false
+
+    let items = css_style_value_list_values(css_style_value_as_value_list(font_family_value))
+    for item in ak.vector_span_const(&items):
+        if css_style_value_is_keyword(item):
+            continue  # Skip generic keywords (monospace, serif, etc.)
+
+        let item_family_name = css_string_from_style_value(item)
+
+        if ak.fly_string_equals_ignoring_ascii_case_fly_string(&item_family_name, &family_name):
+            return true
+    return false
+
+## clear_computed_font_cache's lambdas over the family name: the cache predicate and the DOM walk.
+struct CssFontComputerClearComputedFontCache:
+    var family_name: ak.FlyString
+
+    ## The predicate of `m_computed_font_cache.remove_all_matching`.
+    static func references_family(context: void*?, key: const CssComputedFontCacheKey*, value: const (const web_fonts.FontCascadeList*)*) -> bool:
+        let captures = (CssFontComputerClearComputedFontCache*)(context else trap("no captures"))
+        return css_style_value_references_font_family(key.font_family, captures.family_name)
+
+    ## The callback of `document().for_each_shadow_including_inclusive_descendant`.
+    static func visit_node(context: void*?, node: DomNode*) -> TraversalDecision:
+        let captures = (CssFontComputerClearComputedFontCache*)(context else trap("no captures"))
+        let element = as_if_dom_element(node) else return TraversalDecision.continue_
+
+        # If this element's subtree is already marked for style update, skip the entire subtree.
+        if dom_node_entire_subtree_needs_style_update(element.dom_node()):
+            return TraversalDecision.skip_children_and_continue
+
+        # If this element already needs a style update, check descendants but don't re-check this element.
+        if dom_node_needs_style_update(element.dom_node()):
+            return TraversalDecision.continue_
+
+        if css_font_computer_element_uses_font_family(element, captures.family_name):
+            dom_node_set_needs_style_update(element.dom_node(), true)
+            return TraversalDecision.continue_
+
+        return TraversalDecision.continue_
+
+## clear_computed_font_cache's element_uses_font_family lambda.
+func css_font_computer_element_uses_font_family(element: DomElement*, family_name: ak.FlyString) -> bool:
+    # Check the element's own font-family.
+    if let style = dom_element_computed_properties(element):
+        if css_style_value_references_font_family(css_computed_properties_property(style, css_data.PropertyId.font_family), family_name):
+            return true
+
+    # Check pseudo-elements, which may use a different font-family than the element itself.
+    for i in 0..<(usize)css_data.PseudoElement.known_pseudo_element_count:
+        if let style = dom_element_computed_properties(element, (css_data.PseudoElement)(u8)i):
+            if css_style_value_references_font_family(css_computed_properties_property(style, css_data.PropertyId.font_family), family_name):
+                return true
+
+    return false
+
+## Ported from Libraries/LibWeb/CSS/FontComputer.cpp:658 Web::CSS::FontComputer::clear_computed_font_cache.
+pub func css_font_computer_clear_computed_font_cache(this: CssFontComputer*, family_name: ak.FlyString):
+    # Only clear cache entries that reference the loaded font family.
+    var captures = CssFontComputerClearComputedFontCache(family_name = family_name)
+    discard(ak.hash_map_remove_all_matching(&this.m_computed_font_cache, ak.Function2[const CssComputedFontCacheKey*, const (const web_fonts.FontCascadeList*)*, bool](call = CssFontComputerClearComputedFontCache.references_family, context = &captures)))
+
+    if dom_document_needs_full_style_update(this.m_document):
+        return
+
+    # Walk the DOM tree (including shadow trees) and invalidate elements that use this font family.
+    discard(dom_node_for_each_shadow_including_inclusive_descendant(this.m_document.dom_node(), ak.Function1[DomNode*, TraversalDecision](call = CssFontComputerClearComputedFontCache.visit_node, context = &captures)))
+
+## Ported from Libraries/LibWeb/CSS/FontComputer.cpp:709 Web::CSS::FontComputer::clear_font_feature_values_cache.
+pub func css_font_computer_clear_font_feature_values_cache(this: CssFontComputer*, family_name: ak.FlyString):
+    discard(ak.hash_map_remove_k(&this.m_font_feature_values_cache, family_name))
+
+## Ported from Libraries/LibWeb/CSS/FontComputer.cpp:714 Web::CSS::FontComputer::did_load_font.
+pub func css_font_computer_did_load_font(this: CssFontComputer*, family_name: ak.FlyString):
+    css_font_computer_clear_computed_font_cache(this, family_name)
+
+## The FontFaceKey of a registered face (register_font_face and unregister_font_face).
+func css_font_computer_font_face_key(face: CssFontFace*) -> CssFontFaceKey:
+    return css_font_face_key_new(ak.fly_string_from_string(css_font_face_family(face)), css_font_face_declared_weight_range(face), css_font_face_declared_slope(face), css_font_face_declared_width(face))
+
+## Ported from Libraries/LibWeb/CSS/FontComputer.cpp:719 Web::CSS::FontComputer::register_font_face.
+pub func css_font_computer_register_font_face(this: CssFontComputer*, face: CssFontFace*):
+    assert(css_font_face_should_be_registered_with_font_computer(face))
+
+    let key = css_font_computer_font_face_key(face)
+    let faces = ak.hash_map_ensure(&this.m_font_faces, key)
+    if not ak.vector_contains_slow[CssFontFace*, ak.PtrTraits[CssFontFace]](faces, face):
+        ak.vector_append_t(faces, face)
+    css_font_computer_did_load_font(this, key.family_name)
+
+## The predicate of unregister_font_face's `remove_all_matching`: `entry == face`.
+func css_font_computer_is_face(context: void*?, entry: const (CssFontFace*)*) -> bool:
+    return *entry == (CssFontFace*)(context else trap("no face"))
+
+## Ported from Libraries/LibWeb/CSS/FontComputer.cpp:735 Web::CSS::FontComputer::unregister_font_face.
+pub func css_font_computer_unregister_font_face(this: CssFontComputer*, face: CssFontFace*):
+    assert(css_font_face_should_be_registered_with_font_computer(face))
+
+    let key = css_font_computer_font_face_key(face)
+    if let faces = ak.hash_map_get_k(&this.m_font_faces, key):
+        discard(ak.vector_remove_all_matching(faces, ak.Function1[const (CssFontFace*)*, bool](call = css_font_computer_is_face, context = face)))
+        if ak.vector_is_empty(faces):
+            discard(ak.hash_map_remove_k(&this.m_font_faces, key))
+    css_font_computer_did_load_font(this, key.family_name)
+
+## Ported from Libraries/LibWeb/CSS/FontComputer.cpp:753 Web::CSS::FontComputer::load_font_face.
+pub func css_font_computer_load_font_face(this: CssFontComputer*, font_face: const CssParsedFontFace*, on_load: gc.Function1[web_fonts.Typeface*?, unit]*?) -> CssFontLoader*?:
+    if ak.vector_is_empty(&font_face.m_sources):
+        if let callback = on_load:
+            ak.function1_call(&callback.function, none)
+        return none
+
+    # FIXME: Handle local() font sources.
+    var urls: ak.Vector[CssUrl]
+    for source in ak.vector_span_const(&font_face.m_sources):
+        match source.local_or_url:
+            .css_url(url):
+                ak.vector_append_t(&urls, url)
+            .fly_string(_):
+                discard(0)
+
+    if ak.vector_is_empty(&urls):
+        if let callback = on_load:
+            ak.function1_call(&callback.function, none)
+        return none
+
+    let rule_or_declaration = CssRuleOrDeclaration(
+        environment_settings_object = dom_document_relevant_settings_object(this.m_document),
+        value = .css_rule_or_declaration_rule(CssRuleOrDeclarationRule(parent_style_sheet = css_rule_parent_style_sheet(css_parsed_font_face_parent_rule(font_face)))),
+    )
+
+    let key = css_url_to_string(ak.vector_first_const(&urls))
+    if let existing = ak.hash_map_get_k(&this.m_loaders_by_url, key):
+        if let callback = on_load:
+            css_font_loader_subscribe(*existing, callback)
+        return *existing
+
+    let loader = heap_allocate_css_font_loader(gc.cell_heap(this.cell()), this, rule_or_declaration, css_parsed_font_face_font_family(font_face), css_parsed_font_face_unicode_ranges(font_face), urls, on_load)
+    discard(ak.hash_map_set(&this.m_loaders_by_url, key, loader))
+    return loader
+
+## Ported from Libraries/LibWeb/CSS/FontComputer.cpp:793 Web::CSS::FontComputer::load_fonts_from_sheet.
+pub func css_font_computer_load_fonts_from_sheet(this: CssFontComputer*, sheet: CssCssStyleSheet*):
+    # FIXME: Handle @font-face and @font-feature-values within grouping rules (@media, @supports, etc)
+    let rules = css_css_style_sheet_rules(sheet)
+    for i in 0..<css_rule_list_length(rules):
+        let rule = css_rule_list_item(rules, i) else trap("null rule")
+        if let font_face_rule = as_if_css_font_face_rule(rule):
+            if not css_font_face_rule_is_valid(font_face_rule):
+                continue
+
+            let font_face = css_font_face_create_css_connected(dom_document_realm(this.m_document), font_face_rule)
+            css_font_face_set_add_css_connected_font(dom_document_fonts(this.m_document), font_face)
+
+            if css_font_face_has_non_default_unicode_range(font_face):
+                # Register for matching, but defer loading until a rendered codepoint
+                # actually falls in this face's unicode-range.
+                css_font_computer_register_font_face(this, font_face)
+            else:
+                # NB: Load via FontFace::load(), to satisfy this requirement:
+                # https://drafts.csswg.org/css-font-loading/#font-face-load
+                # User agents can initiate font loads on their own, whenever they determine that a given font face is
+                # necessary to render something on the page. When this happens, they must act as if they had called the
+                # corresponding FontFace’s load() method described here.
+                discard(css_font_face_load(font_face))
+
+        if let font_feature_values_rule = as_if_css_font_feature_values_rule(rule):
+            css_rule_clear_caches(font_feature_values_rule.css_rule())
+
+## Ported from Libraries/LibWeb/CSS/FontComputer.cpp:823 Web::CSS::FontComputer::unload_fonts_from_sheet.
+pub func css_font_computer_unload_fonts_from_sheet(this: CssFontComputer*, sheet: CssCssStyleSheet*):
+    # FIXME: Handle @font-face and @font-feature-values within grouping rules (@media, @supports, etc)
+    # https://drafts.csswg.org/css-font-loading/#font-face-css-connection
+    # If a @font-face rule is removed from the document, its connected FontFace object is no longer CSS-connected.
+    let rules = css_css_style_sheet_rules(sheet)
+    for i in 0..<css_rule_list_length(rules):
+        let rule = css_rule_list_item(rules, i) else trap("null rule")
+        if let font_face_rule = as_if_css_font_face_rule(rule):
+            if let font_face = css_font_face_rule_css_connected_font_face(font_face_rule):
+                css_font_computer_unregister_font_face(this, font_face)
+            css_font_face_rule_disconnect_font_face(font_face_rule)
+
+        if let font_feature_values_rule = as_if_css_font_feature_values_rule(rule):
+            css_rule_clear_caches(font_feature_values_rule.css_rule())

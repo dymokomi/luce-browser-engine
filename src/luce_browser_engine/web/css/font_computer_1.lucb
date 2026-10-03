@@ -1,0 +1,311 @@
+#==============================================================================================
+#
+#   font_computer_1 - CSS::FontComputer's keys and CSS::FontLoader: loading an @font-face
+#                     rule's URL sources one after the other
+#
+#   DESCRIPTION:
+#       Port of LibWeb/CSS/FontComputer.cpp (lines 1-297) and the inline members of
+#       FontComputer.h (lines 24-98): FontWeightRange, FontFaceKey and ComputedFontCacheKey
+#       with their AK::Traits (the hashes generated/types_traits calls), FontLoader (fetching
+#       a font, the WOFF2 preparation and its subscribers), font_width_bucket_from_percentage
+#       and MatchingFontCandidate. Fetching is phase 2: fetch_a_style_resource reaches the
+#       Fetch stubs.
+#
+#       Copyright (c) 2018-2025, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2021, the SerenityOS developers.
+#       Copyright (c) 2021-2025, Sam Atkins <sam@ladybird.org>
+#       Copyright (c) 2024, Matthew Olsson <mattco@serenityos.org>
+#       Copyright (c) 2025, Callum Law <callumlaw1709@outlook.com>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: FontWeightRange, FontFaceKey and ComputedFontCacheKey ===================================
+
+## Ported from Libraries/LibWeb/CSS/FontComputer.h:29 Web::CSS::FontWeightRange::hash.
+pub func css_font_weight_range_hash(this: const CssFontWeightRange*) -> u32:
+    return ak.pair_int_hash((u32)this.min, (u32)this.max)
+
+## Ported from Libraries/LibWeb/CSS/FontComputer.h:31 Web::CSS::FontWeightRange::contains_inclusive.
+pub func css_font_weight_range_contains_inclusive(this: const CssFontWeightRange*, weight: i32) -> bool:
+    return this.min <= weight and weight <= this.max
+
+## FontFaceKey's designated initializer `{ .family_name = ..., .weight = ..., .slope = ..., .width = ... }`.
+pub func css_font_face_key_new(family_name: ak.FlyString, weight: CssFontWeightRange, slope: i32, width: i32) -> CssFontFaceKey:
+    return CssFontFaceKey(family_name = family_name, weight = weight, slope = slope, width = width)
+
+## Ported from Libraries/LibWeb/CSS/FontComputer.h:39 Web::CSS::FontFaceKey::hash.
+pub func css_font_face_key_hash(this: const CssFontFaceKey*) -> u32:
+    return ak.pair_int_hash(ak.fly_string_ascii_case_insensitive_hash(&this.family_name), ak.pair_int_hash(css_font_weight_range_hash(&this.weight), ak.pair_int_hash((u32)this.slope, (u32)this.width)))
+
+## Ported from Libraries/LibWeb/CSS/FontComputer.h:40 Web::CSS::FontFaceKey::operator==.
+pub func css_font_face_key_eq(this: const CssFontFaceKey*, other: const CssFontFaceKey*) -> bool:
+    return ak.fly_string_equals_ignoring_ascii_case_fly_string(&this.family_name, &other.family_name) and this.weight == other.weight and this.slope == other.slope and this.width == other.width
+
+## Ported from Libraries/LibWeb/CSS/FontComputer.h:59 Web::CSS::ComputedFontCacheKey::operator== (defaulted):
+## the font family compares by value (ValueComparingNonnullRefPtr).
+pub func css_computed_font_cache_key_eq(this: const CssComputedFontCacheKey*, other: const CssComputedFontCacheKey*) -> bool:
+    if not (this.font_family == other.font_family or css_style_value_equals(this.font_family, other.font_family)):
+        return false
+    return this.font_optical_sizing == other.font_optical_sizing and this.font_size == other.font_size and this.font_slope == other.font_slope and this.font_weight == other.font_weight and css_percentage_eq(&this.font_width, other.font_width) and ak.hash_map_eq(&this.font_variation_settings, &other.font_variation_settings) and css_font_feature_data_eq(&this.font_feature_data, &other.font_feature_data)
+
+## Ported from Libraries/LibWeb/CSS/FontComputer.cpp:50 AK::Traits<Web::CSS::ComputedFontCacheKey>::hash.
+pub func css_computed_font_cache_key_traits_hash(key: const CssComputedFontCacheKey*) -> u32:
+    var hash_: u32 = 0
+    let family_values = css_style_value_list_values(css_style_value_as_value_list(key.font_family))
+    for family_value in ak.vector_span_const(&family_values):
+        if css_style_value_is_keyword(family_value):
+            hash_ = ak.pair_int_hash(hash_, (u32)css_keyword_style_value_keyword(css_style_value_as_keyword(family_value)))
+        else:
+            let family_name = css_string_from_style_value(family_value)
+            hash_ = ak.fly_string_hash(&family_name)
+
+    hash_ = ak.pair_int_hash(hash_, (u32)key.font_optical_sizing)
+    # Traits<CSSPixels>::hash: Traits<int>::hash(key.raw_value()).
+    hash_ = ak.pair_int_hash(hash_, ak.u32_hash((u32)gfx.css_pixels_raw_value(&key.font_size)))
+    hash_ = ak.pair_int_hash(hash_, (u32)key.font_slope)
+    hash_ = ak.pair_int_hash(hash_, ak.u64_hash(key.font_weight.bits()))
+    hash_ = ak.pair_int_hash(hash_, ak.u64_hash(css_percentage_value(&key.font_width).bits()))
+    for entry in ak.hash_map_begin_const(&key.font_variation_settings):
+        hash_ = ak.pair_int_hash(hash_, ak.pair_int_hash(ak.fly_string_hash(&entry.key), ak.u64_hash(entry.value.bits())))
+    hash_ = ak.pair_int_hash(hash_, css_font_feature_data_traits_hash(&key.font_feature_data))
+
+    return hash_
+
+# mark: FontLoader ==============================================================================
+
+## heap.allocate<FontLoader>(...): a FontLoader cell constructed under DeferGC.
+pub func heap_allocate_css_font_loader(heap: gc.Heap*, font_computer: CssFontComputer*, rule_or_declaration: CssRuleOrDeclaration, family_name: ak.FlyString, unicode_ranges: ak.Vector[web_fonts.UnicodeRange], urls: ak.Vector[CssUrl], on_load: gc.Function1[web_fonts.Typeface*?, unit]*?) -> CssFontLoader*:
+    let this = (CssFontLoader*)web_heap_allocate_cell(heap, &css_font_loader_class)
+    gc.heap_defer_gc(heap)
+    css_font_loader_construct(this, font_computer, rule_or_declaration, family_name, unicode_ranges, urls, on_load)
+    gc.heap_undefer_gc(heap)
+    return this
+
+## Ported from Libraries/LibWeb/CSS/FontComputer.cpp:77 Web::CSS::FontLoader::FontLoader.
+pub func css_font_loader_construct(this: CssFontLoader*, font_computer: CssFontComputer*, rule_or_declaration: CssRuleOrDeclaration, family_name: ak.FlyString, unicode_ranges: ak.Vector[web_fonts.UnicodeRange], urls: ak.Vector[CssUrl], on_load: gc.Function1[web_fonts.Typeface*?, unit]*?):
+    this.m_font_computer = font_computer
+    this.m_rule_or_declaration = rule_or_declaration
+    this.m_family_name = family_name
+    this.m_unicode_ranges = unicode_ranges
+    this.m_urls = urls
+    if let callback = on_load:
+        ak.vector_append_t(&this.m_subscribers, callback)
+
+## Ported from Libraries/LibWeb/CSS/FontComputer.h:71 Web::CSS::FontLoader::unicode_ranges.
+pub func css_font_loader_unicode_ranges(this: CssFontLoader*) -> ak.Vector[web_fonts.UnicodeRange]:
+    return this.m_unicode_ranges
+
+## Ported from Libraries/LibWeb/CSS/FontComputer.h:78 Web::CSS::FontLoader::family_name.
+pub func css_font_loader_family_name(this: CssFontLoader*) -> ak.FlyString:
+    return this.m_family_name
+
+## Ported from Libraries/LibWeb/CSS/FontComputer.cpp:90 Web::CSS::FontLoader::subscribe.
+pub func css_font_loader_subscribe(this: CssFontLoader*, callback: gc.Function1[web_fonts.Typeface*?, unit]*):
+    if this.m_has_completed:
+        ak.function1_call(&callback.function, this.m_typeface)
+        return
+    ak.vector_append_t(&this.m_subscribers, callback)
+
+## Ported from Libraries/LibWeb/CSS/FontComputer.cpp:99 Web::CSS::FontLoader::visit_edges (override).
+pub func css_font_loader_visit_edges_impl(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (CssFontLoader*)base
+    gc.cell_visit_edges_impl(base, visitor)
+    gc.cell_visitor_visit_t_2(visitor, this.m_font_computer)
+    match this.m_rule_or_declaration.value:
+        .css_rule_or_declaration_rule(rule):
+            gc.cell_visitor_visit_t(visitor, rule.parent_style_sheet)
+        .css_rule_or_declaration_style_declaration(block):
+            gc.cell_visitor_visit_t(visitor, block.parent_rule)
+    # visitor.visit(m_fetch_controller): FetchController is opaque until phase 2 (a cell in the donor).
+    gc.cell_visitor_visit_cell(visitor, (gc.Cell*?)this.m_fetch_controller)
+    gc.cell_visitor_visit_vector(visitor, &this.m_subscribers)
+
+## Ported from Libraries/LibWeb/CSS/FontComputer.cpp:111 Web::CSS::FontLoader::is_loading.
+pub func css_font_loader_is_loading(this: CssFontLoader*) -> bool:
+    return this.m_fetch_controller != none and this.m_typeface == none
+
+## Ported from Libraries/LibWeb/CSS/FontComputer.cpp:116 Web::CSS::FontLoader::font_with_point_size.
+pub func css_font_loader_font_with_point_size(this: CssFontLoader*, point_size: f32, variations: web_fonts.FontVariationSettings, shape_features: ak.Vector[web_fonts.ShapeFeature]) -> const web_fonts.Font*?:
+    if this.m_typeface == none:
+        if this.m_fetch_controller == none:
+            css_font_loader_start_loading_next_url(this)
+        return none
+    let typeface = this.m_typeface else trap("VERIFY: m_typeface")
+    return web_fonts.typeface_font(typeface, point_size, variations, shape_features)
+
+## The steps after a failed source: the next URL, or the end of loading.
+func css_font_loader_try_next_url_or_fail(loader: CssFontLoader*):
+    if ak.vector_is_empty(&loader.m_urls):
+        css_font_loader_font_did_load_or_fail(loader, none)
+    else:
+        loader.m_fetch_controller = none
+        css_font_loader_start_loading_next_url(loader)
+
+## The captures of the callback start_loading_next_url gives prepare_vector_font_data_off_thread:
+## the loader's GC::Root.
+struct CssFontLoaderPreparedFontData:
+    var loader: gc.Root[CssFontLoader]
+
+## The callback start_loading_next_url gives prepare_vector_font_data_off_thread.
+func css_font_loader_prepared_font_data(context: void*?, prepared_font_data: ErrorOrCssPreparedVectorFontData):
+    let captures = (CssFontLoaderPreparedFontData*)(context else trap("no captures"))
+    let loader = gc.root_cell(&captures.loader) else trap("no loader")
+    gc.root_release(&captures.loader)
+    match prepared_font_data:
+        .ak_error(_):
+            # NB: If we have other sources available, try the next one.
+            css_font_loader_try_next_url_or_fail(loader)
+            return
+        .value(prepared):
+            let maybe_typeface = css_try_load_vector_font(prepared.data, prepared.mime_type_essence) catch:
+                css_font_loader_try_next_url_or_fail(loader)
+                return
+
+            css_font_loader_font_did_load_or_fail(loader, maybe_typeface)
+
+## The captures of the processResponse steps of start_loading_next_url.
+struct CssFontLoaderProcessResponse:
+    var loader: CssFontLoader*
+
+## The processResponse steps of start_loading_next_url (fetch a font).
+func css_font_loader_process_response(context: void*?, response: FetchResponse*, stream: FetchAlgorithmsBodyBytes):
+    let loader = ((CssFontLoaderProcessResponse*)(context else trap("no captures"))).loader
+    # 1. If stream is null, return.
+    # 2. Load a font from stream according to its type.
+
+    var bytes: ak.ByteBuffer
+    match stream:
+        .byte_buffer(buffer):
+            bytes = buffer
+        _:
+            css_font_loader_try_next_url_or_fail(loader)
+            return
+
+    let mime_type_essence_ = css_font_loader_try_load_font_mime_type_essence(loader, response, bytes)
+    if not css_requires_off_thread_vector_font_preparation(bytes, mime_type_essence_):
+        let maybe_typeface = css_try_load_vector_font(bytes, mime_type_essence_) catch:
+            css_font_loader_try_next_url_or_fail(loader)
+            return
+
+        css_font_loader_font_did_load_or_fail(loader, maybe_typeface)
+        return
+
+    let captures = new CssFontLoaderPreparedFontData(loader = gc.root_create(loader)) else trap("out of memory")
+    css_prepare_vector_font_data_off_thread(bytes, ak.Function1[ErrorOrCssPreparedVectorFontData, unit](call = css_font_loader_prepared_font_data, context = captures), mime_type_essence_)
+
+## Ported from Libraries/LibWeb/CSS/FontComputer.cpp:126 Web::CSS::FontLoader::start_loading_next_url.
+pub func css_font_loader_start_loading_next_url(this: CssFontLoader*):
+    # FIXME: Load local() fonts somehow.
+    if let fetch_controller = this.m_fetch_controller:
+        if fetch_controller_state(fetch_controller) == FetchControllerState.ongoing:
+            return
+    if ak.vector_is_empty(&this.m_urls):
+        return
+
+    # https://drafts.csswg.org/css-fonts-4/#fetch-a-font
+    # To fetch a font given a selected <url> url for @font-face rule, fetch url, with ruleOrDeclaration being rule,
+    # destination "font", CORS mode "cors", and processResponse being the following steps given response res and null,
+    # failure or a byte stream stream:
+    let captures = new CssFontLoaderProcessResponse(loader = this) else trap("out of memory")
+    this.m_fetch_controller = css_fetch_a_style_resource(.css_url(ak.vector_take_first(&this.m_urls)), this.m_rule_or_declaration, FetchRequestDestination.font, CssCorsMode.cors, ak.Function2[FetchResponse*, FetchAlgorithmsBodyBytes, unit](call = css_font_loader_process_response, context = captures))
+
+    if this.m_fetch_controller == none:
+        css_font_loader_font_did_load_or_fail(this, none)
+
+## Ported from Libraries/LibWeb/CSS/FontComputer.cpp:203 Web::CSS::FontLoader::font_did_load_or_fail.
+pub func css_font_loader_font_did_load_or_fail(this: CssFontLoader*, typeface: web_fonts.Typeface*?):
+    if let loaded = typeface:
+        this.m_typeface = loaded
+        css_font_computer_clear_computed_font_cache(this.m_font_computer, this.m_family_name)
+    this.m_has_completed = true
+    for callback in ak.vector_span_const(&this.m_subscribers):
+        ak.function1_call(&callback.function, this.m_typeface)
+    ak.vector_clear(&this.m_subscribers)
+    this.m_fetch_controller = none
+
+## Ported from Libraries/LibWeb/CSS/FontComputer.cpp:216 Web::CSS::FontLoader::try_load_font_mime_type_essence.
+func css_font_loader_try_load_font_mime_type_essence(this: CssFontLoader*, response: FetchResponse*, bytes: ak.ByteBuffer) -> ak.ByteString?:
+    # FIXME: This could maybe use the format() provided in @font-face as well, since often the mime type is just application/octet-stream and we have to try every format
+    var mime_type = fetch_extract_mime_type(fetch_response_header_list(response))
+    var is_font = false
+    if let extracted = mime_type:
+        is_font = mime_type_is_font(&extracted)
+    if not is_font:
+        mime_type = mime_resource_sniff(ak.byte_buffer_bytes_const(&bytes), MimeSniffingConfiguration(sniffing_context = MimeSniffingContext.font))
+    let sniffed = mime_type else return none
+    let essence = mime_type_essence(&sniffed)
+    return ak.byte_string_from_string_view(ak.string_bytes_as_string_view(&essence))
+
+# mark: Font matching candidates ================================================================
+
+## One bucket of font_width_bucket_from_percentage.
+struct CssFontWidthBucket:
+    var percentage: f64
+    var width: u32
+
+## font_width_bucket_from_percentage's `static constexpr Array<Bucket, 9> buckets`.
+let css_font_width_buckets: CssFontWidthBucket[9] = [
+    CssFontWidthBucket(percentage = 50.0, width = (u32)web_fonts.FontWidth.ultra_condensed),
+    CssFontWidthBucket(percentage = 62.5, width = (u32)web_fonts.FontWidth.extra_condensed),
+    CssFontWidthBucket(percentage = 75.0, width = (u32)web_fonts.FontWidth.condensed),
+    CssFontWidthBucket(percentage = 87.5, width = (u32)web_fonts.FontWidth.semi_condensed),
+    CssFontWidthBucket(percentage = 100.0, width = (u32)web_fonts.FontWidth.normal),
+    CssFontWidthBucket(percentage = 112.5, width = (u32)web_fonts.FontWidth.semi_expanded),
+    CssFontWidthBucket(percentage = 125.0, width = (u32)web_fonts.FontWidth.expanded),
+    CssFontWidthBucket(percentage = 150.0, width = (u32)web_fonts.FontWidth.extra_expanded),
+    CssFontWidthBucket(percentage = 200.0, width = (u32)web_fonts.FontWidth.ultra_expanded),
+]
+
+## Ported from Libraries/LibWeb/CSS/FontComputer.cpp:228 Web::CSS::font_width_bucket_from_percentage.
+func css_font_width_bucket_from_percentage(percentage: f64) -> u32:
+    # Maps a font-width Percentage to the nearest standard Gfx::FontWidth bucket.
+
+    var best = css_font_width_buckets[0]
+    var best_distance = math.abs(percentage - best.percentage)
+    for i in 1..<css_font_width_buckets.length:
+        let distance = math.abs(percentage - css_font_width_buckets[i].percentage)
+        if distance < best_distance:
+            best_distance = distance
+            best = css_font_width_buckets[i]
+    return best.width
+
+## A MatchingFontCandidate with its default members (`matching_family_fonts.empend(map_key)`).
+func css_font_computer_matching_font_candidate_new(key: CssFontFaceKey) -> CssFontComputerMatchingFontCandidate:
+    return CssFontComputerMatchingFontCandidate(key = key, width = (u32)web_fonts.FontWidth.normal, system_typeface = none)
+
+## The captures of the pending-face loader MatchingFontCandidate::font_with_point_size gives the
+## font list. C++ captures a GC::Root of the face; the list and these captures are managed
+## memory, which the collector scans (DESIGN.md §3.3), so the face is kept alive by the pointer.
+struct CssFontComputerMatchingFontCandidatePendingFace:
+    var rooted_face: CssFontFace*
+
+## The pending-face loader: `const_cast<FontFace&>(*rooted_face).load()`.
+func css_font_computer_matching_font_candidate_load_pending_face(context: void*?):
+    let captures = (CssFontComputerMatchingFontCandidatePendingFace*)(context else trap("no captures"))
+    discard(css_font_face_load(captures.rooted_face))
+
+## Ported from Libraries/LibWeb/CSS/FontComputer.cpp:264 Web::CSS::FontComputer::MatchingFontCandidate::font_with_point_size.
+func css_font_computer_matching_font_candidate_font_with_point_size(this: const CssFontComputerMatchingFontCandidate*, font_faces: const ak.HashMap[CssFontFaceKey, ak.Vector[CssFontFace*], CssFontFaceKeyTraits]*, point_size: f32, variations: const web_fonts.FontVariationSettings*, font_feature_data: const CssFontFeatureData*, font_feature_values: const ak.HashMap[CssFontFeatureValueKey, ak.Vector[u32], CssFontFeatureValueKeyTraits]*) -> const web_fonts.FontCascadeList*?:
+    let shape_features = css_font_feature_data_to_shape_features(font_feature_data, font_feature_values)
+
+    if let system_typeface = this.system_typeface:
+        let font_list = web_fonts.font_cascade_list_create()
+        web_fonts.font_cascade_list_add(font_list, web_fonts.typeface_font(system_typeface, point_size, *variations, shape_features))
+        return font_list
+
+    let faces = ak.hash_map_get_k_const(font_faces, this.key) else return none
+
+    let font_list = web_fonts.font_cascade_list_create()
+    for face in ak.vector_span_const(faces):
+        if let face_fonts = css_font_face_font_with_point_size(face, point_size, *variations, shape_features):
+            web_fonts.font_cascade_list_extend(font_list, face_fonts)
+            continue
+        # Unloaded subset face: surface it as a pending entry so the fetch only
+        # fires once font_for_code_point() sees a codepoint in its unicode-range.
+        if css_font_face_has_urls(face) and css_font_face_has_non_default_unicode_range(face):
+            let captures = new CssFontComputerMatchingFontCandidatePendingFace(rooted_face = face) else trap("out of memory")
+            web_fonts.font_cascade_list_add_pending_face(font_list, css_font_face_unicode_ranges(face), ak.Function0[unit](call = css_font_computer_matching_font_candidate_load_pending_face, context = captures))
+    if web_fonts.font_cascade_list_is_empty(font_list):
+        return none
+    return font_list

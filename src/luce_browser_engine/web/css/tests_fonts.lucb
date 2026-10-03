@@ -1,0 +1,593 @@
+#==============================================================================================
+#
+#   tests_fonts - the CSS font cases of region r41 against the reference build
+#
+#   DESCRIPTION:
+#       Ladybird has no unit tests for FontComputer, FontFace, FontFaceSet, FontFeatureData,
+#       FontLoading or ParsedFontFace. A local oracle (luce-browser-tools,
+#       oracles/luce-browser-engine/css_fonts) runs the reference build's code on the cases of
+#       tests_fonts_cases and prints one line per case; this test does the same with the port and
+#       compares the lines. The modes: font_feature_value_type_from_string; the shape features
+#       and traits hashes of a ComputedProperties' font_feature_data (r40's tcp_build, with an
+#       @font-feature-values map); font_format_is_supported and font_tech_is_supported;
+#       requires_off_thread_vector_font_preparation and try_load_vector_font; @font-face rules
+#       through ParsedFontFace::from_descriptors; FontFace's descriptor attributes (the `_impl`
+#       setters and the public ones); and font matching, FontComputer::compute_font_for_style_values
+#       through ComputedProperties::computed_font_list with loaded font faces registered.
+#
+#       The fonts are those of tests/libweb/fonts (`luce-base test` runs from the repository
+#       root), in a font database with a PathFontProvider over that directory and a FontPlugin in
+#       layout test mode (every generic family is SerenitySans, the symbol font Noto Emoji), as
+#       the oracle has them. The database, its typefaces and their fonts outlive the tests (the
+#       typefaces cache their fonts), so they and everything the font computations allocate come
+#       from the C heap (memory.heap), not from a test's VM heap or buffer.
+#
+#==============================================================================================
+
+# mark: Fonts and documents =====================================================================
+
+## The directory of the test fonts, relative to the repository root.
+let test_fonts_directory: str = "tests/libweb/fonts/"
+
+## Whether test_fonts_setup has installed the font database's provider and the FontPlugin.
+var test_fonts_installed: bool
+
+## The font database of the tests: a PathFontProvider over tests/libweb/fonts, and a FontPlugin
+## in layout test mode, installed once per test run (in the C heap). The plugin is built as
+## FontPlugin's constructor builds it for a provider that is not a PathFontProvider (the oracle's
+## provider), which loads no system font directories.
+func test_fonts_setup():
+    if test_fonts_installed:
+        return
+    with memory.heap:
+        let provider = web_fonts.path_font_provider_create()
+        discard(web_fonts.font_database_install_system_font_provider(web_fonts.font_database_the(), (web_fonts.SystemFontProvider*)provider))
+        web_fonts.path_font_provider_load_all_fonts_from_uri(provider, ak.sv("file://tests/libweb/fonts"))
+
+        let plugin = new PlatformFontPlugin(m_default_fixed_width_font = none, m_is_layout_test_mode = true) else trap("out of memory")
+        platform_font_plugin_update_generic_fonts(plugin)
+        let default_fixed_width_font_name = platform_font_plugin_generic_font_name(plugin, PlatformGenericFont.ui_monospace, 400, 0)
+        plugin.m_default_fixed_width_font = web_fonts.font_database_get(web_fonts.font_database_the(), default_fixed_width_font_name, 12.0, 400, (u32)web_fonts.FontWidth.normal, 0)
+        assert(plugin.m_default_fixed_width_font != none)
+        ak.vector_append_t(&plugin.m_symbol_font_names, ak.fly_string_from_str("Noto Emoji"))
+        platform_font_plugin_install(plugin)
+    test_fonts_installed = true
+
+## The bytes of a test file.
+func test_fonts_read(name: str) -> ak.ByteBuffer:
+    var builder = ak.string_builder_new()
+    ak.string_builder_append(&builder, test_fonts_directory)
+    ak.string_builder_append(&builder, name)
+    let path = ak.string_builder_to_string_without_validation(&builder)
+    let font_data = web_fonts.font_data_create_from_file(ak.string_view_text(ak.string_bytes_as_string_view(&path))) else trap("cannot read a test file")
+    return ak.byte_buffer_copy_span_u8(web_fonts.font_data_bytes(font_data)) else trap("out of memory")
+
+## A typeface of a test font file (`try_load_vector_font(read_font_file(name))`).
+func test_fonts_typeface(name: str) -> web_fonts.Typeface*:
+    return css_try_load_vector_font(test_fonts_read(name)) else trap("cannot load a test font")
+
+## A document of `realm` with a style scope and its own FontComputer (Document's constructor's
+## steps for both), as the oracle's fresh document.
+func test_fonts_document(realm: Realm*) -> DomDocument*:
+    let document = test_document_in_realm(realm)
+    css_style_scope_construct(&document.m_style_scope, document.dom_node())
+    document.m_font_computer = heap_allocate_css_font_computer(realm_heap(realm), document)
+    return document
+
+## A FontFace of `realm` (`realm.create<FontFace>(realm, WebIDL::create_promise(realm))`): the
+## status promise is a JS object (phase 3), so the realm cell stands in for it.
+func test_fonts_face(realm: Realm*) -> CssFontFace*:
+    return realm_create_css_font_face(realm, realm, (JsPromiseCapability*)(void*)realm)
+
+## The tests' documents and the settings realm's Page are hand-built outside the heap
+## (Page::visit_edges is region r28's) and the test realms are not made to be traced, so no
+## collection runs during a font test: the heap defers collecting until test_fonts_end_deferral,
+## which drops the collection the deferral would run at its end (destroying the VM collects
+## everything without tracing).
+func test_fonts_defer_collections(realm: Realm*):
+    gc.heap_defer_gc(realm_heap(realm))
+
+## The end of test_fonts_defer_collections.
+func test_fonts_end_deferral(realm: Realm*):
+    let heap = realm_heap(realm)
+    heap.m_should_gc_when_deferral_ends = false
+    gc.heap_undefer_gc(heap)
+
+# mark: Printing ================================================================================
+
+## Appends text.
+func test_fonts_put(out: ak.StringBuilder*, text: str):
+    ak.string_builder_append(out, text)
+
+## Appends a String.
+func test_fonts_string(out: ak.StringBuilder*, text: ak.String):
+    ak.string_builder_append_string_view(out, ak.string_bytes_as_string_view(&text))
+
+## Appends a FlyString.
+func test_fonts_fly(out: ak.StringBuilder*, text: ak.FlyString):
+    ak.string_builder_append_string_view(out, ak.fly_string_bytes_as_string_view(&text))
+
+## Appends an integer.
+func test_fonts_int(out: ak.StringBuilder*, value: i64):
+    test_fonts_string(out, css_string_formatted("{}", [ak.arg_i64(value)]))
+
+## Appends a double as AK's `{}` prints it.
+func test_fonts_num(out: ak.StringBuilder*, value: f64):
+    test_fonts_string(out, css_string_formatted("{}", [ak.arg_f64(value)]))
+
+## Appends an optional Percentage's value, or "-".
+func test_fonts_optional_percentage(out: ak.StringBuilder*, value: CssPercentage?):
+    if let percentage = value:
+        test_fonts_num(out, css_percentage_value(&percentage))
+    else:
+        test_fonts_put(out, "-")
+
+## Appends an optional FlyString, or "-".
+func test_fonts_optional_fly(out: ak.StringBuilder*, value: ak.FlyString?):
+    if let string = value:
+        test_fonts_fly(out, string)
+    else:
+        test_fonts_put(out, "-")
+
+## The oracle's font: its family, slope, typeface width and point size, the variation axes
+## (sorted) and the shape features it was made with. (The weight is left out: a variable font's
+## instance reports the "wght" it was made with, and web_fonts does not instance variable fonts
+## yet; the axes say what the font computer asked for.)
+func test_fonts_font(out: ak.StringBuilder*, font: const web_fonts.Font*):
+    test_fonts_fly(out, web_fonts.font_family(font))
+    test_fonts_put(out, "/")
+    test_fonts_int(out, (i64)web_fonts.font_slope(font))
+    test_fonts_put(out, "/")
+    test_fonts_int(out, (i64)web_fonts.typeface_width(web_fonts.font_typeface(font)))
+    test_fonts_put(out, "/")
+    test_fonts_num(out, (f64)web_fonts.font_point_size(font))
+    test_fonts_put(out, "<")
+    let axes = web_fonts.font_variation_settings_to_sorted_list(&font.m_font_variation_settings)
+    for (index, axis) in ak.vector_span_const(&axes).indexed():
+        if index > 0:
+            test_fonts_put(out, ",")
+        test_fonts_put(out, (str)axis.tag.cc[0..<4])
+        test_fonts_put(out, "=")
+        test_fonts_num(out, (f64)axis.value)
+    test_fonts_put(out, ">[")
+    for (index, feature) in ak.vector_span_const(&font.m_shape_features).indexed():
+        if index > 0:
+            test_fonts_put(out, ",")
+        test_fonts_put(out, (str)feature.tag[0..<4])
+        test_fonts_put(out, "=")
+        test_fonts_int(out, (i64)feature.value)
+    test_fonts_put(out, "]")
+
+## The oracle's font_list: each entry's font (and its unicode ranges), the pending faces and the
+## last-resort font.
+func test_fonts_font_list(out: ak.StringBuilder*, list: const web_fonts.FontCascadeList*):
+    test_fonts_put(out, "[")
+    for (index, entry) in web_fonts.font_cascade_list_for_each_font_entry(list).indexed():
+        if index > 0:
+            test_fonts_put(out, " ")
+        test_fonts_font(out, entry.font)
+        if let range_data = entry.range_data:
+            test_fonts_put(out, "{")
+            test_fonts_string(out, web_fonts.unicode_range_to_string(&range_data.enclosing_range))
+            test_fonts_put(out, ":")
+            test_fonts_int(out, (i64)ak.vector_size(&range_data.unicode_ranges))
+            test_fonts_put(out, "}")
+    test_fonts_put(out, "] pending ")
+    test_fonts_int(out, (i64)ak.vector_size(&list.m_pending_faces))
+    if let last_resort_font = list.m_last_resort_font:
+        test_fonts_put(out, " last ")
+        test_fonts_font(out, last_resort_font)
+
+# mark: Splitting the case arguments ============================================================
+
+## `text` split at `separator` (every part, empty ones too).
+func test_fonts_split(text: str, separator: u8) -> ak.Vector[str]:
+    var parts: ak.Vector[str]
+    var start: usize = 0
+    for i in 0..<text.bytes.length:
+        if text.bytes[i] == separator:
+            ak.vector_append_t(&parts, (str)text.bytes[start..<i])
+            start = i + 1
+    ak.vector_append_t(&parts, (str)text.bytes[start..])
+    return parts
+
+## The position of `needle` (two bytes) in `text`.
+func test_fonts_find_pair(text: str, needle: str) -> usize?:
+    if text.bytes.length < 2:
+        return none
+    for i in 0..<text.bytes.length - 1:
+        if text.bytes[i] == needle.bytes[0] and text.bytes[i + 1] == needle.bytes[1]:
+            return i
+    return none
+
+## A decimal or hexadecimal number of a case argument.
+func test_fonts_number(text: str, base_: u32 = 10) -> i64:
+    var negative = false
+    var value: i64 = 0
+    for i in 0..<text.bytes.length:
+        let byte = text.bytes[i]
+        if byte == '-' and i == 0:
+            negative = true
+            continue
+        var digit: i64 = 0
+        if byte >= '0' and byte <= '9':
+            digit = (i64)(byte - '0')
+        elif byte >= 'a' and byte <= 'f':
+            digit = (i64)(byte - 'a') + 10
+        elif byte >= 'A' and byte <= 'F':
+            digit = (i64)(byte - 'A') + 10
+        else:
+            trap("not a number")
+        value = value * (i64)base_ + digit
+    return -value if negative else value
+
+# mark: The modes ===============================================================================
+
+## The `features` mode: the shape features of a ComputedProperties' font_feature_data over an
+## @font-feature-values map ("type:name=v,v;..."), the data's hash and each map key's hash.
+func test_fonts_features(out: ak.StringBuilder*, realm: Realm*, declarations: str, values_spec: str):
+    var values: ak.HashMap[CssFontFeatureValueKey, ak.Vector[u32], CssFontFeatureValueKeyTraits]
+    var key_hashes = ak.string_builder_new()
+    if values_spec.length > 0:
+        let entries = test_fonts_split(values_spec, ';')
+        for entry in ak.vector_span_const(&entries):
+            let colon_parts = test_fonts_split(entry, ':')
+            let type_ = css_font_feature_value_type_from_string(ak.fly_string_from_str(*ak.vector_at_const(&colon_parts, 0))) else trap("a feature value type")
+            let name_and_numbers = test_fonts_split(*ak.vector_at_const(&colon_parts, 1), '=')
+            var numbers: ak.Vector[u32]
+            let number_texts = test_fonts_split(*ak.vector_at_const(&name_and_numbers, 1), ',')
+            for number in ak.vector_span_const(&number_texts):
+                ak.vector_append_t(&numbers, (u32)test_fonts_number(number))
+            let key = CssFontFeatureValueKey(type_ = type_, name = ak.fly_string_from_str(*ak.vector_at_const(&name_and_numbers, 0)))
+            ak.string_builder_append(&key_hashes, " ")
+            test_fonts_int(&key_hashes, (i64)css_font_feature_value_key_traits_hash(&key))
+            discard(ak.hash_map_set(&values, key, numbers))
+
+    let style = tcp_build(realm, declarations)
+    let data = css_computed_properties_font_feature_data(style)
+    let features = css_font_feature_data_to_shape_features(&data, &values)
+    for (index, feature) in ak.vector_span_const(&features).indexed():
+        if index > 0:
+            test_fonts_put(out, ",")
+        test_fonts_put(out, (str)feature.tag[0..<4])
+        test_fonts_put(out, "=")
+        test_fonts_int(out, (i64)feature.value)
+    test_fonts_put(out, " | hash ")
+    test_fonts_int(out, (i64)css_font_feature_data_traits_hash(&data))
+    test_fonts_put(out, " | keys")
+    let hashes = ak.string_builder_to_string_without_validation(&key_hashes)
+    test_fonts_string(out, hashes)
+
+## The `load` mode: requires_off_thread_vector_font_preparation and try_load_vector_font.
+func test_fonts_load(out: ak.StringBuilder*, file: str, mime: str):
+    let bytes = test_fonts_read(file)
+    var mime_type_essence_: ak.ByteString?
+    if mime != "-":
+        mime_type_essence_ = ak.byte_string_from_str(mime)
+    let off_thread = css_requires_off_thread_vector_font_preparation(bytes, mime_type_essence_)
+    test_fonts_put(out, "off-thread ")
+    test_fonts_int(out, 1 if off_thread else 0)
+    if off_thread:
+        return
+    let typeface = css_try_load_vector_font(bytes, mime_type_essence_) catch failure:
+        test_fonts_put(out, " error ")
+        test_fonts_put(out, failure.message)
+        return
+    test_fonts_put(out, " ")
+    test_fonts_fly(out, web_fonts.typeface_family(typeface))
+    test_fonts_put(out, " ")
+    test_fonts_int(out, (i64)web_fonts.typeface_weight(typeface))
+
+## The `fontface` mode: an @font-face rule in a sheet of a document, its validity and its
+## ParsedFontFace.
+func test_fonts_font_face_rule(out: ak.StringBuilder*, realm: Realm*, descriptors: str):
+    let document = test_fonts_document(realm)
+    var builder = ak.string_builder_new()
+    ak.string_builder_append(&builder, "@font-face { ")
+    ak.string_builder_append(&builder, descriptors)
+    ak.string_builder_append(&builder, " }")
+    let text = ak.string_builder_to_string_without_validation(&builder)
+    var params: CssParsingParams = ---
+    css_parsing_params_construct_dom_document(&params, document)
+    let sheet = parse_css_stylesheet(params, ak.string_bytes_as_string_view(&text))
+    # sheet->m_owning_documents_or_shadow_roots.set(&document) (without loading the sheet's fonts).
+    discard(ak.hash_table_set(&sheet.m_owning_documents_or_shadow_roots, document.dom_node()))
+    let rules = css_css_style_sheet_rules(sheet)
+    if css_rule_list_length(rules) == 0:
+        test_fonts_put(out, "no rule")
+        return
+    let rule = as_css_font_face_rule(css_rule_list_item(rules, 0) else trap("a rule"))
+    test_fonts_put(out, "valid ")
+    test_fonts_int(out, 1 if css_font_face_rule_is_valid(rule) else 0)
+    let face = css_font_face_rule_font_face(rule)
+    test_fonts_put(out, " family ")
+    test_fonts_fly(out, css_parsed_font_face_font_family(&face))
+    test_fonts_put(out, " weight ")
+    if let weight = css_parsed_font_face_weight(&face):
+        test_fonts_int(out, (i64)weight.min)
+        test_fonts_put(out, "-")
+        test_fonts_int(out, (i64)weight.max)
+    else:
+        test_fonts_put(out, "-")
+    test_fonts_put(out, " slope ")
+    if let slope = css_parsed_font_face_slope(&face):
+        test_fonts_int(out, (i64)slope)
+    else:
+        test_fonts_put(out, "-")
+    test_fonts_put(out, " width ")
+    if let width = css_parsed_font_face_width(&face):
+        test_fonts_int(out, (i64)width)
+    else:
+        test_fonts_put(out, "-")
+    test_fonts_put(out, " sources [")
+    let sources = css_parsed_font_face_sources(&face)
+    for (index, source) in ak.vector_span_const(&sources).indexed():
+        if index > 0:
+            test_fonts_put(out, " ")
+        match source.local_or_url:
+            .fly_string(local_):
+                test_fonts_put(out, "local(")
+                test_fonts_fly(out, local_)
+                test_fonts_put(out, ")")
+            .css_url(url):
+                test_fonts_put(out, "url(")
+                test_fonts_string(out, css_url_to_string(&url))
+                test_fonts_put(out, ")")
+        test_fonts_put(out, "/")
+        test_fonts_optional_fly(out, source.format_)
+        test_fonts_put(out, "/")
+        for (tech_index, tech) in ak.vector_span_const(&source.tech).indexed():
+            if tech_index > 0:
+                test_fonts_put(out, ",")
+            test_fonts_int(out, (i64)tech)
+    test_fonts_put(out, "] ranges [")
+    let ranges = css_parsed_font_face_unicode_ranges(&face)
+    for (index, range) in ak.vector_span_const(&ranges).indexed():
+        if index > 0:
+            test_fonts_put(out, " ")
+        test_fonts_string(out, web_fonts.unicode_range_to_string(&range))
+    test_fonts_put(out, "] ascent ")
+    test_fonts_optional_percentage(out, css_parsed_font_face_ascent_override(&face))
+    test_fonts_put(out, " descent ")
+    test_fonts_optional_percentage(out, css_parsed_font_face_descent_override(&face))
+    test_fonts_put(out, " line-gap ")
+    test_fonts_optional_percentage(out, css_parsed_font_face_line_gap_override(&face))
+    test_fonts_put(out, " display ")
+    test_fonts_int(out, (i64)css_parsed_font_face_font_display(&face))
+    test_fonts_put(out, " named ")
+    test_fonts_optional_fly(out, css_parsed_font_face_font_named_instance(&face))
+    test_fonts_put(out, " language ")
+    test_fonts_optional_fly(out, css_parsed_font_face_font_language_override(&face))
+    test_fonts_put(out, " features ")
+    if let settings = css_parsed_font_face_font_feature_settings(&face):
+        test_fonts_put(out, "[")
+        var first = true
+        for entry in ak.ordered_hash_map_begin_const(&settings):
+            if not first:
+                test_fonts_put(out, ",")
+            first = false
+            test_fonts_fly(out, entry.key)
+            test_fonts_put(out, ":")
+            test_fonts_int(out, (i64)entry.value)
+        test_fonts_put(out, "]")
+    else:
+        test_fonts_put(out, "-")
+    test_fonts_put(out, " variations ")
+    if let settings = css_parsed_font_face_font_variation_settings(&face):
+        test_fonts_put(out, "[")
+        var first = true
+        for entry in ak.ordered_hash_map_begin_const(&settings):
+            if not first:
+                test_fonts_put(out, ",")
+            first = false
+            test_fonts_fly(out, entry.key)
+            test_fonts_put(out, ":")
+            test_fonts_num(out, entry.value)
+        test_fonts_put(out, "]")
+    else:
+        test_fonts_put(out, "-")
+
+## The descriptor of a `facedesc` or `facesetter` case and the attribute it sets.
+enum TestFontsDescriptor:
+    family
+    style
+    weight
+    stretch
+    unicode_range
+    feature_settings
+    variation_settings
+    display
+    ascent_override
+    descent_override
+    line_gap_override
+
+## The descriptor named in a case.
+func test_fonts_descriptor(name: str) -> (TestFontsDescriptor, css_data.DescriptorId):
+    if name == "family": return (TestFontsDescriptor.family, css_data.DescriptorId.font_family)
+    if name == "style": return (TestFontsDescriptor.style, css_data.DescriptorId.font_style)
+    if name == "weight": return (TestFontsDescriptor.weight, css_data.DescriptorId.font_weight)
+    if name == "stretch": return (TestFontsDescriptor.stretch, css_data.DescriptorId.font_width)
+    if name == "unicode-range": return (TestFontsDescriptor.unicode_range, css_data.DescriptorId.unicode_range)
+    if name == "feature-settings": return (TestFontsDescriptor.feature_settings, css_data.DescriptorId.font_feature_settings)
+    if name == "variation-settings": return (TestFontsDescriptor.variation_settings, css_data.DescriptorId.font_variation_settings)
+    if name == "display": return (TestFontsDescriptor.display, css_data.DescriptorId.font_display)
+    if name == "ascent-override": return (TestFontsDescriptor.ascent_override, css_data.DescriptorId.ascent_override)
+    if name == "descent-override": return (TestFontsDescriptor.descent_override, css_data.DescriptorId.descent_override)
+    if name == "line-gap-override": return (TestFontsDescriptor.line_gap_override, css_data.DescriptorId.line_gap_override)
+    trap("an unknown descriptor")
+
+## The public setter of a descriptor.
+func test_fonts_public_setter(face: CssFontFace*, descriptor: TestFontsDescriptor, string: ak.String) -> !:
+    match descriptor:
+        .family: try css_font_face_set_family(face, string)
+        .style: try css_font_face_set_style(face, string)
+        .weight: try css_font_face_set_weight(face, string)
+        .stretch: try css_font_face_set_stretch(face, string)
+        .unicode_range: try css_font_face_set_unicode_range(face, string)
+        .feature_settings: try css_font_face_set_feature_settings(face, string)
+        .variation_settings: try css_font_face_set_variation_settings(face, string)
+        .display: try css_font_face_set_display(face, string)
+        .ascent_override: try css_font_face_set_ascent_override(face, string)
+        .descent_override: try css_font_face_set_descent_override(face, string)
+        .line_gap_override: try css_font_face_set_line_gap_override(face, string)
+
+## Whether the public setter of a descriptor throws.
+func test_fonts_public_setter_throws(face: CssFontFace*, descriptor: TestFontsDescriptor, string: ak.String) -> bool:
+    test_fonts_public_setter(face, descriptor, string) catch:
+        return true
+    return false
+
+## The `_impl` setter of a descriptor.
+func test_fonts_impl_setter(face: CssFontFace*, descriptor: TestFontsDescriptor, value: CssStyleValue*):
+    match descriptor:
+        .family: css_font_face_set_family_impl(face, value)
+        .style: css_font_face_set_style_impl(face, value)
+        .weight: css_font_face_set_weight_impl(face, value)
+        .stretch: css_font_face_set_stretch_impl(face, value)
+        .unicode_range: css_font_face_set_unicode_range_impl(face, value)
+        .feature_settings: css_font_face_set_feature_settings_impl(face, value)
+        .variation_settings: css_font_face_set_variation_settings_impl(face, value)
+        .display: css_font_face_set_display_impl(face, value)
+        .ascent_override: css_font_face_set_ascent_override_impl(face, value)
+        .descent_override: css_font_face_set_descent_override_impl(face, value)
+        .line_gap_override: css_font_face_set_line_gap_override_impl(face, value)
+
+## The attribute of a descriptor.
+func test_fonts_attribute(face: CssFontFace*, descriptor: TestFontsDescriptor) -> ak.String:
+    return match descriptor:
+        .family => css_font_face_family(face)
+        .style => css_font_face_style(face)
+        .weight => css_font_face_weight(face)
+        .stretch => css_font_face_stretch(face)
+        .unicode_range => css_font_face_unicode_range(face)
+        .feature_settings => css_font_face_feature_settings(face)
+        .variation_settings => css_font_face_variation_settings(face)
+        .display => css_font_face_display(face)
+        .ascent_override => css_font_face_ascent_override(face)
+        .descent_override => css_font_face_descent_override(face)
+        .line_gap_override => css_font_face_line_gap_override(face)
+
+## The `facedesc` and `facesetter` modes: a FontFace attribute set by its `_impl` setter or its
+## public setter, with the cached weight range, slope and width and the unicode ranges.
+func test_fonts_face_descriptor(out: ak.StringBuilder*, realm: Realm*, name: str, value: str, public_setter: bool):
+    let face = test_fonts_face(realm)
+    let string = ak.string_from_str(value)
+    let (descriptor, descriptor_id) = test_fonts_descriptor(name)
+    if public_setter:
+        if test_fonts_public_setter_throws(face, descriptor, string):
+            discard(idl_take_pending_exception())
+            test_fonts_put(out, "exception")
+            return
+    else:
+        var parsing_params: CssParsingParams = ---
+        css_parsing_params_construct_css_parsing_mode(&parsing_params)
+        let parsed = parse_css_descriptor(parsing_params, css_data.AtRuleId.font_face, css_descriptor_name_and_id_from_id(descriptor_id), ak.string_bytes_as_string_view(&string))
+        if parsed == none:
+            test_fonts_put(out, "parse error")
+            return
+        test_fonts_impl_setter(face, descriptor, parsed else trap("parsed"))
+    test_fonts_string(out, test_fonts_attribute(face, descriptor))
+    test_fonts_put(out, " | weight ")
+    test_fonts_int(out, (i64)face.m_cached_weight_range.min)
+    test_fonts_put(out, "-")
+    test_fonts_int(out, (i64)face.m_cached_weight_range.max)
+    test_fonts_put(out, " slope ")
+    test_fonts_int(out, (i64)face.m_cached_slope)
+    test_fonts_put(out, " width ")
+    test_fonts_int(out, (i64)face.m_cached_width)
+    test_fonts_put(out, " ranges ")
+    test_fonts_int(out, (i64)ak.vector_size(&face.m_unicode_ranges))
+
+## A face of a `match` case ("family|min|max|slope|width|file|U+range,..."): a loaded FontFace
+## (its typeface parsed from the file) registered with the document's FontComputer.
+func test_fonts_register_face(realm: Realm*, document: DomDocument*, spec: str):
+    let fields = test_fonts_split(spec, '|')
+    let face = test_fonts_face(realm)
+    face.m_family = ak.string_from_str(*ak.vector_at_const(&fields, 0))
+    face.m_cached_weight_range = CssFontWeightRange(min = (i32)test_fonts_number(*ak.vector_at_const(&fields, 1)), max = (i32)test_fonts_number(*ak.vector_at_const(&fields, 2)))
+    face.m_cached_slope = (i32)test_fonts_number(*ak.vector_at_const(&fields, 3))
+    face.m_cached_width = (i32)test_fonts_number(*ak.vector_at_const(&fields, 4))
+    face.m_parsed_font = test_fonts_typeface(*ak.vector_at_const(&fields, 5))
+    ak.vector_clear(&face.m_unicode_ranges)
+    if ak.vector_size(&fields) > 6:
+        let ranges = test_fonts_split(*ak.vector_at_const(&fields, 6), ',')
+        for range in ak.vector_span_const(&ranges):
+            let dash = test_fonts_split((str)range.bytes[2..], '-')
+            let min = (u32)test_fonts_number(*ak.vector_at_const(&dash, 0), 16)
+            let max = (u32)test_fonts_number(*ak.vector_at_const(&dash, 1), 16)
+            ak.vector_append_t(&face.m_unicode_ranges, web_fonts.unicode_range_create(min, max))
+    else:
+        ak.vector_append_t(&face.m_unicode_ranges, web_fonts.unicode_range_create(0, 0x10FFFF))
+    face.m_status = BindFontFaceLoadStatus.loaded
+    css_font_computer_register_font_face(dom_document_font_computer(document), face)
+
+## Registers the faces of a `;`-separated list.
+func test_fonts_register_faces(realm: Realm*, document: DomDocument*, specs: str):
+    let parts = test_fonts_split(specs, ';')
+    for spec in ak.vector_span_const(&parts):
+        if spec.length > 0:
+            test_fonts_register_face(realm, document, spec)
+
+## The `match` mode: the computed font list of the declarations with the faces registered, and,
+## for faces after "||", the list again after registering those.
+func test_fonts_match(out: ak.StringBuilder*, realm: Realm*, declarations: str, faces: str):
+    let document = test_fonts_document(realm)
+    let groups = test_fonts_find_pair(faces, "||")
+    let before = (str)faces.bytes[0..<(groups else faces.bytes.length)]
+    test_fonts_register_faces(realm, document, before)
+    let style = tcp_build(realm, declarations)
+    test_fonts_font_list(out, css_computed_properties_computed_font_list(style, dom_document_font_computer(document)))
+    let after = groups else return
+    test_fonts_register_faces(realm, document, (str)faces.bytes[after + 2..])
+    let again = tcp_build(realm, declarations)
+    test_fonts_put(out, " >> ")
+    test_fonts_font_list(out, css_computed_properties_computed_font_list(again, dom_document_font_computer(document)))
+
+## One case through the port: the line the oracle prints.
+func test_fonts_run(realm: Realm*, test_case: const TestFontsCase*) -> ak.String:
+    var builder = ak.string_builder_new()
+    let out = &builder
+    let mode = test_case.mode
+    if mode == "type":
+        if let type_ = css_font_feature_value_type_from_string(ak.fly_string_from_str(test_case.first)):
+            test_fonts_int(out, (i64)type_)
+        else:
+            test_fonts_put(out, "-")
+    elif mode == "features":
+        test_fonts_features(out, realm, test_case.first, test_case.second)
+    elif mode == "format":
+        test_fonts_int(out, 1 if css_font_format_is_supported(ak.fly_string_from_str(test_case.first)) else 0)
+    elif mode == "tech":
+        test_fonts_int(out, 1 if css_font_tech_is_supported_fly_string(ak.fly_string_from_str(test_case.first)) else 0)
+    elif mode == "load":
+        test_fonts_load(out, test_case.first, test_case.second)
+    elif mode == "fontface":
+        test_fonts_font_face_rule(out, realm, test_case.first)
+    elif mode == "facedesc":
+        test_fonts_face_descriptor(out, realm, test_case.first, test_case.second, false)
+    elif mode == "facesetter":
+        test_fonts_face_descriptor(out, realm, test_case.first, test_case.second, true)
+    elif mode == "match":
+        test_fonts_match(out, realm, test_case.first, test_case.second)
+    else:
+        test_fonts_put(out, "unknown mode")
+    return ak.string_builder_to_string_without_validation(out)
+
+# mark: The test ================================================================================
+
+test "the CSS font cases match the reference build":
+    web_initialize_strings()
+    test_fonts_setup()
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    test_fonts_defer_collections(realm)
+    defer test_fonts_end_deferral(realm)
+    with memory.heap:
+        var failures = 0
+        for test_case in &test_fonts_cases:
+            let actual = test_fonts_run(realm, test_case)
+            if not ak.string_eq_string_view(&actual, ak.sv(test_case.expected)):
+                failures += 1
+                let view = ak.string_bytes_as_string_view(&actual)
+                print(f"{test_case.mode} {test_case.first} {test_case.second}: expected {test_case.expected}, got {(str)ak.string_view_bytes(&view)}")
+        assert(failures == 0)

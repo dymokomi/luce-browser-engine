@@ -1,0 +1,102 @@
+#==============================================================================================
+#
+#   font_loading - CSS::FontLoading: turning a downloaded or given font file into a typeface
+#
+#   DESCRIPTION:
+#       Port of LibWeb/CSS/FontLoading.cpp (lines 1-92) and FontLoading.h (lines 1-26): the
+#       WOFF2 check, the format detection of try_load_vector_font and the preparation of WOFF2
+#       data. The donor prepares WOFF2 data on a thread pool and hands the result back to the
+#       origin event loop; the port has no worker threads in phase 1 (DESIGN.md §3.3 rule 6), so
+#       the preparation runs on the calling thread and the result still reaches the callback
+#       through the event loop (Core::deferred_invoke). Converting WOFF2 to TrueType needs a
+#       Brotli decoder, which the port does not have: it traps "unported (P2)".
+#
+#       Copyright (c) 2026-present, the Ladybird developers.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+## `mime_type_essence == "<text>"sv` on an Optional<ByteString>.
+func css_font_loading_essence_is(mime_type_essence_: ak.ByteString?, text: str) -> bool:
+    let essence = mime_type_essence_ else return false
+    return ak.byte_string_eq_string_view(&essence, ak.sv(text))
+
+## Ported from Libraries/LibWeb/CSS/FontLoading.cpp:18 Web::CSS::requires_off_thread_vector_font_preparation.
+pub func css_requires_off_thread_vector_font_preparation(data: ak.ByteBuffer, mime_type_essence_: ak.ByteString? = none) -> bool:
+    if css_font_loading_essence_is(mime_type_essence_, "font/woff2") or css_font_loading_essence_is(mime_type_essence_, "application/font-woff2"):
+        return true
+    if ak.byte_buffer_size(&data) < sizeof(u32):
+        return false
+    let bytes = ak.byte_buffer_bytes_const(&data)
+    let signature = ((u32)bytes[0] << 24) | ((u32)bytes[1] << 16) | ((u32)bytes[2] << 8) | (u32)bytes[3]
+    return signature == css_woff2_signature
+
+## Ported from Libraries/LibWeb/CSS/FontLoading.cpp:28 Web::CSS::prepare_vector_font_data.
+func css_prepare_vector_font_data(data: ak.ByteBuffer, mime_type_essence_: ak.ByteString?) -> CssPreparedVectorFontData!:
+    if not css_requires_off_thread_vector_font_preparation(data, mime_type_essence_):
+        return CssPreparedVectorFontData(data = data, mime_type_essence = mime_type_essence_)
+
+    # NB: WOFF2::convert_to_ttf decompresses the font with Brotli, which the port does not have (the luce-browser-render
+    #     port of the woff2 library fails every conversion).
+    trap("unported (P2): WOFF2::convert_to_ttf needs a Brotli decoder")
+
+## try_load_vector_font's try_ttf lambda.
+func css_try_load_vector_font_ttf(data: const ak.ByteBuffer*) -> web_fonts.Typeface*!:
+    return try web_fonts.typeface_try_load_from_temporary_memory(ak.byte_buffer_bytes_const(data))
+
+## try_load_vector_font's try_woff lambda.
+func css_try_load_vector_font_woff(data: const ak.ByteBuffer*) -> web_fonts.Typeface*!:
+    return try web_fonts.woff_try_load_from_bytes(ak.byte_buffer_bytes_const(data))
+
+## try_load_vector_font's try_woff2 lambda.
+func css_try_load_vector_font_woff2(data: const ak.ByteBuffer*) -> web_fonts.Typeface*!:
+    return try web_fonts.woff2_try_load_from_bytes(ak.byte_buffer_bytes_const(data))
+
+## Ported from Libraries/LibWeb/CSS/FontLoading.cpp:39 Web::CSS::try_load_vector_font.
+pub func css_try_load_vector_font(data: ak.ByteBuffer, mime_type_essence_: ak.ByteString? = none) -> web_fonts.Typeface*!:
+    if let essence = mime_type_essence_:
+        if ak.byte_string_eq_string_view(&essence, ak.sv("font/ttf")) or ak.byte_string_eq_string_view(&essence, ak.sv("application/x-font-ttf")) or ak.byte_string_eq_string_view(&essence, ak.sv("font/otf")):
+            return try css_try_load_vector_font_ttf(&data)
+        if ak.byte_string_eq_string_view(&essence, ak.sv("font/woff")) or ak.byte_string_eq_string_view(&essence, ak.sv("application/font-woff")):
+            return try css_try_load_vector_font_woff(&data)
+        if ak.byte_string_eq_string_view(&essence, ak.sv("font/woff2")) or ak.byte_string_eq_string_view(&essence, ak.sv("application/font-woff2")):
+            return try css_try_load_vector_font_woff2(&data)
+    else:
+        let ttf: web_fonts.Typeface*? = css_try_load_vector_font_ttf(&data) catch: recover none
+        if let typeface = ttf:
+            return typeface
+        let woff: web_fonts.Typeface*? = css_try_load_vector_font_woff(&data) catch: recover none
+        if let typeface = woff:
+            return typeface
+        let woff2: web_fonts.Typeface*? = css_try_load_vector_font_woff2(&data) catch: recover none
+        if let typeface = woff2:
+            return typeface
+
+    error(ak.ak_error, "Automatic format detection failed")
+
+## The captures of the task prepare_vector_font_data_off_thread hands to the origin event loop.
+struct CssPrepareVectorFontDataOffThreadResult:
+    var callback: ak.Function1[ErrorOrCssPreparedVectorFontData, unit]
+    var result: ErrorOrCssPreparedVectorFontData
+
+## The task on the origin event loop: `(*callback)(move(result))`.
+func css_prepare_vector_font_data_off_thread_deliver(context: void*?):
+    let captures = (CssPrepareVectorFontDataOffThreadResult*)(context else trap("no captures"))
+    ak.function1_call(&captures.callback, captures.result)
+
+## The thread pool job of prepare_vector_font_data_off_thread: prepare_vector_font_data's
+## ErrorOr as a value.
+func css_prepare_vector_font_data_result(data: ak.ByteBuffer, mime_type_essence_: ak.ByteString?) -> ErrorOrCssPreparedVectorFontData:
+    let prepared = css_prepare_vector_font_data(data, mime_type_essence_) catch failure:
+        return .ak_error(ak.ak_error_from_failure(failure))
+    return .value(prepared)
+
+## Ported from Libraries/LibWeb/CSS/FontLoading.cpp:70 Web::CSS::prepare_vector_font_data_off_thread.
+pub func css_prepare_vector_font_data_off_thread(data: ak.ByteBuffer, on_complete: ak.Function1[ErrorOrCssPreparedVectorFontData, unit], mime_type_essence_: ak.ByteString? = none):
+    # Keep the callback on the origin thread so any GC roots it captures are
+    # also destroyed there.
+    # NB: The thread pool's job runs here, on the origin thread (no worker threads in phase 1).
+    let result = css_prepare_vector_font_data_result(data, mime_type_essence_)
+
+    let captures = new CssPrepareVectorFontDataOffThreadResult(callback = on_complete, result = result) else trap("out of memory")
+    core_deferred_invoke(ak.Function0[unit](call = css_prepare_vector_font_data_off_thread_deliver, context = captures))
