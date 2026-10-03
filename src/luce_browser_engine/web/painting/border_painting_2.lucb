@@ -1,0 +1,350 @@
+#==============================================================================================
+#
+#   border_painting_2 - Painting::BorderPainting: solid edges, all borders and outlines
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibWeb/Painting/BorderPainting.cpp (lines 251-694): the rest of
+#       `paint_border` (its `draw_border` and `compute_midpoint` lambdas and the up to eight
+#       points of each edge's shape, filled even-odd, joined with the next edge when it has the
+#       same color), `paint_all_borders` and `borders_data_for_outline`.
+#
+#       Copyright (c) 2020, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2021-2023, Sam Atkins <atkinssj@serenityos.org>
+#       Copyright (c) 2022, MacDue <macdue@dueutil.tech>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: The shape of a solid edge =================================================================
+
+## `Gfx::FloatPoint(point.to_type<int>())`.
+func paint_border_float_point(point: gfx.IntPoint) -> gfx.FloatPoint:
+    return gfx.FloatPoint(m_x = (f32)point.m_x, m_y = (f32)point.m_y)
+
+## `a + b` of two Gfx::FloatPoints.
+func paint_border_add(a: gfx.FloatPoint, b: gfx.FloatPoint) -> gfx.FloatPoint:
+    return gfx.float_point_add(&a, b)
+
+## `a - b` of two Gfx::FloatPoints.
+func paint_border_sub(a: gfx.FloatPoint, b: gfx.FloatPoint) -> gfx.FloatPoint:
+    return gfx.float_point_sub(&a, b)
+
+## The `draw_border` lambda of paint_border: the edge's points as a closed path of lines and elliptical arcs, filled
+## when `ready_to_draw` (otherwise the next edge, of the same color, is added to the same path first).
+func paint_border_draw_border(painter: display_list.DisplayListRecorder*, path: gfx.Path*, color: gfx.Color, radius: display_list.CornerRadius, opposite_radius: display_list.CornerRadius, points: const ak.Vector[gfx.FloatPoint]*, joined_corner_has_inner_corner: bool, opposite_joined_corner_has_inner_corner: bool, joined_inner_corner_offset: gfx.FloatSize, opposite_joined_inner_corner_offset: gfx.FloatSize, ready_to_draw: bool):
+    var current: usize = 0
+    gfx.path_move_to(path, *ak.vector_at_const(points, current))
+    current += 1
+    gfx.path_elliptical_arc_to(path, *ak.vector_at_const(points, current), gfx.FloatSize(m_width = (f32)radius.horizontal_radius, m_height = (f32)radius.vertical_radius), 0.0, false, false)
+    current += 1
+    gfx.path_line_to(path, *ak.vector_at_const(points, current))
+    current += 1
+    if joined_corner_has_inner_corner:
+        gfx.path_elliptical_arc_to(path, *ak.vector_at_const(points, current),
+                                   gfx.FloatSize(m_width = (f32)radius.horizontal_radius - joined_inner_corner_offset.m_width, m_height = (f32)radius.vertical_radius - joined_inner_corner_offset.m_height),
+                                   0.0, false, true)
+        current += 1
+    gfx.path_line_to(path, *ak.vector_at_const(points, current))
+    current += 1
+    if opposite_joined_corner_has_inner_corner:
+        gfx.path_elliptical_arc_to(path, *ak.vector_at_const(points, current),
+                                   gfx.FloatSize(m_width = (f32)opposite_radius.horizontal_radius - opposite_joined_inner_corner_offset.m_width, m_height = (f32)opposite_radius.vertical_radius - opposite_joined_inner_corner_offset.m_height),
+                                   0.0, false, true)
+        current += 1
+    gfx.path_line_to(path, *ak.vector_at_const(points, current))
+    current += 1
+    gfx.path_elliptical_arc_to(path, *ak.vector_at_const(points, current), gfx.FloatSize(m_width = (f32)opposite_radius.horizontal_radius, m_height = (f32)opposite_radius.vertical_radius), 0.0, false, false)
+
+    # If joined borders have the same color, combine them to draw together.
+    if ready_to_draw:
+        # The params copy the path (C++ copies a Gfx::Path by cloning it), then the path is cleared.
+        display_list.display_list_recorder_fill_path(painter, display_list.DisplayListRecorderFillPathParams(path = gfx.path_clone(path), paint_style_or_color = display_list.PaintStyleOrColor.color(color), winding_rule = gfx.WindingRule.even_odd))
+        gfx.path_clear(path)
+
+## The `compute_midpoint` lambda of paint_border.
+func paint_border_compute_midpoint(edge: display_list.BorderEdge, horizontal_radius: i32, vertical_radius: i32, joined_border_width: i32) -> gfx.FloatPoint:
+    if horizontal_radius == 0 and vertical_radius == 0:
+        return gfx.FloatPoint(m_x = 0.0, m_y = 0.0)
+    if joined_border_width == 0:
+        match edge:
+            .top, .bottom:
+                return gfx.FloatPoint(m_x = (f32)horizontal_radius, m_y = 0.0)
+            .right, .left:
+                return gfx.FloatPoint(m_x = 0.0, m_y = (f32)vertical_radius)
+            _:
+                trap("VERIFY_NOT_REACHED")
+    # FIXME: this middle point rule seems not exactly the same as main browsers
+    # compute the midpoint based on point whose tangent slope of 1
+    # https://math.stackexchange.com/questions/3325134/find-the-points-on-the-ellipse-where-the-slope-of-the-tangent-line-is-1
+    # AK::sqrt of a float (the double square root rounded to float is the float square root).
+    let denominator = (f32)math.sqrt((f64)((f32)horizontal_radius * (f32)horizontal_radius + (f32)(vertical_radius * vertical_radius)))
+    return gfx.FloatPoint(m_x = (f32)(horizontal_radius * horizontal_radius) / denominator,
+                          m_y = (f32)(vertical_radius * vertical_radius) / denominator)
+
+#   0 /-------------\ 7
+#    / /-----------\ \
+#   /-/ 3         4 \-\
+#  1  2             5  6
+# For each border edge, need to compute 8 points at most, then paint them as closed path.
+# 8 points are the most complicated case, it happens when the joined border width is not 0 and border radius larger than border width on both side.
+# If border radius is smaller than the border width, then the inner corner of the border corner is a right angle.
+
+## The solid edge of paint_border (BorderPainting.cpp:251-585): the edge's points, then `draw_border`.
+func paint_border_paint_solid_edge(painter: display_list.DisplayListRecorder*, edge: display_list.BorderEdge, rect: gfx.DevicePixelRect, radius: display_list.CornerRadius, opposite_radius: display_list.CornerRadius, borders_data: display_list.BordersDataDevicePixels, border_data: display_list.BorderDataDevicePixels, color: gfx.Color, path: gfx.Path*, last: bool):
+    let width = border_data.width
+    let top_left = paint_border_float_point(gfx.device_pixel_rect_top_left(&rect))
+    let top_right = paint_border_float_point(gfx.device_pixel_rect_top_right(&rect))
+    let bottom_left = paint_border_float_point(gfx.device_pixel_rect_bottom_left(&rect))
+    let bottom_right = paint_border_float_point(gfx.device_pixel_rect_bottom_right(&rect))
+    var points = ak.Vector[gfx.FloatPoint]()
+    match edge:
+        .top:
+            let joined_border_width = borders_data.left.width
+            let opposite_joined_border_width = borders_data.right.width
+            let joined_corner_has_inner_corner = width < radius.vertical_radius and joined_border_width < radius.horizontal_radius
+            let opposite_joined_corner_has_inner_corner = width < opposite_radius.vertical_radius and opposite_joined_border_width < opposite_radius.horizontal_radius
+
+            let midpoint = paint_border_compute_midpoint(edge, radius.horizontal_radius, radius.vertical_radius, joined_border_width)
+            let joined_corner_endpoint_offset = gfx.FloatPoint(m_x = -midpoint.m_x, m_y = (f32)radius.vertical_radius - midpoint.m_y)
+            let opposite_midpoint = paint_border_compute_midpoint(edge, opposite_radius.horizontal_radius, opposite_radius.vertical_radius, opposite_joined_border_width)
+            let opposite_joined_border_corner_offset = gfx.FloatPoint(m_x = opposite_midpoint.m_x, m_y = (f32)opposite_radius.vertical_radius - opposite_midpoint.m_y)
+
+            ak.vector_append_t(&points, top_left)
+            ak.vector_append_t(&points, paint_border_add(top_left, joined_corner_endpoint_offset))
+
+            if joined_corner_has_inner_corner:
+                let inner_midpoint = paint_border_compute_midpoint(edge, radius.horizontal_radius - joined_border_width, radius.vertical_radius - width, joined_border_width)
+                let inner_corner_endpoint_offset = gfx.FloatPoint(m_x = -inner_midpoint.m_x, m_y = (f32)(radius.vertical_radius - width) - inner_midpoint.m_y)
+                ak.vector_append_t(&points, paint_border_add(bottom_left, inner_corner_endpoint_offset))
+                ak.vector_append_t(&points, bottom_left)
+            else:
+                let inner_right_angle_offset = gfx.FloatPoint(m_x = (f32)(joined_border_width - radius.horizontal_radius), m_y = 0.0)
+                ak.vector_append_t(&points, paint_border_add(bottom_left, inner_right_angle_offset))
+
+            if opposite_joined_corner_has_inner_corner:
+                let inner_midpoint = paint_border_compute_midpoint(edge, opposite_radius.horizontal_radius - opposite_joined_border_width, opposite_radius.vertical_radius - width, opposite_joined_border_width)
+                let inner_corner_endpoint_offset = gfx.FloatPoint(m_x = inner_midpoint.m_x, m_y = (f32)(opposite_radius.vertical_radius - width) - inner_midpoint.m_y)
+                ak.vector_append_t(&points, bottom_right)
+                ak.vector_append_t(&points, paint_border_add(bottom_right, inner_corner_endpoint_offset))
+            else:
+                let inner_right_angle_offset = gfx.FloatPoint(m_x = (f32)(opposite_joined_border_width - opposite_radius.horizontal_radius), m_y = 0.0)
+                ak.vector_append_t(&points, paint_border_sub(bottom_right, inner_right_angle_offset))
+
+            ak.vector_append_t(&points, paint_border_add(top_right, opposite_joined_border_corner_offset))
+            ak.vector_append_t(&points, top_right)
+
+            paint_border_draw_border(painter, path, color, radius, opposite_radius, &points,
+                                     joined_corner_has_inner_corner,
+                                     opposite_joined_corner_has_inner_corner,
+                                     gfx.FloatSize(m_width = (f32)joined_border_width, m_height = (f32)width),
+                                     gfx.FloatSize(m_width = (f32)opposite_joined_border_width, m_height = (f32)width),
+                                     last or not gfx.color_eq(&color, paint_border_color(display_list.BorderEdge.right, borders_data)))
+        .right:
+            let joined_border_width = borders_data.top.width
+            let opposite_joined_border_width = borders_data.bottom.width
+            let joined_corner_has_inner_corner = width < radius.horizontal_radius and joined_border_width < radius.vertical_radius
+            let opposite_joined_corner_has_inner_corner = width < opposite_radius.horizontal_radius and opposite_joined_border_width < opposite_radius.vertical_radius
+
+            let midpoint = paint_border_compute_midpoint(edge, radius.horizontal_radius, radius.vertical_radius, joined_border_width)
+            let joined_corner_endpoint_offset = gfx.FloatPoint(m_x = midpoint.m_x - (f32)radius.horizontal_radius, m_y = -midpoint.m_y)
+            let opposite_midpoint = paint_border_compute_midpoint(edge, opposite_radius.horizontal_radius, opposite_radius.vertical_radius, opposite_joined_border_width)
+            let opposite_joined_border_corner_offset = gfx.FloatPoint(m_x = opposite_midpoint.m_x - (f32)opposite_radius.horizontal_radius, m_y = opposite_midpoint.m_y)
+
+            ak.vector_append_t(&points, top_right)
+            ak.vector_append_t(&points, paint_border_add(top_right, joined_corner_endpoint_offset))
+
+            if joined_corner_has_inner_corner:
+                let inner_midpoint = paint_border_compute_midpoint(edge, radius.horizontal_radius - width, radius.vertical_radius - joined_border_width, joined_border_width)
+                let inner_corner = gfx.FloatPoint(m_x = -(((f32)radius.horizontal_radius - inner_midpoint.m_x) - (f32)width), m_y = -inner_midpoint.m_y)
+                ak.vector_append_t(&points, paint_border_add(top_left, inner_corner))
+                ak.vector_append_t(&points, top_left)
+            else:
+                let inner_right_angle_offset = gfx.FloatPoint(m_x = 0.0, m_y = (f32)(joined_border_width - radius.horizontal_radius))
+                ak.vector_append_t(&points, paint_border_add(top_left, inner_right_angle_offset))
+
+            if opposite_joined_corner_has_inner_corner:
+                let inner_midpoint = paint_border_compute_midpoint(edge, opposite_radius.horizontal_radius - width, opposite_radius.vertical_radius - opposite_joined_border_width, opposite_joined_border_width)
+                let inner_corner = gfx.FloatPoint(m_x = -(((f32)opposite_radius.horizontal_radius - inner_midpoint.m_x) - (f32)width), m_y = inner_midpoint.m_y)
+                ak.vector_append_t(&points, bottom_left)
+                ak.vector_append_t(&points, paint_border_add(bottom_left, inner_corner))
+            else:
+                let inner_right_angle_offset = gfx.FloatPoint(m_x = 0.0, m_y = (f32)(opposite_joined_border_width - opposite_radius.horizontal_radius))
+                ak.vector_append_t(&points, paint_border_sub(bottom_left, inner_right_angle_offset))
+
+            ak.vector_append_t(&points, paint_border_add(bottom_right, opposite_joined_border_corner_offset))
+            ak.vector_append_t(&points, bottom_right)
+
+            paint_border_draw_border(painter, path, color, radius, opposite_radius, &points,
+                                     joined_corner_has_inner_corner,
+                                     opposite_joined_corner_has_inner_corner,
+                                     gfx.FloatSize(m_width = (f32)width, m_height = (f32)joined_border_width),
+                                     gfx.FloatSize(m_width = (f32)width, m_height = (f32)opposite_joined_border_width),
+                                     last or not gfx.color_eq(&color, paint_border_color(display_list.BorderEdge.bottom, borders_data)))
+        .bottom:
+            let joined_border_width = borders_data.right.width
+            let opposite_joined_border_width = borders_data.left.width
+            let joined_corner_has_inner_corner = width < radius.vertical_radius and joined_border_width < radius.horizontal_radius
+            let opposite_joined_corner_has_inner_corner = width < opposite_radius.vertical_radius and opposite_joined_border_width < opposite_radius.horizontal_radius
+
+            let midpoint = paint_border_compute_midpoint(edge, radius.horizontal_radius, radius.vertical_radius, joined_border_width)
+            let joined_corner_endpoint_offset = gfx.FloatPoint(m_x = midpoint.m_x, m_y = midpoint.m_y - (f32)radius.vertical_radius)
+            let opposite_midpoint = paint_border_compute_midpoint(edge, opposite_radius.horizontal_radius, opposite_radius.vertical_radius, opposite_joined_border_width)
+            let opposite_joined_border_corner_offset = gfx.FloatPoint(m_x = -opposite_midpoint.m_x, m_y = opposite_midpoint.m_y - (f32)opposite_radius.vertical_radius)
+
+            ak.vector_append_t(&points, bottom_right)
+            ak.vector_append_t(&points, paint_border_add(bottom_right, joined_corner_endpoint_offset))
+
+            if joined_corner_has_inner_corner:
+                let inner_midpoint = paint_border_compute_midpoint(edge, radius.horizontal_radius - joined_border_width, radius.vertical_radius - width, joined_border_width)
+                let inner_corner = gfx.FloatPoint(m_x = inner_midpoint.m_x, m_y = -(((f32)radius.vertical_radius - inner_midpoint.m_y) - (f32)width))
+                ak.vector_append_t(&points, paint_border_add(top_right, inner_corner))
+                ak.vector_append_t(&points, top_right)
+            else:
+                let inner_right_angle_offset = gfx.FloatPoint(m_x = (f32)(joined_border_width - radius.horizontal_radius), m_y = 0.0)
+                ak.vector_append_t(&points, paint_border_sub(top_right, inner_right_angle_offset))
+
+            if opposite_joined_corner_has_inner_corner:
+                let inner_midpoint = paint_border_compute_midpoint(edge, opposite_radius.horizontal_radius - opposite_joined_border_width, opposite_radius.vertical_radius - width, opposite_joined_border_width)
+                let inner_corner = gfx.FloatPoint(m_x = -inner_midpoint.m_x, m_y = -(((f32)opposite_radius.vertical_radius - inner_midpoint.m_y) - (f32)width))
+                ak.vector_append_t(&points, top_left)
+                ak.vector_append_t(&points, paint_border_add(top_left, inner_corner))
+            else:
+                let inner_right_angle_offset = gfx.FloatPoint(m_x = (f32)(opposite_joined_border_width - opposite_radius.horizontal_radius), m_y = 0.0)
+                ak.vector_append_t(&points, paint_border_add(top_left, inner_right_angle_offset))
+
+            ak.vector_append_t(&points, paint_border_add(bottom_left, opposite_joined_border_corner_offset))
+            ak.vector_append_t(&points, bottom_left)
+            paint_border_draw_border(painter, path, color, radius, opposite_radius, &points,
+                                     joined_corner_has_inner_corner,
+                                     opposite_joined_corner_has_inner_corner,
+                                     gfx.FloatSize(m_width = (f32)joined_border_width, m_height = (f32)width),
+                                     gfx.FloatSize(m_width = (f32)opposite_joined_border_width, m_height = (f32)width),
+                                     last or not gfx.color_eq(&color, paint_border_color(display_list.BorderEdge.left, borders_data)))
+        .left:
+            let joined_border_width = borders_data.bottom.width
+            let opposite_joined_border_width = borders_data.top.width
+            let joined_corner_has_inner_corner = width < radius.horizontal_radius and joined_border_width < radius.vertical_radius
+            let opposite_joined_corner_has_inner_corner = width < opposite_radius.horizontal_radius and opposite_joined_border_width < opposite_radius.vertical_radius
+
+            let midpoint = paint_border_compute_midpoint(edge, radius.horizontal_radius, radius.vertical_radius, joined_border_width)
+            let joined_corner_endpoint_offset = gfx.FloatPoint(m_x = (f32)radius.horizontal_radius - midpoint.m_x, m_y = midpoint.m_y)
+            let opposite_midpoint = paint_border_compute_midpoint(edge, opposite_radius.horizontal_radius, opposite_radius.vertical_radius, opposite_joined_border_width)
+            let opposite_joined_border_corner_offset = gfx.FloatPoint(m_x = (f32)opposite_radius.horizontal_radius - opposite_midpoint.m_x, m_y = -opposite_midpoint.m_y)
+
+            ak.vector_append_t(&points, bottom_left)
+            ak.vector_append_t(&points, paint_border_add(bottom_left, joined_corner_endpoint_offset))
+
+            if joined_corner_has_inner_corner:
+                let inner_midpoint = paint_border_compute_midpoint(edge, radius.horizontal_radius - width, radius.vertical_radius - joined_border_width, joined_border_width)
+                let inner_corner = gfx.FloatPoint(m_x = (f32)(radius.horizontal_radius - width) - inner_midpoint.m_x, m_y = inner_midpoint.m_y)
+                ak.vector_append_t(&points, paint_border_add(bottom_right, inner_corner))
+                ak.vector_append_t(&points, bottom_right)
+            else:
+                let inner_right_angle_offset = gfx.FloatPoint(m_x = 0.0, m_y = (f32)(joined_border_width - radius.vertical_radius))
+                ak.vector_append_t(&points, paint_border_sub(bottom_right, inner_right_angle_offset))
+
+            if opposite_joined_corner_has_inner_corner:
+                let inner_midpoint = paint_border_compute_midpoint(edge, opposite_radius.horizontal_radius - width, opposite_radius.vertical_radius - opposite_joined_border_width, opposite_joined_border_width)
+                let inner_corner = gfx.FloatPoint(m_x = (f32)(opposite_radius.horizontal_radius - width) - inner_midpoint.m_x, m_y = -inner_midpoint.m_y)
+                ak.vector_append_t(&points, top_right)
+                ak.vector_append_t(&points, paint_border_add(top_right, inner_corner))
+            else:
+                let inner_right_angle_offset = gfx.FloatPoint(m_x = 0.0, m_y = (f32)(opposite_joined_border_width - opposite_radius.vertical_radius))
+                ak.vector_append_t(&points, paint_border_add(top_right, inner_right_angle_offset))
+            ak.vector_append_t(&points, paint_border_add(top_left, opposite_joined_border_corner_offset))
+            ak.vector_append_t(&points, top_left)
+
+            paint_border_draw_border(painter, path, color, radius, opposite_radius, &points,
+                                     joined_corner_has_inner_corner,
+                                     opposite_joined_corner_has_inner_corner,
+                                     gfx.FloatSize(m_width = (f32)width, m_height = (f32)joined_border_width),
+                                     gfx.FloatSize(m_width = (f32)width, m_height = (f32)opposite_joined_border_width),
+                                     last or not gfx.color_eq(&color, paint_border_color(display_list.BorderEdge.top, borders_data)))
+        _:
+            trap("VERIFY_NOT_REACHED")
+
+# mark: All borders and outlines ==================================================================
+
+## Ported from Libraries/LibWeb/Painting/BorderPainting.cpp:588 Web::Painting::paint_all_borders.
+pub func paint_paint_all_borders(painter: display_list.DisplayListRecorder*, border_rect: gfx.DevicePixelRect, corner_radii: display_list.CornerRadii, borders_data: display_list.BordersDataDevicePixels):
+    if borders_data.top.width <= 0 and borders_data.right.width <= 0 and borders_data.left.width <= 0 and borders_data.bottom.width <= 0:
+        return
+
+    var top_left = corner_radii.top_left
+    var top_right = corner_radii.top_right
+    var bottom_right = corner_radii.bottom_right
+    var bottom_left = corner_radii.bottom_left
+
+    # Disable border radii if the corresponding borders don't exist:
+    if borders_data.bottom.width <= 0 and borders_data.left.width <= 0:
+        bottom_left = display_list.CornerRadius(horizontal_radius = 0, vertical_radius = 0)
+    if borders_data.bottom.width <= 0 and borders_data.right.width <= 0:
+        bottom_right = display_list.CornerRadius(horizontal_radius = 0, vertical_radius = 0)
+    if borders_data.top.width <= 0 and borders_data.left.width <= 0:
+        top_left = display_list.CornerRadius(horizontal_radius = 0, vertical_radius = 0)
+    if borders_data.top.width <= 0 and borders_data.right.width <= 0:
+        top_right = display_list.CornerRadius(horizontal_radius = 0, vertical_radius = 0)
+
+    let x = gfx.device_pixel_rect_x(&border_rect)
+    let y = gfx.device_pixel_rect_y(&border_rect)
+    let width = gfx.device_pixel_rect_width(&border_rect)
+    let height = gfx.device_pixel_rect_height(&border_rect)
+    var top_border_rect: gfx.DevicePixelRect = ---
+    gfx.device_pixel_rect_construct_i32(&top_border_rect, x + top_left.horizontal_radius, y, width - top_left.horizontal_radius - top_right.horizontal_radius, borders_data.top.width)
+    var right_border_rect: gfx.DevicePixelRect = ---
+    gfx.device_pixel_rect_construct_i32(&right_border_rect, x + (width - borders_data.right.width), y + top_right.vertical_radius, borders_data.right.width, height - top_right.vertical_radius - bottom_right.vertical_radius)
+    var bottom_border_rect: gfx.DevicePixelRect = ---
+    gfx.device_pixel_rect_construct_i32(&bottom_border_rect, x + bottom_left.horizontal_radius, y + (height - borders_data.bottom.width), width - bottom_left.horizontal_radius - bottom_right.horizontal_radius, borders_data.bottom.width)
+    var left_border_rect: gfx.DevicePixelRect = ---
+    gfx.device_pixel_rect_construct_i32(&left_border_rect, x, y + top_left.vertical_radius, borders_data.left.width, height - top_left.vertical_radius - bottom_left.vertical_radius)
+
+    # AK::CircularQueue<BorderEdge, 4>: always full here, so it is the four edges and the index of the first.
+    let edges: display_list.BorderEdge[4] = [display_list.BorderEdge.top, display_list.BorderEdge.right, display_list.BorderEdge.bottom, display_list.BorderEdge.left]
+    var head: usize = 0
+
+    # Try to find the first border that has a different color than the previous one,
+    # then start painting from that border.
+    for i in 0..<4:
+        discard(i)
+        let first_color = paint_border_color(edges[head], borders_data)
+        if not gfx.color_eq(&first_color, paint_border_color(edges[(head + 1) % 4], borders_data)):
+            head = (head + 1) % 4  # borders.enqueue(borders.dequeue())
+            break
+
+        head = (head + 1) % 4  # borders.enqueue(borders.dequeue())
+
+    let last_edge = edges[(head + 3) % 4]
+    var path = gfx.Path()
+    for k in (usize)0..<4:
+        let edge = edges[(head + k) % 4]
+        match edge:
+            .top:
+                paint_paint_border(painter, display_list.BorderEdge.top, top_border_rect, top_left, top_right, borders_data, &path, edge == last_edge)
+            .right:
+                paint_paint_border(painter, display_list.BorderEdge.right, right_border_rect, top_right, bottom_right, borders_data, &path, edge == last_edge)
+            .bottom:
+                paint_paint_border(painter, display_list.BorderEdge.bottom, bottom_border_rect, bottom_right, bottom_left, borders_data, &path, edge == last_edge)
+            .left:
+                paint_paint_border(painter, display_list.BorderEdge.left, left_border_rect, bottom_left, top_left, borders_data, &path, edge == last_edge)
+            _:
+                trap("VERIFY_NOT_REACHED")
+
+## Ported from Libraries/LibWeb/Painting/BorderPainting.cpp:671 Web::Painting::borders_data_for_outline.
+pub func paint_borders_data_for_outline(layout_node: LayoutNode*, outline_color: gfx.Color, outline_style: css_data.OutlineStyle, outline_width: gfx.CssPixels) -> display_list.BordersData?:
+    var color = outline_color
+    var width = outline_width
+    var line_style: css_data.LineStyle = ---
+    if outline_style == css_data.OutlineStyle.auto:
+        # `auto` lets us do whatever we want for the outline. 2px of the accent colour seems reasonable.
+        line_style = css_data.LineStyle.solid
+        let accent_color = css_keyword_style_value_create(css_data.Keyword.accentcolor).css_style_value()
+        color = css_style_value_to_color(accent_color, css_color_resolution_context_for_layout_node_with_style((LayoutNodeWithStyle*)layout_node)) else trap("MUST: the accent color resolves")
+        width = gfx.CssPixels.from_int(2)
+    else:
+        line_style = css_data.keyword_to_line_style(css_data.to_keyword_outline_style(outline_style)) else css_data.LineStyle.none_
+
+    if gfx.color_alpha(&color) == 0 or line_style == css_data.LineStyle.none_ or gfx.eq_css_pixels_int(width, 0):
+        return none
+
+    let border_data = display_list.BorderData(color = color, line_style = line_style, width = width)
+    return display_list.BordersData(top = border_data, right = border_data, bottom = border_data, left = border_data)

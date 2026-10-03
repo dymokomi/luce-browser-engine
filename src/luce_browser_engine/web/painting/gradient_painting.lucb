@@ -1,0 +1,292 @@
+#==============================================================================================
+#
+#   gradient_painting - Painting::GradientPainting: resolving CSS gradients into the color stop
+#   data the display list paints
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibWeb/Painting/GradientPainting.cpp (lines 1-272): replacing
+#       transition hints by five color stops each, expanding repeating gradients, resolving
+#       color stop positions (CSS Images 3 §3.4.3's fix-up steps), and the linear, conic and
+#       radial gradient data.
+#
+#       `resolve_color_stop_positions` takes the C++ generic lambda that resolves a position to
+#       a fraction of the gradient line as a PaintGradientPositionResolver (which gradient kind
+#       and its basis), with `paint_gradient_resolve_position_to_float` as the lambdas' bodies.
+#
+#       Copyright (c) 2022-2023, MacDue <macdue@dueutil.tech>
+#       Copyright (c) 2025, Sam Atkins <sam@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Color stop lists ==========================================================================
+
+## `Gfx::ColorStop { color, position }` (ColorStopList::empend).
+func paint_gradient_color_stop(color: gfx.Color, position: f32) -> gfx.ColorStop:
+    return gfx.ColorStop(color = color, position = position, transition_hint = none)
+
+## Ported from Libraries/LibWeb/Painting/GradientPainting.cpp:24 Web::Painting::replace_transition_hints_with_normal_color_stops.
+func paint_replace_transition_hints_with_normal_color_stops(color_stop_list: const ak.Vector[gfx.ColorStop]*) -> ak.Vector[gfx.ColorStop]:
+    var stops_with_replaced_transition_hints = ak.Vector[gfx.ColorStop]()
+
+    let first_color_stop = *ak.vector_first_const(color_stop_list)
+    # First color stop in the list should never have transition hint value
+    assert(first_color_stop.transition_hint == none)
+    ak.vector_append_t(&stops_with_replaced_transition_hints, paint_gradient_color_stop(first_color_stop.color, first_color_stop.position))
+
+    # This loop replaces transition hints with five regular points, calculated using the
+    # formula defined in the spec. After rendering using linear interpolation, this will
+    # produce a result close enough to that obtained if the color of each point were calculated
+    # using the non-linear formula from the spec.
+    for i in 1..<ak.vector_size(color_stop_list):
+        let color_stop = *ak.vector_at_const(color_stop_list, i)
+        if color_stop.transition_hint == none:
+            ak.vector_append_t(&stops_with_replaced_transition_hints, paint_gradient_color_stop(color_stop.color, color_stop.position))
+            continue
+
+        let previous_color_stop = *ak.vector_at_const(color_stop_list, i - 1)
+        let next_color_stop = *ak.vector_at_const(color_stop_list, i)
+
+        let distance_between_stops = next_color_stop.position - previous_color_stop.position
+        let transition_hint = color_stop.transition_hint else trap("unreachable: the stop has a transition hint")
+
+        let transition_hint_relative_sampling_positions: f32[5] = [
+            transition_hint * 0.33,
+            transition_hint * 0.66,
+            transition_hint,
+            transition_hint + (1.0 - transition_hint) * 0.33,
+            transition_hint + (1.0 - transition_hint) * 0.66,
+        ]
+
+        for transition_hint_relative_sampling_position in transition_hint_relative_sampling_positions:
+            let position = previous_color_stop.position + transition_hint_relative_sampling_position * distance_between_stops
+            let value = gfx.color_stop_step(previous_color_stop, next_color_stop, position)
+            let color = gfx.color_interpolate(&previous_color_stop.color, next_color_stop.color, value)
+            ak.vector_append_t(&stops_with_replaced_transition_hints, paint_gradient_color_stop(color, position))
+
+        ak.vector_append_t(&stops_with_replaced_transition_hints, paint_gradient_color_stop(color_stop.color, color_stop.position))
+
+    return stops_with_replaced_transition_hints
+
+## The `get_color_between_stops` lambda of expand_repeat_length.
+func paint_gradient_get_color_between_stops(position: f32, current_stop: gfx.ColorStop, previous_stop: gfx.ColorStop) -> gfx.Color:
+    let distance_between_stops = current_stop.position - previous_stop.position
+    let percentage = (position - previous_stop.position) / distance_between_stops
+    return gfx.color_interpolate(&previous_stop.color, current_stop.color, percentage)
+
+## Ported from Libraries/LibWeb/Painting/GradientPainting.cpp:71 Web::Painting::expand_repeat_length.
+func paint_expand_repeat_length(color_stop_list: const ak.Vector[gfx.ColorStop]*, repeat_length: f32) -> ak.Vector[gfx.ColorStop]:
+    # https://drafts.csswg.org/css-images/#repeating-gradients
+    # When rendered, however, the color-stops are repeated infinitely in both directions, with their
+    # positions shifted by multiples of the difference between the last specified color-stop's position
+    # and the first specified color-stop's position. For example, repeating-linear-gradient(red 10px, blue 50px)
+    # is equivalent to linear-gradient(..., red -30px, blue 10px, red 10px, blue 50px, red 50px, blue 90px, ...).
+
+    let first_stop_position = ak.vector_first_const(color_stop_list).position
+    let negative_repeat_count = (i32)math.ceil((f64)(first_stop_position / repeat_length))
+    let positive_repeat_count = (i32)math.ceil((f64)((1.0 - first_stop_position) / repeat_length))
+
+    var color_stop_list_with_expanded_repeat = ak.vector_clone(color_stop_list)
+
+    var repeat_count: i32 = 1
+    while repeat_count <= negative_repeat_count:
+        var index = ak.vector_size(color_stop_list)
+        while index > 0:
+            index -= 1
+            var stop = *ak.vector_at_const(color_stop_list, index)
+            stop.position -= repeat_length * (f32)repeat_count
+            if stop.position < 0.0:
+                stop.color = paint_gradient_get_color_between_stops(0.0, stop, *ak.vector_first_const(&color_stop_list_with_expanded_repeat))
+                stop.position = 0.0
+                ak.vector_prepend_u(&color_stop_list_with_expanded_repeat, stop)
+                break
+            ak.vector_prepend_u(&color_stop_list_with_expanded_repeat, stop)
+        repeat_count += 1
+
+    repeat_count = 1
+    while repeat_count < positive_repeat_count:
+        for original_stop in ak.vector_span_const(color_stop_list):
+            var stop = original_stop
+            stop.position += repeat_length * (f32)repeat_count
+            if stop.position > 1.0:
+                stop.color = paint_gradient_get_color_between_stops(1.0, stop, *ak.vector_last_const(&color_stop_list_with_expanded_repeat))
+                stop.position = 1.0
+                ak.vector_append_t(&color_stop_list_with_expanded_repeat, stop)
+                break
+            ak.vector_append_t(&color_stop_list_with_expanded_repeat, stop)
+        repeat_count += 1
+
+    return color_stop_list_with_expanded_repeat
+
+## Ported from Libraries/LibWeb/Painting/GradientPainting.cpp:120 Web::Painting::expand_color_stops_for_painting.
+func paint_expand_color_stops_for_painting(color_stop_list: const ak.Vector[gfx.ColorStop]*, repeat_length: f32?) -> ak.Vector[gfx.ColorStop]:
+    var expanded = ak.vector_clone(color_stop_list)
+    if let length = repeat_length:
+        expanded = paint_expand_repeat_length(color_stop_list, length)
+    return paint_replace_transition_hints_with_normal_color_stops(&expanded)
+
+# mark: Resolving color stop positions ============================================================
+
+## What a gradient resolves a color stop position against (the C++ passes a lambda).
+enum PaintGradientPositionKind:
+    linear
+    conic
+    radial
+
+## The state of the `resolve_position_to_float` lambdas of the three gradients.
+struct PaintGradientPositionResolver:
+    var kind: PaintGradientPositionKind
+    var gradient_length_px: f32  # linear: the gradient line's length
+    var one_turn: CssAngle  # conic: 360deg
+    var gradient_width: gfx.CssPixels  # radial: the gradient size's width
+
+## The `resolve_position_to_float` lambdas of resolve_linear/conic/radial_gradient_data.
+func paint_gradient_resolve_position_to_float(resolver: const PaintGradientPositionResolver*, position: CssStyleValue*) -> f32:
+    match resolver.kind:
+        .linear:
+            let length = css_length_from_style_value(position, css_length_make_px_f64((f64)resolver.gradient_length_px))
+            return (f32)(css_length_absolute_length_to_px_without_rounding(&length) / (f64)resolver.gradient_length_px)
+        .conic:
+            let angle = css_angle_from_style_value(position, resolver.one_turn)
+            return (f32)(css_angle_to_degrees(&angle) / css_angle_to_degrees(&resolver.one_turn))
+        .radial:
+            let length = css_length_from_style_value(position, css_length_make_px_css_pixels(resolver.gradient_width))
+            return (f32)(css_length_absolute_length_to_px_without_rounding(&length) / (f64)resolver.gradient_width.to_float())
+
+## The `color_stop_length` lambda of resolve_color_stop_positions.
+func paint_gradient_color_stop_length(stop: const CssColorStopListElement*) -> usize:
+    return 2 if stop.color_stop.second_position != none else 1
+
+## The `resolve_stop_position` lambda of resolve_color_stop_positions.
+func paint_gradient_resolve_stop_position(resolver: const PaintGradientPositionResolver*, max_previous_color_stop_or_hint: f32*, position: CssStyleValue*) -> f32:
+    var value = paint_gradient_resolve_position_to_float(resolver, position)
+    value = ak.max_f32(value, *max_previous_color_stop_or_hint)
+    *max_previous_color_stop_or_hint = value
+    return value
+
+## The `color_stop_has_position` lambda of resolve_color_stop_positions.
+func paint_gradient_color_stop_has_position(color_stop: const gfx.ColorStop*) -> bool:
+    return color_stop.transition_hint != none or math.is_finite((f64)color_stop.position)
+
+## Ported from Libraries/LibWeb/Painting/GradientPainting.cpp:128 Web::Painting::resolve_color_stop_positions.
+func paint_resolve_color_stop_positions(node: LayoutNodeWithStyle*, color_stop_list: const ak.Vector[CssColorStopListElement]*, resolve_position_to_float: const PaintGradientPositionResolver*, repeating: bool) -> display_list.ColorStopData:
+    assert(not ak.vector_is_empty(color_stop_list))
+    var resolved_color_stops = ak.Vector[gfx.ColorStop]()
+
+    var expanded_size: usize = 0
+    for stop in ak.vector_span_const(color_stop_list):
+        expanded_size += paint_gradient_color_stop_length(&stop)
+
+    ak.vector_ensure_capacity(&resolved_color_stops, expanded_size)
+    for stop in ak.vector_span_const(color_stop_list):
+        let stop_color = stop.color_stop.color else trap("a color stop without a color")
+        var resolved_stop: gfx.ColorStop = ---
+        resolved_stop.color = css_style_value_to_color(stop_color, css_color_resolution_context_for_layout_node_with_style(node)) else trap("MUST: the color stop's color resolves")
+        resolved_stop.transition_hint = none
+        gfx.color_stop_init_fields(&resolved_stop)
+        for i in 0..<paint_gradient_color_stop_length(&stop):
+            discard(i)
+            ak.vector_append_t(&resolved_color_stops, resolved_stop)
+
+    # 1. If the first color stop does not have a position, set its position to 0%.
+    ak.vector_first(&resolved_color_stops).position = 0.0
+    #    If the last color stop does not have a position, set its position to 100%
+    ak.vector_last(&resolved_color_stops).position = 1.0
+
+    # 2. If a color stop or transition hint has a position that is less than the
+    #    specified position of any color stop or transition hint before it in the list,
+    #    set its position to be equal to the largest specified position of any color stop
+    #    or transition hint before it.
+    var max_previous_color_stop_or_hint = ak.vector_at(&resolved_color_stops, 0).position
+    var resolved_index: usize = 0
+    for stop in ak.vector_span_const(color_stop_list):
+        if let transition_hint = stop.transition_hint:
+            ak.vector_at(&resolved_color_stops, resolved_index).transition_hint = paint_gradient_resolve_stop_position(resolve_position_to_float, &max_previous_color_stop_or_hint, transition_hint)
+        if let position = stop.color_stop.position:
+            ak.vector_at(&resolved_color_stops, resolved_index).position = paint_gradient_resolve_stop_position(resolve_position_to_float, &max_previous_color_stop_or_hint, position)
+        if let second_position = stop.color_stop.second_position:
+            resolved_index += 1
+            ak.vector_at(&resolved_color_stops, resolved_index).position = paint_gradient_resolve_stop_position(resolve_position_to_float, &max_previous_color_stop_or_hint, second_position)
+        resolved_index += 1
+
+    # 3. If any color stop still does not have a position, then, for each run of adjacent color stops
+    #    without positions, set their positions so that they are evenly spaced between the preceding
+    #    and following color stops with positions.
+    # Note: Though not mentioned anywhere in the specification transition hints are counted as "color stops with positions".
+    var i: usize = 1
+    while i < ak.vector_size(&resolved_color_stops) - 1:
+        let stop = *ak.vector_at(&resolved_color_stops, i)
+        if not math.is_finite((f64)stop.position):
+            let run_start = i - 1
+            let start_stop = *ak.vector_at(&resolved_color_stops, i)
+            i += 1
+            let start_position = start_stop.transition_hint else ak.vector_at(&resolved_color_stops, run_start).position
+            # The `find_run_end` lambda (it bounds the run by the CSS list's size, as the C++ does).
+            while i < ak.vector_size(color_stop_list) - 1 and not paint_gradient_color_stop_has_position(ak.vector_at(&resolved_color_stops, i)):
+                i += 1
+            let run_end = i
+            let end_stop = *ak.vector_at(&resolved_color_stops, run_end)
+            let end_position = end_stop.transition_hint else end_stop.position
+            let spacing = (end_position - start_position) / (f32)(run_end - run_start)
+            for j in run_start + 1..<run_end:
+                ak.vector_at(&resolved_color_stops, j).position = start_position + (f32)(j - run_start) * spacing
+        i += 1
+
+    # Determine the location of the transition hint as a percentage of the distance between the two color stops,
+    # denoted as a number between 0 and 1, where 0 indicates the hint is placed right on the first color stop,
+    # and 1 indicates the hint is placed right on the second color stop.
+    for k in 1..<ak.vector_size(&resolved_color_stops):
+        let previous_color_stop = *ak.vector_at(&resolved_color_stops, k - 1)
+        let color_stop = ak.vector_at(&resolved_color_stops, k)
+        if let transition_hint = color_stop.transition_hint:
+            let stop_length = color_stop.position - previous_color_stop.position
+            color_stop.transition_hint = (transition_hint - previous_color_stop.position) / stop_length if stop_length > 0.0 else 0.0
+
+    var repeat_length: f32? = none
+    if repeating:
+        repeat_length = ak.vector_last(&resolved_color_stops).position - ak.vector_first(&resolved_color_stops).position
+
+    return display_list.ColorStopData(list = resolved_color_stops, repeat_length = repeat_length, repeating = repeating)
+
+# mark: Gradient data =============================================================================
+
+## Ported from Libraries/LibWeb/Painting/GradientPainting.cpp:223 Web::Painting::resolve_linear_gradient_data.
+pub func paint_resolve_linear_gradient_data(node: LayoutNodeWithStyle*, gradient_size: gfx.CssPixelSize, linear_gradient: CssLinearGradientStyleValue*) -> display_list.LinearGradientData:
+    let gradient_angle = css_linear_gradient_style_value_angle_degrees(linear_gradient, gradient_size)
+    let gradient_length_px = gfx.calculate_gradient_length(gfx.css_pixel_size_to_type_f32(&gradient_size), gradient_angle)
+
+    let resolver = PaintGradientPositionResolver(kind = PaintGradientPositionKind.linear, gradient_length_px = gradient_length_px)
+    let color_stop_list = css_linear_gradient_style_value_color_stop_list(linear_gradient)
+    var resolved_color_stops = paint_resolve_color_stop_positions(node, &color_stop_list, &resolver, css_linear_gradient_style_value_is_repeating(linear_gradient))
+
+    # Replace transition hints for painting; keep repeat_length for Skia's native tiling
+    resolved_color_stops.list = paint_replace_transition_hints_with_normal_color_stops(&resolved_color_stops.list)
+
+    return display_list.LinearGradientData(gradient_angle = gradient_angle, color_stops = resolved_color_stops, interpolation_method = css_linear_gradient_style_value_interpolation_method(linear_gradient))
+
+## Ported from Libraries/LibWeb/Painting/GradientPainting.cpp:240 Web::Painting::resolve_conic_gradient_data.
+pub func paint_resolve_conic_gradient_data(node: LayoutNodeWithStyle*, conic_gradient: CssConicGradientStyleValue*) -> display_list.ConicGradientData:
+    var one_turn: CssAngle = ---
+    css_angle_construct(&one_turn, 360.0, css_data.AngleUnit.deg)
+    let resolver = PaintGradientPositionResolver(kind = PaintGradientPositionKind.conic, one_turn = one_turn)
+    let color_stop_list = css_conic_gradient_style_value_color_stop_list(conic_gradient)
+    var resolved_color_stops = paint_resolve_color_stop_positions(node, &color_stop_list, &resolver, css_conic_gradient_style_value_is_repeating(conic_gradient))
+
+    # Expand color stops for painting (replace transition hints and expand repeat length)
+    resolved_color_stops.list = paint_expand_color_stops_for_painting(&resolved_color_stops.list, resolved_color_stops.repeat_length)
+    resolved_color_stops.repeat_length = none
+
+    return display_list.ConicGradientData(start_angle = css_conic_gradient_style_value_angle_degrees(conic_gradient), color_stops = resolved_color_stops, interpolation_method = css_conic_gradient_style_value_interpolation_method(conic_gradient))
+
+## Ported from Libraries/LibWeb/Painting/GradientPainting.cpp:256 Web::Painting::resolve_radial_gradient_data.
+pub func paint_resolve_radial_gradient_data(node: LayoutNodeWithStyle*, gradient_size: gfx.CssPixelSize, radial_gradient: CssRadialGradientStyleValue*) -> display_list.RadialGradientData:
+    # Start center, goes right to ending point, where the gradient line intersects the ending shape
+    let resolver = PaintGradientPositionResolver(kind = PaintGradientPositionKind.radial, gradient_width = gradient_size.m_width)
+    let color_stop_list = css_radial_gradient_style_value_color_stop_list(radial_gradient)
+    var resolved_color_stops = paint_resolve_color_stop_positions(node, &color_stop_list, &resolver, css_radial_gradient_style_value_is_repeating(radial_gradient))
+
+    # Expand color stops for painting (replace transition hints and expand repeat length)
+    resolved_color_stops.list = paint_expand_color_stops_for_painting(&resolved_color_stops.list, resolved_color_stops.repeat_length)
+    resolved_color_stops.repeat_length = none
+
+    return display_list.RadialGradientData(color_stops = resolved_color_stops, interpolation_method = css_radial_gradient_style_value_interpolation_method(radial_gradient))
