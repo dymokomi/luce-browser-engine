@@ -1,0 +1,743 @@
+#==============================================================================================
+#
+#   html_dialog_element - HTML::HTMLDialogElement: <dialog>
+#
+#   DESCRIPTION:
+#       Port of LibWeb/HTML/HTMLDialogElement.cpp (lines 1-698) and HTMLDialogElement.h: the
+#       constructor (which moves the mixin tables to HTMLDialogElement's, as C++'s vptrs move),
+#       initialize, the removing/insertion/attribute change steps, dialog toggle events,
+#       show/showModal/close/requestClose, the close watcher, the dialog setup, cleanup and
+#       focusing steps, the command steps and light dismiss.
+#
+#==============================================================================================
+
+# mark: Construction ============================================================================
+
+## Ported from HTMLDialogElement.cpp:28 Web::HTML::HTMLDialogElement::HTMLDialogElement.
+pub func html_dialog_element_construct(this: HtmlDialogElement*, document: DomDocument*, qualified_name: DomQualifiedName):
+    html_element_construct(this.html_element(), document, qualified_name)
+    # The vptrs of the mixin bases move to HTMLDialogElement's tables.
+    let element = this.html_element()
+    element.element.slottable_mixin.vtable = &html_dialog_element_slottable_mixin_vtable
+    element.element.aria_mixin.vtable = &html_dialog_element_aria_mixin_vtable
+    element.element.animatable.vtable = &html_dialog_element_animatable_vtable
+    element.global_event_handlers.vtable = &html_dialog_element_global_event_handlers_vtable
+    element.form_associated_element.vtable = &html_dialog_element_form_associated_element_vtable
+    # String m_return_value: a default-constructed (empty) String.
+    this.m_return_value = ak.string_new()
+
+## Ported from HTMLDialogElement.cpp:35 Web::HTML::HTMLDialogElement::initialize (override).
+pub func html_dialog_element_initialize_impl(base: JsCell*, realm: Realm*):
+    web_set_prototype_for_interface(base, realm, BindInterfaceName.html_dialog_element)
+    html_element_initialize_impl(base, realm)
+
+## Ported from HTMLDialogElement.cpp:41 Web::HTML::HTMLDialogElement::visit_edges (override).
+pub func html_dialog_element_visit_edges_impl(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (HtmlDialogElement*)base
+    html_element_visit_edges_impl(base, visitor)
+
+    gc.cell_visitor_visit_cell(visitor, (gc.Cell*?)this.m_close_watcher)  # opaque in phase 1
+    gc.cell_visitor_visit_t(visitor, this.m_request_close_source_element)
+    gc.cell_visitor_visit_t(visitor, this.m_previously_focused_element)
+
+## Ported from HTMLDialogElement.cpp:51 Web::HTML::HTMLDialogElement::removed_from (override).
+# https://html.spec.whatwg.org/multipage/interactive-elements.html#the-dialog-element:html-element-removing-steps
+pub func html_dialog_element_removed_from_impl(base: DomNode*, is_subtree_root: DomNodeIsSubtreeRoot, old_ancestor: DomNode*?, old_root: DomNode*):
+    let this = (HtmlDialogElement*)base
+    html_element_removed_from_impl(base, is_subtree_root, old_ancestor, old_root)
+
+    # 1. If removedNode has an open attribute, then run the dialog cleanup steps given removedNode.
+    if dom_element_has_attribute(this.dom_element(), html_attribute_names_open):
+        html_dialog_element_run_dialog_cleanup_steps(this)
+
+    # 2. If removedNode's node document's top layer contains removedNode, then remove an element from the top layer
+    #    immediately given removedNode.
+    let document = dom_node_document(base)
+    if ak.ordered_hash_table_contains_t(dom_document_top_layer_elements(document), this.dom_element()):
+        dom_document_remove_an_element_from_the_top_layer_immediately(document, this.dom_element())
+
+    # 3. Set is modal of removedNode to false.
+    html_dialog_element_set_is_modal(this, false)
+
+# mark: Dialog toggle events ====================================================================
+
+## The captures of queue_a_dialog_toggle_event_task's task: `[this, old_state, new_state = move(new_state), source]`.
+struct HtmlDialogElementToggleEventTask:
+    var this: HtmlDialogElement*
+    var old_state: ak.String
+    var new_state: ak.String
+    var source: DomElement*?
+
+    ## The task's steps.
+    static func run(context: void*?):
+        let captures = (HtmlDialogElementToggleEventTask*)(context else trap("dialog toggle task: no captures"))
+        let this = captures.this
+
+        # 1. Fire an event named toggle at element, using ToggleEvent, with the oldState attribute initialized to
+        #    oldState, the newState attribute initialized to newState, and the source attribute initialized to source.
+        var event_init = HtmlToggleEventInit()
+        event_init.old_state = captures.old_state
+        event_init.new_state = captures.new_state
+        event_init.source = captures.source
+
+        discard(dom_event_target_dispatch_event(this.dom_event_target(), html_toggle_event_create(html_element_realm(this.html_element()), html_event_names_toggle, event_init)))
+
+        # 2. Set element's dialog toggle task tracker to null.
+        this.m_dialog_toggle_task_tracker = none
+
+## Ported from HTMLDialogElement.cpp:69 Web::HTML::HTMLDialogElement::queue_a_dialog_toggle_event_task.
+# https://html.spec.whatwg.org/multipage/interactive-elements.html#queue-a-dialog-toggle-event-task
+pub func html_dialog_element_queue_a_dialog_toggle_event_task(this: HtmlDialogElement*, old_state_argument: ak.String, new_state: ak.String, source: DomElement*?):
+    var old_state = old_state_argument
+
+    # 1. If element's dialog toggle task tracker is not null, then:
+    if let tracker = this.m_dialog_toggle_task_tracker:
+        # 1. Set oldState to element's dialog toggle task tracker's old state.
+        old_state = tracker.old_state
+
+        # 2. Remove element's dialog toggle task tracker's task from its task queue.
+        var task_id = tracker.task_id
+        html_task_queue_remove_tasks_matching(html_event_loop_task_queue(html_main_thread_event_loop()), ak.Function1[HtmlTask*, bool](call = html_element_task_has_id, context = &task_id))
+
+        # 3. Set element's dialog toggle task tracker to null.
+        this.m_dialog_toggle_task_tracker = none
+
+    # 2. Queue an element task given the DOM manipulation task source and element to run the following steps:
+    let captures = new HtmlDialogElementToggleEventTask(this = this, old_state = old_state, new_state = new_state, source = source) else trap("out of memory")
+    let task_id = dom_element_queue_an_element_task(this.dom_element(), HtmlTaskSource.dom_manipulation, ak.Function0[unit](call = HtmlDialogElementToggleEventTask.run, context = captures))
+
+    # 3. Set element's dialog toggle task tracker to a struct with task set to the just-queued task and old state set to oldState.
+    this.m_dialog_toggle_task_tracker = HtmlToggleTaskTracker(task_id = task_id, old_state = old_state)
+
+# mark: show, showModal, close, requestClose ====================================================
+
+## A ToggleEvent's init: cancelable, with the given states and source (show, show_a_modal_dialog,
+## close_the_dialog).
+func html_dialog_element_toggle_event_init(cancelable: bool, old_state: str, new_state: str, source: DomElement*?) -> HtmlToggleEventInit:
+    var event_init = HtmlToggleEventInit()
+    event_init.event_init.cancelable = cancelable
+    event_init.old_state = ak.string_from_str(old_state)
+    event_init.new_state = ak.string_from_str(new_state)
+    event_init.source = source
+    return event_init
+
+## Ported from HTMLDialogElement.cpp:108 Web::HTML::HTMLDialogElement::show.
+# https://html.spec.whatwg.org/multipage/interactive-elements.html#dom-dialog-show
+pub func html_dialog_element_show(this: HtmlDialogElement*) -> !:
+    let element = this.dom_element()
+    let realm = html_element_realm(this.html_element())
+    # 1. If this has an open attribute and the is modal flag of this is false, then return.
+    if dom_element_has_attribute(element, html_attribute_names_open) and not this.m_is_modal:
+        return
+
+    # 2. If this has an open attribute, then throw an "InvalidStateError" DOMException.
+    if dom_element_has_attribute(element, html_attribute_names_open):
+        try idl_throw(.idl_dom_exception(idl_invalid_state_error_create(realm, ak.utf16_string_from_str("Dialog already open"))))
+
+    # 3. If the result of firing an event named beforetoggle, using ToggleEvent,
+    #    with the cancelable attribute initialized to true, the oldState attribute initialized to "closed",
+    #    and the newState attribute initialized to "open" at this is false, then return.
+    let event_init = html_dialog_element_toggle_event_init(true, "closed", "open", none)
+
+    let beforetoggle_result = dom_event_target_dispatch_event(this.dom_event_target(), html_toggle_event_create(realm, html_event_names_beforetoggle, event_init))
+    if not beforetoggle_result:
+        return
+
+    # 4. If this has an open attribute, then return.
+    if dom_element_has_attribute(element, html_attribute_names_open):
+        return
+
+    # 5. Queue a dialog toggle event task given this, "closed", "open", and null.
+    html_dialog_element_queue_a_dialog_toggle_event_task(this, ak.string_from_str("closed"), ak.string_from_str("open"), none)
+
+    # 6. Add an open attribute to this, whose value is the empty string.
+    dom_element_set_attribute_value(element, html_attribute_names_open, ak.string_new())
+
+    # 7. Set this's previously focused element to the focused element.
+    this.m_previously_focused_element = dom_document_focused_area(dom_node_document(this.dom_node()))
+
+    # 8. Let document be this's node document.
+    let document = dom_node_document(this.dom_node())
+
+    # 9.-12. hideUntil, then hide all popovers until it.
+    html_dialog_element_hide_all_popovers_until_topmost_ancestor(this, document)
+
+    # 13. Run the dialog focusing steps given this.
+    html_dialog_element_run_dialog_focusing_steps(this)
+
+## Steps 9-12 of show() and 18-21 of show_a_modal_dialog: hideUntil from the showing hint and
+## auto popover lists or the document, and hide all popovers until it.
+func html_dialog_element_hide_all_popovers_until_topmost_ancestor(subject: HtmlDialogElement*, document: DomDocument*):
+    # Let hideUntil be the result of running topmost popover ancestor given subject, document's showing hint
+    # popover list, null, and false.
+    var hide_until = HtmlElementOrDomDocument.html_element(html_element_topmost_popover_ancestor(subject.dom_node(), dom_document_showing_hint_popover_list(document), none, HtmlIsPopover.no))
+    var found = html_dialog_element_hide_until_has_element(hide_until)
+
+    # If hideUntil is null, then set hideUntil to the result of running topmost popover ancestor given subject,
+    # document's showing auto popover list, null, and false.
+    if not found:
+        hide_until = HtmlElementOrDomDocument.html_element(html_element_topmost_popover_ancestor(subject.dom_node(), dom_document_showing_auto_popover_list(document), none, HtmlIsPopover.no))
+        found = html_dialog_element_hide_until_has_element(hide_until)
+
+    # If hideUntil is null, then set hideUntil to document.
+    if not found:
+        hide_until = HtmlElementOrDomDocument.dom_document(document)
+
+    # Run hide all popovers until given hideUntil, false, and true.
+    html_element_hide_all_popovers_until(hide_until, HtmlFocusPreviousElement.no, HtmlFireEvents.yes)
+
+## `hide_until.get<GC::Ptr<HTMLElement>>()` is not null.
+func html_dialog_element_hide_until_has_element(hide_until: HtmlElementOrDomDocument) -> bool:
+    match hide_until:
+        .html_element(element): return element != none
+        .dom_document(_): trap("VERIFY: hideUntil holds an element")
+
+## Ported from HTMLDialogElement.cpp:169 Web::HTML::HTMLDialogElement::show_modal.
+# https://html.spec.whatwg.org/multipage/interactive-elements.html#dom-dialog-showmodal
+pub func html_dialog_element_show_modal(this: HtmlDialogElement*) -> !:
+    # The showModal() method steps are to show a modal dialog given this and null.
+    try html_dialog_element_show_a_modal_dialog(this, none)
+
+## Ported from HTMLDialogElement.cpp:176 Web::HTML::HTMLDialogElement::show_a_modal_dialog.
+# https://html.spec.whatwg.org/multipage/interactive-elements.html#show-a-modal-dialog
+pub func html_dialog_element_show_a_modal_dialog(subject: HtmlDialogElement*, source: DomElement*?) -> !:
+    let realm = html_element_realm(subject.html_element())
+    let element = subject.dom_element()
+
+    # 1. If subject has an open attribute and is modal of subject is true, then return.
+    if dom_element_has_attribute(element, html_attribute_names_open) and subject.m_is_modal:
+        return
+
+    # 2. If subject has an open attribute, then throw an "InvalidStateError" DOMException.
+    if dom_element_has_attribute(element, html_attribute_names_open):
+        try idl_throw(.idl_dom_exception(idl_invalid_state_error_create(realm, ak.utf16_string_from_str("Dialog already open"))))
+
+    # 3. If subject's node document is not fully active, then throw an "InvalidStateError" DOMException.
+    if not dom_document_is_fully_active(dom_node_document(subject.dom_node())):
+        try idl_throw(.idl_dom_exception(idl_invalid_state_error_create(realm, ak.utf16_string_from_str("Document is not fully active"))))
+
+    # 4. If subject is not connected, then throw an "InvalidStateError" DOMException.
+    if not dom_node_is_connected(subject.dom_node()):
+        try idl_throw(.idl_dom_exception(idl_invalid_state_error_create(realm, ak.utf16_string_from_str("Dialog not connected"))))
+
+    # 5. If subject is in the popover showing state, then throw an "InvalidStateError" DOMException.
+    if html_element_popover_visibility_state(subject.html_element()) == HtmlElementPopoverVisibilityState.showing:
+        try idl_throw(.idl_dom_exception(idl_invalid_state_error_create(realm, ak.utf16_string_from_str("Dialog already open as popover"))))
+
+    # 6. If the result of firing an event named beforetoggle, using ToggleEvent,
+    #    with the cancelable attribute initialized to true, the oldState attribute initialized to "closed",
+    #    the newState attribute initialized to "open", and the source attribute initialized to source at subject is
+    #    false, then return.
+    let event_init = html_dialog_element_toggle_event_init(true, "closed", "open", source)
+
+    let beforetoggle_result = dom_event_target_dispatch_event(subject.dom_event_target(), html_toggle_event_create(realm, html_event_names_beforetoggle, event_init))
+    if not beforetoggle_result:
+        return
+
+    # 7. If subject has an open attribute, then return.
+    if dom_element_has_attribute(element, html_attribute_names_open):
+        return
+
+    # 8. If subject is not connected, then return.
+    if not dom_node_is_connected(subject.dom_node()):
+        return
+
+    # 9. If subject is in the popover showing state, then return.
+    if html_element_popover_visibility_state(subject.html_element()) == HtmlElementPopoverVisibilityState.showing:
+        return
+
+    # 10. Queue a dialog toggle event task given subject, "closed", "open", and source.
+    html_dialog_element_queue_a_dialog_toggle_event_task(subject, ak.string_from_str("closed"), ak.string_from_str("open"), source)
+
+    # 11. Add an open attribute to subject, whose value is the empty string.
+    dom_element_set_attribute_value(element, html_attribute_names_open, ak.string_new())
+
+    # 12. Assert: subject's close watcher is not null.
+    assert(subject.m_close_watcher != none)
+
+    # 13. Set is modal of subject to true.
+    html_dialog_element_set_is_modal(subject, true)
+
+    # FIXME: 14. Set subject's node document to be blocked by the modal dialog subject.
+
+    # 15. If subject's node document's top layer does not already contain subject, then add an element to the top
+    #     layer given subject.
+    if not ak.ordered_hash_table_contains_t(dom_document_top_layer_elements(dom_node_document(subject.dom_node())), element):
+        dom_document_add_an_element_to_the_top_layer(dom_node_document(subject.dom_node()), element)
+
+    # FIXME: 16. Set subject's previously focused element to the focused element.
+
+    # 17. Let document be subject's node document.
+    let document = dom_node_document(subject.dom_node())
+
+    # 18.-21. hideUntil, then hide all popovers until it.
+    html_dialog_element_hide_all_popovers_until_topmost_ancestor(subject, document)
+
+    # 22. Run the dialog focusing steps given subject.
+    html_dialog_element_run_dialog_focusing_steps(subject)
+
+## Ported from HTMLDialogElement.cpp:273 Web::HTML::HTMLDialogElement::close.
+# https://html.spec.whatwg.org/multipage/interactive-elements.html#dom-dialog-close
+pub func html_dialog_element_close(this: HtmlDialogElement*, return_value: ak.String?):
+    # 1. If returnValue is not given, then set it to null.
+    # 2. Close the dialog this with returnValue and null.
+    html_dialog_element_close_the_dialog(this, return_value, none)
+
+## Ported from HTMLDialogElement.cpp:281 Web::HTML::HTMLDialogElement::request_close.
+# https://html.spec.whatwg.org/multipage/interactive-elements.html#dom-dialog-requestclose
+pub func html_dialog_element_request_close(this: HtmlDialogElement*, return_value: ak.String?):
+    # 1. If returnValue is not given, then set it to null.
+    # 2. Request to close the dialog this with returnValue and null.
+    html_dialog_element_request_close_the_dialog(this, return_value, none)
+
+## Ported from HTMLDialogElement.cpp:289 Web::HTML::HTMLDialogElement::request_close_the_dialog.
+# https://html.spec.whatwg.org/multipage/interactive-elements.html#dialog-request-close
+pub func html_dialog_element_request_close_the_dialog(this: HtmlDialogElement*, return_value: ak.String?, source: DomElement*?):
+    # 1. If this does not have an open attribute, then return.
+    if not dom_element_has_attribute(this.dom_element(), html_attribute_names_open):
+        return
+
+    # 2. If subject is not connected or subject's node document is not fully active, then return.
+    if not dom_node_is_connected(this.dom_node()) or not dom_document_is_fully_active(dom_node_document(this.dom_node())):
+        return
+
+    # 3. Assert: subject's close watcher is not null.
+    let close_watcher = this.m_close_watcher else trap("VERIFY: the dialog's close watcher")
+
+    # 4. Set subject's enable close watcher for request close to true.
+    this.m_enable_close_watcher_for_request_close = true
+
+    # 5. Set subject's request close return value to returnValue.
+    this.m_request_close_return_value = return_value
+
+    # 6. Set subject's request close source element to source.
+    this.m_request_close_source_element = source
+
+    # 7. Request to close dialog's close watcher with false.
+    discard(html_close_watcher_request_close(close_watcher, false))
+
+    # 8. Set subject's enable close watcher for request close to false.
+    this.m_enable_close_watcher_for_request_close = false
+
+## Ported from HTMLDialogElement.cpp:319 Web::HTML::HTMLDialogElement::return_value.
+# https://html.spec.whatwg.org/multipage/interactive-elements.html#dom-dialog-returnvalue
+pub func html_dialog_element_return_value(this: HtmlDialogElement*) -> ak.String:
+    return this.m_return_value
+
+## Ported from HTMLDialogElement.cpp:325 Web::HTML::HTMLDialogElement::set_return_value.
+# https://html.spec.whatwg.org/multipage/interactive-elements.html#dom-dialog-returnvalue
+pub func html_dialog_element_set_return_value(this: HtmlDialogElement*, return_value: ak.String):
+    this.m_return_value = return_value
+
+## The task of close_the_dialog's step 13 (its context is the dialog): fire close at it.
+func html_dialog_element_fire_close(context: void*?):
+    let this = (HtmlDialogElement*)(context else trap("close task: no dialog"))
+    let close_event = dom_event_create(html_element_realm(this.html_element()), html_event_names_close)
+    discard(dom_event_target_dispatch_event(this.dom_event_target(), close_event))
+
+## Ported from HTMLDialogElement.cpp:331 Web::HTML::HTMLDialogElement::close_the_dialog.
+# https://html.spec.whatwg.org/multipage/interactive-elements.html#close-the-dialog
+pub func html_dialog_element_close_the_dialog(this: HtmlDialogElement*, result: ak.String?, source: DomElement*?):
+    let element = this.dom_element()
+    let document = dom_node_document(this.dom_node())
+    # 1. If subject does not have an open attribute, then return.
+    if not dom_element_has_attribute(element, html_attribute_names_open):
+        return
+
+    # 2. Fire an event named beforetoggle, using ToggleEvent, with the oldState attribute initialized to "open", the
+    #    newState attribute initialized to "closed", and the source attribute initialized to source at subject.
+    let event_init = html_dialog_element_toggle_event_init(false, "open", "closed", source)
+
+    discard(dom_event_target_dispatch_event(this.dom_event_target(), html_toggle_event_create(html_element_realm(this.html_element()), html_event_names_beforetoggle, event_init)))
+
+    # 3. If subject does not have an open attribute, then return.
+    if not dom_element_has_attribute(element, html_attribute_names_open):
+        return
+
+    # 4. Queue a dialog toggle event task given subject, "open", "closed", and source.
+    html_dialog_element_queue_a_dialog_toggle_event_task(this, ak.string_from_str("open"), ak.string_from_str("closed"), source)
+
+    # 5. Remove subject's open attribute.
+    dom_element_remove_attribute(element, html_attribute_names_open)
+
+    # 6. If is modal of subject is true, then request an element to be removed from the top layer given subject.
+    if this.m_is_modal:
+        dom_document_request_an_element_to_be_remove_from_the_top_layer(document, element)
+
+    # 7. Let wasModal be the value of subject's is modal flag.
+    let was_modal = this.m_is_modal
+
+    # 8. Set is modal of subject to false.
+    html_dialog_element_set_is_modal(this, false)
+
+    # 9. If result is not null, then set subject's returnValue attribute to result.
+    if let value = result:
+        html_dialog_element_set_return_value(this, value)
+
+    # 10. Set subject's request close return value to null.
+    this.m_request_close_return_value = none
+
+    # 11. Set subject's request close source element to null.
+    this.m_request_close_source_element = none
+
+    # 12. If subject's previously focused element is not null, then:
+    if let previously_focused_element = this.m_previously_focused_element:
+        # 1. Let element be subject's previously focused element.
+        let focus_element = previously_focused_element
+
+        # 2. Set subject's previously focused element to null.
+        this.m_previously_focused_element = none
+
+        # 3. If subject's node document's focused area of the document's DOM anchor is a shadow-including inclusive
+        #   descendant of subject, or wasModal is true, then run the focusing steps for element; the viewport should
+        #   not be scrolled by doing this step.
+        var is_focus_within_dialog = false
+        if let focused_element = dom_document_focused_area(document):
+            is_focus_within_dialog = dom_node_is_shadow_including_inclusive_descendant_of(focused_element, this.dom_node())
+        if is_focus_within_dialog or was_modal:
+            html_run_focusing_steps(focus_element)
+
+    # 13. Queue an element task on the user interaction task source given the subject element to fire an event named
+    #     close at subject.
+    discard(dom_element_queue_an_element_task(element, HtmlTaskSource.user_interaction, ak.Function0[unit](call = html_dialog_element_fire_close, context = this)))
+
+# mark: The close watcher and the dialog steps ==================================================
+
+## set_close_watcher's cancelAction (its context is the dialog): fire cancel at the dialog,
+## cancelable as the close watcher's event is.
+func html_dialog_element_cancel_action(context: void*?, vm: Vm*) -> JsValue!:
+    let this = (HtmlDialogElement*)(context else trap("cancelAction: no dialog"))
+    let event = as_dom_event((gc.Cell*)js_value_as_object(vm_argument(vm, 0)))
+    let can_prevent_close = dom_event_cancelable(event)
+    let should_continue = dom_event_target_dispatch_event(this.dom_event_target(), dom_event_create(html_element_realm(this.html_element()), html_event_names_cancel, DomEventInit(cancelable = can_prevent_close)))
+    if not should_continue:
+        dom_event_prevent_default(event)
+    return js_undefined()
+
+## set_close_watcher's closeAction (its context is the dialog): close the dialog with its request
+## close return value and source element.
+func html_dialog_element_close_action(context: void*?, vm: Vm*) -> JsValue!:
+    let this = (HtmlDialogElement*)(context else trap("closeAction: no dialog"))
+    html_dialog_element_close_the_dialog(this, this.m_request_close_return_value, this.m_request_close_source_element)
+
+    return js_undefined()
+
+## set_close_watcher's getEnabledState (its context is the dialog).
+func html_dialog_element_get_enabled_state(context: void*?) -> bool:
+    let dialog = (HtmlDialogElement*)(context else trap("getEnabledState: no dialog"))
+    if dialog.m_enable_close_watcher_for_request_close:
+        return true
+    # FIXME: dialog's computed closed-by state is not None
+    return false
+
+## Ported from HTMLDialogElement.cpp:402 Web::HTML::HTMLDialogElement::set_close_watcher.
+# https://html.spec.whatwg.org/multipage/interactive-elements.html#set-the-dialog-close-watcher
+pub func html_dialog_element_set_close_watcher(this: HtmlDialogElement*):
+    let document = dom_node_document(this.dom_node())
+    let realm = html_element_realm(this.html_element())
+    # 1. Assert: dialog's close watcher is null.
+    assert(this.m_close_watcher == none)
+
+    # 2. Assert: dialog has an open attribute and dialog's node document is fully active.
+    assert(dom_element_has_attribute(this.dom_element(), html_attribute_names_open) and dom_document_is_fully_active(document))
+
+    # 3. Set dialog's close watcher to the result of establishing a close watcher given dialog's relevant global
+    #    object, with:
+    #    - cancelAction given canPreventClose being to return the result of firing an event named cancel at dialog,
+    #      with the cancelable attribute initialized to canPreventClose.
+    let cancel_callback_function = js_native_function_create(realm, JsNativeFunctionBehaviour(call = html_dialog_element_cancel_action, context = this), 0, ak.utf16_fly_string_new(), realm)
+    let cancel_callback = realm_create_idl_callback_type_realm(realm, (JsObject*)cancel_callback_function, realm, IdlOperationReturnsPromise.no)
+    #    - closeAction being to close the dialog given dialog, dialog's request close return value, and dialog's
+    #      request close source element.
+    let close_callback_function = js_native_function_create(realm, JsNativeFunctionBehaviour(call = html_dialog_element_close_action, context = this), 0, ak.utf16_fly_string_new(), realm)
+    let close_callback = realm_create_idl_callback_type_realm(realm, (JsObject*)close_callback_function, realm, IdlOperationReturnsPromise.no)
+    #    - getEnabledState being to return true if dialog's enable close watcher for request close is true or dialog's
+    #      computed closed-by state is not None; otherwise false.
+    let get_enabled_state = gc.create_function0(gc.cell_heap(this.cell()), ak.Function0[bool](call = html_dialog_element_get_enabled_state, context = this))
+
+    let window = dom_document_window(document) else trap("VERIFY: GC::Ptr<Window>::operator* on null")
+    let close_watcher = html_close_watcher_establish(window, get_enabled_state)
+    this.m_close_watcher = close_watcher
+    # (CloseWatcher is opaque until phase 3; it is a DOM::EventTarget first.)
+    dom_event_target_add_event_listener_without_options((DomEventTarget*)close_watcher, html_event_names_cancel, dom_idl_event_listener_create(realm, cancel_callback))
+    dom_event_target_add_event_listener_without_options((DomEventTarget*)close_watcher, html_event_names_close, dom_idl_event_listener_create(realm, close_callback))
+
+## Ported from HTMLDialogElement.cpp:450 Web::HTML::HTMLDialogElement::run_dialog_setup_steps.
+# https://html.spec.whatwg.org/multipage/interactive-elements.html#dialog-setup-steps
+pub func html_dialog_element_run_dialog_setup_steps(this: HtmlDialogElement*):
+    # 1. Assert: subject has an open attribute.
+    assert(dom_element_has_attribute(this.dom_element(), html_attribute_names_open))
+
+    # 2. Assert: subject is connected.
+    assert(dom_node_is_connected(this.dom_node()))
+
+    # 3. Assert: subject's node document's open dialogs list does not contain subject.
+    let open_dialogs_list = dom_document_open_dialogs_list(dom_node_document(this.dom_node()))
+    for dialog in ak.vector_span(open_dialogs_list):
+        assert(dialog != this)
+
+    # 4. Add subject to subject's node document's open dialogs list.
+    ak.vector_append_t(open_dialogs_list, this)
+
+    # 5. Set the dialog close watcher with subject.
+    html_dialog_element_set_close_watcher(this)
+
+## Ported from HTMLDialogElement.cpp:469 Web::HTML::HTMLDialogElement::run_dialog_cleanup_steps.
+# https://html.spec.whatwg.org/multipage/interactive-elements.html#dialog-cleanup-steps
+pub func html_dialog_element_run_dialog_cleanup_steps(this: HtmlDialogElement*):
+    # 1. Remove subject from subject's node document's open dialogs list.
+    let open_dialogs_list = dom_document_open_dialogs_list(dom_node_document(this.dom_node()))
+    for (index, dialog) in ak.vector_span(open_dialogs_list).indexed():
+        if dialog == this:
+            ak.vector_remove(open_dialogs_list, index)
+            break
+
+    # 2. If subject's close watcher is not null, then:
+    if let close_watcher = this.m_close_watcher:
+        # 1. Destroy subject's close watcher.
+        html_close_watcher_destroy(close_watcher)
+
+        # 2. Set subject's close watcher to null.
+        this.m_close_watcher = none
+
+## Ported from HTMLDialogElement.cpp:485 Web::HTML::HTMLDialogElement::run_dialog_focusing_steps.
+# https://html.spec.whatwg.org/multipage/interactive-elements.html#dialog-focusing-steps
+pub func html_dialog_element_run_dialog_focusing_steps(this: HtmlDialogElement*):
+    # 1. If the allow focus steps given subject's node document return false, then return.
+    if not dom_document_allow_focus(dom_node_document(this.dom_node())):
+        return
+
+    # 2. Let control be null
+    var control: DomElement*? = none
+
+    # FIXME: 3. If subject has the autofocus attribute, then set control to subject.
+    # FIXME: 4. If control is null, then set control to the focus delegate of subject.
+
+    # 5. If control is null, then set control to subject.
+    if control == none:
+        control = this.dom_element()
+    let control_element = control else trap("VERIFY_NOT_REACHED")
+
+    # 6. Run the focusing steps for control.
+    html_run_focusing_steps(control_element.dom_node())
+
+    # 7. Let topDocument be control's node navigable's top-level traversable's active document.
+    let navigable = dom_node_navigable(control_element.dom_node()) else trap("VERIFY: control has a navigable")
+    let top_level_traversable = html_navigable_top_level_traversable(navigable) else trap("VERIFY: a top-level traversable")
+    let top_document = html_navigable_active_document(top_level_traversable.html_navigable()) else trap("VERIFY: an active document")
+
+    # 8. If control's node document's origin is not the same as the origin of topDocument, then return.
+    let control_origin = dom_document_origin(dom_node_document(control_element.dom_node()))
+    if not web_url.origin_is_same_origin(&control_origin, dom_document_origin(top_document)):
+        return
+
+    # FIXME: 9. Empty topDocument's autofocus candidates.
+    # FIXME: 10. Set topDocument's autofocus processed flag to true.
+
+## Ported from HTMLDialogElement.cpp:515 Web::HTML::HTMLDialogElement::set_is_modal.
+pub func html_dialog_element_set_is_modal(this: HtmlDialogElement*, is_modal: bool):
+    if this.m_is_modal == is_modal:
+        return
+    this.m_is_modal = is_modal
+    css_invalidation_invalidate_style_after_modal_state_change(this.dom_element())
+
+# mark: Commands ================================================================================
+
+## Ported from HTMLDialogElement.cpp:524 Web::HTML::HTMLDialogElement::is_valid_command (override).
+# https://html.spec.whatwg.org/multipage/interactive-elements.html#the-dialog-element:is-valid-command-steps
+pub func html_dialog_element_is_valid_command_impl(base: HtmlElement*, command: ak.String*) -> bool:
+    # 1. If command is in the Close state, the Request Close state, or the Show Modal state, then return true.
+    if ak.string_eq_string_view(command, ak.sv("close")) or ak.string_eq_string_view(command, ak.sv("request-close")) or ak.string_eq_string_view(command, ak.sv("show-modal")):
+        return true
+
+    # 2. Return false.
+    return false
+
+## Ported from HTMLDialogElement.cpp:535 Web::HTML::HTMLDialogElement::command_steps (override).
+# https://html.spec.whatwg.org/multipage/interactive-elements.html#the-dialog-element:command-steps
+pub func html_dialog_element_command_steps_impl(base: HtmlElement*, source: DomElement*, command: ak.String*):
+    let this = (HtmlDialogElement*)base
+    # 1. If element is in the popover showing state, then return.
+    if html_element_popover_visibility_state(base) == HtmlElementPopoverVisibilityState.showing:
+        return
+
+    # 2. If command is in the Close state and element has an open attribute,
+    #    then close the dialog given element with source's optional value and source.
+    if ak.string_eq_string_view(command, ak.sv("close")) and dom_element_has_attribute(this.dom_element(), html_attribute_names_open):
+        let optional_value = html_form_associated_element_optional_value(as_if_form_associated_element(source) else trap("as<FormAssociatedElement> failed"))
+        html_dialog_element_close_the_dialog(this, optional_value, source)
+
+    # 3. If command is in the Request Close state and element has an open attribute,
+    #    then request to close the dialog element with source's optional value and source.
+    if ak.string_eq_string_view(command, ak.sv("request-close")) and dom_element_has_attribute(this.dom_element(), html_attribute_names_open):
+        let optional_value = html_form_associated_element_optional_value(as_if_form_associated_element(source) else trap("as<FormAssociatedElement> failed"))
+        html_dialog_element_request_close_the_dialog(this, optional_value, source)
+
+    # 4. If command is the Show Modal state and element does not have an open attribute,
+    #    then show a modal dialog given element and source.
+    if ak.string_eq_string_view(command, ak.sv("show-modal")) and not dom_element_has_attribute(this.dom_element(), html_attribute_names_open):
+        html_dialog_element_show_a_modal_dialog(this, source) else trap("MUST: show_a_modal_dialog")
+
+# mark: Light dismiss ===========================================================================
+
+## `rect.to_type<double>().contains(x, y)` of a CSS pixel rect.
+func html_dialog_element_rect_contains(rect: gfx.CssPixelRect, x: f64, y: f64) -> bool:
+    let left = gfx.css_pixel_rect_x(&rect).to_double()
+    let top = gfx.css_pixel_rect_y(&rect).to_double()
+    let right = left + gfx.css_pixel_rect_width(&rect).to_double()
+    let bottom = top + gfx.css_pixel_rect_height(&rect).to_double()
+    return x >= left and x < right and y >= top and y < bottom
+
+## Ported from HTMLDialogElement.cpp:564 Web::HTML::HTMLDialogElement::nearest_clicked_dialog.
+# https://html.spec.whatwg.org/multipage/interactive-elements.html#nearest-clicked-dialog
+pub func html_dialog_element_nearest_clicked_dialog(event: UiEventsPointerEvent*, target: DomNode*?) -> HtmlDialogElement*?:
+    # To find the nearest clicked dialog, given a PointerEvent event:
+
+    # 1. Let target be event's target.
+
+    # 2. If target is a dialog element, target has an open attribute, target's is modal is true, and event's clientX
+    #    and clientY are outside the bounds of target, then return null.
+    let target_node = target else trap("VERIFY: a target")
+    if let target_dialog = as_if_html_dialog_element(target_node):
+        if dom_element_has_attribute(target_dialog.dom_element(), html_attribute_names_open) and html_dialog_element_is_modal(target_dialog):
+            # (PointerEvent is opaque until phase 4; it is a MouseEvent first.)
+            let mouse_event = (UiEventsMouseEvent*)event
+            if not html_dialog_element_rect_contains(dom_element_get_bounding_client_rect(target_dialog.dom_element()), ui_events_mouse_event_client_x(mouse_event), ui_events_mouse_event_client_y(mouse_event)):
+                return none
+
+    # 3. Let currentNode be target.
+    var current_node: DomNode*? = target
+
+    # 4. While currentNode is not null:
+    while let current = current_node:
+        # 1. If currentNode is a dialog element and currentNode has an open attribute, then return currentNode.
+        if let current_dialog = as_if_html_dialog_element(current):
+            if dom_element_has_attribute(current_dialog.dom_element(), html_attribute_names_open):
+                return current_dialog
+
+        # 2. Set currentNode to currentNode's parent in the flat tree.
+        current_node = dom_node_first_flat_tree_ancestor_of_type(current, &html_element_class)
+
+    # 5. Return null.
+    return none
+
+## Ported from HTMLDialogElement.cpp:597 Web::HTML::HTMLDialogElement::light_dismiss_open_dialogs.
+# https://html.spec.whatwg.org/multipage/interactive-elements.html#light-dismiss-open-dialogs
+pub func html_dialog_element_light_dismiss_open_dialogs(event: UiEventsPointerEvent*, target: DomNode*?):
+    # To light dismiss open dialogs, given a PointerEvent event:
+    # (PointerEvent is opaque until phase 4; it is a DOM::Event first.)
+    let dom_event = (DomEvent*)event
+
+    # 1. Assert: event's isTrusted attribute is true.
+    assert(dom_event_is_trusted(dom_event))
+
+    # 2. Let document be event's target's node document.
+    # FIXME: The event's target hasn't been initialized yet, so it's passed as an argument
+    let document = dom_node_document(target else trap("VERIFY: a target"))
+
+    # 3. If document's open dialogs list is empty, then return.
+    let open_dialogs_list = dom_document_open_dialogs_list(document)
+    if ak.vector_is_empty(open_dialogs_list):
+        return
+
+    # 4. Let ancestor be the result of running nearest clicked dialog given event.
+    let ancestor = html_dialog_element_nearest_clicked_dialog(event, target)
+
+    # 5. If event's type is "pointerdown", then set document's dialog pointerdown target to ancestor.
+    let type_ = dom_event_type(dom_event)
+    if ak.fly_string_eq_fly_string(&type_, &ui_events_event_names_pointerdown):
+        dom_document_set_dialog_pointerdown_target(document, ancestor)
+
+    # 6. If event's type is "pointerup", then:
+    if ak.fly_string_eq_fly_string(&type_, &ui_events_event_names_pointerup):
+        # 1. Let sameTarget be true if ancestor is document's dialog pointerdown target.
+        let same_target = ancestor == dom_document_dialog_pointerdown_target(document)
+
+        # 2. Set document's dialog pointerdown target to null.
+        dom_document_set_dialog_pointerdown_target(document, none)
+
+        # 3. If sameTarget is false, then return.
+        if not same_target:
+            return
+
+        # 4. Let topmostDialog be the last element of document's open dialogs list.
+        let topmost_dialog = *ak.vector_last(open_dialogs_list)
+
+        # 5. If ancestor is topmostDialog, then return.
+        if ancestor == topmost_dialog:
+            return
+
+        # 6. If topmostDialog's computed closed-by state is not Any, then return.
+        # FIXME: This should use the "computed closed-by state" algorithm.
+        let closedby = dom_element_attribute(topmost_dialog.dom_element(), html_attribute_names_closedby) else return
+        if not ak.string_equals_ignoring_ascii_case_string_view(&closedby, ak.sv("any")):
+            return
+
+        # 7. Assert: topmostDialog's close watcher is not null.
+        assert(topmost_dialog.m_close_watcher != none)
+
+        # 8. Request to close topmostDialog's close watcher with false.
+        html_dialog_element_request_close(topmost_dialog, none)
+
+# mark: Insertion and attribute changes =========================================================
+
+## Ported from HTMLDialogElement.cpp:653 Web::HTML::HTMLDialogElement::inserted (override).
+# https://html.spec.whatwg.org/multipage/interactive-elements.html#the-dialog-element:html-element-insertion-steps
+pub func html_dialog_element_inserted_impl(base: DomNode*):
+    let this = (HtmlDialogElement*)base
+    html_element_inserted_impl(base)
+
+    # 1. If insertedNode's node document is not fully active, then return.
+    if not dom_document_is_fully_active(dom_node_document(base)):
+        return
+
+    # 2. If insertedNode has an open attribute and is connected, then run the dialog setup steps given insertedNode.
+    if dom_element_has_attribute(this.dom_element(), html_attribute_names_open) and dom_node_is_connected(base):
+        html_dialog_element_run_dialog_setup_steps(this)
+
+## Ported from HTMLDialogElement.cpp:667 Web::HTML::HTMLDialogElement::attribute_changed (override).
+# https://html.spec.whatwg.org/multipage/interactive-elements.html#the-dialog-element:concept-element-attributes-change-ext
+pub func html_dialog_element_attribute_changed_impl(base: DomElement*, local_name: ak.FlyString, old_value: ak.String?, value: ak.String?, namespace_: ak.FlyString?):
+    let this = (HtmlDialogElement*)base
+    html_element_attribute_changed_impl(base, local_name, old_value, value, namespace_)
+
+    # 1. If namespace is not null, then return.
+    if namespace_ != none:
+        return
+
+    # 2. If localName is not open, then return.
+    if not ak.fly_string_eq_fly_string(&local_name, &html_attribute_names_open):
+        return
+
+    css_invalidation_invalidate_style_after_open_state_change(base)
+
+    # 3. If value is null and oldValue is not null, then run the dialog cleanup steps given element.
+    if value == none and old_value != none:
+        html_dialog_element_run_dialog_cleanup_steps(this)
+
+    # 4. If element's node document is not fully active, then return.
+    if not dom_document_is_fully_active(dom_node_document(base.dom_node())):
+        return
+
+    # 5. If element is not connected, then return.
+    if not dom_node_is_connected(base.dom_node()):
+        return
+
+    # 6. If value is not null and oldValue is null, then run the dialog setup steps given element.
+    if value != none and old_value == none:
+        html_dialog_element_run_dialog_setup_steps(this)
+
+# mark: Inline functions of HTMLDialogElement.h =================================================
+
+## Ported from HTMLDialogElement.h:27 Web::HTML::HTMLDialogElement::is_focusable (override).
+pub func html_dialog_element_is_focusable_impl(base: DomEventTarget*) -> bool:
+    return true
+
+## Ported from HTMLDialogElement.h:45 Web::HTML::HTMLDialogElement::default_role (override).
+# https://www.w3.org/TR/html-aria/#el-dialog
+pub func html_dialog_element_default_role_impl(base: AriaMixin*) -> AriaRole?:
+    return AriaRole.dialog
+
+## Ported from HTMLDialogElement.h:47 Web::HTML::HTMLDialogElement::is_modal.
+pub func html_dialog_element_is_modal(this: HtmlDialogElement*) -> bool:
+    return this.m_is_modal

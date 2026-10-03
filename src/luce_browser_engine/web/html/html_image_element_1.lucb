@@ -1,0 +1,659 @@
+#==============================================================================================
+#
+#   html_image_element_1 - HTML::HTMLImageElement: construction, hints, image provider, IDL
+#
+#   DESCRIPTION:
+#       Port of LibWeb/HTML/HTMLImageElement.cpp (lines 1-571) and the inline functions of
+#       HTMLImageElement.h: the batching dispatcher of successfully fetched images, the
+#       constructor (which moves the mixin tables to HTMLImageElement's, as C++'s vptrs move,
+#       and registers the element as a viewport client), initialize, finalize, adopting,
+#       visit_edges, the dimension attribute source, the presentational hints, the attribute
+#       change steps, the ImageBox layout node, the Layout::ImageProvider overrides, the
+#       width/height/naturalWidth/naturalHeight/x/y/complete/currentSrc IDL attributes,
+#       decode() and the default role. html_image_element_2 has "update the image data",
+#       html_image_element_3 the environment changes, source sets and animation.
+#
+#==============================================================================================
+
+# mark: The batching dispatcher =================================================================
+
+# We batch handling of successfully fetched images to avoid interleaving 1 image, 1 layout, 1 image, 1 layout, etc.
+# The processing timer is 1ms instead of 0ms, since layout is driven by a 0ms timer, and if we use 0ms here,
+# the event loop will process them in insertion order. This is a bit of a hack, but it works.
+
+## The timer's handler: `[this] { process(); }`.
+func html_batching_dispatcher_on_timer(context: void*?):
+    html_batching_dispatcher_process((HtmlBatchingDispatcher*)(context else trap("no dispatcher")))
+
+## Ported from HTMLImageElement.cpp:56 Web::HTML::BatchingDispatcher::BatchingDispatcher.
+pub func html_batching_dispatcher_construct(this: HtmlBatchingDispatcher*):
+    this.m_timer = core_timer_create_single_shot(1, ak.Function0[unit](call = html_batching_dispatcher_on_timer, context = this))
+
+## Ported from HTMLImageElement.cpp:61 Web::HTML::BatchingDispatcher::enqueue.
+pub func html_batching_dispatcher_enqueue(this: HtmlBatchingDispatcher*, callback: gc.Function0[unit]*?):
+    # NOTE: We don't want to flush the queue on every image load, since that would be slow.
+    #       However, we don't want to keep growing the batch forever either.
+    let max_loads_to_batch_before_flushing: usize = 16
+
+    # (The dispatcher is a static, so its queue lives in the C heap; the roots keep the callbacks.)
+    with memory.heap:
+        ak.vector_append_t(&this.m_queue, gc.root_create(callback))
+    if ak.vector_size(&this.m_queue) < max_loads_to_batch_before_flushing:
+        core_timer_restart(this.m_timer)
+
+## Ported from HTMLImageElement.cpp:73 Web::HTML::BatchingDispatcher::process.
+pub func html_batching_dispatcher_process(this: HtmlBatchingDispatcher*):
+    var queue = this.m_queue
+    this.m_queue = ak.Vector[gc.Root[gc.Function0[unit]]]()
+    for callback in &ak.vector_span(&queue):
+        if let function = gc.root_cell(callback):
+            ak.function0_call(&function.function)
+    # The moved-from queue's roots and storage go with it.
+    with memory.heap:
+        for callback in &ak.vector_span(&queue):
+            gc.root_release(callback)
+        ak.vector_clear(&queue)
+
+## The dispatcher (C++: a function-local static), made on first use in the C heap: a module
+## global is not scanned by the collector.
+var html_batching_dispatcher_s_dispatcher: HtmlBatchingDispatcher*?
+
+## Ported from HTMLImageElement.cpp:84 Web::HTML::batching_dispatcher.
+func html_batching_dispatcher() -> HtmlBatchingDispatcher*:
+    if let dispatcher = html_batching_dispatcher_s_dispatcher:
+        return dispatcher
+    with memory.heap:
+        var dispatcher: HtmlBatchingDispatcher = ---
+        dispatcher.m_queue = ak.Vector[gc.Root[gc.Function0[unit]]]()
+        let created = new HtmlBatchingDispatcher(m_timer = core_timer_create(), m_queue = dispatcher.m_queue) else trap("out of memory")
+        html_batching_dispatcher_construct(created)
+        html_batching_dispatcher_s_dispatcher = created
+    return html_batching_dispatcher_s_dispatcher else trap("the batching dispatcher")
+
+# mark: Construction ============================================================================
+
+## The element of its Layout::ImageProvider base (C++'s `this` adjustment).
+func html_image_element_from_image_provider(base: LayoutImageProvider*) -> HtmlImageElement*:
+    return (HtmlImageElement*)((u8*)base - offsetof(HtmlImageElement, image_provider))
+
+## The animation timer's handler: `[this] { animate(); }`.
+func html_image_element_on_animation_timer(context: void*?):
+    html_image_element_animate((HtmlImageElement*)(context else trap("no image element")))
+
+## Ported from HTMLImageElement.cpp:92 Web::HTML::HTMLImageElement::HTMLImageElement.
+pub func html_image_element_construct(this: HtmlImageElement*, document: DomDocument*, qualified_name: DomQualifiedName):
+    html_element_construct(this.html_element(), document, qualified_name)
+    # The Layout::ImageProvider and DOM::ViewportClient bases (no state) get their tables, then the
+    # vptrs of the mixin bases move to HTMLImageElement's tables.
+    this.image_provider.vtable = &html_image_element_image_provider_vtable
+    this.image_provider.class_id = this.cell().class_id
+    this.viewport_client.vtable = &html_image_element_viewport_client_vtable
+    this.viewport_client.class_id = this.cell().class_id
+    let element = this.html_element()
+    element.element.slottable_mixin.vtable = &html_image_element_slottable_mixin_vtable
+    element.element.aria_mixin.vtable = &html_image_element_aria_mixin_vtable
+    element.element.animatable.vtable = &html_image_element_animatable_vtable
+    element.global_event_handlers.vtable = &html_image_element_global_event_handlers_vtable
+    element.form_associated_element.vtable = &html_image_element_form_associated_element_vtable
+    # SourceSet m_source_set: a default-constructed source set.
+    this.m_source_set = html_source_set_new()
+
+    this.m_animation_timer = core_timer_create()
+    let timer = this.m_animation_timer else trap("the animation timer")
+    timer.on_timeout = ak.Function0[unit](call = html_image_element_on_animation_timer, context = this)
+
+    dom_document_register_viewport_client(document, &this.viewport_client)
+
+## Ported from HTMLImageElement.cpp:103 Web::HTML::HTMLImageElement::finalize (override).
+pub func html_image_element_finalize_impl(base: gc.Cell*):
+    let this = (HtmlImageElement*)base
+    dom_node_finalize_impl(base)
+    dom_document_unregister_viewport_client(dom_node_document(this.dom_node()), &this.viewport_client)
+
+## The document observer's document_became_inactive callback (its context is the element).
+func html_image_element_document_became_inactive(context: void*?):
+    let this = (HtmlImageElement*)(context else trap("no image element"))
+    html_image_element_clear_load_event_delayer(this)
+    core_timer_stop(this.m_animation_timer else trap("the animation timer"))
+
+## Ported from HTMLImageElement.cpp:109 Web::HTML::HTMLImageElement::initialize (override).
+pub func html_image_element_initialize_impl(base: JsCell*, realm: Realm*):
+    let this = (HtmlImageElement*)base
+    web_set_prototype_for_interface(base, realm, BindInterfaceName.html_image_element)
+    html_element_initialize_impl(base, realm)
+
+    let document = dom_node_document(this.dom_node())
+    this.m_current_request = html_image_request_create(realm, dom_document_page(document))
+
+    # AD-HOC: Create a DocumentObserver eagerly to handle document lifecycle changes.
+    #         The document_became_inactive callback handles the navigation case by clearing the
+    #         load event delayer and stopping the animation timer.
+    #         A document_became_active callback is set lazily by update_the_image_data() when
+    #         needed to restart image loading after the document becomes active again.
+    let document_observer = realm_create_dom_document_observer(realm, realm, document)
+    this.m_document_observer = document_observer
+    dom_document_observer_set_document_became_inactive(document_observer, ak.Function0[unit](call = html_image_element_document_became_inactive, context = this))
+
+## Ported from HTMLImageElement.cpp:128 Web::HTML::HTMLImageElement::adopted_from (override).
+pub func html_image_element_adopted_from_impl(base: DomNode*, old_document: DomDocument*):
+    let this = (HtmlImageElement*)base
+    let document = dom_node_document(base)
+    dom_document_unregister_viewport_client(old_document, &this.viewport_client)
+    dom_document_register_viewport_client(document, &this.viewport_client)
+
+    let document_observer = this.m_document_observer else trap("the document observer")
+    dom_document_observer_set_document(document_observer, document)
+    if not dom_document_is_fully_active(old_document) and dom_document_is_fully_active(document):
+        if let callback = dom_document_observer_document_became_active(document_observer):
+            ak.function0_call(&callback.function)
+
+## Ported from HTMLImageElement.cpp:140 Web::HTML::HTMLImageElement::visit_edges (override).
+pub func html_image_element_visit_edges_impl(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (HtmlImageElement*)base
+    html_element_visit_edges_impl(base, visitor)
+    layout_image_provider_image_provider_visit_edges(&this.image_provider, visitor)
+    gc.cell_visitor_visit_t(visitor, this.m_current_request)
+    gc.cell_visitor_visit_t(visitor, this.m_pending_request)
+    gc.cell_visitor_visit_t(visitor, this.m_document_observer)
+    gc.cell_visitor_visit_t(visitor, this.m_dimension_attribute_source)
+    html_lazy_loading_element_visit_lazy_loading_element(this, visitor)
+
+## `m_load_event_delayer.clear()`: destroys a held delayer.
+func html_image_element_clear_load_event_delayer(this: HtmlImageElement*):
+    if let delayer = this.m_load_event_delayer:
+        var released = delayer
+        dom_document_load_event_delayer_destruct(&released)
+    this.m_load_event_delayer = none
+
+# mark: The dimension attribute source and presentational hints =================================
+
+## Ported from HTMLImageElement.cpp:152 Web::HTML::HTMLImageElement::dimension_attribute_source.
+# https://html.spec.whatwg.org/multipage/embedded-content.html#concept-img-dimension-attribute-source
+pub func html_image_element_dimension_attribute_source(this: HtmlImageElement*) -> DomElement*:
+    if let source = this.m_dimension_attribute_source:
+        return source
+    return this.dom_element()
+
+## Ported from HTMLImageElement.cpp:159 Web::HTML::HTMLImageElement::set_dimension_attribute_source.
+pub func html_image_element_set_dimension_attribute_source(this: HtmlImageElement*, source: DomElement*?):
+    if this.m_dimension_attribute_source != source:
+        this.m_dimension_attribute_source = source
+        dom_node_set_needs_style_update(this.dom_node(), true)
+
+## Ported from HTMLImageElement.cpp:167 Web::HTML::HTMLImageElement::is_presentational_hint (override).
+pub func html_image_element_is_presentational_hint_impl(base: DomElement*, name: ak.FlyString) -> bool:
+    if dom_element_is_presentational_hint_impl(base, name):
+        return true
+
+    return ak.fly_string_eq_fly_string(&name, &html_attribute_names_hspace) or ak.fly_string_eq_fly_string(&name, &html_attribute_names_vspace) or ak.fly_string_eq_fly_string(&name, &html_attribute_names_border)
+
+## Ported from HTMLImageElement.cpp:178 Web::HTML::HTMLImageElement::apply_presentational_hints (override).
+pub func html_image_element_apply_presentational_hints_impl(base: DomElement*, properties: ak.Vector[CssStyleProperty]*):
+    dom_element_apply_presentational_hints_impl(base, properties)
+    for attribute in dom_element_attribute_span(base):
+        let name = dom_attr_name(attribute)
+        let value_string = dom_attr_value(attribute)
+        let value = ak.string_bytes_as_string_view(&value_string)
+        if ak.fly_string_eq_fly_string(&name, &html_attribute_names_hspace):
+            if let parsed_value = html_parse_dimension_value(value):
+                ak.vector_append_t(properties, CssStyleProperty(property_id = css_data.PropertyId.margin_left, value = parsed_value))
+                ak.vector_append_t(properties, CssStyleProperty(property_id = css_data.PropertyId.margin_right, value = parsed_value))
+        elif ak.fly_string_eq_fly_string(&name, &html_attribute_names_vspace):
+            if let parsed_value = html_parse_dimension_value(value):
+                ak.vector_append_t(properties, CssStyleProperty(property_id = css_data.PropertyId.margin_top, value = parsed_value))
+                ak.vector_append_t(properties, CssStyleProperty(property_id = css_data.PropertyId.margin_bottom, value = parsed_value))
+        elif ak.fly_string_eq_fly_string(&name, &html_attribute_names_border):
+            if let parsed_value = html_parse_non_negative_integer(value):
+                let width_value = css_length_style_value_create(css_length_make_px_f64(f64(parsed_value))).css_style_value()
+                ak.vector_append_t(properties, CssStyleProperty(property_id = css_data.PropertyId.border_top_width, value = width_value))
+                ak.vector_append_t(properties, CssStyleProperty(property_id = css_data.PropertyId.border_right_width, value = width_value))
+                ak.vector_append_t(properties, CssStyleProperty(property_id = css_data.PropertyId.border_bottom_width, value = width_value))
+                ak.vector_append_t(properties, CssStyleProperty(property_id = css_data.PropertyId.border_left_width, value = width_value))
+
+                let solid_value = css_keyword_style_value_create(css_data.Keyword.solid).css_style_value()
+                ak.vector_append_t(properties, CssStyleProperty(property_id = css_data.PropertyId.border_top_style, value = solid_value))
+                ak.vector_append_t(properties, CssStyleProperty(property_id = css_data.PropertyId.border_right_style, value = solid_value))
+                ak.vector_append_t(properties, CssStyleProperty(property_id = css_data.PropertyId.border_bottom_style, value = solid_value))
+                ak.vector_append_t(properties, CssStyleProperty(property_id = css_data.PropertyId.border_left_style, value = solid_value))
+
+## Ported from HTMLImageElement.cpp:210 Web::HTML::HTMLImageElement::form_associated_element_attribute_changed (override).
+pub func html_image_element_form_associated_element_attribute_changed_impl(base: HtmlFormAssociatedElement*, name: ak.FlyString, old_value: ak.String?, value: ak.String?, namespace_: ak.FlyString?):
+    let this = (HtmlImageElement*)html_form_associated_element_form_associated_element_to_html_element(base)
+    if ak.fly_string_eq_fly_string(&name, &html_attribute_names_crossorigin):
+        this.m_cors_setting = html_cors_setting_attribute_from_keyword(value)
+
+    if ak.fly_string_eq_fly_string(&name, &html_attribute_names_src) or ak.fly_string_eq_fly_string(&name, &html_attribute_names_srcset):
+        html_image_element_update_the_image_data(this, true)
+
+    if ak.fly_string_eq_fly_string(&name, &html_attribute_names_alt):
+        # NB: Called from attribute change handler, layout may be stale.
+        if let layout_node = dom_element_unsafe_layout_node(this.dom_element()):
+            layout_image_provider_did_update_alt_text(as_layout_image_box(layout_node))
+
+    if ak.fly_string_eq_fly_string(&name, &html_attribute_names_decoding):
+        if let decoding = value:
+            if ak.string_equals_ignoring_ascii_case_string_view(&decoding, ak.sv("sync")):
+                ak.dbgln("FIXME: HTMLImageElement.decoding = 'sync' is not implemented yet")
+
+## Ported from HTMLImageElement.cpp:232 Web::HTML::HTMLImageElement::create_layout_node (override).
+pub func html_image_element_create_layout_node_impl(base: DomElement*, style: CssComputedProperties*) -> LayoutNode*?:
+    let this = (HtmlImageElement*)base
+    # heap().allocate<Layout::ImageBox>(...): a layout node's initialize is JS::Cell's, which does nothing.
+    return realm_create_layout_image_box(dom_element_realm(base), dom_node_document(base.dom_node()), base, style, &this.image_provider).layout_node()
+
+## Ported from HTMLImageElement.cpp:237 Web::HTML::HTMLImageElement::adjust_computed_style (override).
+pub func html_image_element_adjust_computed_style_impl(base: DomElement*, style: CssComputedProperties*):
+    # https://drafts.csswg.org/css-display-3/#unbox
+    let display = css_computed_properties_display(style)
+    if css_display_is_contents(&display):
+        css_computed_properties_set_property(style, css_data.PropertyId.display, css_display_style_value_create(css_display_from_short(CssDisplayShort.none_)).css_style_value())
+
+# mark: Bitmaps and Layout::ImageProvider =======================================================
+
+## Ported from HTMLImageElement.cpp:244 Web::HTML::HTMLImageElement::immutable_bitmap.
+pub func html_image_element_immutable_bitmap(this: HtmlImageElement*) -> gfx.ImmutableBitmap*?:
+    return layout_image_provider_current_image_bitmap(&this.image_provider)
+
+## Ported from HTMLImageElement.cpp:249 Web::HTML::HTMLImageElement::default_image_bitmap_sized (override).
+pub func html_image_element_default_image_bitmap_sized_impl(base: LayoutImageProvider*, size: gfx.IntSize) -> gfx.ImmutableBitmap*?:
+    let this = html_image_element_from_image_provider(base)
+    if let data = html_image_request_image_data(html_image_element_current_request(this)):
+        return html_decoded_image_data_bitmap(data, 0, size)
+    return none
+
+## Ported from HTMLImageElement.cpp:256 Web::HTML::HTMLImageElement::is_image_available (override).
+pub func html_image_element_is_image_available_impl(base: LayoutImageProvider*) -> bool:
+    let this = html_image_element_from_image_provider(base)
+    let current_request = this.m_current_request else return false
+    return html_image_request_is_available(current_request)
+
+## Ported from HTMLImageElement.cpp:261 Web::HTML::HTMLImageElement::intrinsic_width (override).
+pub func html_image_element_intrinsic_width_impl(base: LayoutImageProvider*) -> gfx.CssPixels?:
+    let this = html_image_element_from_image_provider(base)
+    if let image_data = html_image_request_image_data(html_image_element_current_request(this)):
+        return html_decoded_image_data_intrinsic_width(image_data)
+    return none
+
+## Ported from HTMLImageElement.cpp:268 Web::HTML::HTMLImageElement::intrinsic_height (override).
+pub func html_image_element_intrinsic_height_impl(base: LayoutImageProvider*) -> gfx.CssPixels?:
+    let this = html_image_element_from_image_provider(base)
+    if let image_data = html_image_request_image_data(html_image_element_current_request(this)):
+        return html_decoded_image_data_intrinsic_height(image_data)
+    return none
+
+## Ported from HTMLImageElement.cpp:275 Web::HTML::HTMLImageElement::intrinsic_aspect_ratio (override).
+pub func html_image_element_intrinsic_aspect_ratio_impl(base: LayoutImageProvider*) -> gfx.CssPixelFraction?:
+    let this = html_image_element_from_image_provider(base)
+    if let image_data = html_image_request_image_data(html_image_element_current_request(this)):
+        return html_decoded_image_data_intrinsic_aspect_ratio(image_data)
+    return none
+
+## Ported from HTMLImageElement.cpp:282 Web::HTML::HTMLImageElement::current_image_bitmap_sized (override).
+pub func html_image_element_current_image_bitmap_sized_impl(base: LayoutImageProvider*, size: gfx.IntSize) -> gfx.ImmutableBitmap*?:
+    let this = html_image_element_from_image_provider(base)
+    if let data = html_image_request_image_data(html_image_element_current_request(this)):
+        return html_decoded_image_data_bitmap(data, this.m_current_frame_index, size)
+    return none
+
+## Ported from HTMLImageElement.cpp:289 Web::HTML::HTMLImageElement::set_visible_in_viewport (override).
+pub func html_image_element_set_visible_in_viewport_impl(base: LayoutImageProvider*, arg0: bool):
+    # FIXME: Loosen grip on image data when it's not visible, e.g via volatile memory.
+    return
+
+# mark: IDL attributes ==========================================================================
+
+## Ported from HTMLImageElement.cpp:295 Web::HTML::HTMLImageElement::width.
+# https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-width
+pub func html_image_element_width(this: HtmlImageElement*) -> u32:
+    dom_document_update_layout_if_needed_for_node(dom_node_document(this.dom_node()), this.dom_node(), DomUpdateLayoutReason.html_image_element_width)
+
+    # Return the rendered width of the image, in CSS pixels, if the image is being rendered.
+    if let paintable_box = dom_node_paintable_box(this.dom_node()):
+        return (u32)paint_paintable_box_content_width(paintable_box).to_int()
+
+    # On setting [the width or height IDL attribute], they must act as if they reflected the respective content attributes of the same name.
+    if let width_attr = dom_element_get_attribute(this.dom_element(), html_attribute_names_width):
+        if let converted = html_parse_non_negative_integer(ak.string_bytes_as_string_view(&width_attr)):
+            if converted <= 2147483647:
+                return converted
+
+    # ...or else the density-corrected intrinsic width and height of the image, in CSS pixels,
+    # if the image has intrinsic dimensions and is available but not being rendered.
+    if let bitmap = layout_image_provider_current_image_bitmap(&this.image_provider):
+        return (u32)gfx.immutable_bitmap_width(bitmap)
+
+    # ...or else 0, if the image is not available or does not have intrinsic dimensions.
+    return 0
+
+## Ported from HTMLImageElement.cpp:318 Web::HTML::HTMLImageElement::set_width.
+pub func html_image_element_set_width(this: HtmlImageElement*, width: u32):
+    var value = width
+    if value > 2147483647:
+        value = 0
+    dom_element_set_attribute_value(this.dom_element(), html_attribute_names_width, ak.string_number_u64(value))
+
+## Ported from HTMLImageElement.cpp:326 Web::HTML::HTMLImageElement::height.
+# https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-height
+pub func html_image_element_height(this: HtmlImageElement*) -> u32:
+    dom_document_update_layout_if_needed_for_node(dom_node_document(this.dom_node()), this.dom_node(), DomUpdateLayoutReason.html_image_element_height)
+
+    # Return the rendered height of the image, in CSS pixels, if the image is being rendered.
+    if let paintable_box = dom_node_paintable_box(this.dom_node()):
+        return (u32)paint_paintable_box_content_height(paintable_box).to_int()
+
+    # On setting [the width or height IDL attribute], they must act as if they reflected the respective content attributes of the same name.
+    if let height_attr = dom_element_get_attribute(this.dom_element(), html_attribute_names_height):
+        if let converted = html_parse_non_negative_integer(ak.string_bytes_as_string_view(&height_attr)):
+            if converted <= 2147483647:
+                return converted
+
+    # ...or else the density-corrected intrinsic height and height of the image, in CSS pixels,
+    # if the image has intrinsic dimensions and is available but not being rendered.
+    if let bitmap = layout_image_provider_current_image_bitmap(&this.image_provider):
+        return (u32)gfx.immutable_bitmap_height(bitmap)
+
+    # ...or else 0, if the image is not available or does not have intrinsic dimensions.
+    return 0
+
+## Ported from HTMLImageElement.cpp:349 Web::HTML::HTMLImageElement::set_height.
+pub func html_image_element_set_height(this: HtmlImageElement*, height: u32):
+    var value = height
+    if value > 2147483647:
+        value = 0
+    dom_element_set_attribute_value(this.dom_element(), html_attribute_names_height, ak.string_number_u64(value))
+
+## Ported from HTMLImageElement.cpp:357 Web::HTML::HTMLImageElement::natural_width.
+# https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-naturalwidth
+pub func html_image_element_natural_width(this: HtmlImageElement*) -> u32:
+    # Return the density-corrected intrinsic width of the image, in CSS pixels,
+    # if the image has intrinsic dimensions and is available.
+    if let bitmap = layout_image_provider_current_image_bitmap(&this.image_provider):
+        return (u32)gfx.immutable_bitmap_width(bitmap)
+
+    # ...or else 0.
+    return 0
+
+## Ported from HTMLImageElement.cpp:369 Web::HTML::HTMLImageElement::natural_height.
+# https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-naturalheight
+pub func html_image_element_natural_height(this: HtmlImageElement*) -> u32:
+    # Return the density-corrected intrinsic height of the image, in CSS pixels,
+    # if the image has intrinsic dimensions and is available.
+    if let bitmap = layout_image_provider_current_image_bitmap(&this.image_provider):
+        return (u32)gfx.immutable_bitmap_height(bitmap)
+
+    # ...or else 0.
+    return 0
+
+## The scroll offset of a paintable box's enclosing scroll frame (x() and y()).
+func html_image_element_scroll_offset(paintable_box: PaintPaintableBox*) -> gfx.CssPixelPoint:
+    let idx = paint_paintable_box_enclosing_scroll_frame_index(paintable_box)
+    if idx != 0:
+        let viewport_paintable = dom_document_paintable(paint_paintable_document(paintable_box.paint_paintable())) else trap("the document's paintable")
+        let scroll_state = paint_viewport_paintable_scroll_state(viewport_paintable)
+        return display_list.scroll_state_cumulative_offset(&scroll_state, idx)
+    return gfx.CssPixelPoint()
+
+## Ported from HTMLImageElement.cpp:381 Web::HTML::HTMLImageElement::x.
+# https://drafts.csswg.org/cssom-view/#dom-htmlimageelement-x
+pub func html_image_element_x(this: HtmlImageElement*) -> i32:
+    # The x attribute, on getting, must return the scaled x-coordinate of the left border edge of the first box
+    # associated with the element, relative to the initial containing block origin, ignoring any transforms that apply
+    # to the element and its ancestors, or zero if there is no box.
+    dom_document_update_layout_if_needed_for_node(dom_node_document(this.dom_node()), this.dom_node(), DomUpdateLayoutReason.html_image_element_x)
+
+    let paintable_box = dom_node_paintable_box(this.dom_node()) else return 0
+
+    let scroll_offset = html_image_element_scroll_offset(paintable_box)
+    let scroll_offset_x = gfx.css_pixel_point_x(&scroll_offset)
+
+    let rect = paint_paintable_box_absolute_border_box_rect(paintable_box)
+    return gfx.css_pixel_rect_x(&rect).sub(scroll_offset_x).to_int()
+
+## Ported from HTMLImageElement.cpp:400 Web::HTML::HTMLImageElement::y.
+# https://drafts.csswg.org/cssom-view/#dom-htmlimageelement-y
+pub func html_image_element_y(this: HtmlImageElement*) -> i32:
+    # The y attribute, on getting, must return the scaled y-coordinate of the top border edge of the first box
+    # associated with the element, relative to the initial containing block origin, ignoring any transforms that apply
+    # to the element and its ancestors, or zero if there is no box.
+    dom_document_update_layout_if_needed_for_node(dom_node_document(this.dom_node()), this.dom_node(), DomUpdateLayoutReason.html_image_element_y)
+
+    let paintable_box = dom_node_paintable_box(this.dom_node()) else return 0
+
+    let scroll_offset = html_image_element_scroll_offset(paintable_box)
+    let scroll_offset_y = gfx.css_pixel_point_y(&scroll_offset)
+
+    let rect = paint_paintable_box_absolute_border_box_rect(paintable_box)
+    return gfx.css_pixel_rect_y(&rect).sub(scroll_offset_y).to_int()
+
+## Ported from HTMLImageElement.cpp:419 Web::HTML::HTMLImageElement::complete.
+# https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-complete
+pub func html_image_element_complete(this: HtmlImageElement*) -> bool:
+    let element = this.dom_element()
+    # The IDL attribute complete must return true if any of the following conditions is true:
+
+    # - Both the src attribute and the srcset attribute are omitted.
+    if not dom_element_has_attribute(element, html_attribute_names_src) and not dom_element_has_attribute(element, html_attribute_names_srcset):
+        return true
+
+    # - The srcset attribute is omitted and the src attribute's value is the empty string.
+    if not dom_element_has_attribute(element, html_attribute_names_srcset):
+        let src = dom_element_attribute(element, html_attribute_names_src) else trap("VERIFY: Optional::value() of the src attribute")
+        if ak.string_is_empty(&src):
+            return true
+
+    # - The img element's current request's state is completely available and its pending request is null.
+    let current_request = html_image_element_current_request(this)
+    if html_image_request_state(current_request) == HtmlImageRequestState.completely_available and this.m_pending_request == none:
+        return true
+
+    # - The img element's current request's state is broken and its pending request is null.
+    if html_image_request_state(current_request) == HtmlImageRequestState.broken and this.m_pending_request == none:
+        return true
+
+    return false
+
+## Ported from HTMLImageElement.cpp:443 Web::HTML::HTMLImageElement::current_src.
+# https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-currentsrc
+pub func html_image_element_current_src(this: HtmlImageElement*) -> ak.String:
+    # The currentSrc IDL attribute must return the img element's current request's current URL.
+    return html_image_request_current_url(html_image_element_current_request(this))
+
+# mark: decode() ================================================================================
+
+## The state decode()'s microtask and callbacks share: `[this, promise, &realm]`, the relevant
+## global, and (for the callbacks) the expected request and a weak element.
+struct HtmlImageElementDecode:
+    var this: HtmlImageElement*
+    var promise: JsPromiseCapability*
+    var realm: Realm*
+    var global: JsObject*?
+    var expected_request: HtmlImageRequest*?
+    var weak_this: gc.Weak[HtmlImageElement]
+    var message: ak.Utf16String
+
+    ## reject_promise: reject the promise with an "EncodingError" DOMException.
+    static func reject_promise(captures: HtmlImageElementDecode*, message: ak.Utf16String):
+        let exception = idl_encoding_error_create(captures.realm, message)
+        var context: HtmlTemporaryExecutionContext = ---
+        html_temporary_execution_context_construct_realm(&context, captures.realm)
+        defer html_temporary_execution_context_destruct(&context)
+        idl_reject_promise(captures.realm, captures.promise, bind_platform_object_wrapper(exception.bind_platform_object()))
+
+    ## queue_reject_task: a global task that rejects with `message`.
+    static func queue_reject_task(captures: HtmlImageElementDecode*, message: ak.Utf16String):
+        let task_captures = new HtmlImageElementDecode(this = captures.this, promise = captures.promise, realm = captures.realm, global = captures.global, expected_request = captures.expected_request, weak_this = captures.weak_this, message = message) else trap("out of memory")
+        discard(html_queue_global_task(HtmlTaskSource.dom_manipulation, captures.global else trap("the relevant global"), gc.create_function0(realm_heap(captures.realm), ak.Function0[unit](call = HtmlImageElementDecode.reject_task, context = task_captures))))
+
+    ## The rejecting global task: `[reject_promise, message = message] { reject_promise(message); }`.
+    static func reject_task(context: void*?):
+        let captures = (HtmlImageElementDecode*)(context else trap("decode: no captures"))
+        HtmlImageElementDecode.reject_promise(captures, captures.message)
+
+    ## queue_resolve_task: a global task that resolves the promise with undefined.
+    static func queue_resolve_task(captures: HtmlImageElementDecode*):
+        discard(html_queue_global_task(HtmlTaskSource.dom_manipulation, captures.global else trap("the relevant global"), gc.create_function0(realm_heap(captures.realm), ak.Function0[unit](call = HtmlImageElementDecode.resolve_task, context = captures))))
+
+    ## The resolving global task.
+    static func resolve_task(context: void*?):
+        let captures = (HtmlImageElementDecode*)(context else trap("decode: no captures"))
+        var execution_context: HtmlTemporaryExecutionContext = ---
+        html_temporary_execution_context_construct_realm(&execution_context, captures.realm)
+        defer html_temporary_execution_context_destruct(&execution_context)
+        idl_resolve_promise(captures.realm, captures.promise, js_undefined())
+
+    ## The microtask of step 2.
+    static func microtask(context: void*?):
+        let captures = (HtmlImageElementDecode*)(context else trap("decode: no captures"))
+        let this = captures.this
+
+        # 1. Let global be this's relevant global object.
+        captures.global = html_relevant_global_object((JsObject*)this)
+
+        # 2. If any of the following are true:
+        #    - this's node document is not fully active;
+        if not dom_document_is_fully_active(dom_node_document(this.dom_node())):
+            # then reject promise with an "EncodingError" DOMException.
+            HtmlImageElementDecode.reject_promise(captures, ak.utf16_string_from_str("Node document not fully active"))
+            return
+
+        #    - or this's current request's state is broken,
+        let current_request = html_image_element_current_request(this)
+        if html_image_request_state(current_request) == HtmlImageRequestState.broken:
+            # then reject promise with an "EncodingError" DOMException.
+            HtmlImageElementDecode.reject_promise(captures, ak.utf16_string_from_str("Current request state is broken"))
+            return
+
+        captures.expected_request = this.m_current_request
+        captures.weak_this = gc.make_weak(this)
+
+        # 3. Otherwise, in parallel wait for one of the following cases to occur, and perform the corresponding actions:
+        if html_image_request_state(current_request) == HtmlImageRequestState.completely_available:
+            HtmlImageElementDecode.queue_resolve_task(captures)
+            return
+
+        html_image_request_add_callbacks(current_request, ak.Function0[unit](call = HtmlImageElementDecode.on_finish, context = captures), ak.Function0[unit](call = HtmlImageElementDecode.on_fail, context = captures))
+
+    ## The request's on_finish callback.
+    static func on_finish(context: void*?):
+        let captures = (HtmlImageElementDecode*)(context else trap("decode: no captures"))
+        # AD-HOC: Enqueue on the batching dispatcher to preserve ordering relative to update_the_image_data's step
+        #         16, which also goes through the batching dispatcher. Otherwise decode() can resolve before the
+        #         current request transitions to CompletelyAvailable, leaving the image dimensions at zero when
+        #         callers inspect them.
+        html_batching_dispatcher_enqueue(html_batching_dispatcher(), gc.create_function0(realm_heap(captures.realm), ak.Function0[unit](call = HtmlImageElementDecode.on_finish_batched, context = captures)))
+
+    ## The batched part of on_finish.
+    static func on_finish_batched(context: void*?):
+        let captures = (HtmlImageElementDecode*)(context else trap("decode: no captures"))
+        if gc.weak_ptr(&captures.weak_this) == none:
+            HtmlImageElementDecode.queue_reject_task(captures, ak.utf16_string_from_str("Image element no longer available"))
+            return
+        let image = gc.weak_ptr(&captures.weak_this) else trap("VERIFY_NOT_REACHED")
+
+        if not dom_document_is_fully_active(dom_node_document(image.dom_node())):
+            HtmlImageElementDecode.queue_reject_task(captures, ak.utf16_string_from_str("Node document not fully active"))
+            return
+        if image.m_current_request != captures.expected_request:
+            HtmlImageElementDecode.queue_reject_task(captures, ak.utf16_string_from_str("Current request changed or was mutated"))
+            return
+        if html_image_request_state(html_image_element_current_request(image)) == HtmlImageRequestState.broken:
+            HtmlImageElementDecode.queue_reject_task(captures, ak.utf16_string_from_str("Current request state is broken"))
+            return
+        HtmlImageElementDecode.queue_resolve_task(captures)
+
+    ## The request's on_fail callback.
+    static func on_fail(context: void*?):
+        let captures = (HtmlImageElementDecode*)(context else trap("decode: no captures"))
+        if gc.weak_ptr(&captures.weak_this) == none:
+            HtmlImageElementDecode.queue_reject_task(captures, ak.utf16_string_from_str("Image element no longer available"))
+            return
+        let image = gc.weak_ptr(&captures.weak_this) else trap("VERIFY_NOT_REACHED")
+
+        if not dom_document_is_fully_active(dom_node_document(image.dom_node())):
+            HtmlImageElementDecode.queue_reject_task(captures, ak.utf16_string_from_str("Node document not fully active"))
+            return
+
+        if image.m_current_request != captures.expected_request:
+            HtmlImageElementDecode.queue_reject_task(captures, ak.utf16_string_from_str("Current request changed or was mutated"))
+            return
+        HtmlImageElementDecode.queue_reject_task(captures, ak.utf16_string_from_str("Current request state is broken"))
+
+## Ported from HTMLImageElement.cpp:450 Web::HTML::HTMLImageElement::decode.
+# https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-decode
+pub func html_image_element_decode(this: HtmlImageElement*) -> JsPromiseCapability*!:
+    let realm = html_element_realm(this.html_element())
+
+    # 1. Let promise be a new promise.
+    let promise = idl_create_promise(realm)
+
+    # 2. Queue a microtask to perform the following steps:
+    let captures = new HtmlImageElementDecode(this = this, promise = promise, realm = realm, global = none, expected_request = none, weak_this = gc.Weak[HtmlImageElement](), message = ak.utf16_string_from_str("")) else trap("out of memory")
+    html_queue_a_microtask(dom_node_document(this.dom_node()), gc.create_function0(realm_heap(realm), ak.Function0[unit](call = HtmlImageElementDecode.microtask, context = captures)))
+
+    # 3. Return promise.
+    return promise
+
+## Ported from HTMLImageElement.cpp:558 Web::HTML::HTMLImageElement::default_role (override).
+pub func html_image_element_default_role_impl(base: AriaMixin*) -> AriaRole?:
+    let this = (HtmlImageElement*)dom_element_from_aria_mixin(base)
+    # https://www.w3.org/TR/html-aria/#el-img
+    # https://www.w3.org/TR/html-aria/#el-img-no-alt
+    # https://w3c.github.io/aria/#image
+    # NOTE: The "image" role value is a synonym for the older "img" role value; however, the el-img test in
+    #       https://wpt.fyi/results/html-aam/roles.html expects the value to be "image" (not "img").
+    let alt = html_image_element_alt(this)
+    if not ak.string_is_empty(&alt):
+        return AriaRole.image
+    # https://www.w3.org/TR/html-aria/#el-img-empty-alt
+    # NOTE: The "none" role value is a synonym for the older "presentation" role value; however, the el-img-alt-no-value
+    #       test in https://wpt.fyi/results/html-aam/roles.html expects the value to be "none" (not "presentation").
+    return AriaRole.none_
+
+# mark: Inline functions of HTMLImageElement.h ==================================================
+
+## Ported from HTMLImageElement.h:31 Web::HTML::HTMLImageElement::is_lazy_loading (override; LAZY_LOADING_ELEMENT).
+pub func html_image_element_is_lazy_loading_impl(base: DomNode*) -> bool:
+    return true
+
+## Ported from HTMLImageElement.h:31 Web::HTML::HTMLImageElement::take_lazy_load_resumption_steps (override; LAZY_LOADING_ELEMENT).
+pub func html_image_element_take_lazy_load_resumption_steps_impl(base: DomElement*) -> gc.Function0[unit]*?:
+    return html_lazy_loading_element_take_lazy_load_resumption_steps_internal((HtmlImageElement*)base)
+
+## Ported from HTMLImageElement.h:39 Web::HTML::HTMLImageElement::is_form_associated_element (override).
+pub func html_image_element_is_form_associated_element_impl(base: HtmlFormAssociatedElement*) -> bool:
+    return true
+
+## Ported from HTMLImageElement.h:43 Web::HTML::HTMLImageElement::alternative_text (override).
+pub func html_image_element_alternative_text_impl(base: DomNode*) -> ak.String?:
+    if let alt = dom_element_get_attribute((DomElement*)base, html_attribute_names_alt):
+        return alt
+    return none
+
+## Ported from HTMLImageElement.h:50 Web::HTML::HTMLImageElement::alt.
+pub func html_image_element_alt(this: HtmlImageElement*) -> ak.String:
+    return dom_element_get_attribute_value(this.dom_element(), html_attribute_names_alt)
+
+## Ported from HTMLImageElement.h:99 Web::HTML::HTMLImageElement::current_request.
+pub func html_image_element_current_request(this: HtmlImageElement*) -> HtmlImageRequest*:
+    return this.m_current_request else trap("the current request")
+
+## Ported from HTMLImageElement.h:100 Web::HTML::HTMLImageElement::current_request.
+pub func html_image_element_current_request_const(this: HtmlImageElement*) -> HtmlImageRequest*:
+    return this.m_current_request else trap("the current request")
+
+## Ported from HTMLImageElement.h:102 Web::HTML::HTMLImageElement::current_frame_index (override).
+pub func html_image_element_current_frame_index_impl(base: LayoutImageProvider*) -> usize:
+    return html_image_element_from_image_provider(base).m_current_frame_index
+
+## Ported from HTMLImageElement.h:117 Web::HTML::HTMLImageElement::to_html_element (override).
+pub func html_image_element_to_html_element_impl(base: LayoutImageProvider*) -> DomElement*?:
+    return html_image_element_from_image_provider(base).dom_element()
+
+## Ported from HTMLImageElement.h:127 Web::HTML::HTMLImageElement::is_html_image_element (override).
+pub func html_image_element_is_html_image_element_impl(base: DomNode*) -> bool:
+    return true
+
+## Ported from HTMLImageElement.h:138 Web::HTML::HTMLImageElement::supports_dimension_attributes (override).
+# https://html.spec.whatwg.org/multipage/embedded-content.html#the-img-element:dimension-attributes
+pub func html_image_element_supports_dimension_attributes_impl(base: DomElement*) -> bool:
+    return true
