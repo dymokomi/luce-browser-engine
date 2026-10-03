@@ -51,6 +51,8 @@ test "Document::create_and_initialize: a P1 HTML document with its Window, Windo
     let vm = web_test_create_vm()
     defer web_test_destroy_vm(vm)
     discard(web_test_install_agent(vm))
+    web_test_install_event_loop_plugin()
+    defer web_test_remove_event_loop_plugin()
     let allocator: memory.Allocator = vm_heap(vm)
     with allocator:
         let (page, traversable) = test_browsing_page_with_traversable(vm)
@@ -113,3 +115,180 @@ test "Document::create_and_initialize: a P1 HTML document with its Window, Windo
         # Navigating to a URL fetches it, which is phase 2: the documents of phase 1 come from
         # responses made as above (a srcdoc iframe's, an embedder's) or from about:blank.
         assert(test_page_still_unported("stub_closure.lucb", "Web::Fetch::Fetching::fetch"))
+
+## A document initialized for a navigation response to `url` in a new top-level traversable of a
+## test page of `vm` (as the first test does), and its traversable.
+func test_browsing_initialized_document(vm: Vm*, url: str) -> (DomDocument*, HtmlTraversableNavigable*):
+    let (page, traversable) = test_browsing_page_with_traversable(vm)
+    discard(page)
+    let response = test_browsing_response(vm, url)
+    let params = test_browsing_navigation_params(vm, traversable.html_navigable(), response)
+    let document = dom_document_create_and_initialize(DocumentDomDocumentType.html, ak.string_from_str("text/html"), params) else trap("create_and_initialize threw")
+    return (document, traversable)
+
+## Parses `html` into `document`, as the navigation's HTML parser would.
+func test_browsing_parse(document: DomDocument*, html: str):
+    let parser = html_parser_create(document, ak.sv(html), HtmlParserScriptingMode.disabled, ak.sv("UTF-8"))
+    html_parser_run_url(parser, dom_document_url(document))
+
+## Whether `url` serializes as `text`.
+func test_browsing_url_is(url: web_url.Url, text: str) -> bool:
+    let serialized = web_url.url_serialize(&url)
+    return test_html_string_is(serialized, text)
+
+# mark: Base URLs ===============================================================================
+
+test "a document's base URL: its URL, then its first base element with an href, against which URLs resolve":
+    web_initialize_strings()
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    discard(web_test_install_agent(vm))
+    web_test_install_event_loop_plugin()
+    defer web_test_remove_event_loop_plugin()
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        let (document, traversable) = test_browsing_initialized_document(vm, "https://example.com/dir/page.html")
+        discard(traversable)
+
+        # Without a base element, the fallback base URL is the document's URL.
+        assert(test_browsing_url_is(dom_document_base_url(document), "https://example.com/dir/page.html"))
+        let relative = dom_document_encoding_parse_url(document, ak.sv("img/a.png")) else trap("the URL parses")
+        assert(test_browsing_url_is(relative, "https://example.com/dir/img/a.png"))
+
+        # The first base element with an href attribute sets the frozen base URL.
+        test_browsing_parse(document, "<!DOCTYPE html><html><head><base target=_blank><base href='/assets/v2/'><base href='other/'></head><body><a href='x.html'>x</a></body></html>")
+        assert(test_browsing_url_is(dom_document_base_url(document), "https://example.com/assets/v2/"))
+        let resolved = dom_document_encoding_parse_url(document, ak.sv("img/a.png")) else trap("the URL parses")
+        assert(test_browsing_url_is(resolved, "https://example.com/assets/v2/img/a.png"))
+        let absolute = dom_document_encoding_parse_url(document, ak.sv("//cdn.example.org/s.css")) else trap("the URL parses")
+        assert(test_browsing_url_is(absolute, "https://cdn.example.org/s.css"))
+
+        # The window's settings object answers the same API base URL.
+        let window = dom_document_window(document) else trap("no window")
+        let settings = html_relevant_settings_object_js_object((JsObject*)window)
+        assert(test_browsing_url_is(html_environment_settings_object_api_base_url(settings), "https://example.com/assets/v2/"))
+
+        # The about:blank document of the new top-level traversable has about:blank as its base URL.
+        let initial_document = html_navigable_active_document(traversable.html_navigable()) else trap("no active document")
+        assert(test_browsing_url_is(dom_document_base_url(initial_document), "about:blank"))
+
+# mark: Style =========================================================================================
+
+test "a connected style element applies its rules to a document of a window through the cascade":
+    web_initialize_strings()
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    discard(web_test_install_agent(vm))
+    web_test_install_event_loop_plugin()
+    defer web_test_remove_event_loop_plugin()
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        test_page_client_color_scheme = CssPreferredColorScheme.light
+        defer test_page_client_color_scheme = CssPreferredColorScheme.auto
+        let (document, traversable) = test_browsing_initialized_document(vm, "https://example.com/style.html")
+        discard(traversable)
+        test_browsing_parse(document, "<!DOCTYPE html><html><head><style>p { color: rgb(0, 128, 0) } #second { color: rgb(1, 2, 3); background-color: rgb(10, 20, 30) }</style></head><body><p id=first>one</p><p id=second style='color: rgb(200, 0, 0)'>two</p></body></html>")
+
+        # The style element's sheet is connected: one sheet in the document's style sheets.
+        assert(ak.vector_size(&dom_document_style_sheets(document).m_sheets) == 1)
+
+        dom_document_update_style(document)
+        let no_context = CssColorResolutionContext()
+        let first = dom_parent_node_get_element_by_id(document.dom_parent_node(), ak.fly_string_from_str("first")) else trap("no #first")
+        let first_color = css_computed_properties_color(dom_element_computed_properties(first) else trap("no computed properties"), css_data.PropertyId.color, no_context)
+        assert(gfx.color_red(&first_color) == 0 and gfx.color_green(&first_color) == 128 and gfx.color_blue(&first_color) == 0)
+
+        # The id rule wins over the type rule, the style attribute over both.
+        let second = dom_parent_node_get_element_by_id(document.dom_parent_node(), ak.fly_string_from_str("second")) else trap("no #second")
+        let second_properties = dom_element_computed_properties(second) else trap("no computed properties")
+        let second_color = css_computed_properties_color(second_properties, css_data.PropertyId.color, no_context)
+        assert(gfx.color_red(&second_color) == 200 and gfx.color_green(&second_color) == 0 and gfx.color_blue(&second_color) == 0)
+        let second_background = css_computed_properties_color(second_properties, css_data.PropertyId.background_color, no_context)
+        assert(gfx.color_red(&second_background) == 10 and gfx.color_green(&second_background) == 20 and gfx.color_blue(&second_background) == 30)
+
+# mark: Collection ==============================================================================
+
+## What make_test_browsing_graph made: the root of the page and weak references to the rest.
+struct TestBrowsingGraph:
+    var page_root: gc.Root[Page]
+    var document_root: gc.Root[DomDocument]
+    var page: gc.Weak[Page]
+    var traversable: gc.Weak[HtmlTraversableNavigable]
+    var browsing_context: gc.Weak[HtmlBrowsingContext]
+    var window_proxy: gc.Weak[HtmlWindowProxy]
+    var initial_document: gc.Weak[DomDocument]
+    var initial_window: gc.Weak[HtmlWindow]
+    var document: gc.Weak[DomDocument]
+    var window: gc.Weak[HtmlWindow]
+    var element: gc.Weak[DomElement]
+
+## A page with a top-level traversable and a document initialized for it with an element, made with the
+## VM's heap as the current allocator; the page and the document are rooted.
+noinline func make_test_browsing_graph(vm: Vm*) -> TestBrowsingGraph:
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        let (document, traversable) = test_browsing_initialized_document(vm, "https://example.com/gc.html")
+        # The tree is built by hand: a parser's end would keep the document (through its end
+        # state's deferred progress check) until the Core event loop runs it.
+        let element = dom_create_element(document, ak.fly_string_from_str("p"), none) else trap("create_element failed")
+        discard(dom_node_append_child(document.dom_node(), element.dom_node()) else trap("append_child failed"))
+        let page = html_navigable_page(traversable.html_navigable())
+        let browsing_context = html_navigable_active_browsing_context(traversable.html_navigable()) else trap("no browsing context")
+        return TestBrowsingGraph(page_root = gc.root_create(page), document_root = gc.root_create(document), page = gc.make_weak(page), traversable = gc.make_weak(traversable), browsing_context = gc.make_weak(browsing_context), window_proxy = gc.make_weak(html_browsing_context_window_proxy(browsing_context)), initial_document = gc.make_weak(html_navigable_active_document(traversable.html_navigable())), initial_window = gc.make_weak(html_navigable_active_window(traversable.html_navigable())), document = gc.make_weak(document), window = gc.make_weak(dom_document_window(document)), element = gc.make_weak(element))
+
+noinline func run_browsing_collection():
+    web_initialize_strings()
+    let vm = web_test_create_vm()
+    discard(web_test_install_agent(vm))
+    web_test_install_event_loop_plugin()
+    defer web_test_remove_event_loop_plugin()
+    let navigables_before = ak.hash_table_size(html_all_navigables())
+    let windows_before = ak.hash_table_size(html_all_windows())
+    var graph = make_test_browsing_graph(vm)
+    # The new traversable, and the initial and the new window, are registered.
+    assert(ak.hash_table_size(html_all_navigables()) == navigables_before + 1)
+    assert(ak.hash_table_size(html_all_windows()) == windows_before + 2)
+    web_test_clobber_stack()
+    gc.heap_collect_garbage(vm_heap(vm))
+
+    # The page keeps its traversable, browsing context, WindowProxy and initial document and window
+    # (through Page, Navigable, BrowsingContext, DocumentState and Window::visit_edges); the
+    # document's root keeps it, its window (its realm's global object) and its elements.
+    assert(web_test_alive(&graph.page))
+    assert(web_test_alive(&graph.traversable))
+    assert(web_test_alive(&graph.browsing_context))
+    assert(web_test_alive(&graph.window_proxy))
+    assert(web_test_alive(&graph.initial_document))
+    assert(web_test_alive(&graph.initial_window))
+    assert(web_test_alive(&graph.document))
+    assert(web_test_alive(&graph.window))
+    assert(web_test_alive(&graph.element))
+
+    # Without the document's root, the document, its window and its elements go.
+    gc.root_release(&graph.document_root)
+    web_test_clobber_stack()
+    gc.heap_collect_garbage(vm_heap(vm))
+    assert(web_test_alive(&graph.page))
+    assert(web_test_alive(&graph.initial_window))
+    assert(not web_test_alive(&graph.document))
+    assert(not web_test_alive(&graph.window))
+    assert(not web_test_alive(&graph.element))
+    assert(ak.hash_table_size(html_all_windows()) == windows_before + 1)
+
+    # Without the page's root, everything goes, and the finalizers leave the C-heap registries.
+    gc.root_release(&graph.page_root)
+    web_test_clobber_stack()
+    gc.heap_collect_garbage(vm_heap(vm))
+    assert(not web_test_alive(&graph.page))
+    assert(not web_test_alive(&graph.traversable))
+    assert(not web_test_alive(&graph.browsing_context))
+    assert(not web_test_alive(&graph.window_proxy))
+    assert(not web_test_alive(&graph.initial_document))
+    assert(not web_test_alive(&graph.initial_window))
+    assert(ak.hash_table_size(html_all_navigables()) == navigables_before)
+    assert(ak.hash_table_size(html_all_windows()) == windows_before)
+    web_test_destroy_vm(vm)
+
+test "a full collection marks a page's traversable, browsing context, windows and documents, and frees them after":
+    web_test_clobber_stack()
+    run_browsing_collection()
