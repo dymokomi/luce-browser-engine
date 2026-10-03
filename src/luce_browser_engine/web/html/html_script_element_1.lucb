@@ -1,0 +1,336 @@
+#==============================================================================================
+#
+#   html_script_element_1 - HTML::HTMLScriptElement: <script> state, executing and preparing
+#
+#   DESCRIPTION:
+#       Port of LibWeb/HTML/HTMLScriptElement.cpp (lines 1-643): construction (which moves the
+#       mixin tables to HTMLScriptElement's, as C++'s vptrs move, and runs the members' default
+#       initializers), initialize, visit_edges, attribute_changed, preparing the script text,
+#       delaying the load event, executing the script block and preparing the script element.
+#
+#       Phase 1 runs with scripting disabled: "prepare the script element" is ported up to its
+#       step 19 ("if scripting is disabled for el, then return"), which every phase-1 document
+#       reaches. Steps 20-37 create and fetch scripts (ClassicScript, the module graph, import
+#       maps, Fetch), all phase 3: past step 19 the port traps "unported (P3)". Executing the
+#       script block is ported whole, with the script and import map calls going to the closure
+#       stubs of phase 3.
+#
+#==============================================================================================
+
+# mark: Construction and visiting ================================================================
+
+## Ported from HTMLScriptElement.cpp:35 Web::HTML::HTMLScriptElement::HTMLScriptElement.
+pub func html_script_element_construct(this: HtmlScriptElement*, document: DomDocument*, qualified_name: DomQualifiedName):
+    html_element_construct(this.html_element(), document, qualified_name)
+    # The vptrs of the mixin bases move to HTMLScriptElement's tables.
+    let element = this.html_element()
+    element.element.slottable_mixin.vtable = &html_script_element_slottable_mixin_vtable
+    element.element.aria_mixin.vtable = &html_script_element_aria_mixin_vtable
+    element.element.animatable.vtable = &html_script_element_animatable_vtable
+    element.global_event_handlers.vtable = &html_script_element_global_event_handlers_vtable
+    element.form_associated_element.vtable = &html_script_element_form_associated_element_vtable
+
+    # The default member initializers (m_crossorigin's NoCORS and m_referrer_policy's
+    # EmptyString are the zeroed cell's).
+    html_script_element_init_fields(this)
+    this.m_result = HtmlScriptElementResult.html_uninitialized(HtmlUninitialized(empty_ = 0))
+    this.m_script_text = ak.utf16_string_new()
+
+## Ported from HTMLScriptElement.cpp:42 Web::HTML::HTMLScriptElement::initialize (override).
+pub func html_script_element_initialize_impl(base: JsCell*, realm: Realm*):
+    web_set_prototype_for_interface(base, realm, BindInterfaceName.html_script_element)
+    html_element_initialize_impl(base, realm)
+
+## The cell a script element's result holds, if any (Script and ImportMapParseResult are opaque in
+## phase 1, so they are visited as cells).
+func html_script_element_result_cell(result: HtmlScriptElementResult) -> gc.Cell*?:
+    return match result:
+        .html_uninitialized(_) => none
+        .html_null(_) => none
+        .html_script(script) => (gc.Cell*?)script
+        .html_import_map_parse_result(import_map) => (gc.Cell*?)import_map
+
+## Ported from HTMLScriptElement.cpp:48 Web::HTML::HTMLScriptElement::visit_edges (override).
+pub func html_script_element_visit_edges_impl(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (HtmlScriptElement*)base
+    html_element_visit_edges_impl(base, visitor)
+    # m_result.visit([](Uninitialized) {}, [](Null) {}, [&](GC::Ref<T> result) { visitor.visit(result); })
+    gc.cell_visitor_visit_cell(visitor, html_script_element_result_cell(this.m_result))
+    gc.cell_visitor_visit_t[DomDocument](visitor, this.m_parser_document)
+    gc.cell_visitor_visit_t[DomDocument](visitor, this.m_preparation_time_document)
+
+# mark: Attribute changes, script text and the load event =======================================
+
+## Ported from HTMLScriptElement.cpp:59 Web::HTML::HTMLScriptElement::attribute_changed (override).
+pub func html_script_element_attribute_changed_impl(base: DomElement*, name: ak.FlyString, old_value: ak.String?, value: ak.String?, namespace_: ak.FlyString?):
+    let this = (HtmlScriptElement*)base
+    html_element_attribute_changed_impl(base, name, old_value, value, namespace_)
+
+    if html_name_is(name, html_attribute_names_crossorigin):
+        this.m_crossorigin = html_cors_setting_attribute_from_keyword(value)
+    elif html_name_is(name, html_attribute_names_referrerpolicy):
+        let policy = value else ak.string_new()
+        this.m_referrer_policy = referrer_policy_from_string(ak.string_bytes_as_string_view(&policy)) else ReferrerPolicyReferrerPolicy.empty_string
+    elif html_name_is(name, html_attribute_names_src):
+        # https://html.spec.whatwg.org/multipage/scripting.html#script-processing-model:concept-element-attributes-change-ext
+        # 1. If namespace is not null, then return.
+        if namespace_ != none:
+            return
+
+        # AD-HOC: This ensures that prepare_script() is not called when the src attribute is removed.
+        #         See: https://github.com/whatwg/html/pull/10188/files#r1685905457 for more information.
+        if value == none:
+            return
+
+        # 2. If localName is src and element is connected, then run the script HTML element post-connection steps, given element.
+        if dom_node_is_connected(this.dom_node()):
+            dom_node_post_connection(this.dom_node())
+    elif html_name_is(name, html_attribute_names_async):
+        # https://html.spec.whatwg.org/multipage/scripting.html#script-processing-model:script-force-async
+        # When an async attribute is added to a script element el, the user agent must set el's force async to false.
+        this.m_force_async = false
+
+## Ported from HTMLScriptElement.cpp:89 Web::HTML::HTMLScriptElement::prepare_script_text.
+# https://www.w3.org/TR/trusted-types/#prepare-script-text
+pub func html_script_element_prepare_script_text(this: HtmlScriptElement*) -> !:
+    # 1. Let sink be "HTMLScriptElement text" if script is an HTMLScriptElement; otherwise "SVGScriptElement text".
+    let sink = TrustedTypesInjectionSink.html_script_element_text
+
+    # 2. If script’s script text value is not equal to its child text content,
+    #    set script’s script text to the result of executing get Trusted Type compliant string, with the following arguments:
+    #      TrustedScriptURL as expectedType,
+    #      script’s Document’s relevant global object as global,
+    #      script’s child text content attribute value as input,
+    #      sink,
+    #      'script' as sinkGroup.
+    let child_text_content = dom_node_child_text_content(this.dom_node())
+    if not ak.utf16_string_base_eq_utf16_string_base(&this.m_script_text.utf16_string_base, &child_text_content.utf16_string_base):
+        let document = dom_node_document(this.dom_node())
+        this.m_script_text = try trusted_types_get_trusted_type_compliant_string(TrustedTypesTrustedTypeName.trusted_script_url, html_relevant_global_object((JsObject*)document), TrustedTypesTrustedHtmlOrTrustedTypesTrustedScriptOrTrustedTypesTrustedScriptUrlOrUtf16String.utf16_string(dom_node_child_text_content(this.dom_node())), sink, ak.fly_string_to_string_const(&trusted_types_script))
+
+## Ported from HTMLScriptElement.cpp:113 Web::HTML::HTMLScriptElement::begin_delaying_document_load_event.
+pub func html_script_element_begin_delaying_document_load_event(this: HtmlScriptElement*, document: DomDocument*):
+    # https://html.spec.whatwg.org/multipage/scripting.html#concept-script-script
+    # The user agent must delay the load event of the element's node document until the script is ready.
+    # (m_document_load_event_delayer.emplace(document): the previous delayer, if any, is destroyed first.)
+    html_script_element_clear_document_load_event_delayer(this)
+    var delayer: DomDocumentLoadEventDelayer = ---
+    dom_document_load_event_delayer_construct(&delayer, document)
+    this.m_document_load_event_delayer = delayer
+
+## `m_document_load_event_delayer.clear()`: destroys a held delayer, which stops delaying the load event.
+func html_script_element_clear_document_load_event_delayer(this: HtmlScriptElement*):
+    if let delayer = this.m_document_load_event_delayer:
+        var released = delayer
+        dom_document_load_event_delayer_destruct(&released)
+    this.m_document_load_event_delayer = none
+
+# mark: Executing the script block ===============================================================
+
+## AK/Debug.h's HTML_SCRIPT_DEBUG (off in the reference build).
+let html_script_debug: bool = false
+
+## Ported from HTMLScriptElement.cpp:121 Web::HTML::HTMLScriptElement::execute_script.
+# https://html.spec.whatwg.org/multipage/scripting.html#execute-the-script-block
+pub func html_script_element_execute_script(this: HtmlScriptElement*):
+    # https://html.spec.whatwg.org/multipage/document-lifecycle.html#read-html
+    # Before any script execution occurs, the user agent must wait for scripts may run for the newly-created document to be true for document.
+    assert(dom_document_ready_to_run_scripts(dom_node_document(this.dom_node())))
+
+    # 1. Let document be el's node document.
+    let document = dom_node_document(this.dom_node())
+
+    # 2. If el's preparation-time document is not equal to document, then return.
+    if this.m_preparation_time_document != document:
+        ak.dbgln("HTMLScriptElement: Refusing to run script because the preparation time document is not the same as the node document.")
+        return
+
+    # 3. Unblock rendering on el.
+    dom_element_unblock_rendering(this.dom_element())
+
+    # 3. If el's result is null, then fire an event named error at el, and return.
+    if html_script_element_result_is_null(this.m_result):
+        ak.dbgln("HTMLScriptElement: Refusing to run script because the element's result is null.")
+        discard(dom_event_target_dispatch_event(this.dom_event_target(), dom_event_create(dom_element_realm(this.dom_element()), html_event_names_error)))
+        return
+
+    # 5. If el's from an external file is true, or el's type is "module", then increment document's ignore-destructive-writes counter.
+    var incremented_destructive_writes_counter = false
+    if this.m_from_an_external_file or this.m_script_type == HtmlScriptElementScriptType.module:
+        dom_document_increment_ignore_destructive_writes_counter(document)
+        incremented_destructive_writes_counter = true
+
+    # 5. Switch on el's type:
+    # -> "classic"
+    if this.m_script_type == HtmlScriptElementScriptType.classic:
+        # 1. Let oldCurrentScript be the value to which document's currentScript object was most recently set.
+        let old_current_script = dom_document_current_script(document)
+        # 2. If el's root is not a shadow root, then set document's currentScript attribute to el. Otherwise, set it to null.
+        if not is_dom_shadow_root(tree_node_root(this.dom_node())):
+            dom_document_set_current_script(document, this)
+        else:
+            dom_document_set_current_script(document, none)
+
+        if this.m_from_an_external_file:
+            if html_script_debug:
+                let src = dom_element_attribute(this.dom_element(), html_attribute_names_src) else ak.string_new()
+                ak.dbgln(f"HTMLScriptElement: Running script {ak.string_view_text(ak.string_bytes_as_string_view(&src))}")
+        else:
+            if html_script_debug:
+                ak.dbgln("HTMLScriptElement: Running inline script")
+
+        # 3. Run the classic script given by el's result.
+        html_classic_script_run(as_html_classic_script(html_script_element_result_script(this.m_result)))
+
+        # 4. Set document's currentScript attribute to oldCurrentScript.
+        dom_document_set_current_script(document, old_current_script)
+    # -> "module"
+    elif this.m_script_type == HtmlScriptElementScriptType.module:
+        # 1. Assert: document's currentScript attribute is null.
+        assert(dom_document_current_script(document) == none)
+
+        # 2. Run the module script given by el's result.
+        html_module_script_run(as_html_module_script(html_script_element_result_script(this.m_result)))
+    # -> "importmap"
+    elif this.m_script_type == HtmlScriptElementScriptType.import_map:
+        var execution_context: HtmlTemporaryExecutionContext = ---
+        html_temporary_execution_context_construct_realm(&execution_context, dom_element_realm(this.dom_element()))
+        defer html_temporary_execution_context_destruct(&execution_context)
+
+        # 1. Register an import map given el's relevant global object and el's result.
+        let window = as_html_window((gc.Cell*)html_relevant_global_object((JsObject*)this))
+        let result = match this.m_result:
+            .html_import_map_parse_result(import_map) => import_map
+            _ => trap("Variant::get<GC::Ref<ImportMapParseResult>>: another alternative")
+        html_import_map_parse_result_register_import_map(result, window)
+
+    # 7. Decrement the ignore-destructive-writes counter of document, if it was incremented in the earlier step.
+    if incremented_destructive_writes_counter:
+        dom_document_decrement_ignore_destructive_writes_counter(document)
+
+    # 8. If el's from an external file is true, then fire an event named load at el.
+    if this.m_from_an_external_file:
+        discard(dom_event_target_dispatch_event(this.dom_event_target(), dom_event_create(dom_element_realm(this.dom_element()), html_event_names_load)))
+
+## `m_result.has<ResultState::Null>()`.
+func html_script_element_result_is_null(result: HtmlScriptElementResult) -> bool:
+    return match result:
+        .html_null(_) => true
+        _ => false
+
+## `*m_result.get<GC::Ref<Script>>()`.
+func html_script_element_result_script(result: HtmlScriptElementResult) -> HtmlScript*:
+    return match result:
+        .html_script(script) => script
+        _ => trap("Variant::get<GC::Ref<Script>>: another alternative")
+
+# mark: Preparing the script element =============================================================
+
+## Ported from HTMLScriptElement.cpp:202 Web::HTML::HTMLScriptElement::prepare_script (steps 1-19;
+## steps 20-37 are phase 3).
+# https://w3c.github.io/trusted-types/dist/spec/#slot-value-verification
+# https://html.spec.whatwg.org/multipage/scripting.html#prepare-a-script
+pub func html_script_element_prepare_script(this: HtmlScriptElement*):
+    # 1. If el's already started is true, then return.
+    if this.m_already_started:
+        return
+
+    # 2. Let parser document be el's parser document.
+    let parser_document = this.m_parser_document
+
+    # 3. Set el's parser document to null.
+    this.m_parser_document = none
+
+    # 4. If parser document is non-null and el does not have an async attribute, then set el's force async to true.
+    if parser_document != none and not dom_element_has_attribute(this.dom_element(), html_attribute_names_async):
+        this.m_force_async = true
+
+    # 5. Execute the Prepare the script text algorithm on el. If that algorithm threw an error, then return.
+    html_script_element_prepare_script_text(this) catch:
+        return
+
+    # 6. Let source text be el’s script text value.
+    let source_text = this.m_script_text
+
+    # 7. If el has no src attribute, and source text is the empty string, then return.
+    if not dom_element_has_attribute(this.dom_element(), html_attribute_names_src) and ak.utf16_string_base_is_empty(&source_text.utf16_string_base):
+        return
+
+    # 8. If el is not connected, then return.
+    if not dom_node_is_connected(this.dom_node()):
+        return
+
+    # 9. If any of the following are true:
+    #    - el has a type attribute whose value is the empty string;
+    #    - el has no type attribute but it has a language attribute and that attribute's value is the empty string; or
+    #    - el has neither a type attribute nor a language attribute
+    var script_block_type = ak.string_new()
+    let maybe_type_attribute = dom_element_attribute(this.dom_element(), html_attribute_names_type)
+    let maybe_language_attribute = dom_element_attribute(this.dom_element(), html_attribute_names_language)
+    let type_is_empty = html_script_element_optional_string_is_empty(maybe_type_attribute)
+    let language_is_empty = html_script_element_optional_string_is_empty(maybe_language_attribute)
+    if (maybe_type_attribute != none and type_is_empty) or (maybe_type_attribute == none and maybe_language_attribute != none and language_is_empty) or (maybe_type_attribute == none and maybe_language_attribute == none):
+        # then let the script block's type string for this script element be "text/javascript".
+        script_block_type = ak.string_from_str("text/javascript")
+    # Otherwise, if el has a type attribute,
+    elif let type_attribute = maybe_type_attribute:
+        # then let the script block's type string be the value of that attribute with leading and trailing ASCII whitespace stripped.
+        script_block_type = ak.string_trim_string_view(&type_attribute, ak.sv(web_infra.ascii_whitespace)) else trap("MUST: String::trim")
+    # Otherwise, el has a non-empty language attribute;
+    elif maybe_language_attribute != none and not language_is_empty:
+        # let the script block's type string be the concatenation of "text/" and the value of el's language attribute.
+        let language_attribute = maybe_language_attribute else trap("unreachable")
+        var builder = ak.string_builder_new()
+        ak.string_builder_append(&builder, "text/")
+        ak.string_builder_append_string_view(&builder, ak.string_bytes_as_string_view(&language_attribute))
+        script_block_type = ak.string_builder_to_string(&builder) else trap("MUST: String::formatted")
+
+    # 10. If the script block's type string is a JavaScript MIME type essence match,
+    if mime_is_javascript_mime_type_essence_match(ak.string_bytes_as_string_view(&script_block_type)):
+        # then set el's type to "classic".
+        this.m_script_type = HtmlScriptElementScriptType.classic
+    # 11. Otherwise, if the script block's type string is an ASCII case-insensitive match for the string "module",
+    elif ak.string_equals_ignoring_ascii_case_string_view(&script_block_type, ak.sv("module")):
+        # then set el's type to "module".
+        this.m_script_type = HtmlScriptElementScriptType.module
+    # 12. Otherwise, if the script block's type string is an ASCII case-insensitive match for the string "importmap",
+    elif ak.string_equals_ignoring_ascii_case_string_view(&script_block_type, ak.sv("importmap")):
+        # then set el's type to "importmap".
+        this.m_script_type = HtmlScriptElementScriptType.import_map
+    # FIXME: 13. Otherwise, if the script block's type string is an ASCII case-insensitive match for the string "speculationrules", then set el's type to "speculationrules".
+    # 14. Otherwise, return. (No script is executed, and el's type is left as null.)
+    else:
+        assert(this.m_script_type == HtmlScriptElementScriptType.null)
+        return
+
+    # 15. If parser document is non-null, then set el's parser document back to parser document and set el's force async to false.
+    if parser_document != none:
+        this.m_parser_document = parser_document
+        this.m_force_async = false
+
+    # 16. Set el's already started to true.
+    this.m_already_started = true
+
+    # 17. Set el's preparation-time document to its node document.
+    this.m_preparation_time_document = dom_node_document(this.dom_node())
+
+    # 18. If parser document is non-null, and parser document is not equal to el's preparation-time document, then return.
+    if parser_document != none and parser_document != this.m_preparation_time_document:
+        ak.dbgln("HTMLScriptElement: Refusing to run script because the parser document is not the same as the preparation time document.")
+        return
+
+    # 19. If scripting is disabled for el, then return.
+    if dom_node_is_scripting_disabled(this.dom_node()):
+        ak.dbgln("HTMLScriptElement: Refusing to run script because scripting is disabled.")
+        return
+
+    # Steps 20-37 (the nomodule and Content Security Policy checks, the event/for check, the
+    # charset, the script fetch options, fetching a classic script or a module script graph or
+    # creating an inline classic script or import map, and choosing how the result is executed)
+    # need scripting, which phase 1 does not have.
+    trap("unported (P3): Web::HTML::HTMLScriptElement::prepare_script steps 20-37 (scripting is enabled)")
+
+## `maybe_attribute->is_empty()` of a present attribute (false when it is absent).
+func html_script_element_optional_string_is_empty(maybe_value: ak.String?) -> bool:
+    let value = maybe_value else return false
+    return ak.string_is_empty(&value)
