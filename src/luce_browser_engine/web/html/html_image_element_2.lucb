@@ -1,0 +1,532 @@
+#==============================================================================================
+#
+#   html_image_element_2 - HTML::HTMLImageElement: update the image data
+#
+#   DESCRIPTION:
+#       Port of LibWeb/HTML/HTMLImageElement.cpp (lines 573-989): "use srcset or picture",
+#       "update the image data" (the part run when the document is fully active, the list of
+#       available images shortcut, and the microtask that selects a source and starts the
+#       image request) and the callbacks of an image request. The C++ lambdas are capture
+#       structs allocated with `new` (DESIGN.md §2.7); fetching is phase 2.
+#
+#==============================================================================================
+
+## Ported from HTMLImageElement.cpp:574 Web::HTML::HTMLImageElement::uses_srcset_or_picture.
+# https://html.spec.whatwg.org/multipage/images.html#use-srcset-or-picture
+pub func html_image_element_uses_srcset_or_picture(this: HtmlImageElement*) -> bool:
+    # An img element is said to use srcset or picture if it has a srcset attribute specified
+    # or if it has a parent that is a picture element.
+    if dom_element_has_attribute(this.dom_element(), html_attribute_names_srcset):
+        return true
+    let parent = tree_node_parent(this.dom_node()) else return false
+    return is_html_picture_element(parent)
+
+# mark: Update the image data ===================================================================
+
+## The captures of update_the_image_data's continuation when the document becomes active, and of
+## its microtask: `[this, restart_animations, maybe_omit_events, update_the_image_data_count]`.
+struct HtmlImageElementUpdateTheImageDataSteps:
+    var this: HtmlImageElement*
+    var restart_animations: bool
+    var maybe_omit_events: bool
+    var update_the_image_data_count: u64
+
+    ## The document observer's document_became_active callback: queue a microtask to continue.
+    static func document_became_active(context: void*?):
+        let captures = (HtmlImageElementUpdateTheImageDataSteps*)(context else trap("update the image data: no captures"))
+        let this = captures.this
+        html_queue_a_microtask(dom_node_document(this.dom_node()), gc.create_function0(gc.cell_heap(this.cell()), ak.Function0[unit](call = HtmlImageElementUpdateTheImageDataSteps.continue_, context = captures)))
+
+    ## The microtask: update_the_image_data_impl.
+    static func continue_(context: void*?):
+        let captures = (HtmlImageElementUpdateTheImageDataSteps*)(context else trap("update the image data: no captures"))
+        html_image_element_update_the_image_data_impl(captures.this, captures.restart_animations, captures.maybe_omit_events, captures.update_the_image_data_count)
+
+## Ported from HTMLImageElement.cpp:582 Web::HTML::HTMLImageElement::update_the_image_data.
+# https://html.spec.whatwg.org/multipage/images.html#update-the-image-data
+pub func html_image_element_update_the_image_data(this: HtmlImageElement*, restart_animations: bool = false, maybe_omit_events: bool = false):
+    this.m_update_the_image_data_count += 1
+    let update_the_image_data_count = this.m_update_the_image_data_count
+
+    # 1. If the element's node document is not fully active, then:
+    if not dom_document_is_fully_active(dom_node_document(this.dom_node())):
+        # 1. Continue running this algorithm in parallel.
+        # 2. Wait until the element's node document is fully active.
+        # 3. If another instance of this algorithm for this img element was started after this instance
+        #    (even if it aborted and is no longer running), then return.
+        # 4. Queue a microtask to continue this algorithm.
+        let captures = new HtmlImageElementUpdateTheImageDataSteps(this = this, restart_animations = restart_animations, maybe_omit_events = maybe_omit_events, update_the_image_data_count = update_the_image_data_count) else trap("out of memory")
+        dom_document_observer_set_document_became_active(this.m_document_observer else trap("the document observer"), ak.Function0[unit](call = HtmlImageElementUpdateTheImageDataSteps.document_became_active, context = captures))
+
+        return
+
+    html_image_element_update_the_image_data_impl(this, restart_animations, maybe_omit_events, update_the_image_data_count)
+
+## The captures of the tasks update_the_image_data_impl queues: the element, the flags, urlString,
+## previousURL and the selected source.
+struct HtmlImageElementUpdateTheImageDataTask:
+    var this: HtmlImageElement*
+    var restart_animations: bool
+    var maybe_omit_events: bool
+    var url_string: ak.String?
+    var previous_url: ak.String
+    var selected_source: HtmlImageSource?
+
+    ## Step 7.4.7's task (the list of available images had an entry).
+    static func available_image_task(context: void*?):
+        let captures = (HtmlImageElementUpdateTheImageDataTask*)(context else trap("update the image data: no captures"))
+        let this = captures.this
+        # AD-HOC: Bail out if the document became inactive (e.g. iframe removed or navigated)
+        #         between when this task was queued and when it runs.
+        if not dom_document_is_fully_active(dom_node_document(this.dom_node())):
+            html_image_element_clear_load_event_delayer(this)
+            return
+
+        # 1. If restart animation is set, then restart the animation.
+        if captures.restart_animations:
+            html_image_element_restart_the_animation(this)
+
+        # 2. Set the current request's current URL to urlString.
+        let url_string = captures.url_string else trap("VERIFY: urlString")
+        html_image_request_set_current_url(html_image_element_current_request(this), html_element_realm(this.html_element()), url_string)
+
+        # 3. If maybe omit events is not set or previousURL is not equal to urlString, then fire an event named load at the img element.
+        if not captures.maybe_omit_events or not ak.string_equals(&captures.previous_url, &url_string):
+            discard(dom_event_target_dispatch_event(this.dom_event_target(), dom_event_create(html_element_realm(this.html_element()), html_event_names_load)))
+
+    ## Step 11.2's task (no source was selected).
+    static func no_source_task(context: void*?):
+        let captures = (HtmlImageElementUpdateTheImageDataTask*)(context else trap("update the image data: no captures"))
+        let this = captures.this
+        # AD-HOC: Bail out if the document became inactive (e.g. iframe removed or navigated)
+        #         between when this task was queued and when it runs.
+        if not dom_document_is_fully_active(dom_node_document(this.dom_node())):
+            html_image_element_clear_load_event_delayer(this)
+            return
+
+        # 1. Change the current request's current URL to the empty string.
+        let current_request = html_image_element_current_request(this)
+        html_image_request_set_current_url(current_request, html_element_realm(this.html_element()), ak.string_new())
+
+        # 2. If all of the following conditions are true:
+        #    - the element has a src attribute or it uses srcset or picture; and
+        #    - maybe omit events is not set or previousURL is not the empty string
+        let current_url = html_image_request_current_url(current_request)
+        if (dom_element_has_attribute(this.dom_element(), html_attribute_names_src) or html_image_element_uses_srcset_or_picture(this)) and (not captures.maybe_omit_events or not ak.string_eq_string_view(&current_url, ak.sv(""))):
+            discard(dom_event_target_dispatch_event(this.dom_event_target(), dom_event_create(html_element_realm(this.html_element()), html_event_names_error)))
+
+    ## Step 13.4's task (urlString is failure).
+    static func url_failure_task(context: void*?):
+        let captures = (HtmlImageElementUpdateTheImageDataTask*)(context else trap("update the image data: no captures"))
+        let this = captures.this
+        # AD-HOC: Bail out if the document became inactive (e.g. iframe removed or navigated)
+        #         between when this task was queued and when it runs.
+        if not dom_document_is_fully_active(dom_node_document(this.dom_node())):
+            html_image_element_clear_load_event_delayer(this)
+            return
+
+        let selected_source = captures.selected_source else trap("VERIFY: selected source")
+        # 1. Change the current request's current URL to selected source.
+        html_image_request_set_current_url(html_image_element_current_request(this), html_element_realm(this.html_element()), selected_source.url)
+
+        # 2. If maybe omit events is not set or previousURL is not equal to selected source, then fire an event named error at the img element.
+        if not captures.maybe_omit_events or not ak.string_equals(&captures.previous_url, &selected_source.url):
+            discard(dom_event_target_dispatch_event(this.dom_event_target(), dom_event_create(html_element_realm(this.html_element()), html_event_names_error)))
+
+    ## Step 15's task: restart the animation.
+    static func restart_animation_task(context: void*?):
+        let captures = (HtmlImageElementUpdateTheImageDataTask*)(context else trap("update the image data: no captures"))
+        html_image_element_restart_the_animation(captures.this)
+
+## The captures of update_the_image_data_impl's microtask (step 8): `[this, update_the_image_data_count,
+## restart_animations, maybe_omit_events, previous_url]`.
+struct HtmlImageElementUpdateTheImageDataMicrotask:
+    var this: HtmlImageElement*
+    var update_the_image_data_count: u64
+    var restart_animations: bool
+    var maybe_omit_events: bool
+    var previous_url: ak.String
+
+## The captures of step 25's lazy load resumption steps: `[this, request, image_request]`.
+struct HtmlImageElementFetchTheImage:
+    var this: HtmlImageElement*
+    var request: FetchRequest*
+    var image_request: HtmlImageRequest*
+
+    ## The steps: fetch the image.
+    static func run(context: void*?):
+        let captures = (HtmlImageElementFetchTheImage*)(context else trap("fetch the image: no captures"))
+        html_image_request_fetch_image(captures.image_request, html_element_realm(captures.this.html_element()), captures.request)
+
+## `m_load_event_delayer.emplace(document())`: a previous delayer, if any, is destroyed first.
+func html_image_element_emplace_load_event_delayer(this: HtmlImageElement*):
+    html_image_element_clear_load_event_delayer(this)
+    var delayer: DomDocumentLoadEventDelayer = ---
+    dom_document_load_event_delayer_construct(&delayer, dom_node_document(this.dom_node()))
+    this.m_load_event_delayer = delayer
+
+## Ported from HTMLImageElement.cpp:606 Web::HTML::HTMLImageElement::update_the_image_data_impl.
+# https://html.spec.whatwg.org/multipage/images.html#update-the-image-data
+pub func html_image_element_update_the_image_data_impl(this: HtmlImageElement*, restart_animations: bool, maybe_omit_events: bool, update_the_image_data_count: u64):
+    let document = dom_node_document(this.dom_node())
+    let realm = html_element_realm(this.html_element())
+
+    # 1. If the element's node document is not fully active, then:
+    # FIXME: This step and it's substeps is implemented by the calling `update_the_image_data` function.
+    #        By the time that we reach here, the document should be fully active. However, it is possible
+    #        that the node document is swapped out again during the queue of the microtask to run this
+    #        algorithm.
+    if not dom_document_is_fully_active(document):
+        ak.dbgln("FIXME: Node document is not fully active running 'update the image data'")
+        return
+
+    # 2. FIXME: If the user agent cannot support images, or its support for images has been disabled,
+    #           then abort the image request for the current request and the pending request,
+    #           set the current request's state to unavailable, set the pending request to null, and return.
+
+    # 3. Let previousURL be the current request's current URL.
+    let previous_url = html_image_request_current_url(html_image_element_current_request(this))
+
+    # 4. Let selected source be null and selected pixel density be undefined.
+    var selected_source: ak.String? = none
+    var selected_pixel_density: f32? = none
+
+    # 5. If the element does not use srcset or picture
+    #    and it has a src attribute specified whose value is not the empty string,
+    #    then set selected source to the value of the element's src attribute
+    #    and set selected pixel density to 1.0.
+    let maybe_src_attribute = dom_element_attribute(this.dom_element(), html_attribute_names_src)
+    if not html_image_element_uses_srcset_or_picture(this):
+        if let src_attribute = maybe_src_attribute:
+            if not ak.string_is_empty(&src_attribute):
+                selected_source = src_attribute
+                selected_pixel_density = 1.0
+
+    # 6. Set the element's last selected source to selected source.
+    this.m_last_selected_source = selected_source
+
+    # 7. If selected source is not null, then:
+    # (`goto after_step_7` leaves this once-loop.)
+    step_7: while true:
+        let source = selected_source else break step_7
+        # 1. Let urlString be the result of encoding-parsing-and-serializing a URL given selected source, relative to the element's node document.
+        let url_string = dom_document_encoding_parse_and_serialize_url(document, ak.string_bytes_as_string_view(&source))
+
+        # 2. If urlString is failure, then abort this inner set of steps.
+        let url = url_string else break step_7
+
+        # 3. Let key be a tuple consisting of urlString, the img element's crossorigin attribute's mode,
+        #    and, if that mode is not No CORS, the node document's origin.
+        let key = HtmlListOfAvailableImagesKey(url = url, mode = this.m_cors_setting, origin = dom_document_origin(document), cached_hash = none)
+
+        # 4. If the list of available images contains an entry for key, then:
+        if let entry = html_list_of_available_images_get(dom_document_list_of_available_images(document), key):
+            # 1. Set the ignore higher-layer caching flag for that entry.
+            entry.ignore_higher_layer_caching = true
+
+            # 2. Abort the image request for the current request and the pending request.
+            html_abort_the_image_request(realm, this.m_current_request)
+            html_abort_the_image_request(realm, this.m_pending_request)
+
+            # 3. Set the pending request to null.
+            this.m_pending_request = none
+
+            # 4. Set the current request to a new image request whose image data is that of the entry and whose state is completely available.
+            let current_request = html_image_request_create(realm, dom_document_page(document))
+            this.m_current_request = current_request
+            html_image_request_set_image_data(current_request, entry.image_data)
+            html_image_request_set_state(current_request, HtmlImageRequestState.completely_available)
+            this.m_current_frame_index = 0
+
+            # 5. Prepare the current request for presentation given the img element.
+            html_image_request_prepare_for_presentation(current_request, this)
+
+            # 6. Set the current request's current pixel density to selected pixel density.
+            # FIXME: Spec bug! `selected_pixel_density` can be undefined here, per the spec.
+            #        That's why we value_or(1.0f) it.
+            html_image_request_set_current_pixel_density(current_request, selected_pixel_density else 1.0)
+
+            # 7. Queue an element task on the DOM manipulation task source given the img element and following steps:
+            let captures = new HtmlImageElementUpdateTheImageDataTask(this = this, restart_animations = restart_animations, maybe_omit_events = maybe_omit_events, url_string = url_string, previous_url = previous_url, selected_source = none) else trap("out of memory")
+            discard(dom_element_queue_an_element_task(this.dom_element(), HtmlTaskSource.dom_manipulation, ak.Function0[unit](call = HtmlImageElementUpdateTheImageDataTask.available_image_task, context = captures)))
+
+            # 8. Abort the update the image data algorithm.
+            return
+        break step_7
+    # after_step_7:
+    # 8. Queue a microtask to perform the rest of this algorithm, allowing the task that invoked this algorithm to continue.
+    let microtask = new HtmlImageElementUpdateTheImageDataMicrotask(this = this, update_the_image_data_count = update_the_image_data_count, restart_animations = restart_animations, maybe_omit_events = maybe_omit_events, previous_url = previous_url) else trap("out of memory")
+    html_queue_a_microtask(document, gc.create_function0(gc.cell_heap(this.cell()), ak.Function0[unit](call = html_image_element_update_the_image_data_microtask, context = microtask)))
+
+## The microtask of update_the_image_data_impl's step 8: steps 9 to 25.
+func html_image_element_update_the_image_data_microtask(context: void*?):
+    let captures = (HtmlImageElementUpdateTheImageDataMicrotask*)(context else trap("update the image data: no captures"))
+    let this = captures.this
+    let restart_animations = captures.restart_animations
+    let maybe_omit_events = captures.maybe_omit_events
+    let previous_url = captures.previous_url
+    let document = dom_node_document(this.dom_node())
+    let realm = html_element_realm(this.html_element())
+
+    # 9. If another instance of this algorithm for this img element was started after this instance
+    #    (even if it aborted and is no longer running), then return.
+    if captures.update_the_image_data_count != this.m_update_the_image_data_count:
+        return
+
+    # AD-HOC: Bail out if the document became inactive (e.g. iframe removed or navigated)
+    #         between when this microtask was queued and when it runs.
+    if not dom_document_is_fully_active(document):
+        html_image_element_clear_load_event_delayer(this)
+        return
+
+    # 10. Let selected source and selected pixel density be
+    #    the URL and pixel density that results from selecting an image source, respectively.
+    var selected_source: HtmlImageSource? = none
+    var pixel_density: f32? = none
+    if let result = html_image_element_select_an_image_source(this):
+        selected_source = result.source
+        pixel_density = (f32)result.pixel_density
+
+    # 11. If selected source is null, then:
+    if selected_source == none:
+        # 1. Set the current request's state to broken,
+        #    abort the image request for the current request and the pending request,
+        #    and set the pending request to null.
+        html_image_request_set_state(html_image_element_current_request(this), HtmlImageRequestState.broken)
+        html_abort_the_image_request(realm, this.m_current_request)
+        html_abort_the_image_request(realm, this.m_pending_request)
+        this.m_pending_request = none
+
+        # 2. Queue an element task on the DOM manipulation task source given the img element and the following steps:
+        let task = new HtmlImageElementUpdateTheImageDataTask(this = this, restart_animations = restart_animations, maybe_omit_events = maybe_omit_events, url_string = none, previous_url = previous_url, selected_source = none) else trap("out of memory")
+        discard(dom_element_queue_an_element_task(this.dom_element(), HtmlTaskSource.dom_manipulation, ak.Function0[unit](call = HtmlImageElementUpdateTheImageDataTask.no_source_task, context = task)))
+
+        # 3. Return.
+        return
+    let source = selected_source else trap("VERIFY_NOT_REACHED")
+
+    # 12. Let urlString be the result of encoding-parsing-and-serializing a URL given selected source, relative to the element's node document.
+    let url_string = dom_document_encoding_parse_and_serialize_url(document, ak.string_bytes_as_string_view(&source.url))
+
+    # 13. If urlString is failure, then:
+    if url_string == none:
+        # 1. Abort the image request for the current request and the pending request.
+        html_abort_the_image_request(realm, this.m_current_request)
+        html_abort_the_image_request(realm, this.m_pending_request)
+
+        # 2. Set the current request's state to broken.
+        html_image_request_set_state(html_image_element_current_request(this), HtmlImageRequestState.broken)
+
+        # 3. Set the pending request to null.
+        this.m_pending_request = none
+
+        # 4. Queue an element task on the DOM manipulation task source given the img element and the following steps:
+        let task = new HtmlImageElementUpdateTheImageDataTask(this = this, restart_animations = restart_animations, maybe_omit_events = maybe_omit_events, url_string = none, previous_url = previous_url, selected_source = selected_source) else trap("out of memory")
+        discard(dom_element_queue_an_element_task(this.dom_element(), HtmlTaskSource.dom_manipulation, ak.Function0[unit](call = HtmlImageElementUpdateTheImageDataTask.url_failure_task, context = task)))
+
+        # 5. Return.
+        return
+    let url = url_string else trap("VERIFY_NOT_REACHED")
+
+    # 14. If the pending request is not null and urlString is the same as the pending request's current URL, then return.
+    if let pending_request = this.m_pending_request:
+        let pending_url = html_image_request_current_url(pending_request)
+        if ak.string_equals(&url, &pending_url):
+            return
+
+    # 15. If urlString is the same as the current request's current URL and the current request's state is partially available,
+    #     then abort the image request for the pending request,
+    #     queue an element task on the DOM manipulation task source given the img element
+    #     to restart the animation if restart animation is set, and return.
+    let current_url = html_image_request_current_url(html_image_element_current_request(this))
+    if ak.string_equals(&url, &current_url) and html_image_request_state(html_image_element_current_request(this)) == HtmlImageRequestState.partially_available:
+        html_abort_the_image_request(realm, this.m_pending_request)
+        if restart_animations:
+            let task = new HtmlImageElementUpdateTheImageDataTask(this = this, restart_animations = restart_animations, maybe_omit_events = maybe_omit_events, url_string = url_string, previous_url = previous_url, selected_source = none) else trap("out of memory")
+            discard(dom_element_queue_an_element_task(this.dom_element(), HtmlTaskSource.dom_manipulation, ak.Function0[unit](call = HtmlImageElementUpdateTheImageDataTask.restart_animation_task, context = task)))
+        return
+
+    # 16. If the pending request is not null, then abort the image request for the pending request.
+    html_abort_the_image_request(realm, this.m_pending_request)
+
+    # AD-HOC: At this point we start deviating from the spec in order to allow sharing ImageRequest between
+    #         multiple image elements (as well as CSS background-images, etc.)
+
+    # 17. Set image request to a new image request whose current URL is urlString.
+    let image_request = html_image_request_create(realm, dom_document_page(document))
+    html_image_request_set_current_url(image_request, realm, url)
+
+    # 18. If the current request's state is unavailable or broken, then set the current request to image request.
+    #     Otherwise, set the pending request to image request.
+    let current_state = html_image_request_state(html_image_element_current_request(this))
+    if current_state == HtmlImageRequestState.unavailable or current_state == HtmlImageRequestState.broken:
+        this.m_current_request = image_request
+    else:
+        this.m_pending_request = image_request
+
+    # 24. Let delay load event be true if the img's lazy loading attribute is in the Eager state, or if scripting is disabled for the img, and false otherwise.
+    let delay_load_event = html_lazy_loading_element_lazy_loading_attribute(this) == HtmlLazyLoading.eager
+
+    # When delay load event is true, fetching the image must delay the load event of the element's node document
+    # until the task that is queued by the networking task source once the resource has been fetched (defined below) has been run.
+    if delay_load_event:
+        html_image_element_emplace_load_event_delayer(this)
+
+    html_image_element_add_callbacks_to_image_request(this, image_request, maybe_omit_events, url, previous_url, captures.update_the_image_data_count)
+
+    # AD-HOC: If the image request is already available or fetching, no need to start another fetch.
+    if html_image_request_is_available(image_request) or html_image_request_is_fetching(image_request):
+        return
+
+    # AD-HOC: create_potential_CORS_request expects a url, but the following step passes a URL string.
+    let url_record = dom_document_encoding_parse_url(document, ak.string_bytes_as_string_view(&source.url)) else trap("VERIFY: url_record.has_value()")
+
+    # 19. Let request be the result of creating a potential-CORS request given urlString, "image",
+    #     and the current state of the element's crossorigin content attribute.
+    let request = html_create_potential_cors_request(realm_vm(realm), url_record, FetchRequestDestination.image, this.m_cors_setting)
+
+    # 20. Set request's client to the element's node document's relevant settings object.
+    fetch_request_set_client(request, dom_document_relevant_settings_object(document))
+
+    # 21. If the element uses srcset or picture, set request's initiator to "imageset".
+    if html_image_element_uses_srcset_or_picture(this):
+        fetch_request_set_initiator(request, FetchRequestInitiator.image_set)
+
+    # 22. Set request's referrer policy to the current state of the element's referrerpolicy attribute.
+    let referrer_policy_attribute = dom_element_get_attribute_value(this.dom_element(), html_attribute_names_referrerpolicy)
+    fetch_request_set_referrer_policy(request, referrer_policy_from_string(ak.string_bytes_as_string_view(&referrer_policy_attribute)) else ReferrerPolicyReferrerPolicy.empty_string)
+
+    # 23. Set request's priority to the current state of the element's fetchpriority attribute.
+    let fetchpriority_attribute = dom_element_get_attribute_value(this.dom_element(), html_attribute_names_fetchpriority)
+    fetch_request_set_priority(request, fetch_request_priority_from_string(ak.string_bytes_as_string_view(&fetchpriority_attribute)) else FetchRequestPriority.auto)
+
+    # 25. If the will lazy load element steps given the img return true, then:
+    if html_lazy_loading_element_will_lazy_load_element(this):
+        # 1. Set the img's lazy load resumption steps to the rest of this algorithm starting with the step labeled fetch the image.
+        let steps = new HtmlImageElementFetchTheImage(this = this, request = request, image_request = image_request) else trap("out of memory")
+        html_lazy_loading_element_set_lazy_load_resumption_steps(this, ak.Function0[unit](call = HtmlImageElementFetchTheImage.run, context = steps))
+
+        # 2. Start intersection-observing a lazy loading element for the img element.
+        dom_document_start_intersection_observing_a_lazy_loading_element(document, this.dom_element())
+
+        # 3. Return.
+        return
+
+    html_image_request_fetch_image(image_request, realm, request)
+
+# mark: The image request's callbacks ===========================================================
+
+## The captures of add_callbacks_to_image_request's two callbacks: `[this, image_request,
+## maybe_omit_events, url_string, previous_url, update_the_image_data_count]`.
+struct HtmlImageElementImageRequestCallbacks:
+    var this: HtmlImageElement*
+    var image_request: HtmlImageRequest*
+    var maybe_omit_events: bool
+    var url_string: ak.String
+    var previous_url: ak.String
+    var update_the_image_data_count: u64
+
+    ## on_finish: enqueue the success steps on the batching dispatcher.
+    static func on_finish(context: void*?):
+        let captures = (HtmlImageElementImageRequestCallbacks*)(context else trap("image request callbacks: no captures"))
+        html_batching_dispatcher_enqueue(html_batching_dispatcher(), gc.create_function0(gc.cell_heap(captures.this.cell()), ak.Function0[unit](call = HtmlImageElementImageRequestCallbacks.on_finish_batched, context = captures)))
+
+    ## The batched success steps.
+    static func on_finish_batched(context: void*?):
+        let captures = (HtmlImageElementImageRequestCallbacks*)(context else trap("image request callbacks: no captures"))
+        let this = captures.this
+        let image_request = captures.image_request
+        let document = dom_node_document(this.dom_node())
+        let realm = html_element_realm(this.html_element())
+        # AD-HOC: Bail out if the document became inactive (e.g. iframe removed or navigated)
+        #         between when the fetch completed and when this batched callback runs.
+        if not dom_document_is_fully_active(document):
+            html_image_element_clear_load_event_delayer(this)
+            return
+
+        # AD-HOC: If another instance of update_the_image_data was started after the one that initiated this
+        #         request, this callback is stale. Bail out to avoid corrupting the state of the newer request.
+        if captures.update_the_image_data_count != this.m_update_the_image_data_count:
+            html_image_element_clear_load_event_delayer(this)
+            return
+
+        let shared_resource_request = html_image_request_shared_resource_request(image_request) else trap("VERIFY: image_request->shared_resource_request()")
+        let image_data = html_shared_resource_request_image_data(shared_resource_request)
+        html_image_request_set_image_data(image_request, image_data)
+
+        let key = HtmlListOfAvailableImagesKey(url = captures.url_string, mode = this.m_cors_setting, origin = dom_document_origin(document), cached_hash = none)
+
+        # 1. If image request is the pending request, abort the image request for the current request,
+        #    upgrade the pending request to the current request
+        #    and prepare image request for presentation given the img element.
+        if image_request == this.m_pending_request:
+            html_abort_the_image_request(realm, this.m_current_request)
+            html_image_element_upgrade_pending_request_to_current_request(this)
+            html_image_request_prepare_for_presentation(image_request, this)
+
+        # 2. Set image request to the completely available state.
+        html_image_request_set_state(image_request, HtmlImageRequestState.completely_available)
+
+        # 3. Add the image to the list of available images using the key key, with the ignore higher-layer caching flag set.
+        let data = image_data else trap("VERIFY: GC::Ptr<DecodedImageData>::operator* on null")
+        html_list_of_available_images_add(dom_document_list_of_available_images(document), key, data, true)
+
+        dom_node_set_needs_style_update(this.dom_node(), true)
+        dom_node_set_needs_layout_update(this.dom_node(), DomSetNeedsLayoutReason.html_image_element_update_the_image_data)
+
+        # 4. If maybe omit events is not set or previousURL is not equal to urlString, then fire an event named load at the img element.
+        if not captures.maybe_omit_events or not ak.string_equals(&captures.previous_url, &captures.url_string):
+            discard(dom_event_target_dispatch_event(this.dom_event_target(), dom_event_create(realm, html_event_names_load)))
+
+        this.m_current_frame_index = 0
+        let animation_timer = this.m_animation_timer else trap("the animation timer")
+        core_timer_stop(animation_timer)
+        if html_decoded_image_data_is_animated(data) and html_decoded_image_data_frame_count(data) > 1:
+            core_timer_set_interval(animation_timer, html_decoded_image_data_frame_duration(data, 0))
+            core_timer_start(animation_timer)
+
+        html_image_element_clear_load_event_delayer(this)
+
+    ## on_fail: the image data is not in a supported file format.
+    static func on_fail(context: void*?):
+        let captures = (HtmlImageElementImageRequestCallbacks*)(context else trap("image request callbacks: no captures"))
+        let this = captures.this
+        let image_request = captures.image_request
+        let realm = html_element_realm(this.html_element())
+        # AD-HOC: Bail out if the document became inactive (e.g. iframe removed or navigated)
+        #         between when the fetch completed and when this failure callback runs.
+        if not dom_document_is_fully_active(dom_node_document(this.dom_node())):
+            html_image_element_clear_load_event_delayer(this)
+            return
+
+        # The image data is not in a supported file format;
+
+        # AD-HOC: If another instance of update_the_image_data was started after the one that initiated this
+        #         request, this callback is stale. Bail out to avoid corrupting the state of the newer request.
+        if captures.update_the_image_data_count != this.m_update_the_image_data_count:
+            html_image_element_clear_load_event_delayer(this)
+            return
+
+        # the user agent must set image request's state to broken,
+        html_image_request_set_state(image_request, HtmlImageRequestState.broken)
+
+        # abort the image request for the current request and the pending request,
+        html_abort_the_image_request(realm, this.m_current_request)
+        html_abort_the_image_request(realm, this.m_pending_request)
+
+        # upgrade the pending request to the current request if image request is the pending request,
+        if image_request == this.m_pending_request:
+            html_image_element_upgrade_pending_request_to_current_request(this)
+
+        # and then, if maybe omit events is not set or previousURL is not equal to urlString,
+        # queue an element task on the DOM manipulation task source given the img element
+        # to fire an event named error at the img element.
+        if not captures.maybe_omit_events or not ak.string_equals(&captures.previous_url, &captures.url_string):
+            discard(dom_event_target_dispatch_event(this.dom_event_target(), dom_event_create(realm, html_event_names_error)))
+
+        html_image_element_clear_load_event_delayer(this)
+
+## Ported from HTMLImageElement.cpp:893 Web::HTML::HTMLImageElement::add_callbacks_to_image_request.
+pub func html_image_element_add_callbacks_to_image_request(this: HtmlImageElement*, image_request: HtmlImageRequest*, maybe_omit_events: bool, url_string: ak.String, previous_url: ak.String, update_the_image_data_count: u64):
+    let captures = new HtmlImageElementImageRequestCallbacks(this = this, image_request = image_request, maybe_omit_events = maybe_omit_events, url_string = url_string, previous_url = previous_url, update_the_image_data_count = update_the_image_data_count) else trap("out of memory")
+    html_image_request_add_callbacks(image_request, ak.Function0[unit](call = HtmlImageElementImageRequestCallbacks.on_finish, context = captures), ak.Function0[unit](call = HtmlImageElementImageRequestCallbacks.on_fail, context = captures))
