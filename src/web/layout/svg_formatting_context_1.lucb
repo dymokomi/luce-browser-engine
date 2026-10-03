@@ -1,0 +1,370 @@
+#==============================================================================================
+#
+#   svg_formatting_context_1 - Layout::SVGFormattingContext: SVG viewports and their viewBox
+#                              transforms
+#
+#   DESCRIPTION:
+#       Port of LibWeb/Layout/SVGFormattingContext.cpp (lines 1-374) and SVGFormattingContext.h:
+#       construction, the automatic content sizes, the viewBox transform of an SVG viewport
+#       (https://svgwg.org/svg2-draft/coords.html#PreserveAspectRatioAttribute), container
+#       elements, `run` (the layout of an SVG root, a nested viewport, a mask or a clip path
+#       as a viewport), the layout of one child element and of a nested <svg> viewport
+#       (https://svgwg.org/svg2-draft/coords.html#EstablishingANewSVGViewport).
+#
+#       SVG formatting contexts are not cells: like the other formatting contexts they live
+#       in managed memory (layout_make_formatting_context_storage, docs/regions/r44.md), and
+#       the contexts C++ makes on the stack (a nested viewport's, a mask's, a foreignObject's
+#       BFC) are made there too; `~SVGFormattingContext` is the default destructor, and a
+#       BlockFormattingContext's is run where C++ leaves its scope.
+#
+#       Copyright (c) 2021-2023, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2022, Sam Atkins <atkinssj@serenityos.org>
+#       Copyright (c) 2022, Tobias Christiansen <tobyase@serenityos.org>
+#       Copyright (c) 2023, MacDue <macdue@dueutil.tech>
+#       Copyright (c) 2025, Jelle Raaijmakers <jelle@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Helpers =================================================================================
+
+## `Gfx::AffineTransform {}`: the identity (a zeroed AffineTransform is not).
+pub func layout_identity_affine_transform() -> gfx.AffineTransform:
+    var transform: gfx.AffineTransform = ---
+    gfx.affine_transform_construct(&transform)
+    return transform
+
+## `m_available_space` (and `*m_available_space`): VERIFYs that run() has set it.
+func layout_svg_formatting_context_available_space(this: LayoutSvgFormattingContext*) -> LayoutAvailableSpace:
+    return this.m_available_space else trap("VERIFY: m_available_space has a value")
+
+## `context_box()` of the SVG formatting context.
+func layout_svg_formatting_context_context_box(this: LayoutSvgFormattingContext*) -> LayoutBox*:
+    return layout_formatting_context_context_box(this.layout_formatting_context())
+
+## `m_state`.
+func layout_svg_formatting_context_state(this: LayoutSvgFormattingContext*) -> LayoutState*:
+    return this.formatting_context.m_state
+
+## `SVGFormattingContext nested_context(m_state, m_layout_mode, box, this, parent_viewbox_transform)`.
+func layout_make_svg_formatting_context(this: LayoutSvgFormattingContext*, box: LayoutBox*, parent_viewbox_transform: gfx.AffineTransform) -> LayoutSvgFormattingContext*:
+    let context = layout_make_formatting_context_storage[LayoutSvgFormattingContext]()
+    layout_svg_formatting_context_construct(context, layout_svg_formatting_context_state(this), this.formatting_context.m_layout_mode, box, this.layout_formatting_context(), parent_viewbox_transform)
+    return context
+
+## `length_percentage.to_px(node, reference_value)` of an `x` or `y` computed value.
+func layout_svg_length_percentage_to_px(length_percentage: CssLengthPercentage, node: LayoutNode*, reference_value: gfx.CssPixels) -> gfx.CssPixels:
+    return css_percentage_or_to_px(&length_percentage.percentage_or, node, reference_value)
+
+# mark: Construction ============================================================================
+
+## Ported from Libraries/LibWeb/Layout/SVGFormattingContext.cpp:38 Web::Layout::SVGFormattingContext::SVGFormattingContext.
+pub func layout_svg_formatting_context_construct(this: LayoutSvgFormattingContext*, state: LayoutState*, layout_mode: LayoutMode, box: LayoutBox*, parent: LayoutFormattingContext*?, parent_viewbox_transform: gfx.AffineTransform):
+    layout_formatting_context_construct(this.layout_formatting_context(), LayoutFormattingContextType.svg, layout_mode, state, box, parent)
+    layout_formatting_context_set_class(this.layout_formatting_context(), &layout_svg_formatting_context_class)
+    this.m_parent_viewbox_transform = parent_viewbox_transform
+    # The members' default initializers (the storage is zeroed: m_available_space is empty, the sizes and points are 0).
+    this.m_current_viewbox_transform = layout_identity_affine_transform()
+
+## Ported from Libraries/LibWeb/Layout/SVGFormattingContext.cpp:46 Web::Layout::SVGFormattingContext::automatic_content_width (override).
+pub func layout_svg_formatting_context_automatic_content_width_impl(base: LayoutFormattingContext*) -> gfx.CssPixels:
+    discard(base)
+    return layout_zero_px()
+
+## Ported from Libraries/LibWeb/Layout/SVGFormattingContext.cpp:51 Web::Layout::SVGFormattingContext::automatic_content_height (override).
+pub func layout_svg_formatting_context_automatic_content_height_impl(base: LayoutFormattingContext*) -> gfx.CssPixels:
+    discard(base)
+    return layout_zero_px()
+
+# mark: The viewBox transform ===================================================================
+
+## Ported from Libraries/LibWeb/Layout/SVGFormattingContext.cpp:63 Web::Layout::scale_and_align_viewbox_content.
+# https://svgwg.org/svg2-draft/coords.html#PreserveAspectRatioAttribute
+func layout_scale_and_align_viewbox_content(preserve_aspect_ratio: SvgPreserveAspectRatio, view_box: SvgViewBox, viewbox_scale: gfx.FloatSize, svg_box_state: const LayoutStateUsedValues*) -> LayoutViewBoxTransform:
+    var viewbox_transform = LayoutViewBoxTransform(offset = gfx.CssPixelPoint(m_x = layout_zero_px(), m_y = layout_zero_px()), scale_factor_x = 0.0, scale_factor_y = 0.0)
+
+    if preserve_aspect_ratio.align == SvgPreserveAspectRatioAlign.none_:
+        viewbox_transform.scale_factor_x = f64(viewbox_scale.m_width)
+        viewbox_transform.scale_factor_y = f64(viewbox_scale.m_height)
+        viewbox_transform.offset = gfx.CssPixelPoint(m_x = layout_zero_px(), m_y = layout_zero_px())
+        return viewbox_transform
+
+    match preserve_aspect_ratio.meet_or_slice:
+        .meet:
+            # meet (the default) - Scale the graphic such that:
+            # - aspect ratio is preserved
+            # - the entire ‘viewBox’ is visible within the SVG viewport
+            # - the ‘viewBox’ is scaled up as much as possible, while still meeting the other criteria
+            viewbox_transform.scale_factor_y = f64(ak.min_f32(viewbox_scale.m_width, viewbox_scale.m_height))
+            viewbox_transform.scale_factor_x = viewbox_transform.scale_factor_y
+        .slice:
+            # slice - Scale the graphic such that:
+            # aspect ratio is preserved
+            # the entire SVG viewport is covered by the ‘viewBox’
+            # the ‘viewBox’ is scaled down as much as possible, while still meeting the other criteria
+            viewbox_transform.scale_factor_y = f64(ak.max_f32(viewbox_scale.m_width, viewbox_scale.m_height))
+            viewbox_transform.scale_factor_x = viewbox_transform.scale_factor_y
+        _:
+            trap("VERIFY_NOT_REACHED")
+
+    # Handle X alignment:
+    if layout_state_used_values_has_definite_width(svg_box_state):
+        match preserve_aspect_ratio.align:
+            .x_min_y_min, .x_min_y_mid, .x_min_y_max:
+                # Align the <min-x> of the element's ‘viewBox’ with the smallest X value of the SVG viewport.
+                gfx.css_pixel_point_translate_by_css_pixels_css_pixels(&viewbox_transform.offset, layout_zero_px(), layout_zero_px())
+            .none_, .x_mid_y_min, .x_mid_y_mid, .x_mid_y_max:
+                # none: Do not force uniform scaling. Scale the graphic content of the given element non-uniformly
+                # if necessary such that the element's bounding box exactly matches the SVG viewport rectangle.
+                # FIXME: None is unimplemented (treat as xMidYMid)
+                # Align the midpoint X value of the element's ‘viewBox’ with the midpoint X value of the SVG viewport.
+                let scaled_width = gfx.css_pixels_nearest_value_for_f64(view_box.width * viewbox_transform.scale_factor_x)
+                gfx.css_pixel_point_translate_by_css_pixels_css_pixels(&viewbox_transform.offset, layout_div_int(layout_state_used_values_content_width(svg_box_state).sub(scaled_width), 2), layout_zero_px())
+            .x_max_y_min, .x_max_y_mid, .x_max_y_max:
+                # Align the <min-x>+<width> of the element's ‘viewBox’ with the maximum X value of the SVG viewport.
+                let scaled_width = gfx.css_pixels_nearest_value_for_f64(view_box.width * viewbox_transform.scale_factor_x)
+                gfx.css_pixel_point_translate_by_css_pixels_css_pixels(&viewbox_transform.offset, layout_state_used_values_content_width(svg_box_state).sub(scaled_width), layout_zero_px())
+            _:
+                trap("VERIFY_NOT_REACHED")
+
+    if layout_state_used_values_has_definite_width(svg_box_state):
+        match preserve_aspect_ratio.align:
+            .x_min_y_min, .x_mid_y_min, .x_max_y_min:
+                # Align the <min-y> of the element's ‘viewBox’ with the smallest Y value of the SVG viewport.
+                gfx.css_pixel_point_translate_by_css_pixels_css_pixels(&viewbox_transform.offset, layout_zero_px(), layout_zero_px())
+            .none_, .x_min_y_mid, .x_mid_y_mid, .x_max_y_mid:
+                # none: Do not force uniform scaling. Scale the graphic content of the given element non-uniformly
+                # if necessary such that the element's bounding box exactly matches the SVG viewport rectangle.
+                # FIXME: None is unimplemented (treat as xMidYMid)
+                # Align the midpoint Y value of the element's ‘viewBox’ with the midpoint Y value of the SVG viewport.
+                let scaled_height = gfx.css_pixels_nearest_value_for_f64(view_box.height * viewbox_transform.scale_factor_y)
+                gfx.css_pixel_point_translate_by_css_pixels_css_pixels(&viewbox_transform.offset, layout_zero_px(), layout_div_int(layout_state_used_values_content_height(svg_box_state).sub(scaled_height), 2))
+            .x_min_y_max, .x_mid_y_max, .x_max_y_max:
+                # Align the <min-y>+<height> of the element's ‘viewBox’ with the maximum Y value of the SVG viewport.
+                let scaled_height = gfx.css_pixels_nearest_value_for_f64(view_box.height * viewbox_transform.scale_factor_y)
+                gfx.css_pixel_point_translate_by_css_pixels_css_pixels(&viewbox_transform.offset, layout_zero_px(), layout_state_used_values_content_height(svg_box_state).sub(scaled_height))
+            _:
+                trap("VERIFY_NOT_REACHED")
+
+    return viewbox_transform
+
+## Ported from Libraries/LibWeb/Layout/SVGFormattingContext.cpp:160 Web::Layout::is_container_element.
+func layout_is_container_element(node: LayoutNode*) -> bool:
+    # https://svgwg.org/svg2-draft/struct.html#GroupsOverview
+    let dom_node = layout_node_dom_node(node) else return false
+    if is_svg_svga_element(dom_node):
+        return true
+    if is_svg_use_element(dom_node):
+        return true
+    if is_svg_symbol_element(dom_node):
+        return true
+    if is_svg_svgg_element(dom_node):
+        return true
+    if is_svg_mask_element(dom_node):
+        return true
+    return false
+
+# mark: run =====================================================================================
+
+## Ported from Libraries/LibWeb/Layout/SVGFormattingContext.cpp:179 Web::Layout::SVGFormattingContext::run (override).
+pub func layout_svg_formatting_context_run_impl(base: LayoutFormattingContext*, available_space: LayoutAvailableSpace):
+    let this = (LayoutSvgFormattingContext*)base
+    # NOTE: SVG doesn't have a "formatting context" in the spec, but this is the most
+    #       obvious way to drive SVG layout in our engine at the moment.
+
+    let context_box = layout_svg_formatting_context_context_box(this)
+    let svg_box_state = layout_state_get_mutable(layout_svg_formatting_context_state(this), context_box.layout_node_with_style())
+
+    let document = layout_node_document(context_box.layout_node())
+    if (DomNode*?)dom_document_document_element(document) == layout_node_dom_node(context_box.layout_node()) and not dom_document_is_decoded_svg(document):
+        # Overwrite the content width/height with the styled node width/height (from <svg width height ...>)
+
+        # NOTE: If a height had not been provided by the svg element, it was set to the height of the container
+        let node = layout_state_used_values_node(svg_box_state)
+        let computed_values = &layout_node_computed_values(node.layout_node()).computed_values
+        let width = css_computed_values_width(computed_values)
+        if css_size_is_length(&width):
+            let length = css_size_length(&width)
+            layout_state_used_values_set_content_width(svg_box_state, css_length_to_px_layout_node(&length, node.layout_node()))
+        let height = css_computed_values_height(computed_values)
+        if css_size_is_length(&height):
+            let length = css_size_length(&height)
+            layout_state_used_values_set_content_height(svg_box_state, css_length_to_px_layout_node(&length, node.layout_node()))
+        # FIXME: In SVG 2, length can also be a percentage. We'll need to support that.
+
+    # NOTE: We consider all SVG root elements to have definite size in both axes.
+    #       I'm not sure if this is good or bad, but our viewport transform logic depends on it.
+    layout_state_used_values_set_has_definite_width(svg_box_state, true)
+    layout_state_used_values_set_has_definite_height(svg_box_state, true)
+
+    let dom_node = layout_node_dom_node(context_box.layout_node()) else trap("VERIFY: an SVG formatting context's box has a DOM node")
+    var active_view_box: SvgViewBox? = none
+    if let svg_graphics_element = as_if_svg_graphics_element(dom_node):
+        active_view_box = svg_graphics_element_active_view_box(svg_graphics_element)
+    elif let svg_fit_to_view_box = as_if_svg_fit_to_view_box(dom_node):
+        active_view_box = svg_fit_to_view_box_view_box(svg_fit_to_view_box)
+    # https://svgwg.org/svg2-draft/coords.html#ViewBoxAttribute
+    if let view_box = active_view_box:
+        if view_box.width < 0.0 or view_box.height < 0.0:
+            # A negative value for <width> or <height> is an error and invalidates the ‘viewBox’ attribute.
+            active_view_box = none
+        elif view_box.width == 0.0 or view_box.height == 0.0:
+            # A value of zero disables rendering of the element.
+            return
+
+    this.m_current_viewbox_transform = this.m_parent_viewbox_transform
+    if let view_box = active_view_box:
+        # FIXME: This should allow just one of width or height to be specified.
+        # E.g. We should be able to layout <svg width="100%"> where height is unspecified/auto.
+        if not layout_state_used_values_has_definite_width(svg_box_state) or not layout_state_used_values_has_definite_height(svg_box_state):
+            if css_libweb_css_debug:
+                ak.dbgln("FIXME: Attempting to layout indefinitely sized SVG with a viewbox -- this likely won't work!")
+
+        let scale_width = layout_state_used_values_content_width(svg_box_state).to_double() / view_box.width if layout_state_used_values_has_definite_width(svg_box_state) else 1.0
+        let scale_height = layout_state_used_values_content_height(svg_box_state).to_double() / view_box.height if layout_state_used_values_has_definite_height(svg_box_state) else 1.0
+
+        # The initial value for preserveAspectRatio is xMidYMid meet.
+        var preserve_aspect_ratio = SvgPreserveAspectRatio(align = SvgPreserveAspectRatioAlign.x_mid_y_mid, meet_or_slice = SvgPreserveAspectRatioMeetOrSlice.meet)
+        if let fit_to_view_box = as_if_svg_fit_to_view_box(dom_node):
+            preserve_aspect_ratio = svg_fit_to_view_box_preserve_aspect_ratio(fit_to_view_box) else SvgPreserveAspectRatio(align = SvgPreserveAspectRatioAlign.x_mid_y_mid, meet_or_slice = SvgPreserveAspectRatioMeetOrSlice.meet)
+        elif is_svg_mask_element(dom_node) or is_svg_clip_path_element(dom_node):
+            # This allows mask and clipPath elements to be scaled in the x and y directions independently to match the target size.
+            preserve_aspect_ratio = SvgPreserveAspectRatio(align = SvgPreserveAspectRatioAlign.none_, meet_or_slice = SvgPreserveAspectRatioMeetOrSlice.meet)
+
+        let viewbox_offset_and_scale = layout_scale_and_align_viewbox_content(preserve_aspect_ratio, view_box, gfx.FloatSize(m_width = (f32)scale_width, m_height = (f32)scale_height), svg_box_state)
+
+        let offset = viewbox_offset_and_scale.offset
+        gfx.affine_transform_translate_float_point(&this.m_current_viewbox_transform, gfx.css_pixel_point_to_type_f32(&offset))
+        gfx.affine_transform_scale_f32(&this.m_current_viewbox_transform, (f32)viewbox_offset_and_scale.scale_factor_x, (f32)viewbox_offset_and_scale.scale_factor_y)
+        gfx.affine_transform_translate_float_point(&this.m_current_viewbox_transform, gfx.FloatPoint(m_x = (f32)(-view_box.min_x), m_y = (f32)(-view_box.min_y)))
+
+    # NOTE: Calculate viewport dimensions BEFORE scaling the content by m_parent_viewbox_transform.
+    # For userSpaceOnUse clips (which have no viewBox), we need the unscaled content dimensions,
+    # not the final pixel dimensions. Otherwise, nested clips compound the scale incorrectly.
+    var viewport_width = layout_zero_px()
+    if let view_box = active_view_box:
+        viewport_width = gfx.css_pixels_nearest_value_for_f64(view_box.width)
+    elif layout_state_used_values_has_definite_width(svg_box_state):
+        viewport_width = layout_state_used_values_content_width(svg_box_state)
+    elif css_libweb_css_debug:
+        ak.dbgln("FIXME: Failed to resolve width of SVG viewport!")
+
+    var viewport_height = layout_zero_px()
+    if let view_box = active_view_box:
+        viewport_height = gfx.css_pixels_nearest_value_for_f64(view_box.height)
+    elif layout_state_used_values_has_definite_height(svg_box_state):
+        viewport_height = layout_state_used_values_content_height(svg_box_state)
+    elif css_libweb_css_debug:
+        ak.dbgln("FIXME: Failed to resolve height of SVG viewport!")
+
+    this.m_available_space = available_space
+    this.m_svg_offset = svg_box_state.offset
+    this.m_viewport_size = gfx.CssPixelSize(m_width = viewport_width, m_height = viewport_height)
+
+    if layout_state_used_values_has_definite_width(svg_box_state) and layout_state_used_values_has_definite_height(svg_box_state):
+        # Scale the box of the viewport based on the parent's viewBox transform.
+        # The viewBox transform is always just a simple scale + offset.
+        # FIXME: Avoid converting SVG box to floats.
+        var svg_rect = gfx.FloatRect(m_location = gfx.css_pixel_point_to_type_f32(&svg_box_state.offset),
+                                     m_size = gfx.FloatSize(m_width = layout_state_used_values_content_width(svg_box_state).to_float(), m_height = layout_state_used_values_content_height(svg_box_state).to_float()))
+        svg_rect = gfx.affine_transform_map_f32_float_rect(&this.m_parent_viewbox_transform, svg_rect)
+        let location = gfx.float_rect_location(&svg_rect)
+        layout_state_used_values_set_content_offset(svg_box_state, gfx.float_point_to_type_css_pixels(&location))
+        layout_state_used_values_set_content_width(svg_box_state, gfx.css_pixels_from_f32(gfx.float_rect_width(&svg_rect)))
+        layout_state_used_values_set_content_height(svg_box_state, gfx.css_pixels_from_f32(gfx.float_rect_height(&svg_rect)))
+        layout_state_used_values_set_has_definite_width(svg_box_state, true)
+        layout_state_used_values_set_has_definite_height(svg_box_state, true)
+
+    for child in layout_node_children(context_box.layout_node()):
+        let child_box = as_if_layout_box(child) else continue
+        layout_svg_formatting_context_layout_svg_element(this, child_box)
+
+# mark: One element =============================================================================
+
+## Ported from Libraries/LibWeb/Layout/SVGFormattingContext.cpp:296 Web::Layout::SVGFormattingContext::layout_svg_element.
+func layout_svg_formatting_context_layout_svg_element(this: LayoutSvgFormattingContext*, child: LayoutBox*):
+    # is<SVG::SVGFitToViewBox>(child.dom_node()), is<SVG::SVGForeignObjectElement>(child.dom_node()): false without a DOM node.
+    var is_fit_to_view_box = false
+    var is_foreign_object = false
+    if let child_dom_node = layout_node_dom_node(child.layout_node()):
+        is_fit_to_view_box = as_if_svg_fit_to_view_box(child_dom_node) != none
+        is_foreign_object = is_svg_foreign_object_element(child_dom_node)
+
+    if is_fit_to_view_box:
+        layout_svg_formatting_context_layout_nested_viewport(this, child)
+    elif is_foreign_object and is_layout_block_container(child):
+        let bfc = layout_make_block_formatting_context(layout_svg_formatting_context_state(this), this.formatting_context.m_layout_mode, (LayoutBlockContainer*)child, this.layout_formatting_context())
+        defer layout_formatting_context_destruct(bfc.layout_formatting_context())
+        let child_state = layout_state_get_mutable(layout_svg_formatting_context_state(this), child.layout_node_with_style())
+        let available_space = layout_svg_formatting_context_available_space(this)
+        let computed_values = &layout_node_computed_values(child.layout_node()).computed_values
+        let width = css_computed_values_width(computed_values)
+        let height = css_computed_values_height(computed_values)
+        var rect: gfx.CssPixelRect = ---
+        gfx.css_pixel_rect_construct_css_pixels(&rect,
+                                                layout_svg_length_percentage_to_px(css_computed_values_x(computed_values), child.layout_node(), layout_available_size_to_px_or_zero(&available_space.width)),
+                                                layout_svg_length_percentage_to_px(css_computed_values_y(computed_values), child.layout_node(), layout_available_size_to_px_or_zero(&available_space.height)),
+                                                css_size_to_px(&width, child.layout_node(), layout_available_size_to_px_or_zero(&available_space.width)),
+                                                css_size_to_px(&height, child.layout_node(), layout_available_size_to_px_or_zero(&available_space.height)))
+        let mapped_rect = gfx.affine_transform_map_f32_float_rect(&this.m_current_viewbox_transform, gfx.css_pixel_rect_to_type_f32(&rect))
+        let transformed_rect = gfx.float_rect_to_type_css_pixels(&mapped_rect)
+        layout_state_used_values_set_content_offset(child_state, gfx.css_pixel_rect_location(&transformed_rect))
+        layout_state_used_values_set_content_width(child_state, gfx.css_pixel_rect_width(&transformed_rect))
+        layout_state_used_values_set_content_height(child_state, gfx.css_pixel_rect_height(&transformed_rect))
+
+        layout_formatting_context_run(bfc.layout_formatting_context(), LayoutAvailableSpace(width = layout_available_size_make_definite(layout_state_used_values_content_width(child_state)), height = layout_available_size_make_definite(layout_state_used_values_content_height(child_state))))
+
+        if let mask_box = tree_node_first_child_of_type(child.layout_node(), &layout_svg_mask_box_class):
+            layout_svg_formatting_context_layout_mask_or_clip(this, (LayoutSvgBox*)mask_box)
+
+        if let clip_box = tree_node_first_child_of_type(child.layout_node(), &layout_svg_clip_box_class):
+            layout_svg_formatting_context_layout_mask_or_clip(this, (LayoutSvgBox*)clip_box)
+    elif let graphics_box = as_if_layout_svg_graphics_box(child):
+        layout_svg_formatting_context_layout_graphics_element(this, graphics_box)
+
+## Ported from Libraries/LibWeb/Layout/SVGFormattingContext.cpp:335 the `resolve_dimension` lambda of
+## Web::Layout::SVGFormattingContext::layout_nested_viewport.
+func layout_svg_formatting_context_resolve_dimension(node: LayoutBox*, size: CssSize, reference_value: gfx.CssPixels) -> gfx.CssPixels:
+    # The value auto for width and height on the ‘svg’ element is treated as 100%.
+    # https://svgwg.org/svg2-draft/geometry.html#Sizing
+    if css_size_is_auto(&size):
+        return reference_value
+    return css_size_to_px(&size, node.layout_node(), reference_value)
+
+## Ported from Libraries/LibWeb/Layout/SVGFormattingContext.cpp:330 Web::Layout::SVGFormattingContext::layout_nested_viewport.
+func layout_svg_formatting_context_layout_nested_viewport(this: LayoutSvgFormattingContext*, viewport: LayoutBox*):
+    # Layout for a nested SVG viewport.
+    # https://svgwg.org/svg2-draft/coords.html#EstablishingANewSVGViewport.
+    let nested_viewport_state = layout_state_get_mutable(layout_svg_formatting_context_state(this), viewport.layout_node_with_style())
+
+    let computed_values = &layout_node_computed_values(viewport.layout_node()).computed_values
+    let nested_viewport_x = layout_svg_length_percentage_to_px(css_computed_values_x(computed_values), viewport.layout_node(), this.m_viewport_size.m_width)
+    let nested_viewport_y = layout_svg_length_percentage_to_px(css_computed_values_y(computed_values), viewport.layout_node(), this.m_viewport_size.m_height)
+    let nested_viewport_width = layout_svg_formatting_context_resolve_dimension(viewport, css_computed_values_width(computed_values), this.m_viewport_size.m_width)
+    let nested_viewport_height = layout_svg_formatting_context_resolve_dimension(viewport, css_computed_values_height(computed_values), this.m_viewport_size.m_height)
+
+    var content_offset = gfx.CssPixelPoint(m_x = nested_viewport_x, m_y = nested_viewport_y)
+    var content_width = nested_viewport_width
+    var content_height = nested_viewport_height
+    var parent_viewbox_transform = this.m_current_viewbox_transform
+
+    let svg_element = as_if_svg_svgsvg_element(layout_node_dom_node(viewport.layout_node()) else trap("VERIFY: a nested viewport has a DOM node"))
+    if let element = svg_element:
+        if svg_fit_to_view_box_view_box(&element.svg_fit_to_view_box) != none:
+            # FIXME: Avoid converting SVG box to floats.
+            let nested_rect = gfx.FloatRect(m_location = gfx.FloatPoint(m_x = nested_viewport_x.to_float(), m_y = nested_viewport_y.to_float()),
+                                            m_size = gfx.FloatSize(m_width = nested_viewport_width.to_float(), m_height = nested_viewport_height.to_float()))
+            let mapped_rect = gfx.affine_transform_map_f32_float_rect(&this.m_current_viewbox_transform, nested_rect)
+            let location = gfx.float_rect_location(&mapped_rect)
+            content_offset = gfx.float_point_to_type_css_pixels(&location)
+            content_width = gfx.css_pixels_from_f32(gfx.float_rect_width(&mapped_rect))
+            content_height = gfx.css_pixels_from_f32(gfx.float_rect_height(&mapped_rect))
+            parent_viewbox_transform = layout_identity_affine_transform()
+
+    layout_state_used_values_set_content_offset(nested_viewport_state, content_offset)
+    layout_state_used_values_set_content_width(nested_viewport_state, content_width)
+    layout_state_used_values_set_content_height(nested_viewport_state, content_height)
+    layout_state_used_values_set_has_definite_width(nested_viewport_state, true)
+    layout_state_used_values_set_has_definite_height(nested_viewport_state, true)
+    let nested_context = layout_make_svg_formatting_context(this, viewport, parent_viewbox_transform)
+    layout_formatting_context_run(nested_context.layout_formatting_context(), layout_svg_formatting_context_available_space(this))
