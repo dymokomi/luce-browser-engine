@@ -1,0 +1,232 @@
+#==============================================================================================
+#
+#   tests_layout_geometry - block layout geometry of parsed documents, pinned to the reference
+#                           build
+#
+#   DESCRIPTION:
+#       Runs the cases of tests_layout_geometry_cases (a local oracle over the reference build's
+#       LibWeb, luce-browser-tools/oracles/luce-browser-engine/layout_geometry; the first 19 are
+#       Ladybird's own Tests/LibWeb/Layout block-and-inline tests without text, whose expected
+#       layout dumps the oracle reproduces) through the port: a document is parsed, styled and
+#       its layout tree built as tests_layout_tree does, then the layout steps of
+#       Document::update_layout run (the overflow propagated to the viewport, layout indices,
+#       containing blocks, contained abspos children, a LayoutState and the root
+#       BlockFormattingContext).
+#
+#       The expected text is the layout half of a Layout test (Dump's dump_tree of the laid-out
+#       tree). LayoutState::commit makes paintables, which are region r50's, so the harness runs
+#       Dump's dump_tree on the unpainted tree and gives each box the geometry commit would hand
+#       its PaintableBox: the position (its offset, plus the inset of a relatively positioned box,
+#       summed along the containing block chain, as PaintableBox::absolute_rect does) in place of
+#       "(not painted)", and the box model and content size of its used values.
+#
+#==============================================================================================
+
+# mark: Running the layout ======================================================================
+
+## Document::update_layout's steps from the overflow propagation to the root formatting context (the
+## commit is region r50's paintables): answers the layout state the tree was laid out in.
+noinline func test_layout_geometry_lay_out(document: DomDocument*, layout_state: LayoutState*):
+    let layout_root = dom_document_unsafe_layout_node(document) else trap("no layout tree")
+    let document_element = dom_document_document_element(document)
+    if let root_element = document_element:
+        if dom_element_unsafe_layout_node(root_element) != none:
+            dom_propagate_overflow_to_viewport(root_element, layout_root)
+            dom_propagate_scrollbar_width_to_viewport(root_element, layout_root)
+
+    var layout_index_counter: u32 = 0
+    for layout_node in layout_node_inclusive_subtree(layout_root.layout_node()):
+        if let node_with_style = as_if_layout_node_with_style(layout_node):
+            layout_node_with_style_set_layout_index(node_with_style, layout_index_counter)
+            layout_index_counter += 1
+
+        layout_node_recompute_containing_block(layout_node)
+
+        let box = as_if_layout_box(layout_node) else continue
+
+        layout_box_clear_contained_abspos_children(box)
+
+        if not layout_node_is_absolutely_positioned(box.layout_node()):
+            continue
+
+        if let containing_block = layout_node_containing_block(box.layout_node()):
+            var closest_box_that_establishes_formatting_context: LayoutBox*? = containing_block
+            while let candidate = closest_box_that_establishes_formatting_context:
+                if candidate == layout_root.layout_box():
+                    break
+                if layout_formatting_context_formatting_context_type_created_by_box(candidate) != none:
+                    break
+                closest_box_that_establishes_formatting_context = layout_node_containing_block(candidate.layout_node())
+            let establishing_box = closest_box_that_establishes_formatting_context else trap("VERIFY: no box establishes a formatting context")
+            layout_box_add_contained_abspos_child(establishing_box, box.layout_node())
+
+    layout_state_ensure_capacity(layout_state, layout_index_counter)
+
+    let viewport_rect = gfx.CssPixelRect(gfx.CssPixelPoint(gfx.CssPixels.from_int(0), gfx.CssPixels.from_int(0)), gfx.CssPixelSize(gfx.CssPixels.from_int(800), gfx.CssPixels.from_int(600)))
+    let viewport_state = layout_state_get_mutable(layout_state, layout_root.layout_node_with_style())
+    layout_state_used_values_set_content_width(viewport_state, gfx.css_pixel_rect_width(&viewport_rect))
+    layout_state_used_values_set_content_height(viewport_state, gfx.css_pixel_rect_height(&viewport_rect))
+
+    if let root_element = document_element:
+        if let root_layout_node = dom_element_unsafe_layout_node(root_element):
+            let icb_state = layout_state_get_mutable(layout_state, as_layout_node_with_style_and_box_model_metrics(root_layout_node).layout_node_with_style())
+            layout_state_used_values_set_content_width(icb_state, gfx.css_pixel_rect_width(&viewport_rect))
+
+    let available_space = LayoutAvailableSpace(width = layout_available_size_make_definite(gfx.css_pixel_rect_width(&viewport_rect)),
+                                               height = layout_available_size_make_definite(gfx.css_pixel_rect_height(&viewport_rect)))
+
+    var root_formatting_context: LayoutBlockFormattingContext = ---
+    layout_block_formatting_context_construct(&root_formatting_context, layout_state, LayoutMode.normal, layout_root.layout_block_container(), none)
+    # ~BlockFormattingContext() runs when the context goes out of scope.
+    defer layout_block_formatting_context_destruct(&root_formatting_context)
+    layout_formatting_context_run(&root_formatting_context.formatting_context, available_space)
+
+# mark: The geometry commit would give the paintables ===========================================
+
+## The offset LayoutState::commit gives a box's PaintableBox: its used offset, plus its inset when it is relatively
+## positioned (none when the box was not laid out, so commit made no paintable for it).
+func test_layout_geometry_paintable_offset(state: const LayoutState*, box: LayoutBox*) -> gfx.CssPixelPoint?:
+    let used_values = layout_state_try_get_layout_node_with_style(state, box.layout_node_with_style()) else return none
+    var offset = used_values.offset
+    if css_computed_values_position(&layout_node_computed_values(box.layout_node()).computed_values) == css_data.Positioning.relative:
+        gfx.css_pixel_point_translate_by_css_pixels_css_pixels(&offset, used_values.inset_left, used_values.inset_top)
+    return offset
+
+## PaintableBox::absolute_rect's location: the paintable offsets of the box and of its containing blocks.
+func test_layout_geometry_absolute_position(state: const LayoutState*, box: LayoutBox*) -> gfx.CssPixelPoint?:
+    var position = test_layout_geometry_paintable_offset(state, box) else return none
+    var block_or_none = layout_node_containing_block(box.layout_node())
+    while let block = block_or_none:
+        let block_offset = test_layout_geometry_paintable_offset(state, block) else break
+        gfx.css_pixel_point_translate_by_css_pixel_point(&position, block_offset)
+        block_or_none = layout_node_containing_block(block.layout_node())
+    return position
+
+## Dump's `dump_box_model` of the box model and content size commit would give a box's PaintableBox.
+func test_layout_geometry_append_box_model(builder: ak.StringBuilder*, used_values: const LayoutStateUsedValues*):
+    dump_appendff(builder, " [{}+{}+{} {} {}+{}+{}]", [
+        dump_arg_css_pixels(used_values.margin_left),
+        dump_arg_css_pixels(used_values.border_left),
+        dump_arg_css_pixels(used_values.padding_left),
+        dump_arg_css_pixels(layout_state_used_values_content_width(used_values)),
+        dump_arg_css_pixels(used_values.padding_right),
+        dump_arg_css_pixels(used_values.border_right),
+        dump_arg_css_pixels(used_values.margin_right),
+    ])
+    dump_appendff(builder, " [{}+{}+{} {} {}+{}+{}]", [
+        dump_arg_css_pixels(used_values.margin_top),
+        dump_arg_css_pixels(used_values.border_top),
+        dump_arg_css_pixels(used_values.padding_top),
+        dump_arg_css_pixels(layout_state_used_values_content_height(used_values)),
+        dump_arg_css_pixels(used_values.padding_bottom),
+        dump_arg_css_pixels(used_values.border_bottom),
+        dump_arg_css_pixels(used_values.margin_bottom),
+    ])
+
+## Index of `needle` in `haystack` at or after `start`, if any.
+func test_layout_geometry_find(haystack: const u8[], needle: str, start: usize) -> usize?:
+    let bytes = needle.bytes
+    if haystack.length < bytes.length:
+        return none
+    var index = start
+    while index + bytes.length <= haystack.length:
+        var matches = true
+        for offset in 0..<bytes.length:
+            if haystack[index + offset] != bytes[offset]:
+                matches = false
+                break
+        if matches:
+            return index
+        index += 1
+    return none
+
+## One line of Dump's unpainted dump with a box's geometry: "(not painted)" becomes its position, and its box model
+## goes after the flags (before the formatting context or " children:").
+func test_layout_geometry_patch_line(out: ak.StringBuilder*, line: const u8[], state: const LayoutState*, box: LayoutBox*):
+    let used_values = layout_state_try_get_layout_node_with_style(state, box.layout_node_with_style())
+    let position = test_layout_geometry_absolute_position(state, box)
+    let not_painted = test_layout_geometry_find(line, "(not painted)", 0)
+    if used_values == none or position == none or not_painted == none:
+        ak.string_builder_append(out, (str)line)
+        return
+    let values = used_values else trap("unreachable")
+    let at = not_painted else trap("unreachable")
+    let after_position = at + "(not painted)".length
+    var box_model_at = line.length
+    if let fc = test_layout_geometry_find(line, " [", after_position):
+        box_model_at = fc
+    elif let children = test_layout_geometry_find(line, " children:", after_position):
+        box_model_at = children
+    ak.string_builder_append(out, (str)line[0..<at])
+    ak.string_builder_append(out, "at ")
+    dump_append_css_pixel_point(out, position else trap("unreachable"))
+    ak.string_builder_append(out, (str)line[after_position..<box_model_at])
+    test_layout_geometry_append_box_model(out, values)
+    ak.string_builder_append(out, (str)line[box_model_at..])
+
+## The layout dump of a laid-out document, each line indented by two spaces (the oracle's put_lines).
+func test_layout_geometry_dump(out: ak.StringBuilder*, document: DomDocument*, state: const LayoutState*):
+    let root = dom_document_unsafe_layout_node(document) else trap("no layout tree")
+    var builder = ak.string_builder_new()
+    dump_tree_string_builder_layout_node(&builder, root.layout_node(), false, false)
+    let text = ak.string_builder_string_view(&builder)
+    let bytes = ak.string_view_bytes(&text)
+    var end = bytes.length
+    while end > 0 and (bytes[end - 1] == ' ' or bytes[end - 1] == '\n'):
+        end -= 1
+
+    # One dump line per layout node, in pre-order (no fragments or cascaded properties are dumped here).
+    var nodes = layout_node_inclusive_subtree(root.layout_node()).iterator()
+    var start: usize = 0
+    for i in 0..<end + 1:
+        if i < end and bytes[i] != '\n':
+            continue
+        let line = bytes[start..<i]
+        start = i + 1
+        ak.string_builder_append(out, "  ")
+        let node = nodes.next() else trap("more dump lines than layout nodes")
+        if let box = as_if_layout_box(node):
+            test_layout_geometry_patch_line(out, line, state, box)
+        else:
+            ak.string_builder_append(out, (str)line)
+        ak.string_builder_append(out, "\n")
+
+## Runs one case and answers its output.
+func test_layout_geometry_run_case(heap: gc.Heap*, realm: Realm*, test_case: const TestLayoutGeometryCase*) -> ak.String:
+    var out = ak.string_builder_new()
+    var (document, navigable) = test_layout_tree_build(heap, realm, test_case.html, test_case.css)
+    defer gc.root_release(&navigable)
+    var layout_state: LayoutState
+    test_layout_geometry_lay_out(document, &layout_state)
+    gc.heap_collect_garbage(heap)
+    test_layout_geometry_dump(&out, document, &layout_state)
+    return ak.string_builder_to_string_without_validation(&out)
+
+# mark: Tests ===================================================================================
+
+test "block layout geometry (widths, heights, margins and their collapsing, floats, clearance, positioned boxes, min/max sizes, quirks) matches the reference build":
+    web_initialize_strings()
+    test_fonts_setup()
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    let heap = vm_heap(vm)
+    var passed: usize = 0
+    var failed: usize = 0
+    let allocator: memory.Allocator = heap
+    with allocator:
+        test_page_client_color_scheme = CssPreferredColorScheme.light
+        defer test_page_client_color_scheme = CssPreferredColorScheme.auto
+        test_media_invalidation_install_user_agent_sheets(realm)
+        defer test_style_computer_release_user_agent_sheets()
+        for test_case in &test_layout_geometry_cases:
+            let actual = test_layout_geometry_run_case(heap, realm, test_case)
+            let actual_view = ak.string_bytes_as_string_view(&actual)
+            if ak.string_view_equals(&actual_view, test_case.expected):
+                passed += 1
+            else:
+                failed += 1
+                print(f"layout geometry case mismatch: {test_case.html} / {test_case.css}")
+                print(f"expected:\n{test_case.expected}actual:\n{ak.string_view_text(actual_view)}")
+    print(f"layout geometry: {passed} passed, {failed} failed")
+    assert(failed == 0)
+    assert(passed > 0)

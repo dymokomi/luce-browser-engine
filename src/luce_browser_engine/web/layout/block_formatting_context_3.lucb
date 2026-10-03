@@ -1,0 +1,403 @@
+#==============================================================================================
+#
+#   block_formatting_context_3 - Layout::BlockFormattingContext: block-level boxes in normal
+#                                flow and their automatic heights
+#
+#   DESCRIPTION:
+#       Port of LibWeb/Layout/BlockFormattingContext.cpp (lines 646-1027): the automatic height
+#       of a block-level box (CSS 2.2 §10.6.3, with collapsing bottom margins), the containing
+#       block height of the percentage height quirk, layout_block_level_box (static positions of
+#       abspos boxes, floats, margin collapsing and clearance, independent formatting contexts,
+#       list item markers, relative insets) and layout_block_level_children.
+#
+#       Copyright (c) 2020-2022, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2025-2026, Jelle Raaijmakers <jelle@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Automatic heights =======================================================================
+
+## Ported from Libraries/LibWeb/Layout/BlockFormattingContext.cpp:646 Web::Layout::BlockFormattingContext::compute_auto_height_for_block_level_element.
+pub func layout_block_formatting_context_compute_auto_height_for_block_level_element(this: LayoutBlockFormattingContext*, box: LayoutBox*, available_space: LayoutAvailableSpace) -> gfx.CssPixels:
+    let base = this.layout_formatting_context()
+    if layout_formatting_context_creates_block_formatting_context(box):
+        return layout_formatting_context_compute_auto_height_for_block_formatting_context_root(base, box)
+
+    let box_state = layout_state_get(base.m_state, box.layout_node_with_style())
+
+    let display = layout_node_display(box.layout_node())
+    if css_display_is_flex_inside(&display):
+        # https://drafts.csswg.org/css-flexbox-1/#algo-main-container
+        # NOTE: The automatic block size of a block-level flex container is its max-content size.
+        return layout_formatting_context_calculate_max_content_height(base, box, layout_available_size_to_px_or_zero(&available_space.width))
+    if css_display_is_grid_inside(&display):
+        # https://www.w3.org/TR/css-grid-2/#intrinsic-sizes
+        # In both inline and block formatting contexts, the grid container’s auto block size is its
+        # max-content size.
+        return layout_formatting_context_calculate_max_content_height(base, box, layout_available_size_to_px_or_zero(&available_space.width))
+    if css_display_is_table_inside(&display):
+        return layout_formatting_context_calculate_max_content_height(base, box, layout_available_size_to_px_or_zero(&available_space.width))
+
+    # https://www.w3.org/TR/CSS22/visudet.html#normal-block
+    # 10.6.3 Block-level non-replaced elements in normal flow when 'overflow' computes to 'visible'
+
+    # The element's height is the distance from its top content edge to the first applicable of the following:
+
+    # 1. the bottom edge of the last line box, if the box establishes a inline formatting context with one or more lines
+    if layout_node_children_are_inline(box.layout_node()) and not ak.vector_is_empty(&box_state.line_boxes):
+        return layout_line_box_bottom(ak.vector_at_const(&box_state.line_boxes, ak.vector_size(&box_state.line_boxes) - 1))
+
+    # 2. the bottom edge of the bottom (possibly collapsed) margin of its last in-flow child, if the child's bottom margin does not collapse with the element's bottom margin
+    # 3. the bottom border edge of the last in-flow child whose top margin doesn't collapse with the element's bottom margin
+    if not layout_node_children_are_inline(box.layout_node()):
+        var marker_line_height = layout_zero_px()
+        var child_box_or_none = tree_node_last_child_of_type(box.layout_node(), &layout_box_class)
+        while let child_node = child_box_or_none:
+            child_box_or_none = tree_node_previous_sibling_of_type(child_node, &layout_box_class)
+            let child_box = (LayoutBox*)child_node
+            if layout_node_is_absolutely_positioned(child_node) or layout_node_is_floating(child_node):
+                continue
+
+            # NOTE: Markers are not in-flow, but for list items that contain only floats (or are otherwise empty),
+            #       the marker's line-height determines the list item's height. This ensures proper vertical stacking
+            #       of list items and alignment with their floated content.
+            if layout_node_is_list_item_marker_box(child_node):
+                marker_line_height = css_computed_values_line_height(layout_box_computed(child_box))
+                continue
+
+            let child_box_state = layout_state_get(base.m_state, child_box.layout_node_with_style())
+
+            if layout_margins_collapse_through(child_box, base.m_state):
+                continue
+
+            var margin_bottom = layout_block_formatting_context_block_margin_state_current_collapsed_margin(&this.m_margin_state)
+            if gfx.eq_css_pixels_int(box_state.padding_bottom, 0) and gfx.eq_css_pixels_int(box_state.border_bottom, 0):
+                layout_block_formatting_context_block_margin_state_set_box_last_in_flow_child_margin_bottom_collapsed(&this.m_margin_state, true)
+                margin_bottom = layout_zero_px()
+
+            return ak.max(layout_zero_px(), child_box_state.offset.m_y.add(layout_state_used_values_content_height(child_box_state)).add(layout_state_used_values_border_box_bottom(child_box_state)).add(margin_bottom))
+
+        # If no in-flow children were found but there's a marker, use the marker's line-height.
+        if marker_line_height.gt(layout_zero_px()):
+            return marker_line_height
+
+    # AD-HOC: Contenteditable elements must have a minimum height (line-height) when empty, to remain clickable and
+    #         usable for text input, even though this is not specified.
+    #         See: https://github.com/w3c/editing/issues/70.
+    if let dom_node = layout_node_dom_node(box.layout_node()):
+        if is_dom_element(dom_node) and dom_node_is_editing_host(dom_node):
+            return css_computed_values_line_height(layout_box_computed(box))
+
+    # 4. zero, otherwise
+    return layout_zero_px()
+
+## The `content_height_of` lambda of containing_block_height_to_resolve_percentage_in_quirks_mode.
+func layout_containing_block_height_to_resolve_percentage_in_quirks_mode_content_height_of(state: const LayoutState*, node: LayoutNodeWithStyleAndBoxModelMetrics*) -> gfx.CssPixels:
+    let node_used_values = layout_state_try_get_layout_node_with_style(state, node.layout_node_with_style()) else return layout_zero_px()
+    return layout_state_used_values_content_height(node_used_values)
+
+## Ported from Libraries/LibWeb/Layout/BlockFormattingContext.cpp:724 Web::Layout::containing_block_height_to_resolve_percentage_in_quirks_mode.
+func layout_containing_block_height_to_resolve_percentage_in_quirks_mode(box: LayoutBox*, state: const LayoutState*) -> gfx.CssPixels:
+    # https://quirks.spec.whatwg.org/#the-percentage-height-calculation-quirk
+    var containing_block_or_none = layout_node_containing_block(box.layout_node())
+    while let containing_block = containing_block_or_none:
+        # 1. Let element be the nearest ancestor containing block of element, if there is one.
+        #    Otherwise, return the initial containing block.
+        if layout_node_is_viewport(containing_block.layout_node()):
+            return layout_containing_block_height_to_resolve_percentage_in_quirks_mode_content_height_of(state, containing_block.layout_node_with_style_and_box_model_metrics())
+
+        # 2. If element has a computed value of the display property that is table-cell, then return a
+        #    UA-defined value.
+        let display = layout_node_display(containing_block.layout_node())
+        if css_display_is_table_cell(&display):
+            # FIXME: Likely UA-defined value should not be 0.
+            return layout_zero_px()
+
+        # 3. If element has a computed value of the height property that is not auto, then return element.
+        let height = css_computed_values_height(layout_box_computed(containing_block))
+        if not css_size_is_auto(&height):
+            return layout_containing_block_height_to_resolve_percentage_in_quirks_mode_content_height_of(state, containing_block.layout_node_with_style_and_box_model_metrics())
+
+        # 4. If element has a computed value of the position property that is absolute, or if element is a
+        #    not a block container or a table wrapper box, then return element.
+        if layout_node_is_absolutely_positioned(containing_block.layout_node()) or not is_layout_block_container(containing_block) or is_layout_table_wrapper(containing_block):
+            return layout_containing_block_height_to_resolve_percentage_in_quirks_mode_content_height_of(state, containing_block.layout_node_with_style_and_box_model_metrics())
+
+        # 5. Jump to the first step.
+        containing_block_or_none = layout_node_containing_block(containing_block.layout_node())
+    trap("VERIFY_NOT_REACHED")
+
+# mark: Block-level boxes =======================================================================
+
+## The lambda layout_block_level_box registers as the margin state's block container y position update callback
+## (`[this, &box, y, introduce_clearance](CSSPixels margin_top) {...}`); it lives in that function's frame.
+struct LayoutBlockFormattingContextLayoutBlockLevelBoxYPositionUpdate:
+    var context: LayoutBlockFormattingContext*
+    var box: LayoutBox*
+    var y: gfx.CssPixels
+    var introduce_clearance: LayoutBlockFormattingContextDidIntroduceClearance
+
+## The body of LayoutBlockFormattingContextLayoutBlockLevelBoxYPositionUpdate's lambda.
+func layout_block_formatting_context_layout_block_level_box_y_position_update(context: void*?, margin_top: gfx.CssPixels):
+    let captures = (LayoutBlockFormattingContextLayoutBlockLevelBoxYPositionUpdate*)(context else trap("the y position update callback without its captures"))
+    if captures.introduce_clearance == LayoutBlockFormattingContextDidIntroduceClearance.no:
+        layout_block_formatting_context_place_block_level_element_in_normal_flow_vertically(captures.context, captures.box, margin_top.add(captures.y))
+
+## Ported from Libraries/LibWeb/Layout/BlockFormattingContext.cpp:766 Web::Layout::BlockFormattingContext::layout_block_level_box.
+pub func layout_block_formatting_context_layout_block_level_box(this: LayoutBlockFormattingContext*, box: LayoutBox*, block_container: LayoutBlockContainer*, bottom_of_lowest_margin_box: gfx.CssPixels*, available_space: LayoutAvailableSpace):
+    let base = this.layout_formatting_context()
+    let node = box.layout_node()
+    if layout_node_is_absolutely_positioned(node):
+        if base.m_layout_mode == LayoutMode.normal:
+            let box_state = layout_state_get_mutable(base.m_state, box.layout_node_with_style())
+            var static_position = LayoutStaticPositionRect()
+            var static_position_y = this.m_y_offset_of_current_block_container else trap("no current block container y offset")
+            # FIXME: This is a heuristic approximation. Ideally, originally-inline abspos
+            #        elements would have their static position determined by the IFC that
+            #        laid out the surrounding inline content, but our architecture currently
+            #        routes all abspos elements through the BFC as block-level children.
+            #        When the previous sibling is the anonymous wrapper that contains the
+            #        inline content this element would have been part of, use that wrapper's
+            #        y-offset as a rough approximation of the correct static position.
+            let display_before_box_type_transformation = layout_node_display_before_box_type_transformation(node)
+            if css_display_is_inline_outside(&display_before_box_type_transformation):
+                if let previous_sibling = tree_node_previous_sibling(node):
+                    if let sibling = as_if_layout_node_with_style(previous_sibling):
+                        if layout_node_is_anonymous(sibling.layout_node()) and layout_node_children_are_inline(sibling.layout_node()):
+                            static_position_y = layout_state_get(base.m_state, sibling).offset.m_y
+            static_position.rect = gfx.CssPixelRect(gfx.CssPixelPoint(layout_zero_px(), static_position_y), gfx.CssPixelSize(layout_zero_px(), layout_zero_px()))
+            layout_state_used_values_set_static_position_rect(box_state, static_position)
+        return
+
+    let box_state = layout_state_get_mutable(base.m_state, box.layout_node_with_style())
+
+    # NOTE: ListItemMarkerBoxes are placed by their corresponding ListItemBox.
+    if is_layout_list_item_marker_box(box):
+        return
+
+    layout_block_formatting_context_resolve_vertical_box_model_metrics(this, box, layout_state_used_values_content_width(layout_state_get(base.m_state, block_container.layout_node_with_style())))
+
+    if layout_node_is_floating(node):
+        let y = this.m_y_offset_of_current_block_container else trap("no current block container y offset")
+        let margin_top = layout_block_formatting_context_block_margin_state_current_collapsed_margin(&this.m_margin_state) if not layout_block_formatting_context_block_margin_state_has_block_container_waiting_for_final_y_position(&this.m_margin_state) else layout_zero_px()
+        layout_block_formatting_context_layout_floating_box(this, box, block_container, available_space, margin_top.add(y))
+        *bottom_of_lowest_margin_box = ak.max(*bottom_of_lowest_margin_box, box_state.offset.m_y.add(layout_state_used_values_content_height(box_state)).add(layout_state_used_values_margin_box_bottom(box_state)))
+        return
+
+    layout_block_formatting_context_block_margin_state_add_margin(&this.m_margin_state, box_state.margin_top)
+    let introduce_clearance = layout_block_formatting_context_clear_floating_boxes(this, node, none)
+    if introduce_clearance == LayoutBlockFormattingContextDidIntroduceClearance.yes:
+        layout_block_formatting_context_block_margin_state_reset(&this.m_margin_state)
+    layout_block_formatting_context_block_margin_state_update_block_waiting_for_final_y_position(&this.m_margin_state)
+
+    let y = this.m_y_offset_of_current_block_container else trap("no current block container y offset")
+
+    let document = layout_node_document(node)
+    let dom_node = layout_node_dom_node(node)
+    let computed_values = layout_box_computed(box)
+    let computed_height = css_computed_values_height(computed_values)
+    let box_is_html_element_in_quirks_mode = dom_document_in_quirks_mode(document) and dom_node != none and dom_node_is_html_html_element(dom_node else trap("unreachable")) and css_size_is_auto(&computed_height)
+
+    # NOTE: In quirks mode, the html element's height matches the viewport so it can be treated as definite
+    if layout_state_used_values_has_definite_height(box_state) or box_is_html_element_in_quirks_mode:
+        layout_block_formatting_context_resolve_used_height_if_treated_as_auto(this, box, available_space)
+
+    let independent_formatting_context = layout_formatting_context_create_independent_formatting_context_if_needed(base, base.m_state, base.m_layout_mode, box)
+    defer layout_formatting_context_destruct(independent_formatting_context)
+
+    # NOTE: It is possible to encounter SVGMaskBox nodes while doing layout of formatting context established by <foreignObject> with a mask.
+    #       We should skip and let SVGFormattingContext take care of them.
+    if layout_node_is_svg_mask_box(node):
+        return
+
+    if independent_formatting_context == none and not is_layout_block_container(box):
+        let description = layout_node_debug_description(node)
+        ak.dbgln(f"FIXME: Block-level box is not BlockContainer but does not create formatting context: {ak.string_view_text(ak.string_bytes_as_string_view(&description))}")
+        return
+
+    var margin_top = layout_block_formatting_context_block_margin_state_current_collapsed_margin(&this.m_margin_state)
+
+    if layout_block_formatting_context_block_margin_state_has_block_container_waiting_for_final_y_position(&this.m_margin_state):
+        # If first child margin top will collapse with margin-top of containing block then margin-top of child is 0
+        margin_top = layout_zero_px()
+
+    layout_block_formatting_context_place_block_level_element_in_normal_flow_vertically(this, box, y.add(margin_top))
+
+    layout_block_formatting_context_compute_width(this, box, available_space)
+    layout_block_formatting_context_avoid_float_intrusions(this, box, available_space)
+
+    layout_block_formatting_context_place_block_level_element_in_normal_flow_horizontally(this, box, available_space)
+
+    var available_space_for_height_resolution = available_space
+    let display = layout_node_display(node)
+    let is_table_box = css_display_is_table_row(&display) or css_display_is_table_row_group(&display) or css_display_is_table_header_group(&display) or css_display_is_table_footer_group(&display) or css_display_is_table_cell(&display) or css_display_is_table_caption(&display)
+    # https://quirks.spec.whatwg.org/#the-percentage-height-calculation-quirk
+    var is_in_ua_internal_shadow_tree = false
+    if let element_node = dom_node:
+        if let shadow_root = dom_node_containing_shadow_root(element_node):
+            is_in_ua_internal_shadow_tree = dom_shadow_root_is_user_agent_internal(shadow_root)
+    if dom_document_in_quirks_mode(document) and css_size_is_percentage(&computed_height) and not is_table_box and not is_in_ua_internal_shadow_tree:
+        # In quirks mode, for the purpose of calculating the height of an element, if the
+        # computed value of the position property of element is relative or static, the specified value
+        # for the height property of element is a <percentage>, and element does not have a computed
+        # value of the display property that is table-row, table-row-group, table-header-group,
+        # table-footer-group, table-cell or table-caption, the containing block of element must be
+        # calculated using the following algorithm, aborting on the first step that returns a value:
+        let height = layout_containing_block_height_to_resolve_percentage_in_quirks_mode(box, base.m_state)
+        available_space_for_height_resolution.height = layout_available_size_make_definite(height)
+
+    layout_block_formatting_context_resolve_used_height_if_not_treated_as_auto(this, box, available_space_for_height_resolution)
+
+    # NOTE: Flex containers with `auto` height are treated as `max-content`, so we can compute their height early.
+    if layout_box_has_auto_content_box_size(box) or css_display_is_flex_inside(&display):
+        layout_block_formatting_context_resolve_used_height_if_treated_as_auto(this, box, available_space_for_height_resolution)
+
+    # This monster basically means: "a ListItemBox that does not have specified content in the ::marker pseudo-element".
+    # This happens for ::marker with content 'normal'.
+    # FIXME: We currently so not support ListItemBox-es generated by pseudo-elements. We will need to, eventually.
+    let li_box = as_if_layout_list_item_box(box)
+    var is_list_item_box_without_css_content = li_box != none
+    if let li = li_box:
+        if let element_node = dom_node:
+            if let element = as_if_dom_element(element_node):
+                if let computed_properties = dom_element_computed_properties(element, css_data.PseudoElement.marker):
+                    is_list_item_box_without_css_content = not css_style_value_is_content(css_computed_properties_property(computed_properties, css_data.PropertyId.content))
+        discard(li)
+
+    # Before we insert the children of a list item we need to know the location of the marker.
+    # If we do not do this then left-floating elements inside the list item will push the marker to the right,
+    # in some cases even causing it to overlap with the non-floating content of the list.
+    var inline_space_used_before_children_formatted = LayoutFormattingContextSpaceUsedByFloats()
+    if is_list_item_box_without_css_content:
+        let li = li_box else trap("unreachable: a list item box")
+        if let marker = layout_list_item_box_marker(li):
+            # We need to ensure that our height and width are final before we calculate our left offset.
+            # Otherwise, the y at which we calculate the intrusion by floats might be incorrect.
+            layout_block_formatting_context_ensure_sizes_correct_for_left_offset_calculation(this, li)
+
+            let list_item_state = layout_state_get(base.m_state, li.layout_node_with_style())
+            let marker_state = layout_state_get(base.m_state, marker.layout_node_with_style())
+
+            let offset_y = ak.max(layout_zero_px(), layout_div_int(css_computed_values_line_height(layout_box_computed(marker.layout_box())).sub(layout_state_used_values_content_height(marker_state)), 2))
+            inline_space_used_before_children_formatted = layout_block_formatting_context_intrusion_by_floats_into_box_layout_state_used_values(this, list_item_state, offset_y)
+
+    if let context = independent_formatting_context:
+        # Margins of elements that establish new formatting contexts do not collapse with their in-flow children
+        layout_block_formatting_context_block_margin_state_reset(&this.m_margin_state)
+
+        # This box establishes a new formatting context. Pass control to it.
+        var inner_available_space = layout_state_used_values_available_inner_space_or_constraints_from(box_state, available_space)
+
+        # For boxes with auto height but non-auto min-height, we need to determine if the content height is less than
+        # min-height. If so, we run layout with min-height as the available height.
+        let computed_min_height = css_computed_values_min_height(computed_values)
+        if layout_formatting_context_should_treat_height_as_auto(base, box, available_space) and not css_size_is_auto(&computed_min_height):
+            var throwaway_state: LayoutState
+            layout_state_construct(&throwaway_state, box.layout_node_with_style())
+            # Populate the entire containing block chain: the throwaway BFC may encounter abspos
+            # elements whose containing block is an ancestor above `box`. We stop when the source
+            # state lacks an entry, which happens when it is itself a nested throwaway state.
+            var cb_or_none = layout_node_containing_block(node)
+            while let cb = cb_or_none:
+                if layout_state_try_get_layout_node_with_style(base.m_state, cb.layout_node_with_style()) == none:
+                    break
+                discard(layout_state_populate_node_from(&throwaway_state, base.m_state, cb.layout_node_with_style()))
+                cb_or_none = layout_node_containing_block(cb.layout_node())
+
+            let measuring_context = layout_formatting_context_create_independent_formatting_context_if_needed(base, &throwaway_state, base.m_layout_mode, box) else trap("no measuring context for a box that creates one")
+            defer layout_formatting_context_destruct(measuring_context)
+            layout_formatting_context_run(measuring_context, inner_available_space)
+            let content_height = layout_formatting_context_automatic_content_height(measuring_context)
+            let min_height = layout_formatting_context_calculate_inner_height(base, box, available_space, computed_min_height)
+            if content_height.lt(min_height):
+                inner_available_space.height = layout_available_size_make_definite(min_height)
+
+        layout_formatting_context_run(context, inner_available_space)
+    else:
+        # This box participates in the current block container's flow.
+        let space_available_for_children = available_space if layout_node_is_anonymous(node) else layout_state_used_values_available_inner_space_or_constraints_from(box_state, available_space)
+        if layout_node_children_are_inline(node):
+            layout_block_formatting_context_layout_inline_children(this, as_layout_block_container(box), space_available_for_children)
+        else:
+            var registered_block_container_y_position_update_callback = false
+            var y_position_update = LayoutBlockFormattingContextLayoutBlockLevelBoxYPositionUpdate(context = this, box = box, y = y, introduce_clearance = introduce_clearance)
+            if box_state.border_top.gt(layout_zero_px()) or box_state.padding_top.gt(layout_zero_px()):
+                # margin-top of block container can't collapse with it's children if it has non zero border or padding
+                layout_block_formatting_context_block_margin_state_reset(&this.m_margin_state)
+            elif not layout_block_formatting_context_block_margin_state_has_block_container_waiting_for_final_y_position(&this.m_margin_state):
+                # margin-top of block container can be updated during children layout hence it's final y position yet to be determined
+                layout_block_formatting_context_block_margin_state_register_block_container_y_position_update_callback(&this.m_margin_state,
+                                                                                                                       ak.Function1[gfx.CssPixels, unit](call = layout_block_formatting_context_layout_block_level_box_y_position_update, context = &y_position_update))
+                registered_block_container_y_position_update_callback = true
+
+            layout_block_formatting_context_layout_block_level_children(this, as_layout_block_container(box), space_available_for_children)
+
+            if registered_block_container_y_position_update_callback:
+                layout_block_formatting_context_block_margin_state_unregister_block_container_y_position_update_callback(&this.m_margin_state)
+
+    # Tables already set their height during the independent formatting context run. When multi-line text cells are involved, using different
+    # available space here than during the independent formatting context run can result in different line breaks and thus a different height.
+    if not css_display_is_table_inside(&display):
+        layout_block_formatting_context_resolve_used_height_if_treated_as_auto(this, box, available_space_for_height_resolution, independent_formatting_context)
+
+    # Now that our children are formatted we place the ListItemBox with the left space we remembered.
+    if is_list_item_box_without_css_content:
+        # The marker pseudo-element will be created from a ListItemMarkerBox
+        let li = li_box else trap("unreachable: a list item box")
+        layout_block_formatting_context_layout_list_item_marker(this, li, inline_space_used_before_children_formatted)
+    # Otherwise, it will be a dealt with as a generic pseudo-element with the content of the ::marker pseudo-element.
+
+    if independent_formatting_context != none or not layout_margins_collapse_through(box, base.m_state):
+        if not layout_block_formatting_context_block_margin_state_box_last_in_flow_child_margin_bottom_collapsed(&this.m_margin_state):
+            layout_block_formatting_context_block_margin_state_reset(&this.m_margin_state)
+        this.m_y_offset_of_current_block_container = box_state.offset.m_y.add(layout_state_used_values_content_height(box_state)).add(layout_state_used_values_border_box_bottom(box_state))
+    layout_block_formatting_context_block_margin_state_set_box_last_in_flow_child_margin_bottom_collapsed(&this.m_margin_state, false)
+
+    layout_block_formatting_context_block_margin_state_add_margin(&this.m_margin_state, box_state.margin_bottom)
+    layout_block_formatting_context_block_margin_state_update_block_waiting_for_final_y_position(&this.m_margin_state)
+
+    let block_container_state = layout_state_get(base.m_state, block_container.layout_node_with_style())
+    let block_container_rect = layout_formatting_context_content_box_rect_layout_state_used_values(base, block_container_state)
+    layout_formatting_context_compute_inset(base, box.layout_node_with_style_and_box_model_metrics(), gfx.css_pixel_rect_size(&block_container_rect))
+
+    *bottom_of_lowest_margin_box = ak.max(*bottom_of_lowest_margin_box, box_state.offset.m_y.add(layout_state_used_values_content_height(box_state)).add(layout_state_used_values_margin_box_bottom(box_state)))
+
+    if let context = independent_formatting_context:
+        layout_formatting_context_parent_context_did_dimension_child_root_box(context)
+
+## Ported from Libraries/LibWeb/Layout/BlockFormattingContext.cpp:989 Web::Layout::BlockFormattingContext::layout_block_level_children.
+pub func layout_block_formatting_context_layout_block_level_children(this: LayoutBlockFormattingContext*, block_container: LayoutBlockContainer*, available_space: LayoutAvailableSpace):
+    let base = this.layout_formatting_context()
+    assert(not layout_node_children_are_inline(block_container.layout_node()))
+
+    var bottom_of_lowest_margin_box = layout_zero_px()
+
+    # TemporaryChange<Optional<CSSPixels>> change { m_y_offset_of_current_block_container, CSSPixels(0) };
+    let saved_y_offset_of_current_block_container = this.m_y_offset_of_current_block_container
+    this.m_y_offset_of_current_block_container = layout_zero_px()
+    defer this.m_y_offset_of_current_block_container = saved_y_offset_of_current_block_container
+    for child in layout_node_children(block_container.layout_node()):
+        let box = as_if_layout_box(child) else continue
+        layout_block_formatting_context_layout_block_level_box(this, box, block_container, &bottom_of_lowest_margin_box, available_space)
+
+    if base.m_layout_mode == LayoutMode.intrinsic_sizing:
+        let block_container_state = layout_state_get_mutable(base.m_state, block_container.layout_node_with_style())
+        if not layout_state_used_values_has_definite_width(block_container_state):
+            var width = layout_formatting_context_greatest_child_width(base, block_container.layout_box())
+            let computed_values = layout_box_computed(block_container.layout_box())
+            # NOTE: Min and max constraints are not applied to a box that is being sized as intrinsic because
+            #       according to css-sizing-3 spec:
+            #       The min-content size of a box in each axis is the size it would have if it was a float given an
+            #       auto size in that axis (and no minimum or maximum size in that axis) and if its containing block
+            #       was zero-sized in that axis.
+            if block_container_state.width_constraint == LayoutSizeConstraint.none_:
+                if not layout_formatting_context_should_treat_max_width_as_none(base, block_container.layout_box(), available_space.width):
+                    let max_width = layout_formatting_context_calculate_inner_width(base, block_container.layout_box(), available_space.width, css_computed_values_max_width(computed_values))
+                    width = ak.min(width, max_width)
+                let computed_min_width = css_computed_values_min_width(computed_values)
+                if not css_size_is_auto(&computed_min_width):
+                    let min_width = layout_formatting_context_calculate_inner_width(base, block_container.layout_box(), available_space.width, computed_min_width)
+                    width = ak.max(width, min_width)
+            layout_state_used_values_set_content_width(block_container_state, width)
+            layout_state_used_values_set_content_height(block_container_state, bottom_of_lowest_margin_box)

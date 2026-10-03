@@ -1,0 +1,492 @@
+#==============================================================================================
+#
+#   formatting_context_4 - Layout::FormattingContext: laying out absolutely positioned boxes,
+#                          anchor insets and relative position insets
+#
+#   DESCRIPTION:
+#       Port of LibWeb/Layout/FormattingContext.cpp (lines 1386-1870): the resolution of
+#       anchor() in inset properties (css-anchor-position-1), the layout of the absolutely
+#       positioned children of a formatting context's root (sizes before and after inside
+#       layout, alignment, the used offset), the height of absolutely positioned replaced
+#       boxes (CSS 2.2 §10.6.5) and the insets of relatively positioned boxes.
+#
+#       Copyright (c) 2020-2022, Andreas Kling <andreas@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Anchor insets ===========================================================================
+
+## The state resolve_anchor_insets' lambdas (resolve_anchor_rect, resolve_anchor_side, resolve_anchor_for_inset) capture.
+struct LayoutAnchorInsetsResolver:
+    var context: LayoutFormattingContext*
+    var element: DomElement*
+    var default_anchor_name: ak.FlyString?
+    var containing_block_state: const LayoutStateUsedValues*
+    var containing_block_direction: css_data.Direction
+    var box_direction: css_data.Direction
+
+## The `resolve_anchor_rect` lambda of resolve_anchor_insets.
+func layout_anchor_insets_resolver_resolve_anchor_rect(this: const LayoutAnchorInsetsResolver*, anchor: CssAnchorStyleValue*) -> gfx.CssPixelRect?:
+    let name = css_anchor_style_value_anchor_name(anchor) if css_anchor_style_value_anchor_name(anchor) != none else this.default_anchor_name
+    let anchor_name = name else return none
+
+    let anchor_element = dom_document_element_by_anchor_name(dom_node_document(this.element.dom_node()), anchor_name, this.element.dom_node()) else return none
+
+    # NB: We use unsafe_layout_node() because we are in the middle of layout.
+    let anchor_layout_node = dom_element_unsafe_layout_node(anchor_element) else return none
+    let anchor_box = as_if_layout_box(anchor_layout_node) else return none
+
+    let anchor_state = layout_state_get(this.context.m_state, anchor_box.layout_node_with_style())
+    let anchor_cumulative_offset = layout_state_used_values_cumulative_offset(anchor_state)
+    let anchor_border_box_origin = gfx.css_pixel_point_sub(&anchor_cumulative_offset,
+                                                           gfx.CssPixelPoint(layout_state_used_values_border_box_left(anchor_state), layout_state_used_values_border_box_top(anchor_state)))
+    let containing_block_cumulative_offset = layout_state_used_values_cumulative_offset(this.containing_block_state)
+    let containing_block_padding_box_origin = gfx.css_pixel_point_sub(&containing_block_cumulative_offset,
+                                                                      gfx.CssPixelPoint(this.containing_block_state.padding_left, this.containing_block_state.padding_top))
+    return gfx.CssPixelRect(
+        gfx.css_pixel_point_sub(&anchor_border_box_origin, containing_block_padding_box_origin),
+        gfx.CssPixelSize(layout_state_used_values_border_box_width(anchor_state), layout_state_used_values_border_box_height(anchor_state)),
+    )
+
+## The `resolve_anchor_side` lambda of resolve_anchor_insets.
+func layout_anchor_insets_resolver_resolve_anchor_side(this: const LayoutAnchorInsetsResolver*, anchor: CssAnchorStyleValue*, is_from_end: bool, is_horizontal_axis: bool) -> gfx.CssPixels?:
+    let rect = layout_anchor_insets_resolver_resolve_anchor_rect(this, anchor) else return none
+    let side = css_anchor_style_value_anchor_side(anchor)
+    if css_style_value_is_keyword(side):
+        let keyword = css_style_value_to_keyword(side)
+        match keyword:
+            # https://drafts.csswg.org/css-anchor-position-1/#typedef-anchor-side
+            # top | right | bottom | left
+            #     Refers to the specified side of the anchor box.
+            # If its <anchor-side> specifies a physical keyword, it's specified in an inset property applicable to that
+            # axis.
+            .top:
+                if is_horizontal_axis: return none
+                return gfx.css_pixel_rect_top(&rect)
+            .bottom:
+                if is_horizontal_axis: return none
+                return gfx.css_pixel_rect_bottom(&rect)
+            .left:
+                if is_horizontal_axis: return gfx.css_pixel_rect_left(&rect)
+                return none
+            .right:
+                if is_horizontal_axis: return gfx.css_pixel_rect_right(&rect)
+                return none
+
+            # center
+            #     Equivalent to 50%.
+            .center:
+                if is_horizontal_axis:
+                    return gfx.css_pixel_rect_left(&rect).add(layout_div_int(gfx.css_pixel_rect_width(&rect), 2))
+                return gfx.css_pixel_rect_top(&rect).add(layout_div_int(gfx.css_pixel_rect_height(&rect), 2))
+
+            # start | end
+            #     Refers to one of the sides of the anchor box in the same axis as the inset property it's used in,
+            #     by resolving the keyword against the writing mode of the positioned box's containing block.
+            .start, .end:
+                let is_start = keyword == css_data.Keyword.start
+                if is_horizontal_axis:
+                    let use_left = (this.containing_block_direction == css_data.Direction.ltr) == is_start
+                    return gfx.css_pixel_rect_left(&rect) if use_left else gfx.css_pixel_rect_right(&rect)
+                return gfx.css_pixel_rect_top(&rect) if is_start else gfx.css_pixel_rect_bottom(&rect)
+
+            # self-start | self-end
+            #     Refers to one of the sides of the anchor box in the same axis as the inset property it's used in,
+            #     by resolving the keyword against the writing mode of the positioned box.
+            .self_start, .self_end:
+                let is_start = keyword == css_data.Keyword.self_start
+                if is_horizontal_axis:
+                    let use_left = (this.box_direction == css_data.Direction.ltr) == is_start
+                    return gfx.css_pixel_rect_left(&rect) if use_left else gfx.css_pixel_rect_right(&rect)
+                return gfx.css_pixel_rect_top(&rect) if is_start else gfx.css_pixel_rect_bottom(&rect)
+
+            # inside | outside
+            #     Resolves to one of the anchor box's sides, depending on which inset property it's used in. inside
+            #     refers to the same side as the inset property, while outside refers to the opposite.
+            .inside, .outside:
+                let same_side = keyword == css_data.Keyword.inside
+                if is_horizontal_axis:
+                    return gfx.css_pixel_rect_right(&rect) if is_from_end == same_side else gfx.css_pixel_rect_left(&rect)
+                return gfx.css_pixel_rect_bottom(&rect) if is_from_end == same_side else gfx.css_pixel_rect_top(&rect)
+
+            _:
+                trap("VERIFY_NOT_REACHED")
+    if css_style_value_is_percentage(side):
+        # <percentage>
+        #     Refers to a position a corresponding percentage between the start and end sides, with 0% being
+        #     equivalent to start and 100% being equivalent to end.
+        let percentage_value = css_percentage_style_value_percentage(css_style_value_as_percentage(side))
+        let percentage = css_percentage_as_fraction(&percentage_value)
+        if is_horizontal_axis:
+            let start = gfx.css_pixel_rect_left(&rect) if this.containing_block_direction == css_data.Direction.ltr else gfx.css_pixel_rect_right(&rect)
+            let end = gfx.css_pixel_rect_right(&rect) if this.containing_block_direction == css_data.Direction.ltr else gfx.css_pixel_rect_left(&rect)
+            return start.add(gfx.css_pixels_nearest_value_for_f64(end.sub(start).to_double() * percentage))
+        return gfx.css_pixel_rect_top(&rect).add(gfx.css_pixels_nearest_value_for_f64(gfx.css_pixel_rect_height(&rect).to_double() * percentage))
+    return none
+
+## The `resolve_anchor_for_inset` lambda of resolve_anchor_insets.
+func layout_anchor_insets_resolver_resolve_anchor_for_inset(this: const LayoutAnchorInsetsResolver*, anchor: CssAnchorStyleValue*, is_from_end: bool, is_horizontal_axis: bool) -> CssLengthPercentageOrAuto:
+    var maybe_side_px = layout_anchor_insets_resolver_resolve_anchor_side(this, anchor, is_from_end, is_horizontal_axis)
+
+    # If any of these conditions are false, the anchor() function computes to its specified fallback value. If no
+    # fallback value is specified, it makes the declaration referencing it invalid at computed-value time.
+    # NB: The fallback value can itself be an anchor(), so we walk the chain.
+    var current = anchor
+    while maybe_side_px == none:
+        let fallback = css_anchor_style_value_fallback_value(current) else return css_length_percentage_or_auto_make_auto()
+        if not css_style_value_is_anchor(fallback):
+            return css_length_percentage_or_auto_from_style_value(fallback)
+        current = css_style_value_as_anchor(fallback)
+        maybe_side_px = layout_anchor_insets_resolver_resolve_anchor_side(this, current, is_from_end, is_horizontal_axis)
+
+    # For inset properties measuring from the end edge (right, bottom), the resolved length is the distance from
+    # the anchor side to the corresponding edge of the containing block's padding box.
+    let side_px = maybe_side_px else trap("unreachable: the side was resolved")
+    if is_from_end:
+        let containing_block_extent = layout_state_used_values_padding_box_width(this.containing_block_state) if is_horizontal_axis else layout_state_used_values_padding_box_height(this.containing_block_state)
+        return layout_length_percentage_or_auto_px(containing_block_extent.sub(side_px))
+    return layout_length_percentage_or_auto_px(side_px)
+
+## Ported from Libraries/LibWeb/Layout/FormattingContext.cpp:1387 Web::Layout::FormattingContext::resolve_anchor_insets.
+# https://drafts.csswg.org/css-anchor-position-1/#anchor-pos
+pub func layout_formatting_context_resolve_anchor_insets(this: LayoutFormattingContext*, box: LayoutBox*):
+    # https://drafts.csswg.org/css-anchor-position-1/#resolving-anchor
+    # An anchor() function is a resolvable anchor function only if all the following conditions are true:
+    #   - It's applied to an absolutely positioned box.
+    #   - If its <anchor-side> specifies a physical keyword, it's specified in an inset property applicable to that
+    #     axis.
+    #   - There is a target anchor element for the box it's used on, and the <anchor-name> value specified in the
+    #     function.
+    # NB: The first two conditions are guaranteed: this function is called from layout_absolutely_positioned_element(),
+    #     and we only resolve anchor() values in inset properties.
+    # FIXME: Support anchor-scope, position-try-fallbacks, anchor-size(), and other anchor positioning features.
+
+    let dom_node = layout_node_dom_node(box.layout_node()) else return
+    let element = as_if_dom_element(dom_node) else return
+
+    let computed = dom_element_computed_properties(element) else return
+    let top = css_computed_properties_property(computed, css_data.PropertyId.top)
+    let right = css_computed_properties_property(computed, css_data.PropertyId.right)
+    let bottom = css_computed_properties_property(computed, css_data.PropertyId.bottom)
+    let left = css_computed_properties_property(computed, css_data.PropertyId.left)
+    if not css_style_value_is_anchor(top) and not css_style_value_is_anchor(right) and not css_style_value_is_anchor(bottom) and not css_style_value_is_anchor(left):
+        return
+
+    let containing_block = layout_node_containing_block(box.layout_node()) else return
+
+    let resolver = LayoutAnchorInsetsResolver(
+        context = this,
+        element = element,
+        default_anchor_name = css_computed_values_position_anchor(layout_box_computed(box)), containing_block_state = layout_state_get(this.m_state, containing_block.layout_node_with_style()), containing_block_direction = css_computed_values_direction(layout_box_computed(containing_block)),
+        box_direction = css_computed_values_direction(layout_box_computed(box)),
+    )
+    # https://drafts.csswg.org/css-anchor-position-1/#determining
+    # Several features of this specification refer to the position and size of an anchor box. Unless otherwise
+    # specified, this refers to the border box edge of the principal box of relevant anchor element.
+    # https://drafts.csswg.org/css-anchor-position-1/#acceptable-anchor-element
+    # FIXME: An element possible anchor is an acceptable anchor element for an absolutely positioned element positioned
+    #        el if all of the following are true:
+    #        - possible anchor is laid out strictly before positioned el [...]
+    # https://drafts.csswg.org/css-anchor-position-1/#anchor-pos
+    # An anchor() function representing a resolvable anchor function resolves at computed value time (using style &
+    # layout interleaving) to the <length> that would align the edge of the positioned boxes' inset-modified containing
+    # block corresponding to the property the function appears in with the specified edge of the target anchor
+    # element's anchor box.
+
+    let existing_inset = css_computed_values_inset(layout_box_computed(box))
+    let new_top = layout_anchor_insets_resolver_resolve_anchor_for_inset(&resolver, css_style_value_as_anchor(top), false, false) if css_style_value_is_anchor(top) else css_length_box_top_const(&existing_inset)
+    let new_right = layout_anchor_insets_resolver_resolve_anchor_for_inset(&resolver, css_style_value_as_anchor(right), true, true) if css_style_value_is_anchor(right) else css_length_box_right_const(&existing_inset)
+    let new_bottom = layout_anchor_insets_resolver_resolve_anchor_for_inset(&resolver, css_style_value_as_anchor(bottom), true, false) if css_style_value_is_anchor(bottom) else css_length_box_bottom_const(&existing_inset)
+    let new_left = layout_anchor_insets_resolver_resolve_anchor_for_inset(&resolver, css_style_value_as_anchor(left), false, true) if css_style_value_is_anchor(left) else css_length_box_left_const(&existing_inset)
+    var new_inset: CssLengthBox = ---
+    css_length_box_construct_css_length_percentage_or_auto(&new_inset, new_top, new_right, new_bottom, new_left)
+    css_mutable_computed_values_set_inset(layout_node_with_style_mutable_computed_values(box.layout_node_with_style()), new_inset)
+
+# mark: Absolutely positioned boxes =============================================================
+
+## Ported from Libraries/LibWeb/Layout/FormattingContext.cpp:1587 Web::Layout::FormattingContext::layout_absolutely_positioned_children.
+pub func layout_formatting_context_layout_absolutely_positioned_children(this: LayoutFormattingContext*):
+    if this.m_layout_mode != LayoutMode.normal:
+        return
+    let children = layout_box_contained_abspos_children(layout_formatting_context_context_box(this))
+    for index in 0..<ak.vector_size(children):
+        let child = *ak.vector_at_const(children, index)
+        let box = as_layout_box(child)
+        layout_formatting_context_layout_absolutely_positioned_element(this, box)
+
+## Ported from Libraries/LibWeb/Layout/FormattingContext.cpp:1597 Web::Layout::FormattingContext::layout_absolutely_positioned_element.
+pub func layout_formatting_context_layout_absolutely_positioned_element(this: LayoutFormattingContext*, box: LayoutBox*):
+    # SVG elements cannot be absolutely positioned.
+    assert(not layout_node_is_svg_box(box.layout_node()))
+
+    layout_formatting_context_resolve_anchor_insets(this, box)
+
+    let containing_block_info = layout_formatting_context_resolve_abspos_containing_block_info(this, box)
+
+    let available_space = LayoutAvailableSpace(
+        width = layout_available_size_make_definite(layout_clamp_to_max_dimension_value(gfx.css_pixel_rect_width(&containing_block_info.rect))),
+        height = layout_available_size_make_definite(layout_clamp_to_max_dimension_value(gfx.css_pixel_rect_height(&containing_block_info.rect))),
+    )
+
+    let box_containing_block = layout_node_containing_block(box.layout_node()) else trap("an abspos box without a containing block")
+    let containing_block_state = layout_state_get_mutable(this.m_state, box_containing_block.layout_node_with_style())
+
+    # The size of the containing block of an abspos box is always definite from the perspective of the abspos box.
+    # Since abspos boxes are laid out last, we can mark the containing block as having definite sizes at this point.
+    layout_state_used_values_set_has_definite_width(containing_block_state, true)
+    layout_state_used_values_set_has_definite_height(containing_block_state, true)
+
+    let box_state = layout_state_get_mutable(this.m_state, box.layout_node_with_style())
+    let computed_values = layout_box_computed(box)
+
+    # The border computed values are not changed by the compute_height & width calculations below.
+    # The spec only adjusts and computes sizes, insets and margins.
+    box_state.border_left = css_computed_values_border_left(computed_values).width
+    box_state.border_right = css_computed_values_border_right(computed_values).width
+    box_state.border_top = css_computed_values_border_top(computed_values).width
+    box_state.border_bottom = css_computed_values_border_bottom(computed_values).width
+
+    let containing_block_width = layout_available_size_to_px_or_zero(&available_space.width)
+    let padding = css_computed_values_padding(computed_values)
+    let padding_left = css_length_box_left_const(&padding)
+    let padding_right = css_length_box_right_const(&padding)
+    let padding_top = css_length_box_top_const(&padding)
+    let padding_bottom = css_length_box_bottom_const(&padding)
+    box_state.padding_left = css_length_percentage_or_auto_to_px_or_zero(&padding_left, box.layout_node(), containing_block_width)
+    box_state.padding_right = css_length_percentage_or_auto_to_px_or_zero(&padding_right, box.layout_node(), containing_block_width)
+    box_state.padding_top = css_length_percentage_or_auto_to_px_or_zero(&padding_top, box.layout_node(), containing_block_width)
+    box_state.padding_bottom = css_length_percentage_or_auto_to_px_or_zero(&padding_bottom, box.layout_node(), containing_block_width)
+
+    layout_formatting_context_compute_width_for_absolutely_positioned_element(this, box, available_space)
+
+    # NOTE: We compute height before *and* after doing inside layout.
+    #       This is done so that inside layout can resolve percentage heights.
+    #       In some situations, e.g with non-auto top & bottom values, the height can be determined early.
+    layout_formatting_context_compute_height_for_absolutely_positioned_element(this, box, available_space, LayoutFormattingContextBeforeOrAfterInsideLayout.before)
+
+    # If the box width and/or height is fixed and/or or resolved from inset properties,
+    # mark the size as being definite (since layout was not required to resolve it, per CSS-SIZING-3).
+    let inset = css_computed_values_inset(computed_values)
+    let inset_left = css_length_box_left_const(&inset)
+    let inset_right = css_length_box_right_const(&inset)
+    let inset_top = css_length_box_top_const(&inset)
+    let inset_bottom = css_length_box_bottom_const(&inset)
+    if not css_length_percentage_or_auto_is_auto(&inset_left) and not css_length_percentage_or_auto_is_auto(&inset_right):
+        layout_state_used_values_set_has_definite_width(box_state, true)
+    if not css_length_percentage_or_auto_is_auto(&inset_top) and not css_length_percentage_or_auto_is_auto(&inset_bottom):
+        layout_state_used_values_set_has_definite_height(box_state, true)
+
+    # NOTE: BFC is special, as their abspos auto height depends on performing inside layout.
+    #       For other formatting contexts, the height we've resolved early is good.
+    #       See FormattingContext::compute_auto_height_for_absolutely_positioned_element()
+    #       for the special-casing of BFC roots.
+    let computed_height = css_computed_values_height(computed_values)
+    if not layout_formatting_context_creates_block_formatting_context(box):
+        let height_resolved_from_aspect_ratio = css_size_is_auto(&computed_height) and layout_box_has_preferred_aspect_ratio(box) and layout_state_used_values_has_definite_width(box_state)
+        layout_state_used_values_set_has_definite_width(box_state, true)
+        if not css_size_is_auto(&computed_height) or height_resolved_from_aspect_ratio:
+            layout_state_used_values_set_has_definite_height(box_state, true)
+
+    let independent_formatting_context = layout_formatting_context_layout_inside(this, box, LayoutMode.normal, layout_state_used_values_available_inner_space_or_constraints_from(box_state, available_space))
+    defer layout_formatting_context_destruct(independent_formatting_context)
+
+    if css_size_is_auto(&computed_height):
+        layout_formatting_context_compute_height_for_absolutely_positioned_element(this, box, available_space, LayoutFormattingContextBeforeOrAfterInsideLayout.after)
+
+    # Apply grid alignment for auto inset axes
+    if let horizontal_alignment = containing_block_info.horizontal_alignment:
+        if css_length_percentage_or_auto_is_auto(&inset_left) and css_length_percentage_or_auto_is_auto(&inset_right):
+            let available_space_for_alignment = gfx.css_pixel_rect_width(&containing_block_info.rect).sub(layout_state_used_values_margin_box_width(box_state))
+            match horizontal_alignment:
+                .center:
+                    box_state.inset_left = layout_div_int(available_space_for_alignment, 2)
+                    box_state.inset_right = layout_div_int(available_space_for_alignment, 2)
+                .start:
+                    box_state.inset_right = available_space_for_alignment
+                .end:
+                    box_state.inset_left = available_space_for_alignment
+                _:
+                    # Alignment::Normal, Alignment::Stretch and the others
+                    discard(0)
+
+    if let vertical_alignment = containing_block_info.vertical_alignment:
+        if css_length_percentage_or_auto_is_auto(&inset_top) and css_length_percentage_or_auto_is_auto(&inset_bottom):
+            let available_space_for_alignment = gfx.css_pixel_rect_height(&containing_block_info.rect).sub(layout_state_used_values_margin_box_height(box_state))
+            match vertical_alignment:
+                .center:
+                    box_state.inset_top = layout_div_int(available_space_for_alignment, 2)
+                    box_state.inset_bottom = layout_div_int(available_space_for_alignment, 2)
+                .start, .self_start:
+                    box_state.inset_bottom = available_space_for_alignment
+                .end, .self_end:
+                    box_state.inset_top = available_space_for_alignment
+                _:
+                    # Alignment::Normal, Alignment::Stretch, Alignment::Baseline and the others
+                    discard(0)
+
+    var used_offset = gfx.CssPixelPoint()
+
+    var static_position = layout_state_used_values_static_position(layout_state_get(this.m_state, box.layout_node_with_style()))
+    let static_position_cb = layout_node_static_position_containing_block(box.layout_node())
+    let actual_containing_block = layout_node_containing_block(box.layout_node())
+    if let static_containing_block = static_position_cb:
+        if static_position_cb != actual_containing_block:
+            let actual = actual_containing_block else trap("an abspos box without a containing block")
+            let static_cumulative_offset = layout_state_used_values_cumulative_offset(layout_state_get(this.m_state, static_containing_block.layout_node_with_style()))
+            let offset = gfx.css_pixel_point_sub(&static_cumulative_offset, layout_state_used_values_cumulative_offset(layout_state_get(this.m_state, actual.layout_node_with_style())))
+            discard(gfx.css_pixel_point_add_assign(&static_position, offset))
+
+    # Horizontal axis
+    if containing_block_info.horizontal_axis_mode == LayoutAbsposAxisMode.static_position:
+        gfx.css_pixel_point_set_x(&used_offset, static_position.m_x)
+    else:
+        gfx.css_pixel_point_set_x(&used_offset, gfx.css_pixel_rect_x(&containing_block_info.rect).add(box_state.inset_left))
+
+    # Vertical axis
+    if containing_block_info.vertical_axis_mode == LayoutAbsposAxisMode.static_position:
+        gfx.css_pixel_point_set_y(&used_offset, static_position.m_y)
+    else:
+        gfx.css_pixel_point_set_y(&used_offset, gfx.css_pixel_rect_y(&containing_block_info.rect).add(box_state.inset_top))
+
+    gfx.css_pixel_point_translate_by_css_pixels_css_pixels(&used_offset, layout_state_used_values_margin_box_left(box_state), layout_state_used_values_margin_box_top(box_state))
+
+    layout_state_used_values_set_content_offset(box_state, used_offset)
+
+    if let context = independent_formatting_context:
+        layout_formatting_context_parent_context_did_dimension_child_root_box(context)
+
+## Ported from Libraries/LibWeb/Layout/FormattingContext.cpp:1743 Web::Layout::FormattingContext::compute_height_for_absolutely_positioned_replaced_element.
+pub func layout_formatting_context_compute_height_for_absolutely_positioned_replaced_element(this: LayoutFormattingContext*, box: LayoutBox*, available_space: LayoutAvailableSpace, before_or_after_inside_layout: LayoutFormattingContextBeforeOrAfterInsideLayout):
+    # 10.6.5 Absolutely positioned, replaced elements
+    # This situation is similar to 10.6.4, except that the element has an intrinsic height.
+
+    # The used value of 'height' is determined as for inline replaced elements.
+    let height = layout_formatting_context_compute_height_for_replaced_element(this, box, available_space)
+
+    let height_of_containing_block = layout_available_size_to_px_or_zero(&available_space.height)
+    let computed_values = layout_box_computed(box)
+    let box_state = layout_state_get_mutable(this.m_state, box.layout_node_with_style())
+    let border_top = css_computed_values_border_top(computed_values).width
+    let border_bottom = css_computed_values_border_bottom(computed_values).width
+    let padding_top = box_state.padding_top
+    let padding_bottom = box_state.padding_bottom
+    let available = height_of_containing_block.sub(height).sub(border_top).sub(padding_top).sub(padding_bottom).sub(border_bottom)
+    let inset = css_computed_values_inset(computed_values)
+    let margin = css_computed_values_margin(computed_values)
+    var top = css_length_box_top_const(&inset)
+    var margin_top = css_length_box_top_const(&margin)
+    var bottom = css_length_box_bottom_const(&inset)
+    var margin_bottom = css_length_box_bottom_const(&margin)
+    let static_position = layout_state_used_values_static_position(layout_state_get(this.m_state, box.layout_node_with_style()))
+
+    # The `to_px` lambda.
+    let node = box.layout_node()
+
+    # If 'margin-top' or 'margin-bottom' is specified as 'auto' its used value is determined by the rules below.
+    # 2. If both 'top' and 'bottom' have the value 'auto', replace 'top' with the element's static position.
+    if css_length_percentage_or_auto_is_auto(&top) and css_length_percentage_or_auto_is_auto(&bottom):
+        top = layout_length_percentage_or_auto_px(static_position.m_x)
+
+    # 3. If 'bottom' is 'auto', replace any 'auto' on 'margin-top' or 'margin-bottom' with '0'.
+    if css_length_percentage_or_auto_is_auto(&bottom):
+        if css_length_percentage_or_auto_is_auto(&margin_top):
+            margin_top = layout_length_percentage_or_auto_px(layout_zero_px())
+        if css_length_percentage_or_auto_is_auto(&margin_bottom):
+            margin_bottom = layout_length_percentage_or_auto_px(layout_zero_px())
+
+    # 4. If at this point both 'margin-top' and 'margin-bottom' are still 'auto',
+    # solve the equation under the extra constraint that the two margins must get equal values.
+    if css_length_percentage_or_auto_is_auto(&margin_top) and css_length_percentage_or_auto_is_auto(&margin_bottom):
+        let remainder = available.sub(css_length_percentage_or_auto_to_px_or_zero(&top, node, height_of_containing_block)).sub(css_length_percentage_or_auto_to_px_or_zero(&bottom, node, height_of_containing_block))
+        margin_top = layout_length_percentage_or_auto_px(layout_div_int(remainder, 2))
+        margin_bottom = layout_length_percentage_or_auto_px(layout_div_int(remainder, 2))
+
+    # 5. If at this point there is an 'auto' left, solve the equation for that value.
+    if css_length_percentage_or_auto_is_auto(&top):
+        top = layout_length_percentage_or_auto_px(available.sub(css_length_percentage_or_auto_to_px_or_zero(&bottom, node, height_of_containing_block)).sub(css_length_percentage_or_auto_to_px_or_zero(&margin_top, node, height_of_containing_block)).sub(css_length_percentage_or_auto_to_px_or_zero(&margin_bottom, node, height_of_containing_block)))
+    elif css_length_percentage_or_auto_is_auto(&bottom):
+        bottom = layout_length_percentage_or_auto_px(available.sub(css_length_percentage_or_auto_to_px_or_zero(&top, node, height_of_containing_block)).sub(css_length_percentage_or_auto_to_px_or_zero(&margin_top, node, height_of_containing_block)).sub(css_length_percentage_or_auto_to_px_or_zero(&margin_bottom, node, height_of_containing_block)))
+    elif css_length_percentage_or_auto_is_auto(&margin_top):
+        margin_top = layout_length_percentage_or_auto_px(available.sub(css_length_percentage_or_auto_to_px_or_zero(&top, node, height_of_containing_block)).sub(css_length_percentage_or_auto_to_px_or_zero(&bottom, node, height_of_containing_block)).sub(css_length_percentage_or_auto_to_px_or_zero(&margin_bottom, node, height_of_containing_block)))
+    elif css_length_percentage_or_auto_is_auto(&margin_bottom):
+        margin_bottom = layout_length_percentage_or_auto_px(available.sub(css_length_percentage_or_auto_to_px_or_zero(&top, node, height_of_containing_block)).sub(css_length_percentage_or_auto_to_px_or_zero(&margin_top, node, height_of_containing_block)).sub(css_length_percentage_or_auto_to_px_or_zero(&bottom, node, height_of_containing_block)))
+
+    # 6. If at this point the values are over-constrained, ignore the value for 'bottom' and solve for that value.
+    let remaining = available.sub(css_length_percentage_or_auto_to_px_or_zero(&top, node, height_of_containing_block)).sub(css_length_percentage_or_auto_to_px_or_zero(&bottom, node, height_of_containing_block)).sub(css_length_percentage_or_auto_to_px_or_zero(&margin_top, node, height_of_containing_block)).sub(css_length_percentage_or_auto_to_px_or_zero(&margin_bottom, node, height_of_containing_block))
+    if not gfx.eq_css_pixels_int(remaining, 0):
+        bottom = layout_length_percentage_or_auto_px(available.sub(css_length_percentage_or_auto_to_px_or_zero(&top, node, height_of_containing_block)).sub(css_length_percentage_or_auto_to_px_or_zero(&margin_top, node, height_of_containing_block)).sub(css_length_percentage_or_auto_to_px_or_zero(&margin_bottom, node, height_of_containing_block)))
+
+    layout_state_used_values_set_content_height(box_state, height)
+
+    # do not set calculated insets or margins on the first pass, there will be a second pass
+    let computed_height = css_computed_values_height(computed_values)
+    if css_size_is_auto(&computed_height) and before_or_after_inside_layout == LayoutFormattingContextBeforeOrAfterInsideLayout.before:
+        return
+    layout_state_used_values_set_has_definite_height(box_state, true)
+    box_state.inset_top = css_length_percentage_or_auto_to_px_or_zero(&top, node, height_of_containing_block)
+    box_state.inset_bottom = css_length_percentage_or_auto_to_px_or_zero(&bottom, node, height_of_containing_block)
+    box_state.margin_top = css_length_percentage_or_auto_to_px_or_zero(&margin_top, node, height_of_containing_block)
+    box_state.margin_bottom = css_length_percentage_or_auto_to_px_or_zero(&margin_bottom, node, height_of_containing_block)
+
+# mark: Relative position insets ================================================================
+
+## The `resolve_two_opposing_insets` lambda of compute_inset: the used start and end insets of one axis.
+func layout_formatting_context_compute_inset_resolve_two_opposing_insets(box: LayoutNodeWithStyleAndBoxModelMetrics*, computed_first: const CssLengthPercentageOrAuto*, computed_second: const CssLengthPercentageOrAuto*, reference_for_percentage: gfx.CssPixels) -> (gfx.CssPixels, gfx.CssPixels):
+    let resolved_first = css_length_percentage_or_auto_to_px_or_zero(computed_first, box.layout_node(), reference_for_percentage)
+    let resolved_second = css_length_percentage_or_auto_to_px_or_zero(computed_second, box.layout_node(), reference_for_percentage)
+
+    if css_length_percentage_or_auto_is_auto(computed_first) and css_length_percentage_or_auto_is_auto(computed_second):
+        # If opposing inset properties in an axis both compute to auto (their initial values),
+        # their used values are zero (i.e., the boxes stay in their original position in that axis).
+        return (layout_zero_px(), layout_zero_px())
+    if css_length_percentage_or_auto_is_auto(computed_first) or css_length_percentage_or_auto_is_auto(computed_second):
+        # If only one is auto, its used value becomes the negation of the other, and the box is shifted by the specified amount.
+        if css_length_percentage_or_auto_is_auto(computed_first):
+            let used_end = resolved_second
+            return (used_end.neg(), used_end)
+        let used_start = resolved_first
+        return (used_start, used_start.neg())
+    # If neither is auto, the position is over-constrained; (with respect to the writing mode of its containing block)
+    # the computed end side value is ignored, and its used value becomes the negation of the start side.
+    let used_start = resolved_first
+    return (used_start, used_start.neg())
+
+## The `treat_percentage_as_auto` lambda of compute_inset.
+func layout_formatting_context_compute_inset_treat_percentage_as_auto(this: LayoutFormattingContext*, box: LayoutNodeWithStyleAndBoxModelMetrics*, value: CssLengthPercentageOrAuto) -> CssLengthPercentageOrAuto:
+    if css_length_percentage_or_auto_contains_percentage(&value):
+        var containing_block = layout_node_containing_block(box.layout_node())
+        while let block = containing_block:
+            let display = layout_node_display(block.layout_node())
+            if not (layout_node_is_anonymous(block.layout_node()) and not css_display_is_table_cell(&display)):
+                break
+            containing_block = layout_node_containing_block(block.layout_node())
+        if let block = containing_block:
+            if not layout_state_used_values_has_definite_height(layout_state_get(this.m_state, block.layout_node_with_style())):
+                return css_length_percentage_or_auto_make_auto()
+    return value
+
+## Ported from Libraries/LibWeb/Layout/FormattingContext.cpp:1820 Web::Layout::FormattingContext::compute_inset.
+# https://www.w3.org/TR/css-position-3/#relpos-insets
+pub func layout_formatting_context_compute_inset(this: LayoutFormattingContext*, box: LayoutNodeWithStyleAndBoxModelMetrics*, containing_block_size: gfx.CssPixelSize):
+    let computed_values = &layout_node_computed_values(box.layout_node()).computed_values
+    if css_computed_values_position(computed_values) != css_data.Positioning.relative:
+        return
+
+    let box_state = layout_state_get_mutable(this.m_state, box.layout_node_with_style())
+
+    # NOTE: Percentage heights resolve against the containing block's used height. If the containing block's height is
+    #       indefinite, percentage insets behave as auto.
+
+    # FIXME: Respect the containing block's writing-mode.
+    let inset = css_computed_values_inset(computed_values)
+    let inset_left = css_length_box_left_const(&inset)
+    let inset_right = css_length_box_right_const(&inset)
+    let (used_left, used_right) = layout_formatting_context_compute_inset_resolve_two_opposing_insets(box, &inset_left, &inset_right, containing_block_size.m_width)
+    box_state.inset_left = used_left
+    box_state.inset_right = used_right
+    let inset_top = layout_formatting_context_compute_inset_treat_percentage_as_auto(this, box, css_length_box_top_const(&inset))
+    let inset_bottom = layout_formatting_context_compute_inset_treat_percentage_as_auto(this, box, css_length_box_bottom_const(&inset))
+    let (used_top, used_bottom) = layout_formatting_context_compute_inset_resolve_two_opposing_insets(box, &inset_top, &inset_bottom, containing_block_size.m_height)
+    box_state.inset_top = used_top
+    box_state.inset_bottom = used_bottom
