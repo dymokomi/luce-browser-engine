@@ -1,0 +1,196 @@
+#==============================================================================================
+#
+#   driver_collect - the tests of the copied Tests/LibWeb tree, and TestConfig.ini
+#
+#   DESCRIPTION:
+#       Port of what Tests/LibWeb/test-web/main.cpp does before it runs anything:
+#       is_valid_test_name; collect_dump_tests for Layout (input/ beside expected/, the
+#       expectation of input/T/N.html being expected/T/N.txt), collect_ref_tests (Ref/input)
+#       and collect_crash_tests (Crash, every file); the support files of imported WPT tests
+#       left out (support_file_patterns); the -f globs, each matched as `*GLOB*` against the
+#       path relative to the test root; and load_test_config, whose [Skipped] and
+#       [LoadFromHttpServer] groups list paths (a key ending in `/` names a directory).
+#
+#       Phase 1 has no HTTP server (test-web serves the [LoadFromHttpServer] tests from one), so
+#       those are skipped too, with their own reason. The tests are run in path order (the
+#       donor's order is the file system's).
+#
+#       Copyright (c) 2024-2026, the Ladybird developers.
+#       Copyright (c) 2026 the luce-browser authors.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Paths ===================================================================================
+
+## `pieces` joined (the strings are kept by the driver for its whole run).
+func cat(pieces: const str[]) -> str:
+    return strings.join(pieces, "") catch failure: trap("out of memory")
+
+## `path` as a C string (a NUL-terminated copy).
+func c_path(path: str) -> c.str:
+    return (c.str)(strings.copy(path) catch failure: trap("out of memory"))
+
+## Whether `path` is a directory.
+func is_directory(path: str) -> bool:
+    let kind = files.path_kind(path) catch failure: return false
+    return kind == files.FileKind.directory
+
+## The name without its last extension (LexicalPath::title).
+func path_title(name: str) -> str:
+    if let dot = strings.last(name, '.'):
+        return (str)name.bytes[..<dot]
+    return name
+
+# mark: Globs ===================================================================================
+
+## Whether `text` matches `glob`, whose `*` stands for any run of characters and `?` for any one
+## (AK::StringUtils::matches, case-sensitive).
+func glob_matches(text: const u8[], glob: const u8[]) -> bool:
+    var t: usize = 0
+    var g: usize = 0
+    var star: usize? = none
+    var star_text: usize = 0
+    while t < text.length:
+        if g < glob.length and (glob[g] == '?' or glob[g] == text[t]):
+            t += 1
+            g += 1
+        elif g < glob.length and glob[g] == '*':
+            star = g
+            star_text = t
+            g += 1
+        elif let star_index = star:
+            g = star_index + 1
+            star_text += 1
+            t = star_text
+        else:
+            return false
+    while g < glob.length and glob[g] == '*':
+        g += 1
+    return g == glob.length
+
+## test-web's support_file_patterns: files of imported WPT tests that are not tests.
+func is_support_file(relative_path: str) -> bool:
+    let patterns: str[4] = ["*/wpt-import/*/support/*", "*/wpt-import/*/resources/*", "*/wpt-import/common/*", "*/wpt-import/images/*"]
+    let path = cat(["/", relative_path])
+    for pattern in patterns:
+        if glob_matches(path.bytes, pattern.bytes):
+            return true
+    return false
+
+# mark: Tests ===================================================================================
+
+## One test: its suite, its input (relative to the test root, as test-web reports it) and, for a
+## Layout test, its expectation.
+struct Test:
+    var mode: TestMode
+    var relative_path: str
+    var expectation_path: str?
+
+## test-web's is_valid_test_name.
+func is_valid_test_name(name: str) -> bool:
+    let suffixes: str[6] = [".htm", ".html", ".svg", ".xhtml", ".xht", ".pdf"]
+    for suffix in suffixes:
+        if strings.ends_with(name, suffix):
+            return true
+    return false
+
+## collect_dump_tests, collect_ref_tests and collect_crash_tests: the tests under
+## `root`/`base`/`trail` (recursively, in name order), appended to `tests`.
+func collect_tests(tests: ak.Vector[Test]*, root: str, mode: TestMode, base: str, trail: str):
+    let input_directory = cat([root, "/", base, "/input", trail]) if mode != TestMode.crash else cat([root, "/", base, trail])
+    let names = files.list(c_path(input_directory)) catch failure: return
+    for name in names:
+        let input_path = cat([input_directory, "/", name])
+        if is_directory(input_path):
+            collect_tests(tests, root, mode, base, cat([trail, "/", name]))
+            continue
+        if not is_valid_test_name(name):
+            continue
+        let relative_path = (str)input_path.bytes[root.length + 1..]
+        var expectation_path: str? = none
+        if mode == TestMode.layout:
+            expectation_path = cat([root, "/", base, "/expected", trail, "/", path_title(name), ".txt"])
+        ak.vector_append_t(tests, Test(mode = mode, relative_path = relative_path, expectation_path = expectation_path))
+
+# mark: TestConfig.ini ==========================================================================
+
+## Why a test is not run.
+enum SkipReason:
+    none_
+    skipped
+    needs_http_server
+
+## The groups of TestConfig.ini: the paths (relative to the test root) a group lists.
+struct TestConfig:
+    var skipped: ak.Vector[str]
+    var load_from_http_server: ak.Vector[str]
+
+## load_test_config: the keys of each group of `root`/TestConfig.ini (Core::ConfigFile: `[Group]`
+## lines, `key` or `key=value` lines, `;` and `#` comments). A missing file is an empty config.
+func load_test_config(root: str) -> TestConfig:
+    let data = files.read(c_path(cat([root, "/TestConfig.ini"]))) catch failure: return TestConfig()
+    return parse_test_config((str)data, root)
+
+## The groups of the text of a TestConfig.ini of `root` (see load_test_config).
+func parse_test_config(text: str, root: str) -> TestConfig:
+    var config: TestConfig
+    var group = ""
+    var lines = strings.SplitIterator.over(text, "\n") catch failure: trap("out of memory")
+    while let raw_line = lines.next():
+        let line = strings.trim(raw_line)
+        if line.length == 0 or strings.starts_with(line, ";") or strings.starts_with(line, "#"):
+            continue
+        if strings.starts_with(line, "[") and strings.ends_with(line, "]"):
+            group = (str)line.bytes[1..<line.length - 1]
+            continue
+        var key = line
+        if let parts = strings.split_once(line, "="):
+            key = strings.trim(parts.0)
+        if group == "Skipped":
+            ak.vector_append_t(&config.skipped, key)
+        elif group == "LoadFromHttpServer":
+            ak.vector_append_t(&config.load_from_http_server, key)
+        else:
+            io.stderr().write(f"Unknown group '{group}' in config {root}/TestConfig.ini\n") catch failure: continue
+    return config
+
+## Whether one of `keys` names `relative_path` (exactly, or a directory holding it).
+func config_lists(keys: const ak.Vector[str]*, relative_path: str) -> bool:
+    for key in ak.vector_span_const(keys):
+        if strings.ends_with(key, "/"):
+            if strings.starts_with(relative_path, key):
+                return true
+        elif key == relative_path:
+            return true
+    return false
+
+## Why `test` is not run, if it is not.
+func skip_reason(config: const TestConfig*, test_case: const Test*) -> SkipReason:
+    if config_lists(&config.skipped, test_case.relative_path):
+        return SkipReason.skipped
+    if config_lists(&config.load_from_http_server, test_case.relative_path):
+        return SkipReason.needs_http_server
+    return SkipReason.none_
+
+# mark: Selecting the tests =====================================================================
+
+## The tests of the suites `options` names that match its glob (test-web wraps it as `*GLOB*`),
+## without support files, in path order within each suite.
+func collect_selected_tests(options: const Options*) -> ak.Vector[Test]:
+    var all: ak.Vector[Test]
+    if options.suites[0]:
+        collect_tests(&all, options.root, TestMode.layout, "Layout", "")
+    if options.suites[1]:
+        collect_tests(&all, options.root, TestMode.ref, "Ref", "")
+    if options.suites[2]:
+        collect_tests(&all, options.root, TestMode.crash, "Crash", "")
+    var glob = "*"
+    if let filter = options.filter:
+        glob = cat(["*", filter, "*"])
+    var tests: ak.Vector[Test]
+    for test_case in ak.vector_span_const(&all):
+        if is_support_file(test_case.relative_path) or not glob_matches(test_case.relative_path.bytes, glob.bytes):
+            continue
+        ak.vector_append_t(&tests, test_case)
+    return tests

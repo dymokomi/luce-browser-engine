@@ -1,0 +1,187 @@
+#==============================================================================================
+#
+#   web_test - the headless runner of Ladybird's Layout, Ref and Crash tests over the engine
+#
+#   DESCRIPTION:
+#       DESIGN.md §6. One program with two modes:
+#
+#         web_test [layout] [ref] [crash] [-f GLOB] [-j N] [--update-failures] [--timeout S]
+#                  [--root DIR] [--results DIR] [--expected-failures DIR] [-v]
+#             The driver: walks the repository's copy of Ladybird's tests (tests/libweb, §6.8),
+#             honors TestConfig.ini's skip lists, runs every test in a child process (a trap
+#             cannot be caught and must not end the run) with a timeout, compares the outcomes
+#             with tests/expected_failures/<suite>.txt (an unexpected failure and an unexpected
+#             pass both fail the run; --update-failures rewrites the lists), writes what failed
+#             under the results directory and prints a summary with the most frequent
+#             `unported:` traps.
+#
+#         web_test --one PATH --mode layout|ref|crash [--root DIR] [--out FILE]
+#                  [--no-rendering]
+#             The worker: one page, one test (driver_*.lucb runs it; worker_*.lucb is it). It
+#             does natively what Ladybird's test-web does through injected JavaScript and IPC
+#             (Tests/LibWeb/test-web/main.cpp, Services/WebContent): the platform plugins in
+#             layout-test mode, a Page with a headless PageClient (800x600, device pixel ratio
+#             1, scripting disabled), the document of a file: response parsed and loaded, the
+#             load event, document.fonts.ready and two animation frames, a screenshot, and the
+#             result: the layout, paint and stacking-context dumps (layout), whether the test
+#             and its reference render alike (ref), or nothing but finishing (crash).
+#
+#       The worker writes its result to --out (or standard output) and reports how far it got
+#       on standard error ("web_test: stage NAME"), so the driver can tell where a test that
+#       trapped stopped; a trap's own message ("trap: FILE:LINE:COLUMN: unported: NAME") names
+#       the function a test needs next (DESIGN.md §4.5, reachability-driven order).
+#
+#       Copyright (c) 2026 the luce-browser authors.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+import ak
+import c
+import files
+import gc
+import gfx
+import io
+import math
+import memory
+import os
+import process
+import strings
+import thread
+import time
+import web_fonts
+import web_url
+import luce_browser_engine.web as web
+
+# mark: The command line ========================================================================
+
+## The suites a test belongs to (Ladybird's TestMode, for the three phase-1 suites).
+enum TestMode:
+    layout
+    ref
+    crash
+
+## The name of a mode, as the command line and the expected-failures files spell it.
+func test_mode_name(mode: TestMode) -> str:
+    return match mode:
+        .layout => "layout"
+        .ref => "ref"
+        .crash => "crash"
+
+## The mode a command-line word names, if any.
+func test_mode_from_name(name: str) -> TestMode?:
+    if name == "layout": return TestMode.layout
+    if name == "ref": return TestMode.ref
+    if name == "crash": return TestMode.crash
+    return none
+
+## What the command line asked for.
+struct Options:
+    ## Worker mode: the test to run (--one).
+    var one: str?
+    var mode: TestMode
+    ## Worker mode: where to write the result (--out); standard output without it.
+    var out: str?
+    ## Worker mode: dump without rendering (--no-rendering, see worker_modes).
+    var no_rendering: bool
+    ## The copy of Ladybird's Tests/LibWeb (--root).
+    var root: str
+    ## Driver mode: the suites to run (none named: all three).
+    var suites: bool[3]
+    ## Driver mode: only the tests whose path matches (-f).
+    var filter: str?
+    ## Driver mode: workers run at once (-j).
+    var jobs: usize
+    ## Driver mode: seconds before a worker is stopped (--timeout).
+    var timeout_seconds: u64
+    ## Driver mode: rewrite the expected-failures lists (--update-failures).
+    var update_failures: bool
+    ## Driver mode: where the failures are written (--results).
+    var results: str
+    ## Driver mode: the expected-failures lists (--expected-failures).
+    var expected_failures: str
+    ## Driver mode: list every test (-v).
+    var verbose: bool
+
+## The usage text.
+func usage():
+    io.stderr().write("usage: web_test [layout] [ref] [crash] [-f GLOB] [-j N] [--update-failures] [--timeout SECONDS]\n") catch failure: return
+    io.stderr().write("                [--root DIR] [--results DIR] [--expected-failures DIR] [-v]\n") catch failure: return
+    io.stderr().write("       web_test --one PATH --mode layout|ref|crash [--root DIR] [--out FILE] [--no-rendering]\n") catch failure: return
+
+## The options of `arguments` (the program name first), or none when they are not understood.
+func parse_options(arguments: const str[]) -> Options?:
+    var options = Options(mode = TestMode.layout, root = "tests/libweb", jobs = default_jobs(), timeout_seconds = 30,
+                          results = "build/web_test_results", expected_failures = "tests/expected_failures")
+    var index: usize = 1
+    while index < arguments.length:
+        let argument = arguments[index]
+        index += 1
+        let has_value = index < arguments.length
+        if argument == "--one" and has_value:
+            options.one = arguments[index]
+            index += 1
+        elif argument == "--mode" and has_value:
+            options.mode = test_mode_from_name(arguments[index]) else return none
+            index += 1
+        elif argument == "--out" and has_value:
+            options.out = arguments[index]
+            index += 1
+        elif argument == "--no-rendering":
+            options.no_rendering = true
+        elif argument == "--root" and has_value:
+            options.root = arguments[index]
+            index += 1
+        elif argument == "-f" and has_value:
+            options.filter = arguments[index]
+            index += 1
+        elif argument == "-j" and has_value:
+            let jobs = parse_count(arguments[index]) else return none
+            options.jobs = jobs if jobs > 0 else 1
+            index += 1
+        elif argument == "--timeout" and has_value:
+            options.timeout_seconds = (u64)(parse_count(arguments[index]) else return none)
+            index += 1
+        elif argument == "--update-failures":
+            options.update_failures = true
+        elif argument == "--results" and has_value:
+            options.results = arguments[index]
+            index += 1
+        elif argument == "--expected-failures" and has_value:
+            options.expected_failures = arguments[index]
+            index += 1
+        elif argument == "-v":
+            options.verbose = true
+        elif let mode = test_mode_from_name(argument):
+            options.suites[(usize)test_mode_index(mode)] = true
+        else:
+            return none
+    if not options.suites[0] and not options.suites[1] and not options.suites[2]:
+        options.suites = [true, true, true]
+    return options
+
+## The index of a mode in Options.suites.
+func test_mode_index(mode: TestMode) -> u8:
+    return match mode:
+        .layout => 0
+        .ref => 1
+        .crash => 2
+
+## A non-negative decimal count, if `text` is one.
+func parse_count(text: str) -> usize?:
+    if text.length == 0: return none
+    var value: usize = 0
+    for byte in text.bytes:
+        if byte < '0' or byte > '9': return none
+        value = value * 10 + (usize)(byte - '0')
+    return value
+
+# mark: main ====================================================================================
+
+pub func main(arguments: str[]) -> i32:
+    if let options = parse_options(arguments):
+        if let path = options.one:
+            return worker_main(path, &options)
+        return driver_main(&options)
+    usage()
+    return 2

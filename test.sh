@@ -11,7 +11,7 @@ for file in $(git ls-files '*.lucb' | grep -v -e '/types_' -e '/stubs/' -e '/gen
     luce-base fmt "$file" --check > /dev/null || { echo "$file is not formatted (luce-base fmt $file --write)"; exit 1; }
 done
 
-for module in src/luce_browser_engine/web tools/gen_css_values tools/embed_css tools/gen_dom_tree; do
+for module in src/luce_browser_engine/web tools/gen_css_values tools/embed_css tools/gen_dom_tree tests/web_test; do
     echo "== luce-base check $module -W"
     # -W reports warnings without failing, so any output at all fails the run.
     output=$(luce-base check "$module" -W 2>&1) || { echo "$output"; exit 1; }
@@ -26,6 +26,8 @@ for module in web; do
     echo "== luce-base test src/luce_browser_engine/$module"
     luce-base test "src/luce_browser_engine/$module"
 done
+echo "== luce-base test tests/web_test"
+luce-base test tests/web_test
 
 # The value-dependent generated fragments (web/generated/math_functions.lucb, ...) are written by
 # tools/gen_css_values from data/css, the embedded style sheets (web/generated/*_style_sheet_source.lucb)
@@ -49,3 +51,11 @@ mkdir -p "$generated/html"
 luce-base build tools/gen_dom_tree -o build/gen_dom_tree
 build/gen_dom_tree data/html src/luce_browser_engine/web "$generated/html"
 cmp "$generated/html/media_controls_dom.lucb" src/luce_browser_engine/web/generated/html/media_controls_dom.lucb
+
+# Ladybird's Layout, Ref and Crash tests (the copy in tests/libweb) through the headless runner,
+# one worker process per test, against tests/expected_failures: an unexpected failure or an
+# unexpected pass fails the run (DESIGN.md §6). After a change that makes tests pass or fail,
+# review build/web_test_results and run `build/web_test --update-failures`.
+echo "== web_test layout ref crash"
+luce-base build tests/web_test -o build/web_test
+build/web_test layout ref crash

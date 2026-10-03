@@ -1392,6 +1392,11 @@ arguments and the harness compares byte for byte with `Layout/expected/<path>.tx
 dumping it renders once (Ladybird takes a screenshot first "to force the lazy layout of
 SVG-as-image documents").
 
+A Layout test that traps or crashes is run a second time with `--no-rendering` (r57): the page
+stays hidden, so "update the rendering" never paints it, and the dumps are taken right after the
+load. The driver reports how many of those match (all three dumps, and the layout tree alone) and
+where they stop: a measure of layout while painting is not ported, never a pass.
+
 Expected failures live in `tests/expected_failures/layout.txt`, one path per line with a reason
 code (`script`, `resource`, `noscript`, `font`, `unported`, `bug`). The runner fails on any
 unexpected failure *and* on any unexpected pass (so the list only shrinks);

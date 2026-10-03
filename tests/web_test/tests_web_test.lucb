@@ -1,0 +1,208 @@
+#==============================================================================================
+#
+#   tests_web_test - the runner's own parts, pinned to test-web's behaviour
+#
+#   DESCRIPTION:
+#       Ladybird has no unit tests for test-web; these pin what the runner ports or adds:
+#       Fuzzy.cpp's parsing and matching (the expected values follow Fuzzy.cpp's code and
+#       https://web-platform-tests.org/writing-tests/reftests.html#fuzzy-matching), the glob
+#       matching of -f (AK::StringUtils::matches), TestConfig.ini's groups, support files, the
+#       expected-failures lists, how a worker's log and result are read, and the worker's event
+#       loop (timers in order, single-shot timers, deferred invocations).
+#
+#       Copyright (c) 2026 the luce-browser authors.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Fuzzy matching ==========================================================================
+
+## Whether parsing `range` fails.
+func fuzzy_range_fails(range: str) -> bool:
+    discard(parse_fuzzy_range(range) catch failure: return true)
+    return false
+
+## Whether parsing `content` fails.
+func fuzzy_match_fails(content: str) -> bool:
+    discard(parse_fuzzy_match(none, content) catch failure: return true)
+    return false
+
+test "fuzzy ranges and configurations parse as Fuzzy.cpp parses them":
+    let single = parse_fuzzy_range("5") else trap("5 parses")
+    assert(single.minimum_value == 5 and single.maximum_value == 5)
+    let range = parse_fuzzy_range("0-12000") else trap("0-12000 parses")
+    assert(range.minimum_value == 0 and range.maximum_value == 12000)
+    assert(range.contains(0) and range.contains(12000) and not range.contains(12001))
+    assert(fuzzy_range_fails("3-1"))
+    assert(fuzzy_range_fails("a"))
+    assert(fuzzy_range_fails("1-2-3"))
+    # AK's String::split leaves out empty parts, and to_number trims whitespace.
+    let leading = parse_fuzzy_range("-2") else trap("-2 parses")
+    assert(leading.minimum_value == 2 and leading.maximum_value == 2)
+    let spaced = parse_fuzzy_range(" 1 - 3 ") else trap("spaced parses")
+    assert(spaced.minimum_value == 1 and spaced.maximum_value == 3)
+
+    let named = parse_fuzzy_match(none, "maxDifference=0-2;totalPixels=0-12000") else trap("named parses")
+    assert(named.color_value_error.maximum_value == 2 and named.pixel_error_count.maximum_value == 12000)
+    let swapped = parse_fuzzy_match(none, "totalPixels=7;maxDifference=1-3") else trap("swapped parses")
+    assert(swapped.color_value_error.minimum_value == 1 and swapped.color_value_error.maximum_value == 3)
+    assert(swapped.pixel_error_count.minimum_value == 7 and swapped.pixel_error_count.maximum_value == 7)
+    let unnamed = parse_fuzzy_match(none, "1-4; 10-20") else trap("unnamed parses")
+    assert(unnamed.color_value_error.maximum_value == 4 and unnamed.pixel_error_count.minimum_value == 10)
+    assert(fuzzy_match_fails("1;2;3"))
+    assert(fuzzy_match_fails("1"))
+    assert(fuzzy_match_fails("foo=1;2"))
+    assert(fuzzy_match_fails("maxDifference=1;maxDifference=2"))
+    assert(fuzzy_match_fails(";2"))
+    let doubled = parse_fuzzy_match(none, "1;;2") else trap("1;;2 parses")
+    assert(doubled.pixel_error_count.minimum_value == 2)
+
+## A 4x4 bitmap filled with `color`.
+func test_bitmap(color: gfx.Color) -> gfx.Bitmap*:
+    let bitmap = gfx.bitmap_create_int_size(gfx.BitmapFormat.bgra8888, gfx.IntSize(m_width = 4, m_height = 4)) else trap("a bitmap")
+    for y in 0..<4:
+        for x in 0..<4:
+            gfx.bitmap_set_pixel(bitmap, (i32)x, (i32)y, color)
+    return bitmap
+
+test "screenshots match exactly, or within the first fuzzy configuration for their reference":
+    let white = gfx.color_new_u8_u8_u8(255, 255, 255)
+    let a = test_bitmap(white)
+    let b = test_bitmap(white)
+    let reference = worker_file_url("/tests/reference.html")
+    let other = worker_file_url("/tests/other.html")
+    var none_configured: FuzzyMatch[1] = ---
+    assert(fuzzy_screenshot_match("t", &reference, a, b, none_configured[..<0], true))
+
+    # Two pixels off by 3 in red.
+    gfx.bitmap_set_pixel(b, 1, 1, gfx.color_new_u8_u8_u8(252, 255, 255))
+    gfx.bitmap_set_pixel(b, 2, 2, gfx.color_new_u8_u8_u8(252, 255, 255))
+    assert(not fuzzy_screenshot_match("t", &reference, a, b, none_configured[..<0], false))
+    var tight: FuzzyMatch[1] = [parse_fuzzy_match(none, "0-2;0-10") else trap("parses")]
+    assert(not fuzzy_screenshot_match("t", &reference, a, b, tight, false))
+    var loose: FuzzyMatch[1] = [parse_fuzzy_match(none, "maxDifference=3;totalPixels=2") else trap("parses")]
+    assert(fuzzy_screenshot_match("t", &reference, a, b, loose, true))
+    var too_few: FuzzyMatch[1] = [parse_fuzzy_match(none, "maxDifference=3;totalPixels=1") else trap("parses")]
+    assert(not fuzzy_screenshot_match("t", &reference, a, b, too_few, false))
+
+    # The first configuration whose reference is the one compared, or that names none, applies.
+    var by_reference: FuzzyMatch[2] = [parse_fuzzy_match(other, "0-3;0-2") else trap("parses"), parse_fuzzy_match(none, "0-1;0-1") else trap("parses")]
+    assert(not fuzzy_screenshot_match("t", &reference, a, b, by_reference, false))
+    assert(fuzzy_screenshot_match("t", &other, a, b, by_reference, true))
+
+    # Different sizes never match.
+    let small = gfx.bitmap_create_int_size(gfx.BitmapFormat.bgra8888, gfx.IntSize(m_width = 2, m_height = 4)) else trap("a bitmap")
+    assert(not fuzzy_screenshot_match("t", &reference, a, small, loose, false))
+
+# mark: Selecting tests =========================================================================
+
+test "-f globs match as AK::StringUtils::matches, wrapped in stars":
+    assert(glob_matches("Layout/input/acid1.html".bytes, "*acid1*".bytes))
+    assert(glob_matches("Layout/input/block-and-inline/abspos-block.html".bytes, "*block-and-inline/*".bytes))
+    assert(glob_matches("abc".bytes, "a?c".bytes))
+    assert(glob_matches("abc".bytes, "***".bytes))
+    assert(glob_matches("".bytes, "*".bytes))
+    assert(not glob_matches("abc".bytes, "a?".bytes))
+    assert(not glob_matches("Layout/input/a.html".bytes, "*Ref/*".bytes))
+    assert(glob_matches("aXbXc".bytes, "a*b*c".bytes))
+    assert(not glob_matches("aXbX".bytes, "a*b*c".bytes))
+
+test "support files of imported WPT tests are not tests":
+    assert(is_support_file("Ref/input/wpt-import/css/css-flexbox/support/100x100-green.html"))
+    assert(is_support_file("Ref/input/wpt-import/css/resources/x.html"))
+    assert(is_support_file("Ref/input/wpt-import/common/reftest-wait.html"))
+    assert(not is_support_file("Ref/input/wpt-import/css/css-flexbox/flex-001.html"))
+    assert(not is_support_file("Layout/input/support/x.html"))
+    assert(is_valid_test_name("a.html") and is_valid_test_name("a.xht") and not is_valid_test_name("a.css"))
+    assert(path_title("abspos-block.html") == "abspos-block")
+
+test "TestConfig.ini: [Skipped] and [LoadFromHttpServer] paths and directories":
+    let text = "[LoadFromHttpServer]\n; a comment\nCrash/HTML/x.html\n\n[Skipped]\n# another\nRef/input/wpt-import/fullscreen/\nLayout/input/a.html\n"
+    let config = parse_test_config(text, "root")
+    assert(ak.vector_size(&config.skipped) == 2 and ak.vector_size(&config.load_from_http_server) == 1)
+    let skipped = Test(mode = TestMode.ref, relative_path = "Ref/input/wpt-import/fullscreen/rendering/a.html", expectation_path = none)
+    let http = Test(mode = TestMode.crash, relative_path = "Crash/HTML/x.html", expectation_path = none)
+    let runs = Test(mode = TestMode.layout, relative_path = "Layout/input/a.html.txt", expectation_path = none)
+    assert(skip_reason(&config, &skipped) == SkipReason.skipped)
+    assert(skip_reason(&config, &http) == SkipReason.needs_http_server)
+    assert(skip_reason(&config, &runs) == SkipReason.none_)
+
+# mark: Judging and reporting ===================================================================
+
+test "a worker's log: its last stage and its trap's message":
+    let log = "web_test: stage page\nweb_test: stage loaded\ntrap: src/x/stub.lucb:41:5: unported: Web::Painting::Foo::bar\n"
+    assert(last_stage(log) == "loaded")
+    assert((trap_message(log) else "") == "unported: Web::Painting::Foo::bar")
+    assert((unported_name("web_test: unported (P2): loading a document") else "") == "unported (P2): loading a document")
+    assert(trap_message("web_test: stage done\n") == none)
+    assert(last_stage("") == "start")
+
+test "the layout tree is the first of a Layout test's three dumps":
+    let dumps = "Viewport <#document> at [0,0]\n  BlockContainer <html>\n\nViewportPaintable (Viewport<#document>) [0,0 800x600]\n\nSC for Viewport<#document>\n"
+    assert(layout_tree_part(dumps) == "Viewport <#document> at [0,0]\n  BlockContainer <html>")
+    assert(layout_tree_part("Viewport <#document> at [0,0]\n") == "Viewport <#document> at [0,0]")
+    assert(layout_tree_part("(no layout tree)\n\n(no layout tree)\n\n(no layout tree)") == "(no layout tree)")
+    assert(trim_trailing_newlines("a\n\n") == "a")
+
+test "expected-failures lists: paths, reasons and notes":
+    let entries = parse_expected_failures("# a comment\nLayout/input/a.html unported # unported: X::y\n\nLayout/input/b.html font\nLayout/input/c.html\n")
+    assert(ak.vector_size(&entries) == 3)
+    let a = ak.vector_at_const(&entries, 0)
+    assert(a.path == "Layout/input/a.html" and a.reason == "unported" and a.note == "unported: X::y")
+    assert(ak.vector_at_const(&entries, 1).reason == "font")
+    assert(ak.vector_at_const(&entries, 2).reason == "bug")
+    assert(find_expected_failure(&entries, "Layout/input/b.html") != none)
+    assert(find_expected_failure(&entries, "Layout/input/d.html") == none)
+    assert(contains_ignoring_case("<NoScript>", "<noscript"))
+    assert(is_automatic_reason("unported") and not is_automatic_reason("font"))
+    assert(pad_count(12) == "    12")
+
+# mark: The worker's event loop =================================================================
+
+## A log of what a timer or deferred function ran.
+struct TestLoopLog:
+    var events: u8[8]
+    var count: usize
+
+## The function that logs `context`'s event.
+struct TestLoopEvent:
+    var log: TestLoopLog*
+    var name: u8
+
+    static func call(context: void*?):
+        let event = (TestLoopEvent*)(context else trap("no event"))
+        event.log.events[event.log.count] = event.name
+        event.log.count += 1
+
+test "the worker's event loop: deferred invocations first, then due timers by registration, single-shot ones once":
+    var event_loop = WorkerEventLoop(next_timer_id = 0, exit_requested = false, exit_code = 0)
+    web.core_event_loop_install(&event_loop)
+    var log = TestLoopLog()
+    var first = TestLoopEvent(log = &log, name = 'a')
+    var second = TestLoopEvent(log = &log, name = 'b')
+    var deferred = TestLoopEvent(log = &log, name = 'd')
+    let one = web.core_timer_create_single_shot(0, ak.Function0[unit](call = TestLoopEvent.call, context = &first))
+    let two = web.core_timer_create_single_shot(0, ak.Function0[unit](call = TestLoopEvent.call, context = &second))
+    web.core_timer_start(one)
+    web.core_timer_start(two)
+    web.core_deferred_invoke(ak.Function0[unit](call = TestLoopEvent.call, context = &deferred))
+    assert(event_loop.has_pending_events())
+    assert(event_loop.pump(web.CoreEventLoopPumpMode.dont_wait_for_events) == 3)
+    assert(log.count == 3 and log.events[0] == 'd' and log.events[1] == 'a' and log.events[2] == 'b')
+    assert(not web.core_timer_is_active(one) and ak.vector_is_empty(&event_loop.timers))
+    assert(not event_loop.has_pending_events())
+
+    # A timer due later is waited for; a stopped one never fires.
+    let later = web.core_timer_create_single_shot(20, ak.Function0[unit](call = TestLoopEvent.call, context = &first))
+    let stopped = web.core_timer_create_single_shot(10, ak.Function0[unit](call = TestLoopEvent.call, context = &second))
+    web.core_timer_start(later)
+    web.core_timer_start(stopped)
+    web.core_timer_stop(stopped)
+    assert(not event_loop.has_pending_events())
+    worker_drain(&event_loop)
+    assert(log.count == 3)
+    discard(event_loop.pump(web.CoreEventLoopPumpMode.wait_for_events))
+    assert(log.count == 4 and log.events[3] == 'a')
+
+    event_loop.quit(3)
+    assert(event_loop.was_exit_requested() and event_loop.exit_code == 3)

@@ -1,0 +1,223 @@
+#==============================================================================================
+#
+#   worker_page_client - the worker's headless PageClient
+#
+#   DESCRIPTION:
+#       Web::PageClient as WebContent implements it (Services/WebContent/PageClient.cpp) for a
+#       headless view in test mode, with what Ladybird's UI process tells it as a test starts
+#       (LibWebView/HeadlessWebView.cpp initialize_client): the viewport and window size
+#       (800x600, Tests/LibWeb/test-web/main.cpp), device pixel ratio 1, zoom 1, one 1920x1080
+#       screen, the preferred color scheme, contrast and motion left `auto`. What the UI
+#       process would receive (the page finished loading, a screenshot) is recorded here for
+#       the worker.
+#
+#       The palette is the one WebContent's PageClient sets up (setup_palette: a zeroed system
+#       theme with magenta and cyan window colors, not dark). test-web then sends the theme of
+#       Base/res/themes/Default.ini, whose colors differ but which is not dark either: phase-1
+#       tests read the palette only for `prefers-color-scheme` (light either way) and the
+#       `-libweb-palette-*` keywords, which none uses.
+#
+#       Copyright (c) 2020-2026, the Ladybird developers.
+#       Copyright (c) 2026 the luce-browser authors.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: The client ==============================================================================
+
+## The worker's PageClient (WebContent::PageClient), a cell like the C++ one.
+struct WorkerPageClient: gc.IsCell:
+    var page_client: web.PageClient
+    var m_page: web.Page*?
+    var m_id: u64
+    var m_palette_impl: gfx.PaletteImpl*?
+    var m_screen_rect: gfx.DevicePixelRect
+    var m_viewport_size: gfx.IntSize
+    var m_device_pixel_ratio: f64
+    var m_zoom_level: f64
+    var m_maximum_frames_per_second: f64
+    var m_frame_timer: web.CoreTimer*?
+    var m_last_frame_dispatch_time: f64?
+    var m_input_event_queue: ak.Queue[web.QueuedInputEvent]
+    ## The URLs whose loading finished (page_did_finish_loading), the last one first seen.
+    var m_finished_loading: ak.Vector[web_url.Url]
+    ## The screenshots the page took (page_did_take_screenshot), in order.
+    var m_screenshots: ak.Vector[gfx.ShareableBitmap]
+    ## The frames requested (request_frame).
+    var m_frames_requested: u32
+
+    func cell() -> gc.Cell*: return (gc.Cell*)&self
+
+## The client of a PageClient this file made.
+func worker_client(base: web.PageClient*) -> WorkerPageClient*:
+    return (WorkerPageClient*)base
+
+## PageClient::visit_edges: its page.
+func worker_page_client_visit_edges(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (WorkerPageClient*)base
+    gc.cell_visit_edges_impl(base, visitor)
+    gc.cell_visitor_visit_t(visitor, this.m_page)
+
+func worker_page_client_id(this: web.PageClient*) -> u64:
+    return worker_client(this).m_id
+
+func worker_page_client_page(this: web.PageClient*) -> web.Page*:
+    return worker_client(this).m_page else trap("web_test: the PageClient has no page")
+
+func worker_page_client_is_connection_open(this: web.PageClient*) -> bool:
+    return true
+
+## WebContent's PageClient::is_url_suitable_for_same_process_navigation: every URL a test
+## loads stays in this process.
+func worker_page_client_is_url_suitable_for_same_process_navigation(this: web.PageClient*, current_url: web_url.Url, target_url: web_url.Url) -> bool:
+    return true
+
+func worker_page_client_palette(this: web.PageClient*) -> gfx.Palette:
+    var palette: gfx.Palette = ---
+    gfx.palette_construct(&palette, worker_client(this).m_palette_impl else trap("web_test: no palette"))
+    return palette
+
+func worker_page_client_screen_rect(this: web.PageClient*) -> gfx.DevicePixelRect:
+    return worker_client(this).m_screen_rect
+
+func worker_page_client_zoom_level(this: web.PageClient*) -> f64:
+    return worker_client(this).m_zoom_level
+
+func worker_page_client_device_pixel_ratio(this: web.PageClient*) -> f64:
+    return worker_client(this).m_device_pixel_ratio
+
+func worker_page_client_device_pixels_per_css_pixel(this: web.PageClient*) -> f64:
+    let client = worker_client(this)
+    return client.m_device_pixel_ratio * client.m_zoom_level
+
+func worker_page_client_preferred_color_scheme(this: web.PageClient*) -> web.CssPreferredColorScheme:
+    return web.CssPreferredColorScheme.auto
+
+func worker_page_client_preferred_contrast(this: web.PageClient*) -> web.CssPreferredContrast:
+    return web.CssPreferredContrast.auto
+
+func worker_page_client_preferred_motion(this: web.PageClient*) -> web.CssPreferredMotion:
+    return web.CssPreferredMotion.auto
+
+func worker_page_client_screen_count(this: web.PageClient*) -> usize:
+    return 1
+
+func worker_page_client_input_event_queue(this: web.PageClient*) -> ak.Queue[web.QueuedInputEvent]*:
+    return &worker_client(this).m_input_event_queue
+
+func worker_page_client_report_finished_handling_input_event(this: web.PageClient*, page_id: u64, event_was_handled: web.EventResult):
+    return
+
+## The lambda of WebContent's frame timer: the rendering is updated on the next turn.
+func worker_page_client_frame_timer_fired(context: void*?):
+    let client = (WorkerPageClient*)(context else trap("web_test: frame timer without a client"))
+    client.m_last_frame_dispatch_time = web.high_resolution_time_unsafe_shared_current_time()
+    web.html_event_loop_queue_task_to_update_the_rendering(web.html_main_thread_event_loop())
+
+## PageClient::request_frame: at most one frame per 1/60 s.
+func worker_page_client_request_frame(this: web.PageClient*):
+    let client = worker_client(this)
+    client.m_frames_requested += 1
+    let frame_timer = client.m_frame_timer else trap("web_test: no frame timer")
+    if web.core_timer_is_active(frame_timer):
+        return
+
+    var delay = 0.0
+    if let last_frame_dispatch_time = client.m_last_frame_dispatch_time:
+        let now = web.high_resolution_time_unsafe_shared_current_time()
+        let minimum_frame_interval = 1000.0 / client.m_maximum_frames_per_second
+        delay = math.max(0.0, last_frame_dispatch_time + minimum_frame_interval - now)
+
+    web.core_timer_restart_i32(frame_timer, (i32)math.ceil(delay))
+
+func worker_page_client_page_did_finish_loading(this: web.PageClient*, url: web_url.Url):
+    ak.vector_append_t(&worker_client(this).m_finished_loading, url)
+
+func worker_page_client_page_did_take_screenshot(this: web.PageClient*, screenshot: gfx.ShareableBitmap):
+    ak.vector_append_t(&worker_client(this).m_screenshots, screenshot)
+
+func worker_page_client_request_file(this: web.PageClient*, request: web.FileRequest):
+    return
+
+func worker_page_client_display_list_player_type(this: web.PageClient*) -> web.DisplayListPlayerType:
+    return web.DisplayListPlayerType.skia_cpu
+
+func worker_page_client_is_headless(this: web.PageClient*) -> bool:
+    return true
+
+## The worker client's vtable: PageClient's, with WebContent's overrides of what a phase-1 page
+## asks.
+let worker_page_client_vtable: web.PageClientVTable = web.PageClientVTable(
+    cell_vtable = web.JsCellVTable(cell_vtable = gc.CellVTable(class_info = &worker_page_client_class, visit_edges = worker_page_client_visit_edges)),
+    id = worker_page_client_id,
+    page = worker_page_client_page,
+    page_const = worker_page_client_page,
+    is_connection_open = worker_page_client_is_connection_open,
+    is_url_suitable_for_same_process_navigation = worker_page_client_is_url_suitable_for_same_process_navigation,
+    palette = worker_page_client_palette,
+    screen_rect = worker_page_client_screen_rect,
+    zoom_level = worker_page_client_zoom_level,
+    device_pixel_ratio = worker_page_client_device_pixel_ratio,
+    device_pixels_per_css_pixel = worker_page_client_device_pixels_per_css_pixel,
+    preferred_color_scheme = worker_page_client_preferred_color_scheme,
+    preferred_contrast = worker_page_client_preferred_contrast,
+    preferred_motion = worker_page_client_preferred_motion,
+    screen_count = worker_page_client_screen_count,
+    input_event_queue = worker_page_client_input_event_queue,
+    report_finished_handling_input_event = worker_page_client_report_finished_handling_input_event,
+    request_frame = worker_page_client_request_frame,
+    page_did_finish_loading = worker_page_client_page_did_finish_loading,
+    page_did_take_screenshot = worker_page_client_page_did_take_screenshot,
+    request_file = worker_page_client_request_file,
+    display_list_player_type = worker_page_client_display_list_player_type,
+    is_headless = worker_page_client_is_headless,
+)
+
+## The class of the worker's client: a PageClient (its class id).
+## (A constant expression cannot read web.page_client_class's ids; worker_create_page_client
+## checks that they agree.)
+let worker_page_client_class: ak.ClassInfo = ak.ClassInfo(name = "WebTestPageClient", first_id = 316, last_id = 316, size = sizeof(WorkerPageClient),
+                                                          vtable = (const void*)&worker_page_client_vtable)
+
+# mark: Creating the client and its page ========================================================
+
+## WebContent's PageHost making its first page: PageClient::create (the client, its page by
+## Page::create, the palette, the frame timer), then what HeadlessWebView sends as it starts:
+## the viewport (PageClient::set_viewport) and window size, the screen. Answers the client.
+func worker_create_page_client(vm: web.Vm*) -> WorkerPageClient*:
+    assert(worker_page_client_class.first_id == web.page_client_class.first_id and worker_page_client_class.last_id == web.page_client_class.last_id,
+           "the worker's PageClient has PageClient's class id")
+    let heap = web.vm_heap(vm)
+    gc.heap_defer_gc(heap)
+    let client = (WorkerPageClient*)web.web_heap_allocate_cell(heap, &worker_page_client_class)
+    client.m_id = 0
+    client.m_device_pixel_ratio = 1.0
+    client.m_zoom_level = 1.0
+    client.m_maximum_frames_per_second = 60.0
+    client.m_page = web.page_create(vm, &client.page_client)
+    worker_page_client_setup_palette(client)
+    client.m_frame_timer = web.core_timer_create_single_shot(0, ak.Function0[unit](call = worker_page_client_frame_timer_fired, context = client))
+    gc.heap_undefer_gc(heap)
+
+    client.m_screen_rect = gfx.DevicePixelRect(m_location = gfx.IntPoint(m_x = 0, m_y = 0), m_size = gfx.IntSize(m_width = 1920, m_height = 1080))
+    return client
+
+## PageClient::setup_palette (WebContent): a zeroed system theme with magenta and cyan window colors.
+func worker_page_client_setup_palette(client: WorkerPageClient*):
+    let buffer = gfx.core_anonymous_buffer_create_with_size(sizeof(gfx.SystemTheme)) else trap("VERIFY: the theme buffer")
+    let theme = (gfx.SystemTheme*)(gfx.core_anonymous_buffer_data(&buffer) else trap("VERIFY: the theme buffer"))
+    let magenta = gfx.color_new_named_color(gfx.ColorNamedColor.magenta)
+    let cyan = gfx.color_new_named_color(gfx.ColorNamedColor.cyan)
+    theme.color[(i32)gfx.ColorRole.window] = gfx.color_value(&magenta)
+    theme.color[(i32)gfx.ColorRole.window_text] = gfx.color_value(&cyan)
+    client.m_palette_impl = gfx.palette_impl_create_with_anonymous_buffer(buffer)
+
+## PageClient::set_viewport (WebContent) with the page's top-level traversable, and
+## Page::set_window_size: what HeadlessWebView sends as it starts.
+func worker_page_client_set_viewport(client: WorkerPageClient*, width: i32, height: i32):
+    let page = client.m_page else trap("web_test: no page")
+    client.m_viewport_size = gfx.IntSize(m_width = width, m_height = height)
+    let traversable = web.page_top_level_traversable(page)
+    web.html_navigable_set_viewport_size((web.HtmlNavigable*)traversable, web.page_device_to_css_size(page, client.m_viewport_size), web.InvalidateDisplayList.no)
+    web.page_set_viewport_is_fullscreen(page, web.ViewportIsFullscreen.no)
+    web.page_set_window_size(page, client.m_viewport_size)

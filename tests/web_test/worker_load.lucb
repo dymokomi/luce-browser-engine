@@ -1,0 +1,202 @@
+#==============================================================================================
+#
+#   worker_load - a test's page, its document loaded from a file, and the waits of test-web
+#
+#   DESCRIPTION:
+#       The page: WebContent's PageHost makes a PageClient (with its Page) and a fresh top-level
+#       traversable on about:blank (TraversableNavigable::create_a_fresh_top_level_traversable);
+#       HeadlessWebView then sets the 800x600 viewport. Phase 1 runs with scripting disabled
+#       (DESIGN.md §1.3), as SVG-as-image documents do upstream.
+#
+#       The document (DESIGN.md §6.1 step 3): phase 1 has no fetching, so the worker does what
+#       SVG/SVGDecodedImageData.cpp does for an image's bytes and what DocumentLoading.cpp's
+#       load_html_document does for a navigation response: a file: response whose URL list is
+#       the test's file URL (URL::create_with_file_scheme of its absolute path, as test-web
+#       loads it) and whose Content-Type is text/html, navigation params for it in the
+#       top-level traversable, Document::create_and_initialize, the new document made the
+#       traversable's active document (SVGDecodedImageData's activation, completed by
+#       Document::make_active as Navigable's activation of a history entry does), then
+#       HTMLParser::create_with_uncertain_encoding over the bytes and HTMLParser::run(url).
+#       The parser's "the end" completes the loading on the event loop (DOMContentLoaded, the
+#       load event, "completely finish loading"), and the page tells its client the document
+#       finished loading, which is when test-web injects its waiting script.
+#
+#       The waits (test-web's afterFontsAndPaint, natively): document.fonts.ready, then two
+#       animation frame callbacks (`requestAnimationFrame(() => requestAnimationFrame(...))`:
+#       Window::request_animation_frame adds to the window's AnimationFrameCallbackDriver and
+#       requests a frame from the client), which run in two rounds of "update the rendering".
+#       The `test-wait` / `reftest-wait` classes need script to change, so they are not
+#       watched in phase 1.
+#
+#       Copyright (c) 2023-2026, the Ladybird developers.
+#       Copyright (c) 2026 the luce-browser authors.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Stages ==================================================================================
+
+## Reports that the worker reached `stage` (the driver reads the last one a failed worker
+## reported).
+func worker_stage(stage: str):
+    io.stderr().write(f"web_test: stage {stage}\n") catch failure: return
+
+# mark: The page ================================================================================
+
+## A test's page: the client, its page and the page's top-level traversable.
+struct WorkerPage:
+    var client: WorkerPageClient*
+    var page: web.Page*
+    var traversable: web.HtmlTraversableNavigable*
+
+## The lambda of create_a_fresh_top_level_traversable that finishes the initial about:blank
+## document.
+func worker_initial_document_the_end(context: void*?):
+    let traversable = (web.HtmlTraversableNavigable*)(context else trap("web_test: no traversable"))
+    let document = web.html_navigable_active_document((web.HtmlNavigable*)traversable) else trap("web_test: no initial document")
+    web.html_parser_the_end(document)
+
+## TraversableNavigable::create_a_fresh_top_level_traversable(page, about:blank), which
+## PageHost's constructor calls, without its AD-HOC emulated geolocation position (a
+## Geolocation::GeolocationCoordinates, phase 4): a new top-level traversable set as the page's,
+## its initial about:blank document marked as finished parsing on the event loop.
+func worker_create_a_fresh_top_level_traversable(page: web.Page*) -> web.HtmlTraversableNavigable*:
+    let traversable = web.html_traversable_navigable_create_a_new_top_level_traversable(page, none, ak.string_from_str(""))
+    web.page_set_top_level_traversable(page, traversable)
+    let heap = gc.cell_heap((gc.Cell*)traversable)
+    web.platform_event_loop_plugin_deferred_invoke(web.platform_event_loop_plugin_the(),
+                                                   gc.create_function0(heap, ak.Function0[unit](call = worker_initial_document_the_end, context = traversable)))
+    return traversable
+
+## The page of a test (PageHost::PageHost, HeadlessWebView::initialize_client): its client, a
+## fresh top-level traversable on about:blank whose initial document has finished, the
+## viewport, visible unless the page is not `rendering`, scripting disabled.
+func worker_create_page(vm: web.Vm*, event_loop: WorkerEventLoop*, rendering: bool) -> WorkerPage:
+    let client = worker_create_page_client(vm)
+    let page = client.m_page else trap("web_test: no page")
+    let traversable = worker_create_a_fresh_top_level_traversable(page)
+    # ViewImplementation::initialize_client: the viewport (zoom 1, device pixel ratio 1, at most 60
+    # frames a second, the client's defaults) and the system visibility state, visible for a
+    # headless view. Without rendering the page stays hidden (the traversable's initial state),
+    # and "update the rendering" leaves hidden documents alone.
+    worker_page_client_set_viewport(client, 800, 600)
+    if rendering:
+        web.html_traversable_navigable_set_system_visibility_state(traversable, web.HtmlVisibilityState.visible)
+    web.page_set_is_scripting_enabled(page, false)
+    worker_drain(event_loop)
+    return WorkerPage(client = client, page = page, traversable = traversable)
+
+# mark: Loading a document ======================================================================
+
+## The file: URL of the absolute path `path` (URL::create_with_file_scheme).
+func worker_file_url(path: str) -> web_url.Url:
+    return web_url.create_with_file_scheme(ak.byte_string_from_str(path), ak.byte_string_empty(), ak.byte_string_empty()) else trap("web_test: the test path is not a file URL")
+
+## A response of a navigation to `url` as a file: fetch delivers it: its URL list « url » and a
+## `Content-Type: text/html` header.
+func worker_file_response(vm: web.Vm*, url: web_url.Url) -> web.FetchResponse*:
+    let response = web.fetch_infrastructure_response_create(vm)
+    ak.vector_append_t(web.fetch_response_url_list(response), url)
+    web.http_header_list_append(web.fetch_response_header_list(response), ak.sv("Content-Type"), ak.sv("text/html"))
+    return response
+
+## Loads the HTML `bytes` of the file `url` into the page's top-level traversable as its active
+## document (see the header) and starts parsing them. Answers the document.
+func worker_load_document(page: const WorkerPage*, vm: web.Vm*, url: web_url.Url, bytes: const u8[]) -> web.DomDocument*:
+    let heap = web.vm_heap(vm)
+    let navigable = (web.HtmlNavigable*)page.traversable
+
+    # The navigation params of a response (Navigable::populate_session_history_entry for a fetched
+    # response): its origin, a new policy container, no sandboxing.
+    let response = worker_file_response(vm, url)
+    let origin = web_url.url_origin(&url)
+    let coop = web.HtmlOpenerPolicy()
+    let coop_enforcement_result = web.HtmlOpenerPolicyEnforcementResult(url = url, origin = origin, opener_policy = coop)
+    let policy_container = web.heap_allocate_html_policy_container(heap)
+    let navigation_params = web.heap_allocate_html_navigation_params(heap, none, navigable, none, response, none, none, coop_enforcement_result, none,
+                                                                     origin, policy_container, (web.HtmlSandboxingFlagSet)0, coop, none,
+                                                                     web.HtmlUserNavigationInvolvement.browser_ui)
+
+    # load_html_document, step 1: create and initialize a Document of "html" and "text/html".
+    let document = web.dom_document_create_and_initialize(web.DocumentDomDocumentType.html, ak.string_from_str("text/html"), navigation_params) else trap("web_test: Document::create_and_initialize threw")
+
+    # SVGDecodedImageData::create: the new document replaces the navigable's (FIXME there: use
+    # Navigable::navigate, which is phase 2), then the activation of its history entry.
+    # SVGDecodedImageData also destroys the replaced document. A navigation does not: it
+    # unloads the previous document and destroys it only when it is not salvageable
+    # (Document::unload, step 16), and neither the initial about:blank document nor a test
+    # document a reftest's reference replaces has done anything to lose that state.
+    web.html_navigable_set_ongoing_navigation(navigable, web.EmptyOrHtmlNavigableTraversalOrString.empty)
+    web.html_navigable_set_active_document(navigable, document)
+    web.dom_document_make_active(document)
+    worker_stage("created")
+
+    # load_html_document, step 3: an HTML parser over the response's body.
+    let input = ak.byte_buffer_copy_span_u8(bytes) else trap("out of memory")
+    let parser = web.html_parser_create_with_uncertain_encoding(document, input)
+    web.html_parser_run_url(parser, url)
+    worker_stage("parsed")
+    return document
+
+## Whether the client was told that `url` finished loading.
+func worker_finished_loading(client: WorkerPageClient*, url: const web_url.Url*) -> bool:
+    for index in 0..<ak.vector_size(&client.m_finished_loading):
+        let loaded = *ak.vector_at_const(&client.m_finished_loading, index)
+        if web_url.url_equals(url, loaded, web_url.ExcludeFragment.yes):
+            return true
+    return false
+
+## Runs the event loop until the page tells its client that `url` finished loading (test-web's
+## on_load_finish for the test's URL).
+func worker_wait_for_load(page: const WorkerPage*, event_loop: WorkerEventLoop*, url: const web_url.Url*):
+    while not worker_finished_loading(page.client, url):
+        discard(event_loop.pump(web.CoreEventLoopPumpMode.wait_for_events))
+    worker_stage("loaded")
+
+# mark: afterFontsAndPaint ======================================================================
+
+## The two nested animation frame callbacks of afterFontsAndPaint.
+struct WorkerAnimationFrames:
+    var window: web.HtmlWindow*
+    var client: WorkerPageClient*
+    var remaining: i32
+
+## One animation frame callback: the next one is requested until none remain.
+func worker_animation_frame(context: void*?, now: f64):
+    let frames = (WorkerAnimationFrames*)(context else trap("web_test: animation frame without its state"))
+    frames.remaining -= 1
+    if frames.remaining > 0:
+        worker_request_animation_frame(frames)
+
+## Window::request_animation_frame with a native callback.
+func worker_request_animation_frame(frames: WorkerAnimationFrames*):
+    let heap = gc.cell_heap((gc.Cell*)frames.window)
+    let callback = gc.create_function1(heap, ak.Function1[f64, unit](call = worker_animation_frame, context = frames))
+    discard(web.html_animation_frame_callback_driver_add(web.html_window_animation_frame_callback_driver(frames.window), callback))
+    web.page_client_request_frame(&frames.client.page_client)
+
+## test-web's afterFontsAndPaint: document.fonts.ready, then two animation frames.
+func worker_after_fonts_and_paint(page: const WorkerPage*, event_loop: WorkerEventLoop*, document: web.DomDocument*):
+    let ready = web.css_font_face_set_ready(web.dom_document_fonts(document))
+    while not web.idl_is_promise_fulfilled(ready):
+        discard(event_loop.pump(web.CoreEventLoopPumpMode.wait_for_events))
+    worker_stage("fonts-ready")
+
+    let window = web.dom_document_window(document) else trap("web_test: the document has no window")
+    let frames = new WorkerAnimationFrames(window = window, client = page.client, remaining = 2) else trap("out of memory")
+    worker_request_animation_frame(frames)
+    while frames.remaining > 0:
+        discard(event_loop.pump(web.CoreEventLoopPumpMode.wait_for_events))
+    worker_stage("painted")
+
+# mark: Screenshots =============================================================================
+
+## A screenshot of the page (test-web's TestWebView::take_screenshot: the traversable's screenshot
+## task, whose bitmap reaches the client).
+func worker_take_screenshot(page: const WorkerPage*, event_loop: WorkerEventLoop*) -> gfx.Bitmap*?:
+    let count = ak.vector_size(&page.client.m_screenshots)
+    web.html_traversable_navigable_queue_screenshot_task(page.traversable, none)
+    while ak.vector_size(&page.client.m_screenshots) == count:
+        discard(event_loop.pump(web.CoreEventLoopPumpMode.wait_for_events))
+    worker_stage("screenshot")
+    return ak.vector_at_const(&page.client.m_screenshots, count).m_bitmap

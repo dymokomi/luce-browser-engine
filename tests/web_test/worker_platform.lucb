@@ -1,0 +1,201 @@
+#==============================================================================================
+#
+#   worker_platform - the worker's platform: its event loop, plugins, fonts and VM
+#
+#   DESCRIPTION:
+#       What WebContent's main (Services/WebContent/main.cpp) installs before it serves a page,
+#       for one test in layout-test mode:
+#         - the process's event loop: Core::EventLoop over a timer registry and a queue of
+#           deferred invocations (LibCore's EventLoopImplementationUnix, minus file
+#           descriptors and signals, which phase 1 does not use), installed behind the
+#           engine's Core seam (external/lib_core/event_loop.lucb), and the
+#           Platform::EventLoopPlugin over it;
+#         - the fonts: a PathFontProvider with the test fonts (resource://fonts in Ladybird:
+#           SerenitySans and Noto Emoji, here tests/libweb/fonts) and Platform::FontPlugin in
+#           layout-test mode, which maps every generic family to SerenitySans. Ladybird's
+#           FontPlugin also loads the system's font directories; tests that depend on them
+#           are not portable, so the worker loads only the test fonts (DESIGN.md §6.1);
+#         - the main thread VM (Bindings::initialize_main_thread_vm with a similar-origin
+#           window agent).
+#
+#       The loop lives in the worker's main frame (worker_main), so the conservative scan of
+#       the stack keeps the managed storage of its timer registry and deferred queue alive:
+#       a registered Core::Timer stays alive until it is unregistered (LibCore holds a weak
+#       pointer to its owner; here a timer whose owner was collected without stopping it
+#       cannot fire into freed memory).
+#
+#       Copyright (c) 2018-2026, the Ladybird developers.
+#       Copyright (c) 2026 the luce-browser authors.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: The event loop ==========================================================================
+
+## A registered timer (LibCore's EventLoopTimer): fires `timer` at `fire_time` (time.now()
+## nanoseconds), then every `interval_ms` while it stays registered.
+struct LoopTimer:
+    var timer: web.CoreTimer*
+    var id: isize
+    var interval_ms: i32
+    var should_reload: bool
+    var fire_time: u64
+
+## The worker's event loop (web.CoreEventLoopImplementation): one thread, no file descriptors.
+struct WorkerEventLoop: web.CoreEventLoopImplementation:
+    var timers: ak.Vector[LoopTimer]
+    var next_timer_id: isize
+    var deferred: ak.Vector[ak.Function0[unit]]
+    var exit_requested: bool
+    var exit_code: i32
+
+    ## Runs the deferred invocations queued so far, then fires the timers that are due; in
+    ## wait_for_events mode, first sleeps until a timer is due when nothing else is pending.
+    ## Answers how many events were processed. With nothing queued and no timer registered,
+    ## nothing can ever happen in this process: the test is stalled, and the worker stops.
+    mutating func pump(mode: web.CoreEventLoopPumpMode) -> usize:
+        if mode == web.CoreEventLoopPumpMode.wait_for_events and ak.vector_is_empty(&self.deferred):
+            if let next = self.next_fire_time():
+                let now = time.now()
+                if next > now:
+                    thread.sleep((next - now + 999999) // 1000000)
+            else:
+                trap("web_test: stalled: the event loop has nothing left to run")
+        var processed: usize = 0
+
+        # Deferred invocations queued while these run wait for the next pump.
+        let pending = self.deferred
+        self.deferred = ak.Vector[ak.Function0[unit]]()
+        for index in 0..<ak.vector_size(&pending):
+            var function = *ak.vector_at_const(&pending, index)
+            ak.function0_call(&function)
+            processed += 1
+
+        # The timers due now, by id; each is looked up again before it fires, since firing one
+        # may stop another.
+        let now = time.now()
+        var due: ak.Vector[isize]
+        for index in 0..<ak.vector_size(&self.timers):
+            let entry = ak.vector_at_const(&self.timers, index)
+            if entry.fire_time <= now:
+                ak.vector_append_t(&due, entry.id)
+        for index in 0..<ak.vector_size(&due):
+            let id = *ak.vector_at_const(&due, index)
+            let slot = self.find_timer(id) else continue
+            let entry = ak.vector_at(&self.timers, slot)
+            let timer = entry.timer
+            if entry.should_reload:
+                entry.fire_time = now + (u64)entry.interval_ms * 1000000
+            else:
+                discard(ak.vector_take(&self.timers, slot))
+            web.core_timer_timer_event(timer)
+            processed += 1
+        return processed
+
+    mutating func quit(code: i32):
+        self.exit_requested = true
+        self.exit_code = code
+
+    mutating func was_exit_requested() -> bool:
+        return self.exit_requested
+
+    mutating func wake():
+        return  # One thread: nothing waits while code runs.
+
+    mutating func deferred_invoke(function: ak.Function0[unit]):
+        ak.vector_append_t(&self.deferred, function)
+
+    mutating func register_timer(timer: web.CoreTimer*, milliseconds: i32, should_reload: bool) -> isize:
+        self.next_timer_id += 1
+        let interval = milliseconds if milliseconds > 0 else 0
+        ak.vector_append_t(&self.timers, LoopTimer(timer = timer, id = self.next_timer_id, interval_ms = interval,
+                                                   should_reload = should_reload, fire_time = time.now() + (u64)interval * 1000000))
+        return self.next_timer_id
+
+    mutating func unregister_timer(timer_id: isize):
+        if let slot = self.find_timer(timer_id):
+            discard(ak.vector_take(&self.timers, slot))
+
+    ## The index of the registered timer `id`, if it is registered.
+    func find_timer(id: isize) -> usize?:
+        for index in 0..<ak.vector_size(&self.timers):
+            if ak.vector_at_const(&self.timers, index).id == id:
+                return index
+        return none
+
+    ## When the next timer is due, if any is registered.
+    func next_fire_time() -> u64?:
+        var next: u64? = none
+        for index in 0..<ak.vector_size(&self.timers):
+            let fire_time = ak.vector_at_const(&self.timers, index).fire_time
+            if let earliest = next:
+                if fire_time < earliest:
+                    next = fire_time
+            else:
+                next = fire_time
+        return next
+
+    ## Whether anything is queued or due right now.
+    func has_pending_events() -> bool:
+        if not ak.vector_is_empty(&self.deferred):
+            return true
+        let now = time.now()
+        for index in 0..<ak.vector_size(&self.timers):
+            if ak.vector_at_const(&self.timers, index).fire_time <= now:
+                return true
+        return false
+
+## Pumps `event_loop` until nothing is queued or due (timers due later are left alone).
+func worker_drain(event_loop: WorkerEventLoop*):
+    while event_loop.has_pending_events():
+        discard(event_loop.pump(web.CoreEventLoopPumpMode.dont_wait_for_events))
+
+## The EventLoopPlugin (a stateless object in the C heap, as WebContent's `new EventLoopPlugin`).
+func worker_install_event_loop(event_loop: WorkerEventLoop*):
+    web.core_event_loop_install(event_loop)
+    let plugin = (new web.PlatformEventLoopPlugin in memory.heap) else trap("out of memory")
+    web.platform_event_loop_plugin_install(plugin)
+
+# mark: Fonts ===================================================================================
+
+## The test fonts in `directory` as the system fonts (WebContent's PathFontProvider over
+## resource://fonts) and the FontPlugin in layout-test mode: Platform::FontPlugin's constructor
+## (platform/font_plugin.lucb) without the system's font directories, in the C heap as it is.
+func worker_install_fonts(directory: str):
+    let provider = web_fonts.path_font_provider_create()
+    discard(web_fonts.font_database_install_system_font_provider(web_fonts.font_database_the(), (web_fonts.SystemFontProvider*)provider))
+    var uri = ak.string_builder_new()
+    with memory.heap:
+        ak.string_builder_append(&uri, "file://")
+        ak.string_builder_append(&uri, directory)
+    let uri_view = ak.string_builder_string_view(&uri)
+    web_fonts.path_font_provider_load_all_fonts_from_uri(provider, uri_view)
+
+    let c_heap = web_fonts.font_allocators_c_heap()
+    let previous = web_fonts.font_allocators_enter(&c_heap)
+    defer web_fonts.font_allocators_leave(previous)
+    with memory.heap:
+        let plugin = (new web.PlatformFontPlugin(m_default_fixed_width_font = none, m_is_layout_test_mode = true)) else trap("out of memory")
+        web.platform_font_plugin_update_generic_fonts(plugin)
+        let default_fixed_width_font_name = web.platform_font_plugin_generic_font_name(plugin, web.PlatformGenericFont.ui_monospace, 400, 0)
+        plugin.m_default_fixed_width_font = web_fonts.font_database_get(web_fonts.font_database_the(), default_fixed_width_font_name, 12.0, 400, (u32)web_fonts.FontWidth.normal, 0)
+        assert(plugin.m_default_fixed_width_font != none, "the test fonts provide the default fixed-width font")
+        ak.vector_append_t(&plugin.m_symbol_font_names, ak.fly_string_from_str("Noto Emoji"))
+        web.platform_font_plugin_install(plugin)
+
+# mark: The VM ==================================================================================
+
+## Everything WebContent's main sets up before its first page: the strings, the event loop and
+## its plugin, the fonts, and the main thread VM. Answers the VM.
+func worker_initialize_platform(event_loop: WorkerEventLoop*, root: str) -> web.Vm*:
+    web.web_initialize_strings()
+    worker_install_event_loop(event_loop)
+    var fonts = ak.string_builder_new()
+    with memory.heap:
+        ak.string_builder_append(&fonts, root)
+        ak.string_builder_append(&fonts, "/fonts")
+    let fonts_view = ak.string_builder_string_view(&fonts)
+    worker_install_fonts(ak.string_view_text(fonts_view))
+    web.bind_initialize_main_thread_vm(web.BindAgentType.similar_origin_window)
+    worker_stage("platform")
+    return web.bind_main_thread_vm()

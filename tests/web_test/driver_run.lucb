@@ -1,0 +1,277 @@
+#==============================================================================================
+#
+#   driver_run - running the tests: one worker process per test, in parallel, with a timeout
+#
+#   DESCRIPTION:
+#       A luce-base trap cannot be caught and must not end the run (the luce-js test262 runner
+#       splits for the same reason), so every test runs in a child process: this program with
+#       `--one PATH --mode MODE --out FILE`, through luce-std's process.Command, which runs the
+#       child on a worker thread, captures its standard output and error and can stop it. Up
+#       to -j children run at once; one that is still running after --timeout seconds is
+#       stopped (test-web's per-test timeout, 30 s by default).
+#
+#       A child's outcome: it exited 0 having written its result (then the result is judged:
+#       a Layout dump against its expectation, "pass" or "fail" from a Ref or Crash worker), it
+#       trapped (its standard error holds "trap: FILE:LINE:COLUMN: MESSAGE"; an `unported:`
+#       message names the next function the test needs), it died some other way (a signal, an
+#       exit status), or it timed out. The last "web_test: stage NAME" line it wrote tells how
+#       far it got.
+#
+#       A Layout test that trapped or crashed is run a second time with --no-rendering, which
+#       dumps the page after its load without ever rendering it (worker_modes), so that its
+#       layout can be compared while painting is not ported; that comparison is reported beside
+#       the result, which stays a failure.
+#
+#       Copyright (c) 2026 the luce-browser authors.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Results =================================================================================
+
+## How a test ended.
+enum Outcome:
+    pass
+    fail
+    trapped
+    crash
+    timeout
+    skipped
+
+## The name of an outcome in the summary and results.tsv.
+func outcome_name(outcome: Outcome) -> str:
+    return match outcome:
+        .pass => "pass"
+        .fail => "fail"
+        .trapped => "trap"
+        .crash => "crash"
+        .timeout => "timeout"
+        .skipped => "skipped"
+
+## What a test's run gave.
+struct TestResult:
+    var outcome: Outcome
+    var skip: SkipReason
+    ## The last stage the worker reported.
+    var stage: str
+    ## The trap's message, for a trap.
+    var trap_message: str
+    ## What differed, for a failure; how it died, for a crash.
+    var detail: str
+    ## The worker's result (a Layout test's dumps, also when it stopped partway).
+    var output: str
+    ## The worker's standard output and error.
+    var log: str
+    ## Layout: whether the layout tree (the first of the three dumps) matches.
+    var layout_tree_matches: bool
+    ## Layout: whether the second run without rendering was made, and what it gave.
+    var retried_without_rendering: bool
+    var dumps_match_without_rendering: bool
+    var layout_tree_matches_without_rendering: bool
+    ## The second run's trap message, if it trapped.
+    var trap_message_without_rendering: str
+
+# mark: Judging a worker ========================================================================
+
+## The text after the last "web_test: stage " line of `log`, or "start".
+func last_stage(log: str) -> str:
+    var stage = "start"
+    var lines = strings.SplitIterator.over(log, "\n") catch failure: return stage
+    while let line = lines.next():
+        if strings.starts_with(line, "web_test: stage "):
+            stage = (str)line.bytes["web_test: stage ".length..]
+    return stage
+
+## The message of the trap `log` reports ("trap: FILE:LINE:COLUMN: MESSAGE"), if any.
+func trap_message(log: str) -> str?:
+    var lines = strings.SplitIterator.over(log, "\n") catch failure: return none
+    while let line = lines.next():
+        if strings.starts_with(line, "trap: "):
+            let location_and_message = (str)line.bytes["trap: ".length..]
+            if let parts = strings.split_once(location_and_message, ": "):
+                return parts.1
+            return location_and_message
+    return none
+
+## `text` without its trailing newlines (test-web compares trimmed texts).
+func trim_trailing_newlines(text: str) -> str:
+    var end = text.length
+    while end > 0 and text.bytes[end - 1] == '\n':
+        end -= 1
+    return (str)text.bytes[..<end]
+
+## The layout tree of a Layout result: what comes before the paint tree's first line.
+func layout_tree_part(text: str) -> str:
+    let boundaries: str[3] = ["\n\nViewportPaintable", "\n\n(no paint tree)", "\n\n(no layout tree)"]
+    var end = text.length
+    for boundary in boundaries:
+        if let at = strings.find(text, boundary):
+            if at + 1 < end:
+                end = at + 1
+    return trim_trailing_newlines((str)text.bytes[..<end])
+
+## The contents of the file `path` as text, if it can be read.
+func read_text_file(path: str) -> str?:
+    let data = files.read(c_path(path)) catch failure: return none
+    return (str)data
+
+## Judges a Layout result against its expectation: the outcome, what differed, and whether the
+## layout tree matches.
+func judge_layout(test_case: const Test*, output: str) -> (Outcome, str, bool):
+    let expectation_path = test_case.expectation_path else return (Outcome.fail, "no expectation", false)
+    let expected = read_text_file(expectation_path) else return (Outcome.fail, "no expectation", false)
+    let tree_matches = layout_tree_part(output) == layout_tree_part(expected)
+    if trim_trailing_newlines(output) == trim_trailing_newlines(expected):
+        return (Outcome.pass, "", true)
+    return (Outcome.fail, "the layout tree differs" if not tree_matches else "the paint or stacking-context tree differs", tree_matches)
+
+## The result of a finished worker: its exit status (none when it was stopped or died), its log
+## and its result file.
+func judge(test_case: const Test*, exit_code: i64?, failure: str, log: str, out_path: str) -> TestResult:
+    var result = TestResult(outcome = Outcome.crash, skip = SkipReason.none_, stage = last_stage(log), trap_message = "", detail = "",
+                            output = read_text_file(out_path) else "", log = log)
+    if test_case.mode == TestMode.layout:
+        let expectation_path = test_case.expectation_path else ""
+        if let expected = read_text_file(expectation_path):
+            result.layout_tree_matches = result.output.length > 0 and layout_tree_part(result.output) == layout_tree_part(expected)
+    if let message = trap_message(log):
+        result.outcome = Outcome.trapped
+        result.trap_message = message
+        return result
+    if exit_code == none:
+        result.detail = failure if failure.length > 0 else "the worker died"
+        return result
+    let code = exit_code else trap("unreachable")
+    if code != 0:
+        result.detail = cat(["the worker exited with status ", format_count((u64)code)])
+        return result
+    match test_case.mode:
+        .layout:
+            let (outcome, detail, tree_matches) = judge_layout(test_case, result.output)
+            result.outcome = outcome
+            result.detail = detail
+            result.layout_tree_matches = tree_matches
+        .ref, .crash:
+            if trim_trailing_newlines(result.output) == "pass":
+                result.outcome = Outcome.pass
+            else:
+                result.outcome = Outcome.fail
+                result.detail = "the screenshots differ" if test_case.mode == TestMode.ref else "no result"
+    return result
+
+## `value` in decimal.
+func format_count(value: u64) -> str:
+    var buffer: u8[24]
+    let text = strings.format_u64(value, buffer) catch failure: return "?"
+    return strings.copy(text) catch failure: trap("out of memory")
+
+# mark: Running workers =========================================================================
+
+## The workers run at once by default: one per processor.
+func default_jobs() -> usize:
+    return (usize)os.cpus()
+
+## A test to run: its index among the tests, and whether this is the second run, without
+## rendering.
+struct Job:
+    var index: usize
+    var no_rendering: bool
+
+## A running worker.
+struct Running:
+    var job: Job
+    var command: process.Command
+    var started: u64
+    var out_path: str
+
+## Starts the worker of `job`.
+func start_job(options: const Options*, program: str, work: str, tests: const Test[], job: Job) -> Running:
+    let test_case = &tests[job.index]
+    let out_path = cat([work, "/", format_count((u64)job.index), ".out" if not job.no_rendering else ".retry.out"])
+    let mode = test_mode_name(test_case.mode)
+    let input = cat([options.root, "/", test_case.relative_path])
+    var command: process.Command = ---
+    if job.no_rendering:
+        let arguments: str[9] = ["--one", input, "--mode", mode, "--root", options.root, "--out", out_path, "--no-rendering"]
+        command = process.Command(program, arguments, output_limit = 4194304) catch failure: trap(f"web_test: cannot start a worker: {failure.message}")
+    else:
+        let arguments: str[8] = ["--one", input, "--mode", mode, "--root", options.root, "--out", out_path]
+        command = process.Command(program, arguments, output_limit = 4194304) catch failure: trap(f"web_test: cannot start a worker: {failure.message}")
+    return Running(job = job, command = command, started = time.now(), out_path = out_path)
+
+## The captured output of a finished command.
+func command_output(command: const process.Command*) -> str:
+    let owned = command.output() catch failure: return ""
+    let text = strings.copy(owned.value) catch failure: trap("out of memory")
+    owned.release()
+    return text
+
+## Why a finished command failed, if it did.
+func command_failure(command: const process.Command*) -> str:
+    let owned = command.error_message() catch failure: return ""
+    let text = strings.copy(owned.value) catch failure: trap("out of memory")
+    owned.release()
+    return text
+
+## Runs every test that is not skipped, -j at a time, and answers their results in test order.
+func run_tests(options: const Options*, tests: const Test[], skips: const SkipReason[], work: str) -> ak.Vector[TestResult]:
+    let program = os.executable() catch failure: trap("web_test: cannot find its own executable")
+    var results: ak.Vector[TestResult]
+    var queue: ak.Vector[Job]
+    for index in 0..<tests.length:
+        ak.vector_append_t(&results, TestResult(outcome = Outcome.skipped, skip = skips[index], stage = "", trap_message = "", detail = "", output = "", log = "", trap_message_without_rendering = ""))
+        if skips[index] == SkipReason.none_:
+            ak.vector_append_t(&queue, Job(index = index, no_rendering = false))
+
+    let timeout = options.timeout_seconds * 1000000000
+    var running: ak.Vector[Running]
+    var next: usize = 0
+    var finished: usize = 0
+    while next < ak.vector_size(&queue) or not ak.vector_is_empty(&running):
+        while next < ak.vector_size(&queue) and ak.vector_size(&running) < options.jobs:
+            ak.vector_append_t(&running, start_job(options, program, work, tests, *ak.vector_at_const(&queue, next)))
+            next += 1
+
+        var slot: usize = 0
+        var progressed = false
+        while slot < ak.vector_size(&running):
+            let worker = ak.vector_at(&running, slot)
+            let timed_out = time.since(worker.started) > timeout
+            if not worker.command.is_finished() and not timed_out:
+                slot += 1
+                continue
+            progressed = true
+            var done = ak.vector_take(&running, slot)
+            let test_case = &tests[done.job.index]
+            var result: TestResult = ---
+            if not done.command.is_finished():
+                done.command.cancel()
+                let log = command_output(&done.command)
+                done.command.close()
+                result = TestResult(outcome = Outcome.timeout, skip = SkipReason.none_, stage = last_stage(log), trap_message = "",
+                                    detail = cat(["no result after ", format_count(options.timeout_seconds), " s"]), output = "", log = log)
+            else:
+                let log = command_output(&done.command)
+                let failure = command_failure(&done.command)
+                let exit_code = done.command.exit_code()
+                done.command.close()
+                let status: i64? = exit_code if failure.length == 0 else none
+                result = judge(test_case, status, failure, log, done.out_path)
+
+            if done.job.no_rendering:
+                let first = ak.vector_at(&results, done.job.index)
+                first.retried_without_rendering = true
+                first.dumps_match_without_rendering = result.outcome == Outcome.pass
+                first.layout_tree_matches_without_rendering = result.layout_tree_matches
+                first.trap_message_without_rendering = result.trap_message
+                continue
+            *ak.vector_at(&results, done.job.index) = result
+            finished += 1
+            if options.verbose:
+                print(f"{finished}/{ak.vector_size(&queue)} {outcome_name(result.outcome)} {test_case.relative_path}")
+            # It stopped before its dumps: run the dumps without rendering (see the header).
+            if test_case.mode == TestMode.layout and (result.outcome == Outcome.trapped or result.outcome == Outcome.crash):
+                ak.vector_append_t(&queue, Job(index = done.job.index, no_rendering = true))
+        if not progressed:
+            thread.sleep(2)
+    return results

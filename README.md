@@ -26,7 +26,9 @@ of this repository.
 
 ## Testing
 
-`./test.sh` type-checks every module.
+`./test.sh` type-checks every module, runs the unit tests and the generators' comparisons, then runs
+Ladybird's phase-1 Layout, Ref and Crash tests (copied in `tests/libweb`) through the headless runner
+`tests/web_test` against `tests/expected_failures` (see `docs/regions/r57.md`).
 
 ## License
 

@@ -1,0 +1,269 @@
+#==============================================================================================
+#
+#   worker_modes - one test in the worker: the Layout, Ref and Crash modes
+#
+#   DESCRIPTION:
+#       What test-web does with a test once the page is loaded (Tests/LibWeb/test-web/main.cpp
+#       run_dump_test, run_ref_test), natively:
+#
+#       Layout: afterFontsAndPaint, a screenshot ("to force the lazy layout of SVG-as-image
+#       documents"), then the page's internal info for LayoutTree | PaintTree |
+#       StackingContextTree (Services/WebContent/ConnectionFromClient.cpp
+#       request_internal_page_info: append_layout_tree, append_paint_tree,
+#       append_stacking_context_tree, joined by a newline). Each part is written as soon as it
+#       is made, so a worker that traps on the way leaves the parts it finished.
+#
+#       --no-rendering is a diagnostic for the driver's second try at a Layout test that did not
+#       get to its dumps: the page stays hidden, so the event loop's "update the rendering" never
+#       renders it (nor resolves document.fonts.ready, nor runs animation frames), and the dumps
+#       are taken as soon as the document has loaded; Document::update_layout lays it out, and
+#       LayoutState::commit makes its paintables, but nothing is painted. It tells whether the
+#       layout is right while painting is not ported; it is not the test.
+#
+#       Ref: afterFontsAndPaint and a screenshot of the test; its reference metadata
+#       (Libraries/LibWeb/Internals/Internals.cpp load_reference_test_metadata: the
+#       `<link rel=match|mismatch>` references and `<meta name=fuzzy>` configurations); the
+#       first reference loaded into the same page, waited for and taken a screenshot of; the
+#       two compared (fuzzy.lucb). The result is a line "pass" or "fail".
+#
+#       Crash: afterFontsAndPaint; the result is "pass" (a test fails only by not getting
+#       there: a trap, a signal or the driver's timeout).
+#
+#       Copyright (c) 2024-2026, the Ladybird developers.
+#       Copyright (c) 2026 the luce-browser authors.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: The result ==============================================================================
+
+## Where the worker writes its result: the --out file, or standard output.
+struct WorkerOutput:
+    var file: files.File?
+
+    ## Writes `text` (all of it).
+    mutating func put(text: str):
+        var bytes = text.bytes
+        while bytes.length > 0:
+            var written: usize = 0
+            if self.file != none:
+                var file = self.file else trap("unreachable")
+                written = file.write(bytes) catch failure: trap("web_test: cannot write the result")
+            else:
+                written = io.stdout().write(bytes) catch failure: trap("web_test: cannot write the result")
+            bytes = bytes[written..]
+
+## The output of `path` (replaced), or standard output without one.
+func worker_open_output(path: str?) -> WorkerOutput:
+    if let output_path = path:
+        let file = files.File.open(c_path(output_path), files.OpenMode.replace) catch failure: trap("web_test: cannot open the result file")
+        return WorkerOutput(file = file)
+    return WorkerOutput(file = none)
+
+## Writes the text of `builder` and empties it.
+func worker_put_builder(output: WorkerOutput*, builder: ak.StringBuilder*):
+    let view = ak.string_builder_string_view(builder)
+    output.put(ak.string_view_text(view))
+    ak.string_builder_clear(builder)
+
+# mark: Reading tests ===========================================================================
+
+## The absolute form of `path` (test-web loads tests by their real path).
+func worker_absolute_path(path: str) -> str:
+    if strings.starts_with(path, "/"):
+        return path
+    let directory = os.cwd() catch failure: trap("web_test: no working directory")
+    let pieces: str[3] = [directory, "/", path]
+    return strings.join(pieces, "") catch failure: trap("out of memory")
+
+## The bytes of the file `path`.
+func worker_read_file(path: str) -> u8[]:
+    return files.read(c_path(path)) catch failure: trap(f"web_test: cannot read {path}")
+
+# mark: The page's internal info ================================================================
+
+## The active document of the page's top-level browsing context.
+func worker_active_document(page: const WorkerPage*) -> web.DomDocument*?:
+    return web.html_browsing_context_active_document(web.page_top_level_browsing_context(page.page))
+
+## append_layout_tree (WebContent/ConnectionFromClient.cpp).
+func worker_append_layout_tree(page: const WorkerPage*, builder: ak.StringBuilder*):
+    if let document = worker_active_document(page):
+        web.dom_document_update_layout(document, web.DomUpdateLayoutReason.debugging)
+        if let layout_root = web.dom_document_layout_node(document):
+            web.dump_tree_string_builder_layout_node(builder, (web.LayoutNode*)layout_root)
+        else:
+            ak.string_builder_append(builder, "(no layout tree)")
+    else:
+        ak.string_builder_append(builder, "(no DOM tree)")
+
+## append_paint_tree (WebContent/ConnectionFromClient.cpp).
+func worker_append_paint_tree(page: const WorkerPage*, builder: ak.StringBuilder*):
+    if let document = worker_active_document(page):
+        web.dom_document_update_layout(document, web.DomUpdateLayoutReason.debugging)
+        if let layout_root = web.dom_document_layout_node(document):
+            if let first_paintable = web.layout_node_first_paintable((web.LayoutNode*)layout_root):
+                web.dump_tree_string_builder_paint_paintable(builder, first_paintable)
+            else:
+                ak.string_builder_append(builder, "(no paint tree)")
+        else:
+            ak.string_builder_append(builder, "(no layout tree)")
+    else:
+        ak.string_builder_append(builder, "(no DOM tree)")
+
+## append_stacking_context_tree (WebContent/ConnectionFromClient.cpp).
+func worker_append_stacking_context_tree(page: const WorkerPage*, builder: ak.StringBuilder*):
+    if let document = worker_active_document(page):
+        web.dom_document_update_layout(document, web.DomUpdateLayoutReason.debugging)
+        if let layout_root = web.dom_document_layout_node(document):
+            if web.layout_node_first_paintable((web.LayoutNode*)layout_root) == none:
+                ak.string_builder_append(builder, "(no paint tree)")
+                return
+            let paintable_box = web.layout_box_paintable_box((web.LayoutBox*)layout_root) else trap("VERIFY: the viewport has a paintable box")
+            let viewport_paintable = web.as_paint_viewport_paintable(paintable_box)
+            web.paint_viewport_paintable_build_stacking_context_tree_if_needed(viewport_paintable)
+            if let stacking_context = web.paint_paintable_box_stacking_context((web.PaintPaintableBox*)viewport_paintable):
+                web.paint_stacking_context_dump(stacking_context, builder)
+        else:
+            ak.string_builder_append(builder, "(no layout tree)")
+    else:
+        ak.string_builder_append(builder, "(no DOM tree)")
+
+# mark: The modes ===============================================================================
+
+## The Layout mode: the dumps of the loaded page (see the header).
+func worker_run_layout(page: const WorkerPage*, event_loop: WorkerEventLoop*, document: web.DomDocument*, output: WorkerOutput*, rendering: bool):
+    if rendering:
+        worker_after_fonts_and_paint(page, event_loop, document)
+        discard(worker_take_screenshot(page, event_loop))
+
+    var builder = ak.string_builder_new()
+    worker_append_layout_tree(page, &builder)
+    worker_put_builder(output, &builder)
+    worker_stage("layout-tree")
+    ak.string_builder_append(&builder, "\n")
+    worker_append_paint_tree(page, &builder)
+    worker_put_builder(output, &builder)
+    worker_stage("paint-tree")
+    ak.string_builder_append(&builder, "\n")
+    worker_append_stacking_context_tree(page, &builder)
+    worker_put_builder(output, &builder)
+    worker_stage("stacking-context-tree")
+
+## The match or mismatch references and fuzzy configurations of a reftest
+## (Internals::load_reference_test_metadata).
+struct WorkerReferenceMetadata:
+    var match_references: ak.Vector[web_url.Url]
+    var mismatch_references: ak.Vector[web_url.Url]
+    var fuzzy: ak.Vector[FuzzyMatch]
+
+## The URLs of the `link[rel=type]` elements' hrefs (load_reference_test_metadata's
+## collect_references).
+func worker_collect_references(document: web.DomDocument*, selector: str) -> ak.Vector[web_url.Url]:
+    var references: ak.Vector[web_url.Url]
+    let reference_nodes = web.dom_parent_node_query_selector_all((web.DomParentNode*)document, ak.sv(selector)) else trap("MUST: query_selector_all")
+    for i in 0..<web.dom_node_list_length(reference_nodes):
+        let reference_node = web.dom_node_list_item(reference_nodes, i) else continue
+        let href = web.dom_element_get_attribute_value(web.as_dom_element(reference_node), web.html_attribute_names_href)
+        let href_view = ak.string_bytes_as_string_view(&href)
+        let url = web.dom_document_encoding_parse_url(document, href_view) else trap(f"web_test: Failed to construct URL for '{ak.string_view_text(href_view)}'")
+        ak.vector_append_t(&references, url)
+    return references
+
+## Internals::load_reference_test_metadata of the page's active document.
+func worker_load_reference_test_metadata(page: const WorkerPage*) -> WorkerReferenceMetadata:
+    let document = worker_active_document(page) else trap("web_test: No active document available")
+    var metadata = WorkerReferenceMetadata(match_references = worker_collect_references(document, "link[rel=match]"),
+                                           mismatch_references = worker_collect_references(document, "link[rel=mismatch]"))
+
+    # Collect all <meta name="fuzzy" content=".."> values.
+    let fuzzy_nodes = web.dom_parent_node_query_selector_all((web.DomParentNode*)document, ak.sv("meta[name=fuzzy]")) else trap("MUST: query_selector_all")
+    for i in 0..<web.dom_node_list_length(fuzzy_nodes):
+        let fuzzy_node = web.dom_node_list_item(fuzzy_nodes, i) else continue
+        let content_string = web.dom_element_get_attribute_value(web.as_dom_element(fuzzy_node), web.html_attribute_names_content)
+        var content = ak.string_view_text(ak.string_bytes_as_string_view(&content_string))
+        var reference: web_url.Url? = none
+        if let parts = strings.split_once(content, ":"):
+            reference = web.dom_document_encoding_parse_url(document, ak.sv(parts.0))
+            content = parts.1
+        # test-web's on_reference_test_metadata: a configuration that does not parse is skipped.
+        let fuzzy_match = parse_fuzzy_match(reference, content) catch failure:
+            io.stderr().write(f"Failed to parse fuzzy configuration '{content}': {failure.message}\n") catch ignored: continue
+            continue
+        ak.vector_append_t(&metadata.fuzzy, fuzzy_match)
+    return metadata
+
+## Loads the HTML file of `url` into the page and waits for it as test-web waits for a test.
+func worker_load_and_wait(page: const WorkerPage*, event_loop: WorkerEventLoop*, vm: web.Vm*, url: web_url.Url) -> web.DomDocument*:
+    let path_string = web_url.url_file_path(&url)
+    let path = ak.string_view_text(ak.byte_string_view(&path_string))
+    if not strings.ends_with(path, ".html") and not strings.ends_with(path, ".htm"):
+        trap(f"web_test: unported (P2): loading a document that is not HTML ({path})")
+    let bytes = worker_read_file(path)
+    let document = worker_load_document(page, vm, url, bytes)
+    worker_wait_for_load(page, event_loop, &url)
+    return document
+
+## The Ref mode (see the header): writes "pass" or "fail".
+func worker_run_ref(page: const WorkerPage*, event_loop: WorkerEventLoop*, vm: web.Vm*, url: web_url.Url, document: web.DomDocument*, output: WorkerOutput*):
+    worker_after_fonts_and_paint(page, event_loop, document)
+    let actual = worker_take_screenshot(page, event_loop) else trap("web_test: the screenshot has no bitmap")
+
+    let metadata = worker_load_reference_test_metadata(page)
+    if ak.vector_is_empty(&metadata.match_references) and ak.vector_is_empty(&metadata.mismatch_references):
+        trap("VERIFY_NOT_REACHED: no match or mismatch references")
+
+    # FIXME (test-web): Currently we only support single match or mismatch reference.
+    var should_match = true
+    var reference_url: web_url.Url = ---
+    if not ak.vector_is_empty(&metadata.match_references):
+        reference_url = *ak.vector_at_const(&metadata.match_references, 0)
+    else:
+        should_match = false
+        reference_url = *ak.vector_at_const(&metadata.mismatch_references, 0)
+
+    let reference_document = worker_load_and_wait(page, event_loop, vm, reference_url)
+    worker_stage("reference-loaded")
+    worker_after_fonts_and_paint(page, event_loop, reference_document)
+    let expected = worker_take_screenshot(page, event_loop) else trap("web_test: the screenshot has no bitmap")
+
+    let test_url_string = web_url.url_serialize(&url)
+    let test_url = ak.string_view_text(ak.string_bytes_as_string_view(&test_url_string))
+    let screenshot_matches = fuzzy_screenshot_match(test_url, &reference_url, actual, expected, ak.vector_span_const(&metadata.fuzzy), should_match)
+    output.put("pass\n" if should_match == screenshot_matches else "fail\n")
+
+## The Crash mode: getting here is passing.
+func worker_run_crash(page: const WorkerPage*, event_loop: WorkerEventLoop*, document: web.DomDocument*, output: WorkerOutput*):
+    worker_after_fonts_and_paint(page, event_loop, document)
+    output.put("pass\n")
+
+# mark: The worker ==============================================================================
+
+## Runs the test at `path` in `options.mode` (web_test --one PATH --mode MODE). Answers the
+## exit status: 0 once the result is written (a failed comparison is a result too).
+func worker_main(path: str, options: const Options*) -> i32:
+    # The loop lives in this frame for the whole run (see worker_platform).
+    var event_loop = WorkerEventLoop(next_timer_id = 0, exit_requested = false, exit_code = 0)
+    let vm = worker_initialize_platform(&event_loop, options.root)
+    let heap = web.vm_heap(vm)
+    let allocator: memory.Allocator = heap
+    with allocator:
+        var output = worker_open_output(options.out)
+        let page = worker_create_page(vm, &event_loop, not options.no_rendering)
+        # WebContent's PageHost holds its client (GC::Root).
+        var client_root = gc.root_create(page.client)
+        defer gc.root_release(&client_root)
+        worker_stage("page")
+
+        let absolute_path = worker_absolute_path(path)
+        let url = worker_file_url(absolute_path)
+        let bytes = worker_read_file(absolute_path)
+        let document = worker_load_document(&page, vm, url, bytes)
+        worker_wait_for_load(&page, &event_loop, &url)
+
+        match options.mode:
+            .layout: worker_run_layout(&page, &event_loop, document, &output, not options.no_rendering)
+            .ref: worker_run_ref(&page, &event_loop, vm, url, document, &output)
+            .crash: worker_run_crash(&page, &event_loop, document, &output)
+        worker_stage("done")
+    return 0
