@@ -1,0 +1,436 @@
+#==============================================================================================
+#
+#   svg_filter_element - SVG::SVGFilterElement: <filter>
+#
+#   DESCRIPTION:
+#       Port of LibWeb/SVG/SVGFilterElement.cpp (lines 1-473) with the inline members of
+#       SVGFilterElement.h (https://drafts.fxtf.org/filter-effects/#FilterElement): the
+#       filterUnits and primitiveUnits attributes, the filter region reflections, and the
+#       Gfx::Filter graph built from the filter primitive children (flood, blend, component
+#       transfer, composite, Gaussian blur, color matrix, image, merge, morphology, offset, drop
+#       shadow, turbulence, displacement map), each primitive's `in`/`in2` resolved against
+#       the named results before it.
+#
+#       gfx_filter's lambdas are functions over SvgFilterElementGfxFilterState (the result map
+#       and the root filter they capture by reference). The `Optional<Filter const&>` the
+#       Gfx::Filter factories take is a pointer to a local copy (svg_filter_ref).
+#
+#==============================================================================================
+
+# mark: Construction and attributes ==============================================================
+
+## Ported from Libraries/LibWeb/SVG/SVGFilterElement.cpp:42 Web::SVG::SVGFilterElement::SVGFilterElement.
+pub func svg_filter_element_construct(this: SvgFilterElement*, document: DomDocument*, qualified_name: DomQualifiedName):
+    svg_element_construct(this.svg_element(), document, qualified_name)
+    # The vptrs of the mixin bases move to SVGFilterElement's tables.
+    let element = this.svg_element()
+    element.element.slottable_mixin.vtable = &svg_filter_element_slottable_mixin_vtable
+    element.element.aria_mixin.vtable = &svg_filter_element_aria_mixin_vtable
+    element.element.animatable.vtable = &svg_filter_element_animatable_vtable
+    element.global_event_handlers.vtable = &svg_filter_element_global_event_handlers_vtable
+
+## Ported from Libraries/LibWeb/SVG/SVGFilterElement.cpp:47 Web::SVG::SVGFilterElement::initialize (override).
+pub func svg_filter_element_initialize_impl(base: JsCell*, realm: Realm*):
+    web_set_prototype_for_interface(base, realm, BindInterfaceName.svg_filter_element)
+    svg_element_initialize_impl(base, realm)
+
+## Ported from Libraries/LibWeb/SVG/SVGFilterElement.cpp:53 Web::SVG::SVGFilterElement::visit_edges (override).
+pub func svg_filter_element_visit_edges_impl(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (SvgFilterElement*)base
+    svg_element_visit_edges_impl(base, visitor)
+    svg_svguri_reference_mixin_visit_edges(&this.svguri_reference_mixin, visitor)
+
+## Ported from Libraries/LibWeb/SVG/SVGFilterElement.cpp:59 Web::SVG::SVGFilterElement::attribute_changed (override).
+pub func svg_filter_element_attribute_changed_impl(base: DomElement*, name: ak.FlyString, old_value: ak.String?, value: ak.String?, namespace_: ak.FlyString?):
+    let this = (SvgFilterElement*)base
+    svg_element_attribute_changed_impl(base, name, old_value, value, namespace_)
+
+    let value_text = value else ak.String()  # value.value_or({})
+    if ak.fly_string_eq_fly_string(&name, &svg_attribute_names_filter_units):
+        this.m_filter_units = svg_attribute_parser_parse_units(ak.string_bytes_as_string_view(&value_text))
+    elif ak.fly_string_eq_fly_string(&name, &svg_attribute_names_primitive_units):
+        this.m_primitive_units = svg_attribute_parser_parse_units(ak.string_bytes_as_string_view(&value_text))
+
+# mark: gfx_filter's helpers =====================================================================
+
+## What gfx_filter's lambdas capture by reference: the named results and the filter built so far.
+struct SvgFilterElementGfxFilterState:
+    var result_map: ak.HashMap[ak.String, gfx.Filter, ak.StringTraits]
+    var root_filter: gfx.Filter?
+
+## gfx_filter's `update_result_map` lambda: the root filter is the primitive's named result.
+func svg_filter_element_update_result_map(state: SvgFilterElementGfxFilterState*, result_attribute: SvgAnimatedString*):
+    let result = svg_animated_string_base_val(result_attribute)
+    if not ak.string_is_empty(&result):
+        discard(ak.hash_map_set(&state.result_map, result, state.root_filter else trap("VERIFY: root_filter")))
+
+## The row-major 4x5 matrix of SourceAlpha and of feDropShadow's alpha channel.
+let svg_filter_element_alpha_matrix: f32[20] = [
+    0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 1.0, 0.0,
+]
+
+## gfx_filter's `resolve_input_filter` lambda.
+# https://www.w3.org/TR/filter-effects-1/#element-attrdef-filter-primitive-in
+func svg_filter_element_resolve_input_filter(state: SvgFilterElementGfxFilterState*, name: ak.String) -> gfx.Filter?:
+    # TODO: Add missing ones.
+    if ak.string_eq_string_view(&name, ak.sv("SourceGraphic")):
+        return none
+    if ak.string_eq_string_view(&name, ak.sv("SourceAlpha")):
+        return gfx.filter_color_matrix(svg_filter_element_alpha_matrix)
+
+    if let filter_from_map = ak.hash_map_get_k(&state.result_map, name):
+        return *filter_from_map
+
+    return state.root_filter
+
+## `Optional<Gfx::Filter>` as the `Optional<Filter const&>` a Gfx::Filter factory takes: `storage` holds a copy.
+func svg_filter_ref(filter: gfx.Filter?, storage: gfx.Filter*) -> const gfx.Filter*?:
+    let value = filter else return none
+    *storage = value
+    return storage
+
+## The composite primitive's `to_compositing_and_blending_operator` lambda.
+func svg_composite_to_compositing_and_blending_operator(operator_: SvgSvgfeCompositeElementCompositingOperator) -> gfx.CompositingAndBlendingOperator:
+    match operator_:
+        .over: return gfx.CompositingAndBlendingOperator.source_over
+        .in_: return gfx.CompositingAndBlendingOperator.source_in
+        .out: return gfx.CompositingAndBlendingOperator.destination_out
+        .atop: return gfx.CompositingAndBlendingOperator.source_a_top
+        .xor: return gfx.CompositingAndBlendingOperator.xor
+        .lighter: return gfx.CompositingAndBlendingOperator.lighter
+        _: return gfx.CompositingAndBlendingOperator.source_over
+
+## The displacement map primitive's `convert_channel_selector` lambda.
+func svg_convert_channel_selector(channel_selector: u16) -> gfx.ChannelSelector:
+    if channel_selector == (u16)SvgSvgfeDisplacementMapElementChannelSelector.red:
+        return gfx.ChannelSelector.red
+    if channel_selector == (u16)SvgSvgfeDisplacementMapElementChannelSelector.green:
+        return gfx.ChannelSelector.green
+    if channel_selector == (u16)SvgSvgfeDisplacementMapElementChannelSelector.blue:
+        return gfx.ChannelSelector.blue
+    if channel_selector == (u16)SvgSvgfeDisplacementMapElementChannelSelector.alpha:
+        return gfx.ChannelSelector.alpha
+    trap("VERIFY_NOT_REACHED")
+
+## The turbulence primitive's `type` lambda.
+func svg_turbulence_type(turbulence: SvgSvgfeTurbulenceElement*) -> gfx.TurbulenceType:
+    let turbulence_type = svg_animated_enumeration_base_val(svg_svgfe_turbulence_element_type(turbulence))
+    if turbulence_type == (u16)SvgSvgfeTurbulenceElementTurbulenceType.turbulence:
+        return gfx.TurbulenceType.turbulence
+    if turbulence_type == (u16)SvgSvgfeTurbulenceElementTurbulenceType.fractal_noise:
+        return gfx.TurbulenceType.fractal_noise
+    trap("VERIFY_NOT_REACHED")
+
+## The turbulence primitive's `tile_stitch_size` lambda.
+func svg_turbulence_tile_stitch_size(turbulence: SvgSvgfeTurbulenceElement*) -> gfx.IntSize:
+    let stitch_tiles = svg_animated_enumeration_base_val(svg_svgfe_turbulence_element_stitch_tiles(turbulence))
+    if stitch_tiles == (u16)SvgSvgfeTurbulenceElementStitchType.stitch:
+        # FIXME: Are these the correct width and height?
+        let attributes = &turbulence.svg_filter_primitive_standard_attributes
+        let width = svg_length_value(svg_animated_length_base_val(svg_filter_primitive_standard_attributes_width(attributes, turbulence.svg_element())))
+        let height = svg_length_value(svg_animated_length_base_val(svg_filter_primitive_standard_attributes_height(attributes, turbulence.svg_element())))
+        return gfx.IntSize(m_width = (i32)width, m_height = (i32)height)
+    if stitch_tiles == (u16)SvgSvgfeTurbulenceElementStitchType.no_stitch:
+        return gfx.IntSize()
+    trap("VERIFY_NOT_REACHED")
+
+## The color matrix primitive's parse of up to 20 numbers (`skip_leading_whitespace`, `consume_comma_and_whitespace`
+## and the loop): the matrix and how many numbers were read.
+func svg_parse_color_matrix_values(values_value: ak.String, matrix: f32[20]*) -> usize:
+    var count: usize = 0
+
+    var sv = ak.string_bytes_as_string_view(&values_value)
+    sv = ak.string_view_trim_whitespace(&sv, ak.TrimMode.left)
+    while not ak.string_view_is_empty(&sv) and count < 20:
+        # Parse the next number without trimming (we already trimmed on the left).
+        let result = ak.parse_first_number_string_view_f32(sv, ak.TrimWhitespace.no) else break
+        (*matrix)[count] = result.value
+        count += 1
+        # Advance exactly past the number just parsed, then consume optional comma + whitespace.
+        sv = ak.string_view_substring_view(&sv, result.characters_parsed)
+        if not ak.string_view_is_empty(&sv) and ak.string_view_at(&sv, 0) == ',':
+            sv = ak.string_view_substring_view(&sv, 1)
+        sv = ak.string_view_trim_whitespace(&sv, ak.TrimMode.left)
+    return count
+
+## `AK::parse_number<float>(values_value, AK::TrimWhitespace::Yes)` of a non-empty attribute, or `fallback`.
+func svg_parse_filter_number(values_value: ak.String, fallback: f32) -> f32:
+    if not ak.string_is_empty(&values_value):
+        if let parsed = ak.parse_number_string_view_f32(ak.string_bytes_as_string_view(&values_value), ak.TrimWhitespace.yes):
+            return parsed
+    return fallback
+
+# mark: The filter graph =========================================================================
+
+## Ported from Libraries/LibWeb/SVG/SVGFilterElement.cpp:69 Web::SVG::SVGFilterElement::gfx_filter.
+pub func svg_filter_element_gfx_filter(this: SvgFilterElement*, referenced_node: LayoutNodeWithStyle*) -> gfx.Filter?:
+    var state: SvgFilterElementGfxFilterState
+    # Storage for the `Optional<Filter const&>` arguments (svg_filter_ref).
+    var first_storage: gfx.Filter = ---
+    var second_storage: gfx.Filter = ---
+
+    # for_each_child_of_type<DOM::Element>(...)
+    for node in dom_node_children(this.dom_node()):
+        if not is_dom_element(node):
+            continue
+        if let flood_primitive = as_if_svg_svgfe_flood_element(node):
+            state.root_filter = gfx.filter_flood(svg_svgfe_flood_element_flood_color(flood_primitive), svg_svgfe_flood_element_flood_opacity(flood_primitive))
+            svg_filter_element_update_result_map(&state, svg_filter_primitive_standard_attributes_result(&flood_primitive.svg_filter_primitive_standard_attributes, flood_primitive.svg_element()))
+        elif let blend_primitive = as_if_svg_svgfe_blend_element(node):
+            let foreground = svg_filter_element_resolve_input_filter(&state, svg_animated_string_base_val(svg_svgfe_blend_element_in1(blend_primitive)))
+            let background = svg_filter_element_resolve_input_filter(&state, svg_animated_string_base_val(svg_svgfe_blend_element_in2(blend_primitive)))
+            let blend_mode = svg_svgfe_blend_element_mode(blend_primitive)
+
+            state.root_filter = gfx.filter_blend(svg_filter_ref(background, &first_storage), svg_filter_ref(foreground, &second_storage), blend_mode)
+            svg_filter_element_update_result_map(&state, svg_filter_primitive_standard_attributes_result(&blend_primitive.svg_filter_primitive_standard_attributes, blend_primitive.svg_element()))
+        elif let component_transfer = as_if_svg_svgfe_component_transfer_element(node):
+            let input = svg_filter_element_resolve_input_filter(&state, svg_animated_string_base_val(svg_svgfe_component_transfer_element_in1(component_transfer)))
+
+            # https://drafts.fxtf.org/filter-effects/#feComponentTransferElement
+            # * If more than one transfer function element of the same kind is specified, the last occurrence is to be
+            #   used.
+            # * If any of the transfer function elements are unspecified, the feComponentTransfer must be processed as
+            #   if those transfer function elements were specified with their type attributes set to identity.
+            var argb_function_elements: (SvgComponentTransferFunctionElement*?)[4]
+            for child in dom_node_children(node):
+                if let func_a = as_if_svg_svgfe_func_a_element(child):
+                    argb_function_elements[0] = func_a.svg_component_transfer_function_element()
+                elif let func_r = as_if_svg_svgfe_func_r_element(child):
+                    argb_function_elements[1] = func_r.svg_component_transfer_function_element()
+                elif let func_g = as_if_svg_svgfe_func_g_element(child):
+                    argb_function_elements[2] = func_g.svg_component_transfer_function_element()
+                elif let func_b = as_if_svg_svgfe_func_b_element(child):
+                    argb_function_elements[3] = func_b.svg_component_transfer_function_element()
+
+            var color_tables: ((const u8[])?)[4]
+            for i in 0..<4:
+                if let function_element = argb_function_elements[i]:
+                    color_tables[i] = svg_component_transfer_function_element_color_table(function_element)
+            state.root_filter = gfx.filter_color_table(color_tables[0], color_tables[1], color_tables[2], color_tables[3], svg_filter_ref(input, &first_storage))
+            svg_filter_element_update_result_map(&state, svg_filter_primitive_standard_attributes_result(&component_transfer.svg_filter_primitive_standard_attributes, component_transfer.svg_element()))
+        elif let composite_primitive = as_if_svg_svgfe_composite_element(node):
+            let foreground = svg_filter_element_resolve_input_filter(&state, svg_animated_string_base_val(svg_svgfe_composite_element_in1(composite_primitive)))
+            let background = svg_filter_element_resolve_input_filter(&state, svg_animated_string_base_val(svg_svgfe_composite_element_in2(composite_primitive)))
+            let operator_ = svg_svgfe_composite_element_to(composite_primitive)
+            if operator_ == SvgSvgfeCompositeElementCompositingOperator.arithmetic:
+                let k1 = svg_animated_number_base_val(svg_svgfe_composite_element_k1(composite_primitive))
+                let k2 = svg_animated_number_base_val(svg_svgfe_composite_element_k2(composite_primitive))
+                let k3 = svg_animated_number_base_val(svg_svgfe_composite_element_k3(composite_primitive))
+                let k4 = svg_animated_number_base_val(svg_svgfe_composite_element_k4(composite_primitive))
+
+                state.root_filter = gfx.filter_arithmetic(svg_filter_ref(background, &first_storage), svg_filter_ref(foreground, &second_storage), k1, k2, k3, k4)
+            else:
+                state.root_filter = gfx.filter_blend(svg_filter_ref(background, &first_storage), svg_filter_ref(foreground, &second_storage), svg_composite_to_compositing_and_blending_operator(operator_))
+
+            svg_filter_element_update_result_map(&state, svg_filter_primitive_standard_attributes_result(&composite_primitive.svg_filter_primitive_standard_attributes, composite_primitive.svg_element()))
+        elif let blur_primitive = as_if_svg_svgfe_gaussian_blur_element(node):
+            let input = svg_filter_element_resolve_input_filter(&state, svg_animated_string_base_val(svg_svgfe_gaussian_blur_element_in1(blur_primitive)))
+
+            let radius_x = svg_animated_number_base_val(svg_svgfe_gaussian_blur_element_std_deviation_x(blur_primitive))
+            let radius_y = svg_animated_number_base_val(svg_svgfe_gaussian_blur_element_std_deviation_y(blur_primitive))
+
+            state.root_filter = gfx.filter_blur(radius_x, radius_y, svg_filter_ref(input, &first_storage))
+            svg_filter_element_update_result_map(&state, svg_filter_primitive_standard_attributes_result(&blur_primitive.svg_filter_primitive_standard_attributes, blur_primitive.svg_element()))
+        elif let colormatrix_primitive = as_if_svg_svgfe_color_matrix_element(node):
+            let in_attr = svg_animated_string_base_val(svg_svgfe_color_matrix_element_in1(colormatrix_primitive))
+            let input = svg_filter_element_resolve_input_filter(&state, in_attr)
+
+            let type_value = dom_element_attribute(colormatrix_primitive.dom_element(), svg_attribute_names_type) else ak.String()
+            let values_value = dom_element_attribute(colormatrix_primitive.dom_element(), svg_attribute_names_values) else ak.String()
+            let result_attribute = svg_filter_primitive_standard_attributes_result(&colormatrix_primitive.svg_filter_primitive_standard_attributes, colormatrix_primitive.svg_element())
+
+            # Default type is "matrix" per spec.
+            if ak.string_is_empty(&type_value) or ak.string_equals_ignoring_ascii_case_string_view(&type_value, ak.sv("matrix")):
+                # Parse up to 20 numbers; if we don't get a full 4x5, skip applying.
+                var matrix: f32[20]
+                let count = svg_parse_color_matrix_values(values_value, &matrix)
+
+                if count == 20:
+                    state.root_filter = gfx.filter_color_matrix(matrix, svg_filter_ref(input, &first_storage))
+                    svg_filter_element_update_result_map(&state, result_attribute)
+                else:
+                    # If invalid or missing, treat as identity (no-op) if we already have an input.
+                    if input != none:
+                        state.root_filter = input
+                        svg_filter_element_update_result_map(&state, result_attribute)
+            elif ak.string_equals_ignoring_ascii_case_string_view(&type_value, ak.sv("saturate")):
+                # values: single number s (1 = original)
+                let s = svg_parse_filter_number(values_value, 1.0)
+                state.root_filter = gfx.filter_saturate(s, svg_filter_ref(input, &first_storage))
+                svg_filter_element_update_result_map(&state, result_attribute)
+            elif ak.string_equals_ignoring_ascii_case_string_view(&type_value, ak.sv("hueRotate")):
+                # values: angle in degrees
+                let angle_degrees = svg_parse_filter_number(values_value, 0.0)
+                state.root_filter = gfx.filter_hue_rotate(angle_degrees, svg_filter_ref(input, &first_storage))
+                svg_filter_element_update_result_map(&state, result_attribute)
+            elif ak.string_equals_ignoring_ascii_case_string_view(&type_value, ak.sv("luminanceToAlpha")):
+                # values ignored; convert luminance to alpha and zero RGB.
+                let matrix: f32[20] = [
+                    0.0, 0.0, 0.0, 0.0, 0.0,
+                    0.0, 0.0, 0.0, 0.0, 0.0,
+                    0.0, 0.0, 0.0, 0.0, 0.0,
+                    0.2126, 0.7152, 0.0722, 0.0, 0.0,
+                ]
+                state.root_filter = gfx.filter_color_matrix(matrix, svg_filter_ref(input, &first_storage))
+                svg_filter_element_update_result_map(&state, result_attribute)
+            else:
+                # Unknown 'type' value on feColorMatrix; skip creating a filter and log.
+                ak.dbgln(f"SVGFEColorMatrixElement: Unknown type '{ak.string_view_text(ak.string_bytes_as_string_view(&type_value))}' — skipping filter primitive")
+        elif let image_primitive = as_if_svg_svgfe_image_element(node):
+            let bitmap = svg_svgfe_image_element_current_image_bitmap(image_primitive, gfx.IntSize()) else continue
+
+            let src_rect = svg_svgfe_image_element_content_rect(image_primitive) else continue
+
+            let dom_node = layout_node_dom_node(referenced_node.layout_node()) else continue
+
+            # NB: We use the unsafe accessor here because this may be called
+            #     during layout update, before the layout-is-up-to-date flag
+            #     has been set. The paintable is valid since layout has already
+            #     been performed at this point.
+            let paintable_box = dom_node_unsafe_paintable_box(dom_node) else continue
+
+            let absolute_rect = paint_paintable_box_absolute_rect(paintable_box)
+            let dest_rect = gfx.enclosing_int_rect(gfx.css_pixel_rect_to_type_f32(&absolute_rect))
+            let image_rendering = css_computed_values_image_rendering(&paint_paintable_computed_values(paintable_box.paint_paintable()).computed_values)
+            let scaling_mode = css_to_gfx_scaling_mode(image_rendering, gfx.device_pixel_rect_size(&src_rect), gfx.device_pixel_rect_size(&dest_rect))
+            state.root_filter = gfx.filter_image(bitmap, src_rect, dest_rect, scaling_mode)
+            svg_filter_element_update_result_map(&state, svg_filter_primitive_standard_attributes_result(&image_primitive.svg_filter_primitive_standard_attributes, image_primitive.svg_element()))
+        elif let merge_primitive = as_if_svg_svgfe_merge_element(node):
+            var merge_inputs: ak.Vector[gfx.Filter?]
+            # merge_primitive->for_each_child_of_type<SVGFEMergeNodeElement>(...)
+            for child in dom_node_children(node):
+                if let merge_node = as_if_svg_svgfe_merge_node_element(child):
+                    ak.vector_append_t(&merge_inputs, svg_filter_element_resolve_input_filter(&state, svg_animated_string_base_val(svg_svgfe_merge_node_element_in1(merge_node))))
+
+            state.root_filter = gfx.filter_merge(&merge_inputs)
+            svg_filter_element_update_result_map(&state, svg_filter_primitive_standard_attributes_result(&merge_primitive.svg_filter_primitive_standard_attributes, merge_primitive.svg_element()))
+        elif let morphology_primitive = as_if_svg_svgfe_morphology_element(node):
+            let input = svg_filter_element_resolve_input_filter(&state, svg_animated_string_base_val(svg_svgfe_morphology_element_in1(morphology_primitive)))
+
+            let radius_x = svg_animated_number_base_val(svg_svgfe_morphology_element_radius_x(morphology_primitive))
+            let radius_y = svg_animated_number_base_val(svg_svgfe_morphology_element_radius_y(morphology_primitive))
+            let morphology_operator = svg_svgfe_morphology_element_morphology_operator(morphology_primitive)
+            match morphology_operator:
+                .erode:
+                    state.root_filter = gfx.filter_erode(radius_x, radius_y, input)
+                .dilate:
+                    state.root_filter = gfx.filter_dilate(radius_x, radius_y, input)
+                .unknown:
+                    trap("VERIFY_NOT_REACHED")
+                _:
+                    trap("VERIFY_NOT_REACHED")
+
+            svg_filter_element_update_result_map(&state, svg_filter_primitive_standard_attributes_result(&morphology_primitive.svg_filter_primitive_standard_attributes, morphology_primitive.svg_element()))
+        elif let offset_primitive = as_if_svg_svgfe_offset_element(node):
+            let input = svg_filter_element_resolve_input_filter(&state, svg_animated_string_base_val(svg_svgfe_offset_element_in1(offset_primitive)))
+
+            let dx = svg_animated_number_base_val(svg_svgfe_offset_element_dx(offset_primitive))
+            let dy = svg_animated_number_base_val(svg_svgfe_offset_element_dy(offset_primitive))
+
+            state.root_filter = gfx.filter_offset(dx, dy, svg_filter_ref(input, &first_storage))
+            svg_filter_element_update_result_map(&state, svg_filter_primitive_standard_attributes_result(&offset_primitive.svg_filter_primitive_standard_attributes, offset_primitive.svg_element()))
+        elif let drop_shadow = as_if_svg_svgfe_drop_shadow_element(node):
+            # https://drafts.csswg.org/filter-effects-1/#elementdef-fedropshadow
+            let input = svg_filter_element_resolve_input_filter(&state, svg_animated_string_base_val(svg_svgfe_drop_shadow_element_in1(drop_shadow)))
+            # 1. Take the alpha channel of the input to the feDropShadow filter primitive and the stdDeviation on the
+            #    feDropShadow and do processing as if the following feGaussianBlur was applied:
+            #
+            # <feGaussianBlur in="alpha-channel-of-feDropShadow-in" stdDeviation="stdDeviation-of-feDropShadow"/>
+            let alpha_input = gfx.filter_color_matrix(svg_filter_element_alpha_matrix, svg_filter_ref(input, &first_storage))
+            let std_x = svg_animated_number_base_val(svg_svgfe_drop_shadow_element_std_deviation_x(drop_shadow))
+            let std_y = svg_animated_number_base_val(svg_svgfe_drop_shadow_element_std_deviation_y(drop_shadow))
+            let blurred = gfx.filter_blur(std_x, std_y, &alpha_input)
+
+            # 2. Offset the result of step 1 by dx and dy as specified on the feDropShadow element, equivalent to
+            #    applying an feOffset with these parameters:
+            #
+            # <feOffset dx="dx-of-feDropShadow" dy="dy-of-feDropShadow" result="offsetblur"/>
+            let dx = svg_animated_number_base_val(svg_svgfe_drop_shadow_element_dx(drop_shadow))
+            let dy = svg_animated_number_base_val(svg_svgfe_drop_shadow_element_dy(drop_shadow))
+            let offset_blur = gfx.filter_offset(dx, dy, &blurred)
+
+            # 3. Do processing as if an feFlood element with flood-color and flood-opacity as specified on the
+            #    feDropShadow was applied:
+            #
+            # <feFlood flood-color="flood-color-of-feDropShadow" flood-opacity="flood-opacity-of-feDropShadow"/>
+            let shadow_color = gfx.filter_flood(svg_svgfe_drop_shadow_element_flood_color(drop_shadow), svg_svgfe_drop_shadow_element_flood_opacity(drop_shadow))
+
+            # 4. Composite the result of the feFlood in step 3 with the result of the feOffset in step 2 as if an
+            #    feComposite filter primitive with operator="in" was applied:
+            #
+            # <feComposite in2="offsetblur" operator="in"/>
+            let colored_shadow = gfx.filter_blend(&offset_blur, &shadow_color, gfx.CompositingAndBlendingOperator.source_in)
+
+            # 5. Finally merge the result of the previous step, doing processing as if the following feMerge was performed:
+            #
+            # <feMerge>
+            #   <feMergeNode/>
+            #   <feMergeNode in="in-of-feDropShadow"/>
+            # </feMerge>
+            var merge_inputs: ak.Vector[gfx.Filter?]
+            ak.vector_append_t(&merge_inputs, colored_shadow)
+            ak.vector_append_t(&merge_inputs, input)
+            state.root_filter = gfx.filter_merge(&merge_inputs)
+            svg_filter_element_update_result_map(&state, svg_filter_primitive_standard_attributes_result(&drop_shadow.svg_filter_primitive_standard_attributes, drop_shadow.svg_element()))
+        elif let turbulence = as_if_svg_svgfe_turbulence_element(node):
+            let base_frequency_x = svg_animated_number_base_val(svg_svgfe_turbulence_element_base_frequency_x(turbulence))
+            let base_frequency_y = svg_animated_number_base_val(svg_svgfe_turbulence_element_base_frequency_y(turbulence))
+            let num_octaves = svg_animated_integer_base_val(svg_svgfe_turbulence_element_num_octaves(turbulence))
+            let seed = svg_animated_number_base_val(svg_svgfe_turbulence_element_seed(turbulence))
+
+            let type_ = svg_turbulence_type(turbulence)
+
+            let tile_stitch_size = svg_turbulence_tile_stitch_size(turbulence)
+
+            state.root_filter = gfx.filter_turbulence(type_, base_frequency_x, base_frequency_y, num_octaves, seed, tile_stitch_size)
+            svg_filter_element_update_result_map(&state, svg_filter_primitive_standard_attributes_result(&turbulence.svg_filter_primitive_standard_attributes, turbulence.svg_element()))
+        elif let displacement_map = as_if_svg_svgfe_displacement_map_element(node):
+            let color = svg_filter_element_resolve_input_filter(&state, svg_animated_string_base_val(svg_svgfe_displacement_map_element_in1(displacement_map)))
+            let displacement = svg_filter_element_resolve_input_filter(&state, svg_animated_string_base_val(svg_svgfe_displacement_map_element_in2(displacement_map)))
+            let scale = svg_animated_number_base_val(svg_svgfe_displacement_map_element_scale(displacement_map))
+
+            let x_channel_selector = svg_convert_channel_selector(svg_animated_enumeration_base_val(svg_svgfe_displacement_map_element_x_channel_selector(displacement_map)))
+            let y_channel_selector = svg_convert_channel_selector(svg_animated_enumeration_base_val(svg_svgfe_displacement_map_element_y_channel_selector(displacement_map)))
+
+            state.root_filter = gfx.filter_displacement_map(svg_filter_ref(color, &first_storage), svg_filter_ref(displacement, &second_storage), scale, x_channel_selector, y_channel_selector)
+            svg_filter_element_update_result_map(&state, svg_filter_primitive_standard_attributes_result(&displacement_map.svg_filter_primitive_standard_attributes, displacement_map.svg_element()))
+        else:
+            let description = dom_node_debug_description(node)
+            ak.dbgln(f"SVGFilterElement::gfx_filter(): Unknown or unsupported filter element '{ak.string_view_text(ak.string_bytes_as_string_view(&description))}'")
+
+    return state.root_filter
+
+# mark: The SVG DOM ==============================================================================
+
+## Ported from Libraries/LibWeb/SVG/SVGFilterElement.cpp:437 Web::SVG::SVGFilterElement::filter_units.
+# https://drafts.fxtf.org/filter-effects/#element-attrdef-filter-filterunits
+pub func svg_filter_element_filter_units(this: SvgFilterElement*) -> SvgAnimatedEnumeration*:
+    return svg_animated_enumeration_create(dom_element_realm(this.dom_element()), (u16)(this.m_filter_units else SvgUnits.object_bounding_box))
+
+## Ported from Libraries/LibWeb/SVG/SVGFilterElement.cpp:443 Web::SVG::SVGFilterElement::primitive_units.
+# https://drafts.fxtf.org/filter-effects/#element-attrdef-filter-primitiveunits
+pub func svg_filter_element_primitive_units(this: SvgFilterElement*) -> SvgAnimatedEnumeration*:
+    return svg_animated_enumeration_create(dom_element_realm(this.dom_element()), (u16)(this.m_primitive_units else SvgUnits.user_space_on_use))
+
+## Ported from Libraries/LibWeb/SVG/SVGFilterElement.cpp:449 Web::SVG::SVGFilterElement::x.
+# https://drafts.fxtf.org/filter-effects/#element-attrdef-filter-x
+pub func svg_filter_element_x(this: SvgFilterElement*) -> SvgAnimatedLength*:
+    return svg_element_svg_animated_length_for_property(this.svg_element(), css_data.PropertyId.x)
+
+## Ported from Libraries/LibWeb/SVG/SVGFilterElement.cpp:455 Web::SVG::SVGFilterElement::y.
+# https://drafts.fxtf.org/filter-effects/#element-attrdef-filter-y
+pub func svg_filter_element_y(this: SvgFilterElement*) -> SvgAnimatedLength*:
+    return svg_element_svg_animated_length_for_property(this.svg_element(), css_data.PropertyId.y)
+
+## Ported from Libraries/LibWeb/SVG/SVGFilterElement.cpp:461 Web::SVG::SVGFilterElement::width.
+# https://drafts.fxtf.org/filter-effects/#element-attrdef-filter-width
+pub func svg_filter_element_width(this: SvgFilterElement*) -> SvgAnimatedLength*:
+    return svg_element_svg_animated_length_for_property(this.svg_element(), css_data.PropertyId.width)
+
+## Ported from Libraries/LibWeb/SVG/SVGFilterElement.cpp:467 Web::SVG::SVGFilterElement::height.
+# https://drafts.fxtf.org/filter-effects/#element-attrdef-filter-height
+pub func svg_filter_element_height(this: SvgFilterElement*) -> SvgAnimatedLength*:
+    return svg_element_svg_animated_length_for_property(this.svg_element(), css_data.PropertyId.height)

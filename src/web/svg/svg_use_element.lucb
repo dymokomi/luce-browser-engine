@@ -1,0 +1,321 @@
+#==============================================================================================
+#
+#   svg_use_element - SVG::SVGUseElement: <use>, an instance of another element
+#
+#   DESCRIPTION:
+#       Port of LibWeb/SVG/SVGUseElement.cpp (lines 1-329) with the inline members of
+#       SVGUseElement.h (https://svgwg.org/svg2-draft/struct.html#UseElement): the use-element
+#       shadow tree (a closed, user-agent-internal shadow root) holding a deep clone of the
+#       referenced element, rebuilt when the document completes loading, when the href changes,
+#       and when the referenced element (or a descendant) changes; x and y as a translation
+#       after the element's own transform; circular references (an invalid reference) detection;
+#       and the fetch of a referenced document (P2: SharedResourceRequest).
+#
+#       `SVGUseElement::parse_id_from_href` is only declared in the donor: no port.
+#       `GC::HeapHashTable<GC::Ref<Element const>>` of would_create_circular_reference is a
+#       HashTable on the stack (its buffer is managed memory, scanned conservatively).
+#
+#==============================================================================================
+
+## `HashTable<GC::Ref<Element const>>`: the elements a circular-reference walk has entered.
+type SvgUseElementVisitedSet = ak.HashTable[DomElement*, ak.PtrTraits[DomElement]]
+
+# mark: Construction =============================================================================
+
+## Ported from Libraries/LibWeb/SVG/SVGUseElement.cpp:31 Web::SVG::SVGUseElement::SVGUseElement.
+pub func svg_use_element_construct(this: SvgUseElement*, document: DomDocument*, qualified_name: DomQualifiedName):
+    svg_graphics_element_construct(this.svg_graphics_element(), document, qualified_name)
+    # The vptrs of the mixin bases move to SVGUseElement's tables.
+    let element = this.svg_element()
+    element.element.slottable_mixin.vtable = &svg_use_element_slottable_mixin_vtable
+    element.element.aria_mixin.vtable = &svg_use_element_aria_mixin_vtable
+    element.element.animatable.vtable = &svg_use_element_animatable_vtable
+    element.global_event_handlers.vtable = &svg_use_element_global_event_handlers_vtable
+
+## initialize's document-completely-loaded callback: `[this] { clone_element_tree_as_our_shadow_tree(referenced_element()); }`.
+func svg_use_element_document_completely_loaded(context: void*?):
+    let this = (SvgUseElement*)(context else trap("document completely loaded: no use element"))
+    svg_use_element_clone_element_tree_as_our_shadow_tree(this, svg_use_element_referenced_element(this))
+
+## Ported from Libraries/LibWeb/SVG/SVGUseElement.cpp:36 Web::SVG::SVGUseElement::initialize (override).
+pub func svg_use_element_initialize_impl(base: JsCell*, realm: Realm*):
+    let this = (SvgUseElement*)base
+    web_set_prototype_for_interface(base, realm, BindInterfaceName.svg_use_element)
+    svg_graphics_element_initialize_impl(base, realm)
+
+    # NOTE: The spec says "The shadow tree is open (inspectable by script), but read-only."
+    #       This doesn't actually match other browsers, and there's a spec issue to change it.
+    #       Spec bug: https://github.com/w3c/svgwg/issues/875
+    let document = dom_node_document(this.dom_node())
+    let shadow_root = realm_create_dom_shadow_root(realm, document, this.dom_element(), BindShadowRootMode.closed)
+    dom_shadow_root_set_user_agent_internal(shadow_root, true)
+
+    # The user agent must create a use-element shadow tree whose host is the ‘use’ element itself
+    dom_element_set_shadow_root(this.dom_element(), shadow_root)
+
+    let document_observer = realm_create_dom_document_observer(realm, realm, document)
+    this.m_document_observer = document_observer
+    dom_document_observer_set_document_completely_loaded(document_observer, ak.Function0[unit](call = svg_use_element_document_completely_loaded, context = this))
+
+## Ported from Libraries/LibWeb/SVG/SVGUseElement.cpp:56 Web::SVG::SVGUseElement::visit_edges (override).
+pub func svg_use_element_visit_edges_impl(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (SvgUseElement*)base
+    svg_element_visit_edges_impl(base, visitor)
+    svg_svguri_reference_mixin_visit_edges(&this.svguri_reference_mixin, visitor)
+    gc.cell_visitor_visit_t(visitor, this.m_document_observer)
+    gc.cell_visitor_visit_t(visitor, this.m_resource_request)
+
+## Ported from Libraries/LibWeb/SVG/SVGUseElement.cpp:64 Web::SVG::SVGUseElement::attribute_changed (override).
+pub func svg_use_element_attribute_changed_impl(base: DomElement*, name: ak.FlyString, old_value: ak.String?, value: ak.String?, namespace_: ak.FlyString?):
+    let this = (SvgUseElement*)base
+    svg_graphics_element_attribute_changed_impl(base, name, old_value, value, namespace_)
+
+    # https://svgwg.org/svg2-draft/struct.html#UseLayout
+    let value_text = value else ak.String()  # value.value_or(String {})
+    let xlink_href = ak.fly_string_from_str("xlink:href")
+    if ak.fly_string_eq_fly_string(&name, &svg_attribute_names_x):
+        this.m_x = svg_attribute_parser_parse_coordinate_string_view(ak.string_bytes_as_string_view(&value_text))
+    elif ak.fly_string_eq_fly_string(&name, &svg_attribute_names_y):
+        this.m_y = svg_attribute_parser_parse_coordinate_string_view(ak.string_bytes_as_string_view(&value_text))
+    elif ak.fly_string_eq_fly_string(&name, &svg_attribute_names_href) or ak.fly_string_eq_fly_string(&name, &xlink_href):
+        # When the ‘href’ attribute is set (or, in the absence of an ‘href’ attribute, an ‘xlink:href’ attribute), the user agent must process the URL.
+        svg_use_element_process_the_url(this, value)
+
+# mark: The referenced element ===================================================================
+
+## Ported from Libraries/LibWeb/SVG/SVGUseElement.cpp:80 Web::SVG::SVGUseElement::process_the_url.
+# https://www.w3.org/TR/SVG2/linking.html#processingURL
+func svg_use_element_process_the_url(this: SvgUseElement*, href: ak.String?):
+    # In all other cases, the URL is for a resource to be used in this SVG document. The user agent
+    # must parse the URL to separate out the target fragment from the rest of the URL, and compare
+    # it with the document base URL. If all parts other than the target fragment are equal, this is
+    # a same-document URL reference, and processing the URL must continue as indicated in Identifying
+    # the target element with the current document as the referenced document.
+    let document_url = dom_document_url(dom_node_document(this.dom_node()))
+    let href_text = href else ak.String()  # href.value_or(String {})
+    this.m_href = web_url.url_complete_url(&document_url, ak.string_bytes_as_string_view(&href_text))
+    let url = this.m_href else return
+
+    if svg_use_element_is_referenced_element_same_document(this):
+        svg_use_element_clone_element_tree_as_our_shadow_tree(this, svg_use_element_referenced_element(this))
+    else:
+        svg_use_element_fetch_the_document(this, url)
+
+## Ported from Libraries/LibWeb/SVG/SVGUseElement.cpp:98 Web::SVG::SVGUseElement::is_referenced_element_same_document.
+func svg_use_element_is_referenced_element_same_document(this: SvgUseElement*) -> bool:
+    let href = this.m_href else trap("VERIFY: m_href")
+    return web_url.url_equals(&href, dom_document_url(dom_node_document(this.dom_node())), web_url.ExcludeFragment.yes)
+
+## Ported from Libraries/LibWeb/SVG/SVGUseElement.cpp:103 Web::SVG::SVGUseElement::element_transform (override).
+pub func svg_use_element_element_transform_impl(base: SvgGraphicsElement*) -> gfx.AffineTransform:
+    let this = (SvgUseElement*)base
+    # The x and y properties define an additional transformation (translate(x,y), where x and y represent the computed value of the corresponding property)
+    # to be applied to the ‘use’ element, after any transformations specified with other properties
+    var transform = svg_graphics_element_element_transform_impl(base)
+    gfx.affine_transform_translate_f32(&transform, this.m_x else 0.0, this.m_y else 0.0)
+    return transform
+
+## Ported from Libraries/LibWeb/SVG/SVGUseElement.cpp:110 Web::SVG::SVGUseElement::svg_element_changed.
+pub func svg_use_element_svg_element_changed(this: SvgUseElement*, svg_element: SvgElement*):
+    let to_clone = svg_use_element_referenced_element(this) else return
+
+    # NOTE: We need to check the ancestor because attribute_changed of a child doesn't call children_changed on the parent(s)
+    if to_clone.dom_node() == svg_element.dom_node() or tree_node_is_ancestor_of(to_clone.dom_node(), svg_element.dom_node()):
+        svg_use_element_clone_element_tree_as_our_shadow_tree(this, to_clone)
+
+## `String::from_utf8_with_replacement_character(URL::percent_decode(*m_href->fragment()), WithBOMHandling::No)`.
+func svg_use_element_decoded_fragment(fragment: ak.String) -> ak.String:
+    let decoded = web_url.percent_decode(ak.string_bytes_as_string_view(&fragment))
+    return ak.string_from_utf8_with_replacement_character(ak.byte_string_view(&decoded), ak.StringWithBomHandling.no)
+
+## Ported from Libraries/LibWeb/SVG/SVGUseElement.cpp:123 Web::SVG::SVGUseElement::svg_element_removed.
+pub func svg_use_element_svg_element_removed(this: SvgUseElement*, svg_element: SvgElement*):
+    let href = this.m_href else return
+    let fragment = web_url.url_fragment(&href) else return
+    if not svg_use_element_is_referenced_element_same_document(this):
+        return
+
+    let id = svg_use_element_decoded_fragment(fragment)
+    let element_id = dom_element_get_attribute_value(svg_element.dom_element(), ak.fly_string_from_str("id"))
+    if ak.string_utils_matches(ak.string_bytes_as_string_view(&element_id), ak.string_bytes_as_string_view(&id)):
+        let shadow_root = dom_element_shadow_root(this.dom_element()) else trap("VERIFY: shadow_root()")
+        dom_node_remove_all_children(shadow_root.dom_node())
+
+## Ported from Libraries/LibWeb/SVG/SVGUseElement.cpp:136 Web::SVG::SVGUseElement::referenced_element.
+# https://svgwg.org/svg2-draft/linking.html#processingURL-target
+func svg_use_element_referenced_element(this: SvgUseElement*) -> DomElement*?:
+    let href = this.m_href else return none
+
+    let fragment = web_url.url_fragment(&href) else return none
+
+    if svg_use_element_is_referenced_element_same_document(this):
+        let id = svg_use_element_decoded_fragment(fragment)
+        let document = dom_node_document(this.dom_node())
+        return dom_parent_node_get_element_by_id(document.dom_parent_node(), ak.fly_string_from_string(id))
+
+    let resource_request = this.m_resource_request else return none
+
+    let data = html_shared_resource_request_image_data(resource_request) else return none
+    let svg_data = as_if_svg_decoded_image_data(data) else return none
+
+    let svg_document = svg_decoded_image_data_svg_document(svg_data)
+    return dom_parent_node_get_element_by_id(svg_document.dom_parent_node(), ak.fly_string_from_string(fragment))
+
+## fetch_the_document's on-finish callback: `[this] { clone_element_tree_as_our_shadow_tree(referenced_element()); m_load_event_delayer.clear(); }`.
+func svg_use_element_fetch_on_finish(context: void*?):
+    let this = (SvgUseElement*)(context else trap("fetch the document: no use element"))
+    svg_use_element_clone_element_tree_as_our_shadow_tree(this, svg_use_element_referenced_element(this))
+    svg_use_element_clear_load_event_delayer(this)
+
+## fetch_the_document's on-fail callback: `[this] { m_load_event_delayer.clear(); }`.
+func svg_use_element_fetch_on_fail(context: void*?):
+    let this = (SvgUseElement*)(context else trap("fetch the document: no use element"))
+    svg_use_element_clear_load_event_delayer(this)
+
+## `m_load_event_delayer.clear()`: destroys a held delayer.
+func svg_use_element_clear_load_event_delayer(this: SvgUseElement*):
+    if let delayer = this.m_load_event_delayer:
+        var released = delayer
+        dom_document_load_event_delayer_destruct(&released)
+    this.m_load_event_delayer = none
+
+## Ported from Libraries/LibWeb/SVG/SVGUseElement.cpp:160 Web::SVG::SVGUseElement::fetch_the_document.
+# https://svgwg.org/svg2-draft/linking.html#processingURL-fetch
+func svg_use_element_fetch_the_document(this: SvgUseElement*, url: web_url.Url):
+    let document = dom_node_document(this.dom_node())
+    let realm = dom_element_realm(this.dom_element())
+    # m_load_event_delayer.emplace(document()): a previous delayer, if any, is destroyed first.
+    svg_use_element_clear_load_event_delayer(this)
+    var delayer: DomDocumentLoadEventDelayer = ---
+    dom_document_load_event_delayer_construct(&delayer, document)
+    this.m_load_event_delayer = delayer
+    let resource_request = html_shared_resource_request_get_or_create(realm, dom_document_page(document), url)
+    this.m_resource_request = resource_request
+    html_shared_resource_request_add_callbacks(resource_request, ak.Function0[unit](call = svg_use_element_fetch_on_finish, context = this), ak.Function0[unit](call = svg_use_element_fetch_on_fail, context = this))
+
+    if html_shared_resource_request_needs_fetching(resource_request):
+        let request = html_create_potential_cors_request(realm_vm(realm), url, FetchRequestDestination.image, HtmlCorsSettingAttribute.no_cors)
+        fetch_request_set_client(request, dom_document_relevant_settings_object(document))
+        html_shared_resource_request_fetch_resource(resource_request, realm, request)
+
+# mark: The use-element shadow tree ==============================================================
+
+## Ported from Libraries/LibWeb/SVG/SVGUseElement.cpp:181 Web::SVG::SVGUseElement::clone_element_tree_as_our_shadow_tree.
+# https://svgwg.org/svg2-draft/struct.html#UseShadowTree
+func svg_use_element_clone_element_tree_as_our_shadow_tree(this: SvgUseElement*, to_clone: DomElement*?):
+    let shadow_root = dom_element_shadow_root(this.dom_element()) else trap("VERIFY: shadow_root()")
+    dom_node_remove_all_children(shadow_root.dom_node())
+
+    # https://svgwg.org/svg2-draft/struct.html#UseStyleInheritance
+    # When the referenced element is from the same document as the ‘use’ element, the same document stylesheets will
+    # apply in both the original document and the shadow tree document fragment.
+    dom_shadow_root_set_uses_document_style_sheets(shadow_root, to_clone != none and svg_use_element_is_referenced_element_same_document(this))
+
+    let element_to_clone = to_clone else return
+    if svg_use_element_is_valid_reference_element(this, element_to_clone):
+        # The ‘use’ element references another element, a copy of which is rendered in place of the ‘use’ in the document.
+        let cloned_reference_node = dom_node_clone_node(element_to_clone.dom_node(), none, true) else trap("MUST: clone_node")
+        if is_svg_svgsvg_element(cloned_reference_node) or is_svg_symbol_element(cloned_reference_node):
+            let cloned_element = as_svg_element(cloned_reference_node)
+
+            # The width and height properties on the ‘use’ element override the values for the corresponding
+            # properties on a referenced ‘svg’ or ‘symbol’ element when determining the used value for that property
+            # on the instance root element. However, if the computed value for the property on the ‘use’ element is
+            # auto, then the property is computed as normal for the element instance.
+            if dom_element_has_attribute(this.dom_element(), svg_attribute_names_width):
+                dom_element_set_attribute_value(cloned_element.dom_element(), svg_attribute_names_width, dom_element_get_attribute_value(this.dom_element(), svg_attribute_names_width))
+            if dom_element_has_attribute(this.dom_element(), svg_attribute_names_height):
+                dom_element_set_attribute_value(cloned_element.dom_element(), svg_attribute_names_height, dom_element_get_attribute_value(this.dom_element(), svg_attribute_names_height))
+        discard(dom_node_append_child(shadow_root.dom_node(), cloned_reference_node) else trap("FIXME: should propagate errors"))
+
+## Ported from Libraries/LibWeb/SVG/SVGUseElement.cpp:211 Web::SVG::SVGUseElement::is_valid_reference_element.
+func svg_use_element_is_valid_reference_element(this: SvgUseElement*, reference_element: DomElement*) -> bool:
+    # If the referenced element that results from resolving the URL is not an SVG element, then the reference is invalid and the ‘use’ element is in error.
+    if not dom_node_is_svg_element(reference_element.dom_node()):
+        return false
+
+    # https://svgwg.org/svg2-draft/struct.html#UseShadowTree
+    # When a ‘use’ references another element which is another ‘use’ or whose content contains a ‘use’ element, then
+    # the shadow DOM cloning approach described above is recursive. However, a set of references that directly or
+    # indirectly reference a element to create a circular dependency is an invalid circular reference. The ‘use’
+    # element or element instance whose shadow tree would create the circular reference is in error and must not be
+    # rendered by the user agent.
+    return not svg_use_element_would_create_circular_reference(this, reference_element)
+
+## Ported from Libraries/LibWeb/SVG/SVGUseElement.cpp:226 Web::SVG::SVGUseElement::would_create_circular_reference.
+func svg_use_element_would_create_circular_reference(this: SvgUseElement*, target: DomElement*) -> bool:
+    var visited: SvgUseElementVisitedSet
+    return svg_use_element_would_create_circular_reference_impl(this, target, &visited)
+
+## Ported from Libraries/LibWeb/SVG/SVGUseElement.cpp:232 Web::SVG::SVGUseElement::would_create_circular_reference_impl.
+func svg_use_element_would_create_circular_reference_impl(this: SvgUseElement*, target: DomElement*, visited: SvgUseElementVisitedSet*) -> bool:
+    # FIXME: I am certain there is a much more efficient way of keeping track of cycles here!
+    if ak.hash_table_contains_t(visited, target):
+        return true
+
+    discard(ak.hash_table_set(visited, target))
+
+    var found_circular_reference = false
+    # target.for_each_in_inclusive_subtree_of_type<SVGUseElement>(...)
+    for node in dom_node_inclusive_subtree(target.dom_node()):
+        let element = as_if_svg_use_element(node) else continue
+        let referenced = svg_use_element_referenced_element(element) else continue
+
+        if svg_use_element_would_create_circular_reference_impl(this, referenced, visited):
+            found_circular_reference = true
+            break
+
+    discard(ak.hash_table_remove_t(visited, target))
+
+    return found_circular_reference
+
+# mark: The SVG DOM ==============================================================================
+
+## Ported from Libraries/LibWeb/SVG/SVGUseElement.cpp:262 Web::SVG::SVGUseElement::x.
+# https://www.w3.org/TR/SVG11/shapes.html#RectElementXAttribute
+pub func svg_use_element_x(this: SvgUseElement*) -> SvgAnimatedLength*:
+    # FIXME: Populate the unit type when it is parsed (0 here is "unknown").
+    # FIXME: Create a proper animated value when animations are supported.
+    let realm = dom_element_realm(this.dom_element())
+    let base_length = svg_length_create(realm, 0, this.m_x else 0.0, SvgLengthReadOnly.no)
+    let anim_length = svg_length_create(realm, 0, this.m_x else 0.0, SvgLengthReadOnly.yes)
+    return svg_animated_length_create(realm, base_length, anim_length)
+
+## Ported from Libraries/LibWeb/SVG/SVGUseElement.cpp:272 Web::SVG::SVGUseElement::y.
+# https://www.w3.org/TR/SVG11/shapes.html#RectElementYAttribute
+pub func svg_use_element_y(this: SvgUseElement*) -> SvgAnimatedLength*:
+    # FIXME: Populate the unit type when it is parsed (0 here is "unknown").
+    # FIXME: Create a proper animated value when animations are supported.
+    let realm = dom_element_realm(this.dom_element())
+    let base_length = svg_length_create(realm, 0, this.m_y else 0.0, SvgLengthReadOnly.no)
+    let anim_length = svg_length_create(realm, 0, this.m_y else 0.0, SvgLengthReadOnly.yes)
+    return svg_animated_length_create(realm, base_length, anim_length)
+
+## Ported from Libraries/LibWeb/SVG/SVGUseElement.cpp:281 Web::SVG::SVGUseElement::width.
+pub func svg_use_element_width(this: SvgUseElement*) -> SvgAnimatedLength*:
+    return svg_element_fake_animated_length_fixme(this.svg_element())
+
+## Ported from Libraries/LibWeb/SVG/SVGUseElement.cpp:286 Web::SVG::SVGUseElement::height.
+pub func svg_use_element_height(this: SvgUseElement*) -> SvgAnimatedLength*:
+    return svg_element_fake_animated_length_fixme(this.svg_element())
+
+## Ported from Libraries/LibWeb/SVG/SVGUseElement.cpp:292 Web::SVG::SVGUseElement::instance_root.
+# https://svgwg.org/svg2-draft/struct.html#TermInstanceRoot
+pub func svg_use_element_instance_root(this: SvgUseElement*) -> SvgElement*?:
+    let shadow_root = dom_element_shadow_root(this.dom_element()) else trap("VERIFY: shadow_root()")
+    let child = tree_node_first_child_of_type(shadow_root.dom_node(), &svg_element_class) else return none
+    return as_svg_element(child)
+
+## Ported from Libraries/LibWeb/SVG/SVGUseElement.cpp:297 Web::SVG::SVGUseElement::animated_instance_root.
+pub func svg_use_element_animated_instance_root(this: SvgUseElement*) -> SvgElement*?:
+    return svg_use_element_instance_root(this)
+
+## Ported from Libraries/LibWeb/SVG/SVGUseElement.cpp:302 Web::SVG::SVGUseElement::create_layout_node (override).
+pub func svg_use_element_create_layout_node_impl(base: DomElement*, style: CssComputedProperties*) -> LayoutNode*?:
+    let this = (SvgUseElement*)base
+    # heap().allocate<Layout::SVGGraphicsBox>(...): a layout node's initialize is JS::Cell's, which does nothing.
+    return realm_create_layout_svg_graphics_box(dom_element_realm(base), dom_node_document(base.dom_node()), this.svg_graphics_element(), style).layout_node()
+
+## Ported from Libraries/LibWeb/SVG/SVGUseElement.h:48 Web::SVG::SVGUseElement::is_svg_use_element (override).
+pub func svg_use_element_is_svg_use_element_impl(base: DomNode*) -> bool:
+    return true
