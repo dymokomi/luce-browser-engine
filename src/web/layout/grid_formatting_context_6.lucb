@@ -1,0 +1,420 @@
+#==============================================================================================
+#
+#   grid_formatting_context_6 - Layout::GridFormattingContext: the layout algorithm's driver,
+#                               absolutely positioned children, grid lines and the occupation
+#                               grid
+#
+#   DESCRIPTION:
+#       Port of LibWeb/Layout/GridFormattingContext.cpp (lines 2058-2462): `run` (lines and
+#       areas, placement, tracks and gutters, column then row track sizing with the items'
+#       sizes, the second row pass against the container's height, gutters under alignment,
+#       then each item's position and inside layout, and the used grid-template-columns /
+#       grid-template-rows that getComputedStyle() reports), the containing block of an
+#       absolutely positioned child (its grid area in the augmented grid,
+#       https://www.w3.org/TR/css-grid-2/#abspos-items), laying out absolutely positioned
+#       children, the container's intrinsic and automatic sizes, free space, named lines,
+#       the explicit grid's lines from grid-template-*, and the occupation grid's cells.
+#
+#       Copyright (c) 2023-2025, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
+#       Copyright (c) 2022-2023, Martin Falisse <mfalisse@outlook.com>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: The layout algorithm ====================================================================
+
+## The `serialize` lambda of run: the used track sizes with the explicit line names, as a GridTrackSizeList.
+func layout_grid_formatting_context_serialize_tracks(tracks: const ak.Vector[LayoutGridFormattingContextGridTrack]*, lines: const ak.Vector[ak.Vector[CssGridLineName]]*) -> CssGridTrackSizeList:
+    var result = css_grid_track_size_list_make_none()
+    for i in 0..<ak.vector_size(lines):
+        let names = ak.vector_at_const(lines, i)
+        if not ak.vector_is_empty(names):
+            var grid_line_names = CssGridLineNames(m_names = ak.Vector[CssGridLineName]())
+            for line_name in ak.vector_span_const(names):
+                if not line_name.implicit:
+                    css_grid_line_names_append(&grid_line_names, line_name.name)
+            if not css_grid_line_names_is_empty(&grid_line_names):
+                css_grid_track_size_list_append_css_grid_line_names(&result, grid_line_names)
+
+        if i < ak.vector_size(tracks):
+            let track = ak.vector_at_const(tracks, i)
+            css_grid_track_size_list_append_css_explicit_grid_track(&result, css_explicit_grid_track_new(CssGridRepeatOrCssGridMinMaxOrCssGridSize.css_grid_size(layout_grid_formatting_context_px_grid_size(track.base_size))))
+    return result
+
+## Ported from Libraries/LibWeb/Layout/GridFormattingContext.cpp:2058 Web::Layout::GridFormattingContext::run (override).
+pub func layout_grid_formatting_context_run_impl(base: LayoutFormattingContext*, available_space: LayoutAvailableSpace):
+    let this = (LayoutGridFormattingContext*)base
+    # OPTIMIZATION: If we're in intrinsic sizing layout, but the grid container is not the
+    #               box being measured, we can skip everything here.
+    #               The parent formatting context has already figured out our size anyway.
+    if base.m_layout_mode == LayoutMode.intrinsic_sizing and not layout_available_size_is_intrinsic_sizing_constraint(&available_space.width) and not layout_available_size_is_intrinsic_sizing_constraint(&available_space.height):
+        return
+
+    # FORMATTING_CONTEXT_TRACE() traces only in LIBWEB_LAYOUT_DEBUG builds.
+    this.m_available_space = available_space
+
+    layout_grid_formatting_context_init_grid_lines(this, LayoutGridDimension.column)
+    layout_grid_formatting_context_init_grid_lines(this, LayoutGridDimension.row)
+
+    layout_grid_formatting_context_build_grid_areas(this)
+
+    # NOTE: We store explicit grid sizes to later use in determining the position of items with negative index.
+    this.m_explicit_columns_line_count = ak.vector_size(&this.m_column_lines)
+    this.m_explicit_rows_line_count = ak.vector_size(&this.m_row_lines)
+
+    layout_grid_formatting_context_place_grid_items(this)
+
+    layout_grid_formatting_context_initialize_grid_tracks_for_columns_and_rows(this)
+
+    layout_grid_formatting_context_initialize_gap_tracks_layout_available_space(this, available_space)
+
+    layout_grid_formatting_context_collapse_auto_fit_tracks_if_needed(this, LayoutGridDimension.column)
+    layout_grid_formatting_context_collapse_auto_fit_tracks_if_needed(this, LayoutGridDimension.row)
+
+    let items = ak.vector_span(&this.m_grid_items)
+    for item in &items:
+        let computed_values = layout_box_computed(item.box)
+
+        # NOTE: As the containing blocks of grid items are created by implicit grid areas that are not present in the
+        # layout tree, the initial value of has_definite_width/height computed by LayoutState::UsedValues::set_node
+        # will be incorrect for anything other (auto, percentage, calculated) than fixed lengths.
+        # Therefor, it becomes necessary to reset this value to indefinite.
+        # TODO: Handle this in LayoutState::UsedValues::set_node
+        let width = css_computed_values_width(computed_values)
+        if not css_size_is_length(&width):
+            layout_state_used_values_set_indefinite_content_width(item.used_values)
+        let height = css_computed_values_height(computed_values)
+        if not css_size_is_length(&height):
+            layout_state_used_values_set_indefinite_content_height(item.used_values)
+
+    # Do the first pass of resolving grid items box metrics to compute values that are independent of a track width
+    layout_grid_formatting_context_resolve_items_box_metrics(this, LayoutGridDimension.column)
+
+    layout_grid_formatting_context_run_track_sizing(this, LayoutGridDimension.column)
+
+    # Do the second pass of resolving box metrics to compute values that depend on a track width
+    layout_grid_formatting_context_resolve_items_box_metrics(this, LayoutGridDimension.column)
+
+    # Once the sizes of column tracks, which determine the widths of the grid areas forming the containing blocks
+    # for grid items, ara calculated, it becomes possible to determine the final widths of the grid items.
+    layout_grid_formatting_context_resolve_grid_item_sizes(this, LayoutGridDimension.column)
+
+    # Do the first pass of resolving grid items box metrics to compute values that are independent of a track height
+    layout_grid_formatting_context_resolve_items_box_metrics(this, LayoutGridDimension.row)
+
+    layout_grid_formatting_context_run_track_sizing(this, LayoutGridDimension.row)
+
+    # Do the second pass of resolving box metrics to compute values that depend on a track height
+    layout_grid_formatting_context_resolve_items_box_metrics(this, LayoutGridDimension.row)
+
+    layout_grid_formatting_context_resolve_grid_item_sizes(this, LayoutGridDimension.row)
+
+    layout_grid_formatting_context_determine_grid_container_height(this)
+
+    let intrinsic_grid_container_height = this.m_automatic_content_height
+    let current_available_space = layout_grid_formatting_context_available_space(this)
+    if base.m_layout_mode == LayoutMode.normal and layout_available_size_is_indefinite(&current_available_space.height):
+        layout_grid_formatting_context_rerun_row_track_sizing_using_grid_container_height(this, layout_grid_formatting_context_resolve_used_grid_container_height_for_second_row_layout(this))
+        this.m_automatic_content_height = intrinsic_grid_container_height
+
+    layout_grid_formatting_context_resolve_track_spacing(this, LayoutGridDimension.column)
+
+    layout_grid_formatting_context_resolve_track_spacing(this, LayoutGridDimension.row)
+
+    if base.m_layout_mode == LayoutMode.intrinsic_sizing:
+        layout_grid_formatting_context_determine_intrinsic_size_of_grid_container(this, available_space)
+        return
+
+    for grid_item in &items:
+        let margin_offset = gfx.CssPixelPoint(m_x = layout_state_used_values_margin_box_left(grid_item.used_values), m_y = layout_state_used_values_margin_box_top(grid_item.used_values))
+        let grid_area_rect = layout_grid_formatting_context_get_grid_area_rect(this, grid_item)
+        let top_left = gfx.css_pixel_rect_top_left(&grid_area_rect)
+        layout_state_used_values_set_content_offset(grid_item.used_values, gfx.css_pixel_point_add(&top_left, margin_offset))
+        layout_formatting_context_compute_inset(base, grid_item.box.layout_node_with_style_and_box_model_metrics(), gfx.css_pixel_rect_size(&grid_area_rect))
+
+        let available_space_for_children = LayoutAvailableSpace(width = layout_available_size_make_definite(layout_state_used_values_content_width(grid_item.used_values)), height = layout_available_size_make_definite(layout_state_used_values_content_height(grid_item.used_values)))
+        layout_state_used_values_set_has_definite_width(grid_item.used_values, true)
+        layout_state_used_values_set_has_definite_height(grid_item.used_values, true)
+        if let independent_formatting_context = layout_formatting_context_layout_inside(base, grid_item.box, LayoutMode.normal, available_space_for_children):
+            # The OwnPtr goes out of scope at the end of the `if`.
+            defer layout_formatting_context_destruct(independent_formatting_context)
+            layout_formatting_context_parent_context_did_dimension_child_root_box(independent_formatting_context)
+
+    # (The `serialize` lambda is layout_grid_formatting_context_serialize_tracks.)
+
+    let grid_track_columns = layout_grid_formatting_context_serialize_tracks(&this.m_grid_columns, &this.m_column_lines)
+    let grid_track_rows = layout_grid_formatting_context_serialize_tracks(&this.m_grid_rows, &this.m_row_lines)
+
+    # getComputedStyle() needs to return the resolved values of grid-template-columns and grid-template-rows
+    # so they need to be saved in the state, and then assigned to paintables in LayoutState::commit()
+    layout_state_used_values_set_grid_template_columns(this.m_grid_container_used_values, css_grid_track_size_list_style_value_create(grid_track_columns))
+    layout_state_used_values_set_grid_template_rows(this.m_grid_container_used_values, css_grid_track_size_list_style_value_create(grid_track_rows))
+
+# mark: Absolutely positioned children ==========================================================
+
+## The `explicit_line_position` lambda of resolve_abspos_containing_block_info.
+func layout_grid_formatting_context_explicit_line_position(this: LayoutGridFormattingContext*, dimension: LayoutGridDimension, line_index: i32) -> gfx.CssPixels:
+    let tracks_and_gaps = ak.vector_span(layout_grid_formatting_context_tracks_and_gaps(this, dimension))
+    let grid_container_size = layout_grid_formatting_context_available_size(this, dimension)
+
+    var offset = layout_zero_px()
+    var sum_of_base_sizes_including_gaps = layout_zero_px()
+    for summed_track in tracks_and_gaps:
+        sum_of_base_sizes_including_gaps = sum_of_base_sizes_including_gaps.add(summed_track.base_size)
+
+    let computed_values = layout_box_computed(layout_grid_formatting_context_grid_container(this))
+    let alignment = layout_to_alignment_justify_content(css_computed_values_justify_content(computed_values)) if dimension == LayoutGridDimension.column else layout_to_alignment_align_content(css_computed_values_align_content(computed_values))
+    if alignment == LayoutAlignment.center or alignment == LayoutAlignment.space_around or alignment == LayoutAlignment.space_evenly:
+        let free_space = layout_available_size_to_px_or_zero(&grid_container_size).sub(sum_of_base_sizes_including_gaps)
+        offset = layout_div_int(ak.max(free_space, layout_zero_px()), 2)
+    elif alignment == LayoutAlignment.end:
+        let free_space = layout_available_size_to_px_or_zero(&grid_container_size).sub(sum_of_base_sizes_including_gaps)
+        offset = free_space
+
+    # `min(line_index * 2, tracks_and_gaps.size())` is AK::min<int>.
+    for i in 0..<ak.min[i32](line_index * 2, (i32)tracks_and_gaps.length):
+        offset = offset.add(tracks_and_gaps[(usize)i].base_size)
+    return offset
+
+## The `augmented_grid_padding_edge` lambda of resolve_abspos_containing_block_info.
+func layout_grid_formatting_context_augmented_grid_padding_edge(this: LayoutGridFormattingContext*, dimension: LayoutGridDimension, is_start_line: bool) -> gfx.CssPixels:
+    let available_size = layout_grid_formatting_context_available_size(this, dimension)
+    let padding_start = this.m_grid_container_used_values.padding_left if dimension == LayoutGridDimension.column else this.m_grid_container_used_values.padding_top
+    let padding_end = this.m_grid_container_used_values.padding_right if dimension == LayoutGridDimension.column else this.m_grid_container_used_values.padding_bottom
+
+    if is_start_line:
+        return padding_start.neg()
+
+    var offset = layout_available_size_to_px_or_zero(&available_size) if layout_available_size_is_definite(&available_size) else layout_zero_px()
+    if not layout_available_size_is_definite(&available_size):
+        for track in ak.vector_span(layout_grid_formatting_context_tracks_and_gaps(this, dimension)):
+            offset = offset.add(track.base_size)
+    return offset.add(padding_end)
+
+## The `override_mixed_auto_axis` lambda of resolve_abspos_containing_block_info.
+func layout_grid_formatting_context_override_mixed_auto_axis(this: LayoutGridFormattingContext*, rect: gfx.CssPixelRect*, dimension: LayoutGridDimension, placement_start: const CssGridTrackPlacement*, placement_end: const CssGridTrackPlacement*, placement_position: const LayoutGridFormattingContextPlacementPosition*):
+    let start_is_augmented = css_grid_track_placement_is_auto_positioned(placement_start) and css_grid_track_placement_is_positioned(placement_end) and not css_grid_track_placement_is_span(placement_end)
+    let end_is_augmented = css_grid_track_placement_is_auto_positioned(placement_end) and css_grid_track_placement_is_positioned(placement_start) and not css_grid_track_placement_is_span(placement_start)
+    if not start_is_augmented and not end_is_augmented:
+        return
+
+    let start_offset = layout_grid_formatting_context_augmented_grid_padding_edge(this, dimension, true) if start_is_augmented else layout_grid_formatting_context_explicit_line_position(this, dimension, placement_position.start)
+    let end_offset = layout_grid_formatting_context_augmented_grid_padding_edge(this, dimension, false) if end_is_augmented else layout_grid_formatting_context_explicit_line_position(this, dimension, placement_position.end)
+
+    if dimension == LayoutGridDimension.column:
+        gfx.css_pixel_rect_set_x(rect, start_offset)
+        gfx.css_pixel_rect_set_width(rect, end_offset.sub(start_offset))
+    else:
+        gfx.css_pixel_rect_set_y(rect, start_offset)
+        gfx.css_pixel_rect_set_height(rect, end_offset.sub(start_offset))
+
+## The `grid_area_rect` lambda of resolve_abspos_containing_block_info: the box's area in the augmented grid.
+func layout_grid_formatting_context_abspos_grid_area_rect(this: LayoutGridFormattingContext*, box: LayoutBox*, abspos_box_state: LayoutStateUsedValues*) -> gfx.CssPixelRect:
+    let computed_values = layout_box_computed(box)
+    var item = LayoutGridItem(box = box, used_values = abspos_box_state, row = none, row_span = none, column = none, column_span = none)
+    let row_placement_position = layout_grid_formatting_context_resolve_grid_position(this, box, LayoutGridDimension.row)
+    let column_placement_position = layout_grid_formatting_context_resolve_grid_position(this, box, LayoutGridDimension.column)
+    let row_start = css_computed_values_grid_row_start(computed_values)
+    let row_end = css_computed_values_grid_row_end(computed_values)
+    let column_start = css_computed_values_grid_column_start(computed_values)
+    let column_end = css_computed_values_grid_column_end(computed_values)
+    if not layout_grid_formatting_context_is_auto_positioned_track(this, row_start, row_end):
+        item.row = row_placement_position.start
+        item.row_span = row_placement_position.span
+    if not layout_grid_formatting_context_is_auto_positioned_track(this, column_start, column_end):
+        item.column = column_placement_position.start
+        item.column_span = column_placement_position.span
+
+    var rect = layout_grid_formatting_context_get_grid_area_rect(this, &item)
+
+    # (explicit_line_position, augmented_grid_padding_edge and override_mixed_auto_axis are
+    # layout_grid_formatting_context_explicit_line_position, ..._augmented_grid_padding_edge and
+    # ..._override_mixed_auto_axis.)
+
+    layout_grid_formatting_context_override_mixed_auto_axis(this, &rect, LayoutGridDimension.row, &row_start, &row_end, &row_placement_position)
+    layout_grid_formatting_context_override_mixed_auto_axis(this, &rect, LayoutGridDimension.column, &column_start, &column_end, &column_placement_position)
+
+    return rect
+
+## Ported from Libraries/LibWeb/Layout/GridFormattingContext.cpp:2188 Web::Layout::GridFormattingContext::resolve_abspos_containing_block_info (override).
+# https://www.w3.org/TR/css-grid-2/#abspos-items
+pub func layout_grid_formatting_context_resolve_abspos_containing_block_info_impl(base: LayoutFormattingContext*, box: LayoutBox*) -> LayoutAbsposContainingBlockInfo:
+    let this = (LayoutGridFormattingContext*)base
+    let abspos_box_state = layout_state_get_mutable(base.m_state, box.layout_node_with_style())
+    var containing_block_info = layout_formatting_context_resolve_abspos_containing_block_info_impl(base, box)
+
+    let grid_area_rect = layout_grid_formatting_context_abspos_grid_area_rect(this, box, abspos_box_state)
+
+    containing_block_info.rect = grid_area_rect
+    containing_block_info.horizontal_alignment = layout_grid_formatting_context_alignment_for_item(this, box, LayoutGridDimension.column)
+    containing_block_info.vertical_alignment = layout_grid_formatting_context_alignment_for_item(this, box, LayoutGridDimension.row)
+
+    # An absolutely positioned child of a grid container gets its static
+    # position from grid placement and alignment, but deeper descendants
+    # inside grid items still use the generic static-position behavior from
+    # their in-flow ancestor.
+    if layout_node_static_position_containing_block(box.layout_node()) == layout_grid_formatting_context_grid_container(this):
+        containing_block_info.horizontal_axis_mode = LayoutAbsposAxisMode.inset_from_rect
+        containing_block_info.vertical_axis_mode = LayoutAbsposAxisMode.inset_from_rect
+
+    return containing_block_info
+
+## Ported from Libraries/LibWeb/Layout/GridFormattingContext.cpp:2295 Web::Layout::GridFormattingContext::parent_context_did_dimension_child_root_box (override).
+pub func layout_grid_formatting_context_parent_context_did_dimension_child_root_box_impl(base: LayoutFormattingContext*):
+    let this = (LayoutGridFormattingContext*)base
+    if base.m_layout_mode != LayoutMode.normal:
+        return
+
+    var child_or_none = tree_node_first_child_of_type(layout_grid_formatting_context_grid_container(this).layout_node(), &layout_box_class)
+    while let child = child_or_none:
+        child_or_none = tree_node_next_sibling_of_type(child, &layout_box_class)
+        let box = (LayoutBox*)child
+        if layout_node_is_absolutely_positioned(box.layout_node()):
+            layout_state_used_values_set_static_position_rect(layout_state_get_mutable(base.m_state, box.layout_node_with_style()), layout_grid_formatting_context_calculate_static_position_rect(this, box))
+
+    layout_formatting_context_layout_absolutely_positioned_children(base)
+
+# mark: The grid container's sizes ==============================================================
+
+## Ported from Libraries/LibWeb/Layout/GridFormattingContext.cpp:2310 Web::Layout::GridFormattingContext::determine_intrinsic_size_of_grid_container.
+func layout_grid_formatting_context_determine_intrinsic_size_of_grid_container(this: LayoutGridFormattingContext*, available_space: LayoutAvailableSpace):
+    # https://www.w3.org/TR/css-grid-1/#intrinsic-sizes
+    # The max-content size (min-content size) of a grid container is the sum of the grid container’s track sizes
+    # (including gutters) in the appropriate axis, when the grid is sized under a max-content constraint (min-content constraint).
+
+    if layout_available_size_is_intrinsic_sizing_constraint(&available_space.height):
+        var grid_container_height = layout_zero_px()
+        for row_track in ak.vector_span(&this.m_grid_rows_and_gaps):
+            grid_container_height = grid_container_height.add(row_track.base_size)
+        layout_state_used_values_set_content_height(this.m_grid_container_used_values, grid_container_height)
+
+    if layout_available_size_is_intrinsic_sizing_constraint(&available_space.width):
+        var grid_container_width = layout_zero_px()
+        for column_track in ak.vector_span(&this.m_grid_columns_and_gaps):
+            grid_container_width = grid_container_width.add(column_track.base_size)
+        layout_state_used_values_set_content_width(this.m_grid_container_used_values, grid_container_width)
+
+## Ported from Libraries/LibWeb/Layout/GridFormattingContext.cpp:2333 Web::Layout::GridFormattingContext::automatic_content_width (override).
+pub func layout_grid_formatting_context_automatic_content_width_impl(base: LayoutFormattingContext*) -> gfx.CssPixels:
+    let this = (LayoutGridFormattingContext*)base
+    return layout_state_used_values_content_width(this.m_grid_container_used_values)
+
+## Ported from Libraries/LibWeb/Layout/GridFormattingContext.cpp:2338 Web::Layout::GridFormattingContext::automatic_content_height (override).
+pub func layout_grid_formatting_context_automatic_content_height_impl(base: LayoutFormattingContext*) -> gfx.CssPixels:
+    let this = (LayoutGridFormattingContext*)base
+    return this.m_automatic_content_height
+
+## Ported from Libraries/LibWeb/Layout/GridFormattingContext.cpp:2343 Web::Layout::GridFormattingContext::is_auto_positioned_track.
+func layout_grid_formatting_context_is_auto_positioned_track(this: LayoutGridFormattingContext*, grid_track_start: CssGridTrackPlacement, grid_track_end: CssGridTrackPlacement) -> bool:
+    discard(this)
+    return css_grid_track_placement_is_auto_positioned(&grid_track_start) and css_grid_track_placement_is_auto_positioned(&grid_track_end)
+
+## Ported from Libraries/LibWeb/Layout/GridFormattingContext.cpp:2348 Web::Layout::GridFormattingContext::get_free_space.
+func layout_grid_formatting_context_get_free_space(this: LayoutGridFormattingContext*, available_space: LayoutAvailableSpace, dimension: LayoutGridDimension) -> LayoutAvailableSize:
+    # https://www.w3.org/TR/css-grid-2/#algo-terms
+    # free space: Equal to the available grid space minus the sum of the base sizes of all the grid
+    # tracks (including gutters), floored at zero. If available grid space is indefinite, the free
+    # space is indefinite as well.
+    let available_size = available_space.width if dimension == LayoutGridDimension.column else available_space.height
+    if layout_available_size_is_definite(&available_size):
+        var sum_base_sizes = layout_zero_px()
+        for track in ak.vector_span(layout_grid_formatting_context_tracks_and_gaps(this, dimension)):
+            sum_base_sizes = sum_base_sizes.add(track.base_size)
+        return layout_available_size_make_definite(ak.max(layout_zero_px(), layout_available_size_to_px_or_zero(&available_size).sub(sum_base_sizes)))
+
+    return available_size
+
+# mark: Grid lines ==============================================================================
+
+## Ported from Libraries/LibWeb/Layout/GridFormattingContext.cpp:2366 Web::Layout::GridFormattingContext::get_nth_line_index_by_line_name.
+func layout_grid_formatting_context_get_nth_line_index_by_line_name(this: LayoutGridFormattingContext*, dimension: LayoutGridDimension, line_name: ak.String, nth_line: i32) -> i32?:
+    let lines = &this.m_column_lines if dimension == LayoutGridDimension.column else &this.m_row_lines
+    # Both branches are size_t: `lines.size() + nth_line` and `nth_line - 1` wrap.
+    var line_index: usize = ak.vector_size(lines) +% (usize)(i64)nth_line if nth_line < 0 else (usize)(i64)nth_line -% 1
+    # FIXME: If not enough lines with the name exist, all implicit grid lines on the side
+    # of the explicit grid corresponding to the search direction are assumed to have that name for the purpose of counting this span.
+    # Source: https://drafts.csswg.org/css-grid/#line-placement
+    for actual_line_index in 0..<ak.vector_size(lines):
+        for line in ak.vector_span(ak.vector_at(lines, actual_line_index)):
+            if ak.fly_string_eq_string(&line.name, &line_name):
+                # https://drafts.csswg.org/css-grid/#line-placement
+                # Contributes the nth grid line to the grid item’s placement.
+                if line_index == 0:
+                    return (i32)actual_line_index
+                else:
+                    line_index -= 1
+    return none
+
+## The `expand_lines_definition` lambda of init_grid_lines (it calls itself for the track lists of repeat()s).
+func layout_grid_formatting_context_expand_lines_definition(this: LayoutGridFormattingContext*, dimension: LayoutGridDimension, lines: ak.Vector[ak.Vector[CssGridLineName]]*, line_names: ak.Vector[CssGridLineName]*, lines_definition: const CssGridTrackSizeList*):
+    let list = css_grid_track_size_list_list(lines_definition)
+    for item in ak.vector_span_const(&list):
+        match item:
+            .css_grid_line_names(grid_line_names):
+                let names = css_grid_line_names_names(&grid_line_names)
+                ak.vector_extend_2(line_names, &names)
+            .css_explicit_grid_track(explicit_track):
+                if css_explicit_grid_track_is_default(&explicit_track) or css_explicit_grid_track_is_minmax(&explicit_track):
+                    # `lines.append(line_names)` copies the names before they are cleared.
+                    ak.vector_append_t(lines, ak.vector_clone(line_names))
+                    ak.vector_clear(line_names)
+                elif css_explicit_grid_track_is_repeat(&explicit_track):
+                    var repeat_count: i32 = 0
+                    let repeat = css_explicit_grid_track_repeat(&explicit_track)
+                    if css_grid_repeat_is_auto_fill(&repeat) or css_grid_repeat_is_auto_fit(&repeat):
+                        repeat_count = layout_grid_formatting_context_count_of_repeated_auto_fill_or_fit_tracks(this, dimension, &explicit_track)
+                    else:
+                        repeat_count = (i32)css_grid_repeat_repeat_count(&repeat)
+                    let repeat_track = repeat
+                    let repeat_track_size_list = css_grid_repeat_grid_track_size_list(&repeat_track)
+                    for _repetition in 0..<repeat_count:
+                        layout_grid_formatting_context_expand_lines_definition(this, dimension, lines, line_names, &repeat_track_size_list)
+                else:
+                    trap("VERIFY_NOT_REACHED")
+
+## Ported from Libraries/LibWeb/Layout/GridFormattingContext.cpp:2388 Web::Layout::GridFormattingContext::init_grid_lines.
+func layout_grid_formatting_context_init_grid_lines(this: LayoutGridFormattingContext*, dimension: LayoutGridDimension):
+    let grid_computed_values = layout_box_computed(layout_grid_formatting_context_grid_container(this))
+    let lines_definition = css_computed_values_grid_template_columns(grid_computed_values) if dimension == LayoutGridDimension.column else css_computed_values_grid_template_rows(grid_computed_values)
+    let lines = &this.m_column_lines if dimension == LayoutGridDimension.column else &this.m_row_lines
+
+    var line_names = ak.Vector[CssGridLineName]()
+    # (expand_lines_definition is layout_grid_formatting_context_expand_lines_definition.)
+
+    layout_grid_formatting_context_expand_lines_definition(this, dimension, lines, &line_names, &lines_definition)
+    ak.vector_append_t(lines, line_names)
+
+# mark: OccupationGrid ==========================================================================
+
+## Ported from Libraries/LibWeb/Layout/GridFormattingContext.cpp:2424 Web::Layout::OccupationGrid::set_occupied.
+pub func layout_occupation_grid_set_occupied(this: LayoutOccupationGrid*, column_start: i32, column_end: i32, row_start: i32, row_end: i32):
+    for row_index in row_start..<row_end:
+        for column_index in column_start..<column_end:
+            this.m_min_column_index = ak.min(this.m_min_column_index, column_index)
+            this.m_max_column_index = ak.max(this.m_max_column_index, column_index)
+            this.m_min_row_index = ak.min(this.m_min_row_index, row_index)
+            this.m_max_row_index = ak.max(this.m_max_row_index, row_index)
+
+            discard(ak.hash_table_set(&this.m_occupation_grid, LayoutGridPosition(row = row_index, column = column_index)))
+
+## Ported from Libraries/LibWeb/Layout/GridFormattingContext.cpp:2438 Web::Layout::OccupationGrid::is_occupied.
+pub func layout_occupation_grid_is_occupied(this: const LayoutOccupationGrid*, column_index: i32, row_index: i32) -> bool:
+    return ak.hash_table_contains_t(&this.m_occupation_grid, LayoutGridPosition(row = row_index, column = column_index))
+
+## Ported from Libraries/LibWeb/Layout/GridFormattingContext.cpp:2443 Web::Layout::OccupationGrid::is_area_occupied.
+pub func layout_occupation_grid_is_area_occupied(this: const LayoutOccupationGrid*, column_start: i32, row_start: i32, column_span: i32, row_span: i32) -> bool:
+    for row in row_start..<row_start + row_span:
+        for column in column_start..<column_start + column_span:
+            if layout_occupation_grid_is_occupied(this, column, row):
+                return true
+    return false
+
+# mark: GridItem ================================================================================
+
+## Ported from Libraries/LibWeb/Layout/GridFormattingContext.cpp:2454 Web::Layout::GridItem::gap_adjusted_row.
+pub func layout_grid_item_gap_adjusted_row(this: const LayoutGridItem*) -> i32:
+    return (this.row else trap("VERIFY: the grid item's row has a value")) * 2
+
+## Ported from Libraries/LibWeb/Layout/GridFormattingContext.cpp:2459 Web::Layout::GridItem::gap_adjusted_column.
+pub func layout_grid_item_gap_adjusted_column(this: const LayoutGridItem*) -> i32:
+    return (this.column else trap("VERIFY: the grid item's column has a value")) * 2

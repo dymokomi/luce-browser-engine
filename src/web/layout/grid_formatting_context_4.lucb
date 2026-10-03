@@ -1,0 +1,520 @@
+#==============================================================================================
+#
+#   grid_formatting_context_4 - Layout::GridFormattingContext: maximizing, flexible and auto
+#                               tracks, grid areas, the placement algorithm and the second row
+#                               layout
+#
+#   DESCRIPTION:
+#       Port of LibWeb/Layout/GridFormattingContext.cpp (lines 1123-1611): steps 3 to 5 of the
+#       track sizing algorithm (https://www.w3.org/TR/css-grid-2/#algo-grow-tracks,
+#       https://drafts.csswg.org/css-grid/#algo-flex-tracks with "find the size of an fr",
+#       https://www.w3.org/TR/css-grid-2/#algo-stretch) and its driver, the implicitly-assigned
+#       line names of grid-template-areas, the grid item placement algorithm
+#       (https://drafts.csswg.org/css-grid/#auto-placement-algo) in order-modified document
+#       order, and the grid container's automatic height with the second row track sizing
+#       pass against it.
+#
+#       Copyright (c) 2023-2025, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
+#       Copyright (c) 2022-2023, Martin Falisse <mfalisse@outlook.com>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Maximize tracks =========================================================================
+
+## The `get_free_space_px` lambda of maximize_tracks_using_available_size.
+func layout_grid_formatting_context_get_free_space_px(this: LayoutGridFormattingContext*, available_space: LayoutAvailableSpace, dimension: LayoutGridDimension) -> gfx.CssPixels:
+    # For the purpose of this step: if sizing the grid container under a max-content constraint, the
+    # free space is infinite; if sizing under a min-content constraint, the free space is zero.
+    let free_space = layout_grid_formatting_context_get_free_space(this, available_space, dimension)
+    if layout_available_size_is_max_content(&free_space) or layout_available_size_is_indefinite(&free_space):
+        return gfx.css_pixels_max()
+    if layout_available_size_is_min_content(&free_space):
+        return layout_zero_px()
+    return layout_available_size_to_px_or_zero(&free_space)
+
+## Ported from Libraries/LibWeb/Layout/GridFormattingContext.cpp:1123 Web::Layout::GridFormattingContext::maximize_tracks_using_available_size.
+func layout_grid_formatting_context_maximize_tracks_using_available_size(this: LayoutGridFormattingContext*, available_space: LayoutAvailableSpace, dimension: LayoutGridDimension):
+    # https://www.w3.org/TR/css-grid-2/#algo-grow-tracks
+    # 12.6. Maximize Tracks
+
+    let tracks = ak.vector_span(layout_grid_formatting_context_tracks(this, dimension))
+
+    var free_space_px = layout_grid_formatting_context_get_free_space_px(this, available_space, dimension)
+
+    # If the free space is positive, distribute it equally to the base sizes of all tracks, freezing
+    # tracks as they reach their growth limits (and continuing to grow the unfrozen tracks as needed).
+    var growable_track_count: usize = 0
+    for counted_track in &tracks:
+        if counted_track.base_size_frozen:
+            continue
+        let growth_limit = counted_track.growth_limit else trap("VERIFY: track.growth_limit.has_value()")
+        if counted_track.base_size.lt(growth_limit):
+            growable_track_count += 1
+    while gfx.gt_css_pixels_int(free_space_px, 0) and growable_track_count > 0:
+        # `free_space_px / growable_track_count` is a CSSPixelFraction, read as CSSPixels where it is added.
+        let free_space_to_distribute_per_track = layout_grid_formatting_context_div_count(free_space_px, growable_track_count)
+        for track in &tracks:
+            if track.base_size_frozen:
+                continue
+            let growth_limit = track.growth_limit else trap("VERIFY: the growth limit has a value")
+            if track.base_size.ge(growth_limit):
+                continue
+            let new_base_size = ak.min(growth_limit, track.base_size.add(free_space_to_distribute_per_track))
+            if new_base_size.ge(growth_limit):
+                growable_track_count -= 1
+            track.base_size = new_base_size
+        if layout_grid_formatting_context_get_free_space_px(this, available_space, dimension) == free_space_px:
+            break
+        free_space_px = layout_grid_formatting_context_get_free_space_px(this, available_space, dimension)
+
+## Ported from Libraries/LibWeb/Layout/GridFormattingContext.cpp:1171 Web::Layout::GridFormattingContext::maximize_tracks.
+func layout_grid_formatting_context_maximize_tracks(this: LayoutGridFormattingContext*, dimension: LayoutGridDimension):
+    # https://www.w3.org/TR/css-grid-2/#algo-grow-tracks
+    # 12.6. Maximize Tracks
+
+    let tracks = ak.vector_span(layout_grid_formatting_context_tracks(this, dimension))
+
+    var saved_base_sizes = ak.Vector[gfx.CssPixels]()
+    for saved_track in &tracks:
+        ak.vector_append_t(&saved_base_sizes, saved_track.base_size)
+
+    layout_grid_formatting_context_maximize_tracks_using_available_size(this, layout_grid_formatting_context_available_space(this), dimension)
+
+    # If this would cause the grid to be larger than the grid container’s inner size as limited by its
+    # max-width/height, then redo this step, treating the available grid space as equal to the grid
+    # container’s inner size when it’s sized to its max-width/height.
+    var grid_container_inner_size = layout_zero_px()
+    for track in &tracks:
+        grid_container_inner_size = grid_container_inner_size.add(track.base_size)
+    let available_size = layout_grid_formatting_context_available_size(this, dimension)
+    let computed_values = layout_box_computed(layout_grid_formatting_context_grid_container(this))
+    var should_treat_grid_container_maximum_size_as_none: bool
+    if dimension == LayoutGridDimension.column:
+        should_treat_grid_container_maximum_size_as_none = layout_formatting_context_should_treat_max_width_as_none(this.layout_formatting_context(), layout_grid_formatting_context_grid_container(this), available_size)
+    else:
+        let max_height = css_computed_values_max_height(computed_values)
+        should_treat_grid_container_maximum_size_as_none = not css_size_is_auto(&max_height)
+
+    if not should_treat_grid_container_maximum_size_as_none:
+        let maximum_size = layout_grid_formatting_context_calculate_grid_container_maximum_size(this, dimension)
+        if grid_container_inner_size.gt(maximum_size):
+            for i in 0..<tracks.length:
+                tracks[i].base_size = *ak.vector_at(&saved_base_sizes, i)
+            var available_space_with_max_width = layout_grid_formatting_context_available_space(this)
+            if dimension == LayoutGridDimension.column:
+                available_space_with_max_width.width = layout_available_size_make_definite(maximum_size)
+            else:
+                available_space_with_max_width.height = layout_available_size_make_definite(maximum_size)
+            layout_grid_formatting_context_maximize_tracks_using_available_size(this, available_space_with_max_width, dimension)
+
+# mark: Expand flexible tracks ==================================================================
+
+## `CSSPixelFraction(0)`.
+func layout_grid_formatting_context_zero_fraction() -> gfx.CssPixelFraction:
+    var fraction: gfx.CssPixelFraction = ---
+    gfx.css_pixel_fraction_construct_int(&fraction, 0)
+    return fraction
+
+## `AK::max(a, b)` over CSSPixelFractions: `a < b ? b : a`.
+func layout_grid_formatting_context_max_fraction(a: gfx.CssPixelFraction, b: gfx.CssPixelFraction) -> gfx.CssPixelFraction:
+    if gfx.css_pixel_fraction_cmp_css_pixel_fraction(&a, b) < 0:
+        return b
+    return a
+
+## The `find_the_size_of_an_fr` lambda of expand_flexible_tracks.
+# FIXME: This should ideally take a Span, as that is more idomatic, but Span does not yet support holding references
+func layout_grid_formatting_context_find_the_size_of_an_fr(tracks: const ak.Vector[LayoutGridFormattingContextGridTrack*]*, space_to_fill: gfx.CssPixels) -> gfx.CssPixelFraction:
+    # https://www.w3.org/TR/css-grid-2/#algo-find-fr-size
+    let track_count = ak.vector_size(tracks)
+    var treat_track_as_inflexiable = ak.bitmap_create(track_count, false) else trap("MUST: Bitmap::create")
+    while true:
+        # 1. Let leftover space be the space to fill minus the base sizes of the non-flexible grid tracks.
+        var leftover_space = space_to_fill
+        for track_index in 0..<track_count:
+            let track = *ak.vector_at_const(tracks, track_index)
+            let view = ak.bitmap_view(&treat_track_as_inflexiable)
+            if ak.bitmap_view_get(&view, track_index) or not css_grid_size_is_flexible_length(&track.max_track_sizing_function):
+                leftover_space = leftover_space.sub(track.base_size)
+
+        # 2. Let flex factor sum be the sum of the flex factors of the flexible tracks.
+        #    If this value is less than 1, set it to 1 instead.
+        var flex_factor_sum = layout_zero_px()
+        for track_index in 0..<track_count:
+            let track = *ak.vector_at_const(tracks, track_index)
+            let view = ak.bitmap_view(&treat_track_as_inflexiable)
+            if ak.bitmap_view_get(&view, track_index) or not css_grid_size_is_flexible_length(&track.max_track_sizing_function):
+                continue
+            flex_factor_sum = flex_factor_sum.add(gfx.css_pixels_nearest_value_for_f64(css_grid_size_flex_factor(&track.max_track_sizing_function)))
+        if gfx.lt_int(flex_factor_sum, 1):
+            flex_factor_sum = gfx.CssPixels.from_int(1)
+
+        # 3. Let the hypothetical fr size be the leftover space divided by the flex factor sum.
+        let hypothetical_fr_size = leftover_space.div(flex_factor_sum)
+
+        # 4. If the product of the hypothetical fr size and a flexible track’s flex factor is less than the track’s
+        #    base size, restart this algorithm treating all such tracks as inflexible.
+        var need_to_restart = false
+        for track_index in 0..<track_count:
+            let track = *ak.vector_at_const(tracks, track_index)
+            let view = ak.bitmap_view(&treat_track_as_inflexiable)
+            if ak.bitmap_view_get(&view, track_index) or not css_grid_size_is_flexible_length(&track.max_track_sizing_function):
+                continue
+            let scaled_fraction = gfx.css_pixels_nearest_value_for_f64(css_grid_size_flex_factor(&track.max_track_sizing_function)).mul_fraction(hypothetical_fr_size)
+            if scaled_fraction.lt(track.base_size):
+                ak.bitmap_set(&treat_track_as_inflexiable, track_index, true)
+                need_to_restart = true
+        if need_to_restart:
+            continue
+
+        # 5. Return the hypothetical fr size.
+        return hypothetical_fr_size
+
+    # (VERIFY_NOT_REACHED() after the `do { ... } while (true)` loop: the loop only returns.)
+
+## The `flex_fraction` lambda of expand_flexible_tracks: the grid's used flex fraction.
+func layout_grid_formatting_context_flex_fraction(this: LayoutGridFormattingContext*, dimension: LayoutGridDimension) -> gfx.CssPixelFraction:
+    let available_size = layout_grid_formatting_context_available_size(this, dimension)
+    let free_space = layout_grid_formatting_context_get_free_space(this, layout_grid_formatting_context_available_space(this), dimension)
+    # If the free space is zero or if sizing the grid container under a min-content constraint:
+    if (layout_available_size_is_definite(&free_space) and gfx.eq_css_pixels_int(layout_available_size_to_px_or_zero(&free_space), 0)) or layout_available_size_is_min_content(&available_size):
+        # The used flex fraction is zero.
+        return layout_grid_formatting_context_zero_fraction()
+        # Otherwise, if the free space is a definite length:
+    elif layout_available_size_is_definite(&free_space):
+        # The used flex fraction is the result of finding the size of an fr using all of the grid tracks and a space
+        # to fill of the available grid space.
+        return layout_grid_formatting_context_find_the_size_of_an_fr(layout_grid_formatting_context_tracks_and_gaps(this, dimension), layout_available_size_to_px_or_zero(&available_size))
+    else:
+        # Otherwise, if the free space is an indefinite length:
+        # The used flex fraction is the maximum of:
+        var result = layout_grid_formatting_context_zero_fraction()
+        # For each flexible track, if the flexible track’s flex factor is greater than one, the result of dividing
+        # the track’s base size by its flex factor; otherwise, the track’s base size.
+        let tracks = ak.vector_span(layout_grid_formatting_context_tracks(this, dimension))
+        for track in &tracks:
+            if css_grid_size_is_flexible_length(&track.max_track_sizing_function):
+                if css_grid_size_flex_factor(&track.max_track_sizing_function) > 1.0:
+                    result = layout_grid_formatting_context_max_fraction(result, track.base_size.div(gfx.css_pixels_nearest_value_for_f64(css_grid_size_flex_factor(&track.max_track_sizing_function))))
+                else:
+                    result = layout_grid_formatting_context_max_fraction(result, track.base_size.div(gfx.CssPixels.from_int(1)))
+        # For each grid item that crosses a flexible track, the result of finding the size of an fr using all the
+        # grid tracks that the item crosses and a space to fill of the item’s max-content contribution.
+        let items = ak.vector_span(&this.m_grid_items)
+        for item in &items:
+            var spanned_tracks = ak.Vector[LayoutGridFormattingContextGridTrack*]()
+            var crosses_flexible_track = false
+            for spanned_track in layout_grid_formatting_context_for_each_spanned_track_by_item(this, item, dimension):
+                ak.vector_append_t(&spanned_tracks, spanned_track)
+                if css_grid_size_is_flexible_length(&spanned_track.max_track_sizing_function):
+                    crosses_flexible_track = true
+
+            if crosses_flexible_track:
+                result = layout_grid_formatting_context_max_fraction(result, layout_grid_formatting_context_find_the_size_of_an_fr(&spanned_tracks, layout_grid_formatting_context_calculate_max_content_contribution(this, item, dimension)))
+
+        return result
+
+## Ported from Libraries/LibWeb/Layout/GridFormattingContext.cpp:1213 Web::Layout::GridFormattingContext::expand_flexible_tracks.
+func layout_grid_formatting_context_expand_flexible_tracks(this: LayoutGridFormattingContext*, dimension: LayoutGridDimension):
+    # https://drafts.csswg.org/css-grid/#algo-flex-tracks
+    # 12.7. Expand Flexible Tracks
+    # This step sizes flexible tracks using the largest value it can assign to an fr without exceeding
+    # the available space.
+
+    # (find_the_size_of_an_fr is layout_grid_formatting_context_find_the_size_of_an_fr.)
+
+    # First, find the grid’s used flex fraction:
+    let flex_fraction = layout_grid_formatting_context_flex_fraction(this, dimension)
+
+    # For each flexible track, if the product of the used flex fraction and the track’s flex factor is greater than
+    # the track’s base size, set its base size to that product.
+    for track in ak.vector_span(layout_grid_formatting_context_tracks_and_gaps(this, dimension)):
+        if css_grid_size_is_flexible_length(&track.max_track_sizing_function):
+            let scaled_fraction = gfx.css_pixels_nearest_value_for_f64(css_grid_size_flex_factor(&track.max_track_sizing_function)).mul_fraction(flex_fraction)
+            if scaled_fraction.gt(track.base_size):
+                track.base_size = scaled_fraction
+
+# mark: Stretch auto tracks and the track sizing algorithm ======================================
+
+## Ported from Libraries/LibWeb/Layout/GridFormattingContext.cpp:1330 Web::Layout::GridFormattingContext::stretch_auto_tracks.
+func layout_grid_formatting_context_stretch_auto_tracks(this: LayoutGridFormattingContext*, dimension: LayoutGridDimension):
+    # https://www.w3.org/TR/css-grid-2/#algo-stretch
+    # 12.8. Stretch auto Tracks
+    # This step expands tracks that have an auto max track sizing function by dividing any remaining positive,
+    # definite free space equally amongst them. If the free space is indefinite, but the grid container has a
+    # definite min-width/height, use that size to calculate the free space for this step instead.
+
+    var content_distribution_property_is_normal_or_stretch = false
+    let computed_values = layout_box_computed(layout_grid_formatting_context_grid_container(this))
+    if dimension == LayoutGridDimension.column:
+        let justify_content = css_computed_values_justify_content(computed_values)
+        content_distribution_property_is_normal_or_stretch = justify_content == css_data.JustifyContent.normal or justify_content == css_data.JustifyContent.stretch
+    else:
+        let align_content = css_computed_values_align_content(computed_values)
+        content_distribution_property_is_normal_or_stretch = align_content == css_data.AlignContent.normal or align_content == css_data.AlignContent.stretch
+
+    if not content_distribution_property_is_normal_or_stretch:
+        return
+
+    let tracks_and_gaps = ak.vector_span(layout_grid_formatting_context_tracks_and_gaps(this, dimension))
+    let available_size = layout_grid_formatting_context_available_size(this, dimension)
+
+    var count_of_auto_max_sizing_tracks: i32 = 0
+    for counted_track in tracks_and_gaps:
+        if css_grid_size_is_auto(&counted_track.max_track_sizing_function, available_size):
+            count_of_auto_max_sizing_tracks += 1
+
+    if count_of_auto_max_sizing_tracks == 0:
+        return
+
+    let free_space = layout_grid_formatting_context_get_free_space(this, layout_grid_formatting_context_available_space(this), dimension)
+    let remaining_space = layout_available_size_to_px_or_zero(&free_space)
+    # `remaining_space / count_of_auto_max_sizing_tracks` is a CSSPixelFraction, read as CSSPixels where it is added.
+    let remaining_space_to_distribute_per_track = layout_div_int(remaining_space, count_of_auto_max_sizing_tracks)
+    for track in tracks_and_gaps:
+        if not css_grid_size_is_auto(&track.max_track_sizing_function, available_size):
+            continue
+        track.base_size = track.base_size.add(remaining_space_to_distribute_per_track)
+
+## Ported from Libraries/LibWeb/Layout/GridFormattingContext.cpp:1371 Web::Layout::GridFormattingContext::run_track_sizing.
+func layout_grid_formatting_context_run_track_sizing(this: LayoutGridFormattingContext*, dimension: LayoutGridDimension):
+    # https://www.w3.org/TR/css-grid-2/#algo-track-sizing
+    # 12.3. Track Sizing Algorithm
+
+    # 1. Initialize Track Sizes
+    layout_grid_formatting_context_initialize_track_sizes(this, dimension)
+
+    # 2. Resolve Intrinsic Track Sizes
+    layout_grid_formatting_context_resolve_intrinsic_track_sizes(this, dimension)
+
+    # 3. Maximize Tracks
+    layout_grid_formatting_context_maximize_tracks(this, dimension)
+
+    # 4. Expand Flexible Tracks
+    if layout_grid_formatting_context_has_flexible_tracks(this, dimension):
+        layout_grid_formatting_context_expand_flexible_tracks(this, dimension)
+
+    # 5. Expand Stretched auto Tracks
+    layout_grid_formatting_context_stretch_auto_tracks(this, dimension)
+
+    # If calculating the layout of a grid item in this step depends on the available space in the block
+    # axis, assume the available space that it would have if any row with a definite max track sizing
+    # function had that size and all other rows were infinite. If both the grid container and all
+    # tracks have definite sizes, also apply align-content to find the final effective size of any gaps
+    # spanned by such items; otherwise ignore the effects of track alignment in this estimation.
+
+# mark: Grid areas and item placement ===========================================================
+
+## `GridLineName { .name = MUST(String::formatted("{}{}", name, suffix)), .implicit = true }`.
+func layout_grid_formatting_context_implicit_line_name(name: ak.String, suffix: str) -> CssGridLineName:
+    return CssGridLineName(name = ak.fly_string_from_string(layout_grid_formatting_context_suffixed_name(name, suffix)), implicit = true)
+
+## Ported from Libraries/LibWeb/Layout/GridFormattingContext.cpp:1400 Web::Layout::GridFormattingContext::build_grid_areas.
+func layout_grid_formatting_context_build_grid_areas(this: LayoutGridFormattingContext*):
+    let grid_template_areas = css_computed_values_grid_template_areas(layout_box_computed(layout_grid_formatting_context_grid_container(this)))
+    if css_grid_template_areas_is_empty(&grid_template_areas):
+        return
+
+    var max_column_line_index_of_area: usize = 0
+    var max_row_line_index_of_area: usize = 0
+    for sized_entry in ak.hash_map_begin_const(&grid_template_areas.areas):
+        let area = sized_entry.value
+        max_column_line_index_of_area = ak.max(max_column_line_index_of_area, area.column_end)
+        max_row_line_index_of_area = ak.max(max_row_line_index_of_area, area.row_end)
+
+    if max_column_line_index_of_area >= ak.vector_size(&this.m_column_lines):
+        ak.vector_resize(&this.m_column_lines, max_column_line_index_of_area + 1)
+    if max_row_line_index_of_area >= ak.vector_size(&this.m_row_lines):
+        ak.vector_resize(&this.m_row_lines, max_row_line_index_of_area + 1)
+
+    # https://www.w3.org/TR/css-grid-2/#implicitly-assigned-line-name
+    # 7.3.2. Implicitly-Assigned Line Names
+    # The grid-template-areas property generates implicitly-assigned line names from the named grid areas in the
+    # template. For each named grid area foo, four implicitly-assigned line names are created: two named foo-start,
+    # naming the row-start and column-start lines of the named grid area, and two named foo-end, naming the row-end
+    # and column-end lines of the named grid area.
+    for entry in ak.hash_map_begin_const(&grid_template_areas.areas):
+        let name = entry.key
+        let area = entry.value
+        ak.vector_append_t(ak.vector_at(&this.m_column_lines, area.column_start), layout_grid_formatting_context_implicit_line_name(name, "-start"))
+        ak.vector_append_t(ak.vector_at(&this.m_column_lines, area.column_end), layout_grid_formatting_context_implicit_line_name(name, "-end"))
+        ak.vector_append_t(ak.vector_at(&this.m_row_lines, area.row_start), layout_grid_formatting_context_implicit_line_name(name, "-start"))
+        ak.vector_append_t(ak.vector_at(&this.m_row_lines, area.row_end), layout_grid_formatting_context_implicit_line_name(name, "-end"))
+
+## Ported from Libraries/LibWeb/Layout/GridFormattingContext.cpp:1432 Web::Layout::GridFormattingContext::place_grid_items.
+func layout_grid_formatting_context_place_grid_items(this: LayoutGridFormattingContext*):
+    let base = this.layout_formatting_context()
+    let grid_container = layout_grid_formatting_context_grid_container(this)
+    # (The C++ copies grid-template-columns and grid-template-rows into locals it never reads.)
+    let column_tracks_count = ak.vector_size(&this.m_column_lines) - 1
+    let row_tracks_count = ak.vector_size(&this.m_row_lines) - 1
+
+    # https://drafts.csswg.org/css-grid/#overview-placement
+    # 2.2. Placing Items
+    # The contents of the grid container are organized into individual grid items (analogous to
+    # flex items), which are then assigned to predefined areas in the grid. They can be explicitly
+    # placed using coordinates through the grid-placement properties or implicitly placed into
+    # empty areas using auto-placement.
+    var order_item_bucket = ak.HashMap[i32, ak.Vector[LayoutBox*], ak.I32Traits]()
+    var child_or_none = tree_node_first_child_of_type(grid_container.layout_node(), &layout_box_class)
+    while let child = child_or_none:
+        child_or_none = tree_node_next_sibling_of_type(child, &layout_box_class)
+        let child_box = (LayoutBox*)child
+        if layout_formatting_context_can_skip_is_anonymous_text_run(base, child_box):
+            continue
+
+        if layout_node_is_out_of_flow_layout_formatting_context(child_box.layout_node(), base):
+            continue
+
+        layout_node_set_grid_item(child_box.layout_node(), true)
+
+        let order_bucket = ak.hash_map_ensure(&order_item_bucket, css_computed_values_order(layout_box_computed(child_box)))
+        ak.vector_append_t(order_bucket, child_box)
+
+    layout_occupation_grid_construct_usize(&this.m_occupation_grid, column_tracks_count, row_tracks_count)
+
+    # https://drafts.csswg.org/css-grid/#auto-placement-algo
+    # 8.5. Grid Item Placement Algorithm
+
+    var keys = ak.hash_map_keys(&order_item_bucket)
+    ak.quick_sort_t_collection(ak.vector_span(&keys))
+    let sorted_keys = ak.vector_span(&keys)
+
+    # FIXME: 0. Generate anonymous grid items
+
+    # 1. Position anything that's not auto-positioned.
+    for key in sorted_keys:
+        let boxes_to_place = ak.hash_map_get_k(&order_item_bucket, key) else trap("VERIFY: the order bucket exists")
+        var i: usize = 0
+        while i < ak.vector_size(boxes_to_place):
+            let child_box = *ak.vector_at(boxes_to_place, i)
+            let computed_values = layout_box_computed(child_box)
+            if layout_grid_formatting_context_is_auto_positioned_track(this, css_computed_values_grid_row_start(computed_values), css_computed_values_grid_row_end(computed_values)) or layout_grid_formatting_context_is_auto_positioned_track(this, css_computed_values_grid_column_start(computed_values), css_computed_values_grid_column_end(computed_values)):
+                i += 1
+                continue
+            layout_grid_formatting_context_place_item_with_row_and_column_position(this, child_box)
+            # `boxes_to_place.remove(i); i--;`: the next box is now at index i.
+            ak.vector_remove(boxes_to_place, i)
+
+    # 2. Process the items locked to a given row.
+    for key in sorted_keys:
+        let boxes_to_place = ak.hash_map_get_k(&order_item_bucket, key) else trap("VERIFY: the order bucket exists")
+        var i: usize = 0
+        while i < ak.vector_size(boxes_to_place):
+            let child_box = *ak.vector_at(boxes_to_place, i)
+            let computed_values = layout_box_computed(child_box)
+            if layout_grid_formatting_context_is_auto_positioned_track(this, css_computed_values_grid_row_start(computed_values), css_computed_values_grid_row_end(computed_values)):
+                i += 1
+                continue
+            layout_grid_formatting_context_place_item_with_row_position(this, child_box)
+            ak.vector_remove(boxes_to_place, i)
+
+    # 3. Determine the columns in the implicit grid.
+    # NOTE: "implicit grid" here is the same as the m_occupation_grid
+
+    # 3.1. Start with the columns from the explicit grid.
+    # NOTE: Done in step 1.
+
+    # 3.2. Among all the items with a definite column position (explicitly positioned items, items
+    # positioned in the previous step, and items not yet positioned but with a definite column) add
+    # columns to the beginning and end of the implicit grid as necessary to accommodate those items.
+    # NOTE: "Explicitly positioned items" and "items positioned in the previous step" done in step 1
+    # and 2, respectively. Adding columns for "items not yet positioned but with a definite column"
+    # will be done in step 4.
+
+    # 3.3. If the largest column span among all the items without a definite column position is larger
+    # than the width of the implicit grid, add columns to the end of the implicit grid to accommodate
+    # that column span.
+    for key in sorted_keys:
+        let boxes_to_place = ak.hash_map_get_k(&order_item_bucket, key) else trap("VERIFY: the order bucket exists")
+        for child_box in ak.vector_span(boxes_to_place):
+            let column_span = layout_grid_formatting_context_resolve_grid_span(this, child_box, LayoutGridDimension.column)
+            let max_column_index = (usize)(i64)layout_occupation_grid_max_column_index(&this.m_occupation_grid)
+
+            if column_span -% 1 > max_column_index:
+                layout_occupation_grid_set_max_column_index(&this.m_occupation_grid, column_span -% 1)
+
+    # 4. Position the remaining grid items.
+    # For each grid item that hasn't been positioned by the previous steps, in order-modified document
+    # order:
+    var auto_placement_cursor_column: i32 = 0
+    var auto_placement_cursor_row: i32 = 0
+    let auto_flow = css_computed_values_grid_auto_flow(layout_box_computed(grid_container))
+
+    for key in sorted_keys:
+        let boxes_to_place = ak.hash_map_get_k(&order_item_bucket, key) else trap("VERIFY: the order bucket exists")
+        while not ak.vector_is_empty(boxes_to_place):
+            # Every remaining box is placed and removed (`i` stays 0).
+            let child_box = *ak.vector_at(boxes_to_place, 0)
+            let computed_values = layout_box_computed(child_box)
+
+            if not layout_grid_formatting_context_is_auto_positioned_track(this, css_computed_values_grid_column_start(computed_values), css_computed_values_grid_column_end(computed_values)):
+                # 4.1.1 / 4.2.1: Item with definite column position.
+                let column_start = layout_grid_formatting_context_resolve_grid_position(this, child_box, LayoutGridDimension.column).start
+
+                if auto_flow.dense:
+                    # Dense: reset row cursor to start of implicit grid.
+                    auto_placement_cursor_row = layout_occupation_grid_min_row_index(&this.m_occupation_grid)
+                else:
+                    # Sparse: if column moved backward, bump row.
+                    if column_start < auto_placement_cursor_column:
+                        auto_placement_cursor_row += 1
+                auto_placement_cursor_column = column_start
+
+                layout_grid_formatting_context_place_item_with_column_position(this, child_box, &auto_placement_cursor_row)
+            else:
+                # 4.1.2 / 4.2.2: Item with auto position in both axes.
+                if auto_flow.dense:
+                    # Dense: reset cursor to start of implicit grid.
+                    auto_placement_cursor_column = layout_occupation_grid_min_column_index(&this.m_occupation_grid)
+                    auto_placement_cursor_row = layout_occupation_grid_min_row_index(&this.m_occupation_grid)
+
+                layout_grid_formatting_context_place_item_with_no_declared_position(this, child_box, &auto_placement_cursor_column, &auto_placement_cursor_row)
+
+            ak.vector_remove(boxes_to_place, 0)
+
+    # NOTE: When final implicit grid sizes are known, we can offset their positions so leftmost grid track has 0 index.
+    let items = ak.vector_span(&this.m_grid_items)
+    for item in &items:
+        item.row = (item.row else trap("VERIFY: the grid item's row has a value")) - layout_occupation_grid_min_row_index(&this.m_occupation_grid)
+        item.column = (item.column else trap("VERIFY: the grid item's column has a value")) - layout_occupation_grid_min_column_index(&this.m_occupation_grid)
+
+# mark: The grid container's height =============================================================
+
+## Ported from Libraries/LibWeb/Layout/GridFormattingContext.cpp:1578 Web::Layout::GridFormattingContext::determine_grid_container_height.
+func layout_grid_formatting_context_determine_grid_container_height(this: LayoutGridFormattingContext*):
+    var total_y = layout_zero_px()
+    for grid_row in ak.vector_span(&this.m_grid_rows_and_gaps):
+        total_y = total_y.add(grid_row.base_size)
+    this.m_automatic_content_height = total_y
+
+## Ported from Libraries/LibWeb/Layout/GridFormattingContext.cpp:1586 Web::Layout::GridFormattingContext::resolve_used_grid_container_height_for_second_row_layout.
+func layout_grid_formatting_context_resolve_used_grid_container_height_for_second_row_layout(this: LayoutGridFormattingContext*) -> gfx.CssPixels:
+    let base = this.layout_formatting_context()
+    var height = this.m_automatic_content_height
+    let grid_container = layout_grid_formatting_context_grid_container(this)
+    let computed_values = layout_box_computed(grid_container)
+    let available_space = layout_grid_formatting_context_available_space(this)
+
+    let max_height = css_computed_values_max_height(computed_values)
+    if not layout_formatting_context_should_treat_max_height_as_none(base, grid_container, available_space.height) and not css_size_is_auto(&max_height):
+        let max_height_px = layout_formatting_context_calculate_inner_height(base, grid_container, available_space, max_height)
+        height = ak.min(height, max_height_px)
+
+    let min_height = css_computed_values_min_height(computed_values)
+    if not css_size_is_auto(&min_height):
+        height = ak.max(height, layout_formatting_context_calculate_inner_height(base, grid_container, available_space, min_height))
+
+    return height
+
+## Ported from Libraries/LibWeb/Layout/GridFormattingContext.cpp:1602 Web::Layout::GridFormattingContext::rerun_row_track_sizing_using_grid_container_height.
+func layout_grid_formatting_context_rerun_row_track_sizing_using_grid_container_height(this: LayoutGridFormattingContext*, grid_container_height: gfx.CssPixels):
+    var available_space = layout_grid_formatting_context_available_space(this)
+    available_space.height = layout_available_size_make_definite(grid_container_height)
+    this.m_available_space = available_space
+    layout_grid_formatting_context_initialize_gap_tracks_layout_grid_dimension(this, LayoutGridDimension.row, available_space.height)
+
+    layout_grid_formatting_context_resolve_items_box_metrics(this, LayoutGridDimension.row)
+    layout_grid_formatting_context_run_track_sizing(this, LayoutGridDimension.row)
+    layout_grid_formatting_context_resolve_items_box_metrics(this, LayoutGridDimension.row)
+    layout_grid_formatting_context_resolve_grid_item_sizes(this, LayoutGridDimension.row)
