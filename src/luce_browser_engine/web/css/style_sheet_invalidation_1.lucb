@@ -1,0 +1,330 @@
+#==============================================================================================
+#
+#   style_sheet_invalidation_1 - CSS::StyleSheetInvalidation I: the targeted invalidation set
+#                                of a style sheet or an inserted rule, and applying it to a
+#                                document or a shadow root
+#
+#   DESCRIPTION:
+#       Port of LibWeb/CSS/StyleSheetInvalidation.cpp (lines 1-381): which selectors can reach
+#       light DOM under a shadow host, the rightmost-compound invalidation set of a style rule
+#       with anchor rules for pseudo-element-only and trailing-universal compounds, the one-pass
+#       walk that dirties matching elements, slotted assignees of dirty slots, and
+#       invalidate_root_for_style_sheet_change.
+#
+#       Copyright (c) 2026, Andreas Kling <andreas@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Selectors that escape a shadow tree =====================================================
+
+## Ported from Libraries/LibWeb/CSS/StyleSheetInvalidation.cpp:28 Web::CSS::selector_may_match_light_dom_under_shadow_host.
+pub func css_selector_may_match_light_dom_under_shadow_host_css_selector(selector: const CssSelector*) -> bool:
+    if css_selector_is_slotted(selector):
+        return true
+
+    if not css_selector_contains_pseudo_class(selector, css_data.PseudoClass.host):
+        return false
+
+    # A bare :host selector only targets the host itself, but once a shadow rule keeps walking to another compound it
+    # can match light-DOM nodes in the host tree instead of staying confined to the shadow subtree.
+    return ak.vector_size(&selector.m_compound_selectors) > 1
+
+## Ported from Libraries/LibWeb/CSS/StyleSheetInvalidation.cpp:41 Web::CSS::selector_may_match_light_dom_under_shadow_host.
+pub func css_selector_may_match_light_dom_under_shadow_host_string_view(selector_text: ak.StringView) -> bool:
+    var parsing_params: CssParsingParams = ---
+    css_parsing_params_construct_css_parsing_mode(&parsing_params)
+    let selectors = parse_selector(parsing_params, selector_text) else return false
+    if ak.vector_size(&selectors) != 1:
+        return false
+    return css_selector_may_match_light_dom_under_shadow_host_css_selector(ak.vector_span_const(&selectors)[0])
+
+## Ported from Libraries/LibWeb/CSS/StyleSheetInvalidation.cpp:50 Web::CSS::is_universal_only_compound.
+func css_is_universal_only_compound(compound_selector: const CssSelectorCompoundSelector*) -> bool:
+    if ak.vector_is_empty(&compound_selector.simple_selectors):
+        return false
+    for simple_selector in &ak.vector_span_const(&compound_selector.simple_selectors):
+        if simple_selector.type_ != CssSelectorSimpleSelectorType.universal:
+            return false
+    return true
+
+## Ported from Libraries/LibWeb/CSS/StyleSheetInvalidation.cpp:61 Web::CSS::is_pseudo_element_only_compound.
+func css_is_pseudo_element_only_compound(compound_selector: const CssSelectorCompoundSelector*) -> bool:
+    if ak.vector_is_empty(&compound_selector.simple_selectors):
+        return false
+    for simple_selector in &ak.vector_span_const(&compound_selector.simple_selectors):
+        if simple_selector.type_ != CssSelectorSimpleSelectorType.pseudo_element:
+            return false
+    return true
+
+## Ported from Libraries/LibWeb/CSS/StyleSheetInvalidation.cpp:76 Web::CSS::rightmost_set_has_targetable_features.
+# :has() in the rightmost set filters by an element's previously recorded "affected by :has()" flags. Those flags
+# are not yet set for a brand-new rule that has never been matched, so :has() on its own can't narrow the walk.
+# Treat a rightmost set whose only targetable feature is :has() as if it had no targetable features, so we fall
+# back to whole-subtree invalidation.
+func css_rightmost_set_has_targetable_features(rightmost_set: const CssInvalidationSet*) -> bool:
+    var found_targetable = false
+    for property in css_invalidation_set_properties(rightmost_set):
+        if property.type_ == CssInvalidationSetPropertyType.pseudo_class:
+            let pseudo_class = match property.value:
+                .pseudo_class(value) => value
+                _ => trap("VERIFY: Variant::get<PseudoClass>")
+            if pseudo_class == css_data.PseudoClass.has:
+                continue
+        found_targetable = true
+        break
+    return found_targetable
+
+# mark: The invalidation set of a style rule ====================================================
+
+## Ported from Libraries/LibWeb/CSS/StyleSheetInvalidation.cpp:98 Web::CSS::try_build_anchor_for_leading_compounds.
+# If the leading compounds (everything except the rightmost) of `compound_selectors` produce a usable invalidation
+# set, return an anchor rule built from them.
+func css_try_build_anchor_for_leading_compounds(compound_selectors: const ak.Vector[CssSelectorCompoundSelector]*, throwaway_data: CssStyleInvalidationData*, style_sheet_for_rule: CssCssStyleSheet*?) -> CssAnchorInvalidationRule?:
+    if ak.vector_size(compound_selectors) < 2:
+        return none
+
+    let compounds = ak.vector_span_const(compound_selectors)
+    var anchor_compound_selectors: ak.Vector[CssSelectorCompoundSelector]
+    ak.vector_ensure_capacity(&anchor_compound_selectors, compounds.length - 1)
+    for i in 0..<compounds.length - 1:
+        ak.vector_append_t(&anchor_compound_selectors, compounds[i])
+
+    let rightmost_anchor = ak.vector_last(&anchor_compound_selectors)
+    var anchor_set: CssInvalidationSet
+    for simple in &ak.vector_span_const(&rightmost_anchor.simple_selectors):
+        css_build_invalidation_sets_for_simple_selector(simple, &anchor_set, CssExcludePropertiesNestedInNotPseudoClass.no, throwaway_data, CssInsideNthChildPseudoClass.no)
+    if not css_invalidation_set_has_properties(&anchor_set):
+        return none
+
+    var anchor_selector: CssSelector*? = none
+    if ak.vector_size(&anchor_compound_selectors) > 1:
+        anchor_selector = css_selector_create(anchor_compound_selectors)
+
+    return CssAnchorInvalidationRule(anchor_set = anchor_set, anchor_selector = anchor_selector, style_sheet_for_rule = style_sheet_for_rule)
+
+## Ported from Libraries/LibWeb/CSS/StyleSheetInvalidation.cpp:122 Web::CSS::extend_style_sheet_invalidation_set_with_style_rule.
+pub func css_extend_style_sheet_invalidation_set_with_style_rule(result: CssStyleSheetInvalidationSet*, style_rule: CssStyleRule*):
+    let style_sheet_for_rule = css_rule_parent_style_sheet(style_rule.css_rule())
+
+    var throwaway_data: CssStyleInvalidationData
+
+    let absolutized_selectors = css_style_rule_absolutized_selectors(style_rule)
+    for selector in ak.vector_span_const(&absolutized_selectors):
+        result.may_match_light_dom_under_shadow_host = result.may_match_light_dom_under_shadow_host or css_selector_may_match_light_dom_under_shadow_host_css_selector(selector)
+        result.may_match_shadow_host = result.may_match_shadow_host or css_selector_contains_pseudo_class(selector, css_data.PseudoClass.host)
+
+        let compound_selectors = &selector.m_compound_selectors
+        if ak.vector_is_empty(compound_selectors):
+            continue
+
+        let rightmost = &ak.vector_span_const(compound_selectors)[ak.vector_size(compound_selectors) - 1]
+
+        var rightmost_set: CssInvalidationSet
+        for simple in &ak.vector_span_const(&rightmost.simple_selectors):
+            css_build_invalidation_sets_for_simple_selector(simple, &rightmost_set, CssExcludePropertiesNestedInNotPseudoClass.no, &throwaway_data, CssInsideNthChildPseudoClass.no)
+
+        if css_rightmost_set_has_targetable_features(&rightmost_set):
+            css_invalidation_set_include_all_from(&result.invalidation_set, rightmost_set)
+            continue
+
+        # The rightmost compound has no targetable properties on its own, but we can still avoid a whole-subtree
+        # invalidation if the leading compounds carry an anchor invalidation set that we can match against.
+        if css_is_pseudo_element_only_compound(rightmost):
+            if let anchor = css_try_build_anchor_for_leading_compounds(compound_selectors, &throwaway_data, style_sheet_for_rule):
+                ak.vector_append_t(&result.pseudo_element_rules, CssStyleSheetInvalidationSetPseudoElementInvalidationRule(anchor_set = anchor.anchor_set, anchor_selector = anchor.anchor_selector, style_sheet_for_rule = anchor.style_sheet_for_rule))
+                continue
+
+        if css_is_universal_only_compound(rightmost):
+            if let anchor = css_try_build_anchor_for_leading_compounds(compound_selectors, &throwaway_data, style_sheet_for_rule):
+                ak.vector_append_t(&result.trailing_universal_rules, CssStyleSheetInvalidationSetTrailingUniversalInvalidationRule(anchor_set = anchor.anchor_set, anchor_selector = anchor.anchor_selector, combinator = rightmost.combinator, style_sheet_for_rule = anchor.style_sheet_for_rule))
+                continue
+
+        css_invalidation_set_set_needs_invalidate_whole_subtree(&result.invalidation_set)
+        return
+
+# mark: Applying an invalidation set ============================================================
+
+## Ported from Libraries/LibWeb/CSS/StyleSheetInvalidation.cpp:177 Web::CSS::shadow_host_for_targeted_shadow_root_invalidation.
+func css_shadow_host_for_targeted_shadow_root_invalidation(root: DomNode*) -> DomElement*?:
+    if let shadow_root = as_if_dom_shadow_root(root):
+        return dom_document_fragment_host(shadow_root.dom_document_fragment())
+    return none
+
+## Ported from Libraries/LibWeb/CSS/StyleSheetInvalidation.cpp:185 Web::CSS::element_matches_anchor_rule (the template, over
+## the anchor fields both rule kinds share).
+func css_element_matches_anchor_rule(element: DomElement*, anchor_set: const CssInvalidationSet*, anchor_selector: CssSelector*?, style_sheet_for_rule: CssCssStyleSheet*?, shadow_host: DomElement*?, rule_shadow_root: DomShadowRoot*?) -> bool:
+    if not css_invalidation_element_matches_any_invalidation_set_property(element, anchor_set):
+        return false
+    if let selector = anchor_selector:
+        var context = SelectorEngineMatchContext(style_sheet_for_rule = style_sheet_for_rule, rule_shadow_root = rule_shadow_root)
+        var abstract_element: DomAbstractElement = ---
+        dom_abstract_element_construct(&abstract_element, element)
+        if not selector_engine_matches(selector, abstract_element, shadow_host, &context):
+            return false
+    return true
+
+## element_matches_anchor_rule for a PseudoElementInvalidationRule.
+func css_element_matches_pseudo_element_anchor_rule(element: DomElement*, rule: const CssStyleSheetInvalidationSetPseudoElementInvalidationRule*, shadow_host: DomElement*?, rule_shadow_root: DomShadowRoot*?) -> bool:
+    return css_element_matches_anchor_rule(element, &rule.anchor_set, rule.anchor_selector, rule.style_sheet_for_rule, shadow_host, rule_shadow_root)
+
+## element_matches_anchor_rule for a TrailingUniversalInvalidationRule.
+func css_element_matches_trailing_universal_anchor_rule(element: DomElement*, rule: const CssStyleSheetInvalidationSetTrailingUniversalInvalidationRule*, shadow_host: DomElement*?, rule_shadow_root: DomShadowRoot*?) -> bool:
+    return css_element_matches_anchor_rule(element, &rule.anchor_set, rule.anchor_selector, rule.style_sheet_for_rule, shadow_host, rule_shadow_root)
+
+## Ported from Libraries/LibWeb/CSS/StyleSheetInvalidation.cpp:200 Web::CSS::apply_trailing_universal_combinator.
+func css_apply_trailing_universal_combinator(combinator: CssSelectorCombinator, anchor: DomElement*, target_root: DomNode*):
+    match combinator:
+        .immediate_child:
+            # target_root.for_each_child_of_type<DOM::Element>(...)
+            for child in dom_node_children(target_root):
+                if let element = as_if_dom_element(child):
+                    dom_node_set_needs_style_update(element.dom_node(), true)
+        .descendant:
+            # target_root.for_each_in_subtree_of_type<DOM::Element>(...)
+            for descendant in dom_node_subtree(target_root):
+                if let element = as_if_dom_element(descendant):
+                    dom_node_set_needs_style_update(element.dom_node(), true)
+        .next_sibling:
+            if let sibling = dom_non_document_type_child_node_next_element_sibling(anchor.dom_node()):
+                dom_node_set_needs_style_update(sibling.dom_node(), true)
+        .subsequent_sibling:
+            var sibling = dom_non_document_type_child_node_next_element_sibling(anchor.dom_node())
+            while let current = sibling:
+                dom_node_set_needs_style_update(current.dom_node(), true)
+                sibling = dom_non_document_type_child_node_next_element_sibling(current.dom_node())
+        .column:
+            # The column combinator relates a <col>/<colgroup> anchor to the table cells in the represented column. We do
+            # not yet have a more precise invalidation primitive for column membership, so keep the work bounded to the
+            # current table instead of dropping the invalidation.
+            var ancestor: DomElement*? = anchor
+            while let current = ancestor:
+                if let table = as_if_html_table_element(current):
+                    for descendant in dom_node_subtree(table.dom_node()):
+                        if let cell = as_if_html_table_cell_element(descendant):
+                            dom_node_set_needs_style_update(cell.dom_node(), true)
+                    break
+                ancestor = dom_node_parent_element(current.dom_node())
+        .none_:
+            return
+        _:
+            trap("VERIFY_NOT_REACHED")
+
+## Ported from Libraries/LibWeb/CSS/StyleSheetInvalidation.cpp:245 Web::CSS::invalidate_elements_matching_invalidation_set_and_anchor_rules.
+# Walk `root` once and, for each element, check the primary invalidation set plus every anchor rule in one pass. Doing
+# this as a single traversal instead of one walk per rule kind keeps the dirtying cost proportional to the tree size
+# rather than to tree_size * rule_count.
+func css_invalidate_elements_matching_invalidation_set_and_anchor_rules(root: DomNode*, result: const CssStyleSheetInvalidationSet*, shadow_host: DomElement*?, rule_shadow_root: DomShadowRoot*?):
+    let invalidation_set = &result.invalidation_set
+    let has_primary_set = css_invalidation_set_has_properties(invalidation_set)
+    let has_anchor_rules = not ak.vector_is_empty(&result.pseudo_element_rules) or not ak.vector_is_empty(&result.trailing_universal_rules)
+    if not has_primary_set and not has_anchor_rules:
+        return
+
+    # root.for_each_in_inclusive_subtree_of_type<DOM::Element>(...)
+    for node in dom_node_inclusive_subtree(root):
+        let element = as_if_dom_element(node) else continue
+        if has_primary_set and not dom_node_needs_style_update(element.dom_node()) and css_invalidation_element_matches_any_invalidation_set_property(element, invalidation_set):
+            dom_node_set_needs_style_update(element.dom_node(), true)
+
+        if not dom_node_needs_style_update(element.dom_node()):
+            for rule in &ak.vector_span_const(&result.pseudo_element_rules):
+                if css_element_matches_pseudo_element_anchor_rule(element, rule, shadow_host, rule_shadow_root):
+                    dom_node_set_needs_style_update(element.dom_node(), true)
+                    break
+
+        # Trailing-universal rules dirty *other* elements (siblings or children of the anchor), so we still have to
+        # check them even if `element` is already marked dirty.
+        for rule in &ak.vector_span_const(&result.trailing_universal_rules):
+            if css_element_matches_trailing_universal_anchor_rule(element, rule, shadow_host, rule_shadow_root):
+                css_apply_trailing_universal_combinator(rule.combinator, element, element.dom_node())
+
+## Ported from Libraries/LibWeb/CSS/StyleSheetInvalidation.cpp:283 Web::CSS::slot_or_ancestor_needs_style_update.
+func css_slot_or_ancestor_needs_style_update(slot: HtmlSlotElement*, shadow_root: DomShadowRoot*) -> bool:
+    var node: DomNode*? = slot.dom_node()
+    while let current = node:
+        if current == shadow_root.dom_node():
+            break
+        if dom_node_needs_style_update(current):
+            return true
+        node = dom_node_parent_node(current)
+    return false
+
+## Ported from Libraries/LibWeb/CSS/StyleSheetInvalidation.cpp:294 Web::CSS::invalidate_assigned_elements_for_dirty_slots.
+# Slotted light-DOM nodes inherit from their assigned <slot>. If a targeted shadow-root invalidation dirties the slot
+# or one of its ancestors, we must also dirty the flattened assignees outside the shadow subtree.
+pub func css_invalidate_assigned_elements_for_dirty_slots(shadow_root: DomShadowRoot*):
+    # shadow_root.for_each_in_inclusive_subtree_of_type<HTML::HTMLSlotElement>(...)
+    for node in dom_node_inclusive_subtree(shadow_root.dom_node()):
+        let slot = as_if_html_slot_element(node) else continue
+        if not css_slot_or_ancestor_needs_style_update(slot, shadow_root):
+            continue
+        let assigned_elements = html_slot_element_assigned_elements(slot, HtmlAssignedNodesOptions(flatten = true))
+        for assigned_element in ak.vector_span_const(&assigned_elements):
+            let element = assigned_element else trap("VERIFY: assigned element")
+            dom_node_set_needs_style_update(element.dom_node(), true)
+
+## Ported from Libraries/LibWeb/CSS/StyleSheetInvalidation.cpp:305 Web::CSS::invalidate_root_for_style_sheet_change.
+pub func css_invalidate_root_for_style_sheet_change(root: DomNode*, result: CssStyleSheetInvalidationSet, reason: DomStyleInvalidationReason, force_broad_invalidation: bool = false):
+    let invalidation_set = &result.invalidation_set
+    if force_broad_invalidation or css_invalidation_set_needs_invalidate_whole_subtree(invalidation_set):
+        dom_node_invalidate_style(root, reason)
+        if let shadow_root = as_if_dom_shadow_root(root):
+            # shadow_root->for_each_in_inclusive_subtree_of_type<HTML::HTMLSlotElement>(...)
+            for node in dom_node_inclusive_subtree(shadow_root.dom_node()):
+                if let slot = as_if_html_slot_element(node):
+                    dom_node_set_needs_style_update(slot.dom_node(), true)
+            css_invalidate_assigned_elements_for_dirty_slots(shadow_root)
+
+            if let host = dom_document_fragment_host(shadow_root.dom_document_fragment()):
+                # Broad shadow-root mutations are only allowed to escape the shadow tree when the stylesheet can
+                # actually reach host-side nodes. A layer-order-only change, for example, still needs a full restyle
+                # inside the shadow tree, but it should not turn into a document-wide invalidation for unrelated
+                # light-DOM.
+                if result.may_match_light_dom_under_shadow_host and not result.may_match_shadow_host:
+                    dom_node_invalidate_style(host.dom_node(), reason)
+                elif result.may_match_light_dom_under_shadow_host:
+                    dom_node_invalidate_style(tree_node_root(host.dom_node()), reason)
+                elif result.may_match_shadow_host:
+                    dom_node_invalidate_style(host.dom_node(), reason)
+                    dom_node_set_needs_style_update(shadow_root.dom_node(), true)
+        return
+
+    let rule_shadow_root = as_if_dom_shadow_root(root)
+    css_invalidate_elements_matching_invalidation_set_and_anchor_rules(root, &result, css_shadow_host_for_targeted_shadow_root_invalidation(root), rule_shadow_root)
+
+    if let shadow_root = as_if_dom_shadow_root(root):
+        css_invalidate_assigned_elements_for_dirty_slots(shadow_root)
+
+        if let host = dom_document_fragment_host(shadow_root.dom_document_fragment()):
+            # Slotted selectors never match the host itself, so a targeted ::slotted(...) invalidation only needs to
+            # walk the current host's light-DOM subtree. We can identify that case because it reaches host-side nodes
+            # without ever setting may_match_shadow_host.
+            #
+            # :host combinators are different: they can escape to siblings or other nodes rooted alongside the host,
+            # so they still need the broader host-root walk below.
+            if result.may_match_light_dom_under_shadow_host and not result.may_match_shadow_host:
+                css_invalidate_elements_matching_invalidation_set_and_anchor_rules(host.dom_node(), &result, host, shadow_root)
+            elif result.may_match_light_dom_under_shadow_host:
+                css_invalidate_elements_matching_invalidation_set_and_anchor_rules(tree_node_root(host.dom_node()), &result, host, shadow_root)
+            elif result.may_match_shadow_host:
+                var host_or_shadow_tree_needs_style_update = false
+                if css_invalidation_element_matches_any_invalidation_set_property(host, invalidation_set):
+                    host_or_shadow_tree_needs_style_update = true
+                for rule in &ak.vector_span_const(&result.pseudo_element_rules):
+                    if css_element_matches_pseudo_element_anchor_rule(host, rule, host, shadow_root):
+                        host_or_shadow_tree_needs_style_update = true
+                        break
+                if host_or_shadow_tree_needs_style_update:
+                    dom_node_set_needs_style_update(host.dom_node(), true)
+                    dom_node_invalidate_style(host.dom_node(), reason)
+                    # A targeted :host rule can change inherited values seen by both shadow descendants and the
+                    # host's light-DOM subtree even when no selector directly matches there. Mark both subtrees dirty
+                    # so recursive style update descends into those inherited-value dependents too.
+                    dom_node_set_needs_style_update(shadow_root.dom_node(), true)
+                for rule in &ak.vector_span_const(&result.trailing_universal_rules):
+                    # Host-anchored trailing-universal selectors such as :host > * and :host * target the host's
+                    # light-DOM tree, not descendants inside the shadow root. Keep the host as the selector anchor
+                    # and dirty host-side nodes from there.
+                    if css_element_matches_trailing_universal_anchor_rule(host, rule, host, shadow_root):
+                        css_apply_trailing_universal_combinator(rule.combinator, host, host.dom_node())

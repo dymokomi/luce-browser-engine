@@ -1,0 +1,126 @@
+#==============================================================================================
+#
+#   pseudo_class_invalidator - style invalidation after a document-level pseudo-class state
+#                              (:hover, :focus, :focus-within, :focus-visible, :target)
+#                              moves from one node to another
+#
+#   DESCRIPTION:
+#       Port of LibWeb/CSS/Invalidation/PseudoClassInvalidator.cpp (lines 1-107). Every element
+#       under the invalidation root that is affected by the pseudo-class is matched against the
+#       pseudo-class's rules with the old and the new state, and marked when the set of
+#       matching rules differs.
+#
+#       Copyright (c) 2026-present, the Ladybird developers
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+## The captures of invalidate_style_after_pseudo_class_state_change_impl's lambdas: the state slot and the new
+## state, the rules and the style computer.
+struct CssInvalidationPseudoClassStateChange[T]:
+    var pseudo_class: css_data.PseudoClass
+    var state_slot: T*
+    var new_state: T
+    var rules: const CssRuleCache*
+    var style_computer: CssStyleComputer*
+
+## The captures of `matches_different_set_of_rules_after_state_change`'s for_each_matching_rules callback.
+struct CssInvalidationMatchesDifferentRules[T]:
+    var state_change: CssInvalidationPseudoClassStateChange[T]*
+    var element: DomElement*
+    var result: bool
+
+## invalidate_style_after_pseudo_class_state_change_impl's `does_rule_match_on_element` lambda.
+func css_invalidation_does_rule_match_on_element(style_computer: CssStyleComputer*, element: DomElement*, rule: const CssMatchingRule*) -> bool:
+    let selector = rule.selector
+    if css_selector_can_use_ancestor_filter(selector) and css_style_computer_should_reject_with_ancestor_filter(style_computer, selector):
+        return false
+
+    var context: SelectorEngineMatchContext
+    var abstract_element: DomAbstractElement = ---
+    let maybe_target_pseudo = css_selector_target_pseudo_element(selector)
+    if maybe_target_pseudo == none:
+        dom_abstract_element_construct(&abstract_element, element)
+        return selector_engine_matches(selector, abstract_element, none, &context)
+    let target_pseudo = maybe_target_pseudo else trap("unreachable")
+    match css_selector_pseudo_element_selector_type(&target_pseudo):
+        .before:
+            dom_abstract_element_construct(&abstract_element, element, css_data.PseudoElement.before)
+            return selector_engine_matches(selector, abstract_element, none, &context)
+        .after:
+            dom_abstract_element_construct(&abstract_element, element, css_data.PseudoElement.after)
+            return selector_engine_matches(selector, abstract_element, none, &context)
+        _:
+            return false
+
+## `matches_different_set_of_rules_after_state_change`'s for_each_matching_rules callback.
+func css_invalidation_rules_match_differently[T](context: void*?, rules: const ak.Vector[CssMatchingRule]*) -> ak.IterationDecision:
+    let captures = (CssInvalidationMatchesDifferentRules[T]*)(context else trap("no captures"))
+    let state_change = captures.state_change
+    for rule in &ak.vector_span_const(rules):
+        let before = css_invalidation_does_rule_match_on_element(state_change.style_computer, captures.element, rule)
+        # TemporaryChange change { state_slot, new_state };
+        let saved_state = *state_change.state_slot
+        *state_change.state_slot = state_change.new_state
+        let after = css_invalidation_does_rule_match_on_element(state_change.style_computer, captures.element, rule)
+        *state_change.state_slot = saved_state
+        if before != after:
+            captures.result = true
+            return ak.IterationDecision.break_
+    return ak.IterationDecision.continue_
+
+## invalidate_style_after_pseudo_class_state_change_impl's `matches_different_set_of_rules_after_state_change` lambda.
+func css_invalidation_matches_different_set_of_rules_after_state_change[T](state_change: CssInvalidationPseudoClassStateChange[T]*, element: DomElement*) -> bool:
+    var captures = CssInvalidationMatchesDifferentRules[T](state_change = state_change, element = element, result = false)
+    var abstract_element: DomAbstractElement = ---
+    dom_abstract_element_construct(&abstract_element, element)
+    let callback: func(void*?, const ak.Vector[CssMatchingRule]*) -> ak.IterationDecision = css_invalidation_rules_match_differently[T]
+    css_rule_cache_for_each_matching_rules(state_change.rules, abstract_element, ak.Function1[const ak.Vector[CssMatchingRule]*, ak.IterationDecision](call = callback, context = &captures))
+    return captures.result
+
+## invalidate_style_after_pseudo_class_state_change_impl's `invalidate_affected_elements_recursively` lambda.
+func css_invalidation_invalidate_affected_elements_recursively[T](state_change: CssInvalidationPseudoClassStateChange[T]*, node: DomNode*):
+    if let element = as_if_dom_element(node):
+        css_style_computer_push_ancestor(state_change.style_computer, element)
+        if dom_element_affected_by_pseudo_class(element, state_change.pseudo_class) and css_invalidation_matches_different_set_of_rules_after_state_change(state_change, element):
+            dom_node_set_needs_style_update(element.dom_node(), true)
+
+    for child in dom_node_children(node):
+        css_invalidation_invalidate_affected_elements_recursively(state_change, child)
+
+    if let element = as_if_dom_element(node):
+        css_style_computer_pop_ancestor(state_change.style_computer, element)
+
+## Ported from Libraries/LibWeb/CSS/Invalidation/PseudoClassInvalidator.cpp:20 Web::CSS::Invalidation::invalidate_style_after_pseudo_class_state_change_impl.
+func css_invalidation_invalidate_style_after_pseudo_class_state_change_impl[T](pseudo_class: css_data.PseudoClass, document: DomDocument*, state_slot: T*, invalidation_root: DomNode*, new_state: T):
+    let root = tree_node_root(invalidation_root)
+    let shadow_root = as_if_dom_shadow_root(root)
+    var style_scope = dom_document_style_scope(document)
+    if let shadow_root_ = shadow_root:
+        style_scope = dom_shadow_root_style_scope(shadow_root_)
+
+    var state_change = CssInvalidationPseudoClassStateChange[T](pseudo_class = pseudo_class, state_slot = state_slot, new_state = new_state, rules = css_style_scope_get_pseudo_class_rule_cache(style_scope, pseudo_class), style_computer = dom_document_style_computer(document))
+
+    # Seed the ancestor filter with ancestors above the starting node,
+    # so that ancestor-dependent selectors can still be correctly rejected.
+    var ancestor = tree_node_parent(invalidation_root)
+    while let current = ancestor:
+        if let element = as_if_dom_element(current):
+            css_style_computer_push_ancestor(state_change.style_computer, element)
+        ancestor = tree_node_parent(current)
+
+    css_invalidation_invalidate_affected_elements_recursively(&state_change, invalidation_root)
+
+    ancestor = tree_node_parent(invalidation_root)
+    while let current = ancestor:
+        if let element = as_if_dom_element(current):
+            css_style_computer_pop_ancestor(state_change.style_computer, element)
+        ancestor = tree_node_parent(current)
+
+## Ported from Libraries/LibWeb/CSS/Invalidation/PseudoClassInvalidator.cpp:97 Web::CSS::Invalidation::invalidate_style_after_pseudo_class_state_change.
+pub func css_invalidation_invalidate_style_after_pseudo_class_state_change_dom_node(pseudo_class: css_data.PseudoClass, document: DomDocument*, state_slot: (DomNode*?)*, invalidation_root: DomNode*, new_state: DomNode*?):
+    css_invalidation_invalidate_style_after_pseudo_class_state_change_impl(pseudo_class, document, state_slot, invalidation_root, new_state)
+
+## Ported from Libraries/LibWeb/CSS/Invalidation/PseudoClassInvalidator.cpp:102 Web::CSS::Invalidation::invalidate_style_after_pseudo_class_state_change.
+pub func css_invalidation_invalidate_style_after_pseudo_class_state_change_dom_element(pseudo_class: css_data.PseudoClass, document: DomDocument*, state_slot: (DomElement*?)*, invalidation_root: DomNode*, new_state: DomElement*?):
+    css_invalidation_invalidate_style_after_pseudo_class_state_change_impl(pseudo_class, document, state_slot, invalidation_root, new_state)

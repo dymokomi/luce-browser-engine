@@ -1,0 +1,301 @@
+#==============================================================================================
+#
+#   style_sheet_invalidation_2 - CSS::StyleSheetInvalidation II: invalidating the owners of a
+#                                style sheet, inserted @keyframes, and how shadow-root sheets
+#                                reach the host side
+#
+#   DESCRIPTION:
+#       Port of LibWeb/CSS/StyleSheetInvalidation.cpp (lines 383-641): inserted style rules and
+#       @keyframes rules, the trees a shadow-root sheet change affects, the elements whose
+#       animation-name references an inserted @keyframes, ShadowRootStylesheetEffects of a
+#       sheet or a shadow root, and invalidate_style_for_style_sheet_owners.
+#
+#       Copyright (c) 2026, Andreas Kling <andreas@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Inserted rules ==========================================================================
+
+## The style scope of an owning document or shadow root (invalidate_owners_for_inserted_style_rule and
+## invalidate_owners_for_inserted_keyframes_rule).
+func css_style_scope_of_document_or_shadow_root(document_or_shadow_root: DomNode*) -> CssStyleScope*:
+    if dom_node_is_shadow_root(document_or_shadow_root):
+        return dom_shadow_root_style_scope(as_dom_shadow_root(document_or_shadow_root))
+    return dom_document_style_scope(dom_node_document(document_or_shadow_root))
+
+## Ported from Libraries/LibWeb/CSS/StyleSheetInvalidation.cpp:383 Web::CSS::invalidate_owners_for_inserted_style_rule.
+pub func css_invalidate_owners_for_inserted_style_rule(style_sheet: CssCssStyleSheet*, style_rule: CssStyleRule*, reason: DomStyleInvalidationReason):
+    var invalidation_set: CssStyleSheetInvalidationSet
+    css_extend_style_sheet_invalidation_set_with_style_rule(&invalidation_set, style_rule)
+
+    let owners = css_css_style_sheet_owning_documents_or_shadow_roots(style_sheet)
+    for owner in ak.hash_table_begin_const(&owners):
+        let document_or_shadow_root = *owner else trap("VERIFY: owner")
+        css_style_scope_invalidate_rule_cache(css_style_scope_of_document_or_shadow_root(document_or_shadow_root))
+
+        # A dirty shadow subtree can still need follow-up invalidation on the host side for :host(...) and
+        # ::slotted(...) matches, so we don't skip shadow roots even when their entire subtree is already marked.
+        css_invalidate_root_for_style_sheet_change(document_or_shadow_root, invalidation_set, reason)
+
+## Ported from Libraries/LibWeb/CSS/StyleSheetInvalidation.cpp:400 Web::CSS::for_each_tree_affected_by_shadow_root_stylesheet_change.
+func css_for_each_tree_affected_by_shadow_root_stylesheet_change(root: DomNode*, include_host: bool, include_light_dom_under_shadow_host: bool, callback: ak.Function1[DomNode*, unit]):
+    ak.function1_call(&callback, root)
+
+    if let shadow_root = as_if_dom_shadow_root(root):
+        let host = dom_document_fragment_host(shadow_root.dom_document_fragment()) else return
+
+        # Slotted selectors only reach the current host subtree, but :host combinators can also reach siblings rooted
+        # alongside the host. A bare :host selector, however, only needs the host itself.
+        if include_host and include_light_dom_under_shadow_host:
+            ak.function1_call(&callback, tree_node_root(host.dom_node()))
+        elif include_host or include_light_dom_under_shadow_host:
+            ak.function1_call(&callback, host.dom_node())
+
+## Ported from Libraries/LibWeb/CSS/StyleSheetInvalidation.cpp:422 Web::CSS::style_value_references_animation_name.
+func css_style_value_references_animation_name(value: CssStyleValue*, animation_name: ak.FlyString) -> bool:
+    if css_style_value_is_custom_ident(value):
+        let custom_ident = css_custom_ident_style_value_custom_ident(css_style_value_as_custom_ident(value))
+        return ak.fly_string_eq_fly_string(&custom_ident, &animation_name)
+    if css_style_value_is_string(value):
+        let string_value = css_string_style_value_string_value(css_style_value_as_string(value))
+        return ak.fly_string_eq_fly_string(&string_value, &animation_name)
+
+    if not css_style_value_is_value_list(value):
+        return false
+
+    let values = css_style_value_list_values(css_style_value_as_value_list(value))
+    for item in ak.vector_span_const(&values):
+        if css_style_value_is_custom_ident(item):
+            let custom_ident = css_custom_ident_style_value_custom_ident(css_style_value_as_custom_ident(item))
+            if ak.fly_string_eq_fly_string(&custom_ident, &animation_name):
+                return true
+        if css_style_value_is_string(item):
+            let string_value = css_string_style_value_string_value(css_style_value_as_string(item))
+            if ak.fly_string_eq_fly_string(&string_value, &animation_name):
+                return true
+
+    return false
+
+## element_or_pseudo_references_animation_name's `references_animation_name_in_properties` lambda.
+func css_references_animation_name_in_properties(computed_properties: CssComputedProperties*, animation_name: ak.FlyString) -> bool:
+    return css_style_value_references_animation_name(css_computed_properties_property(computed_properties, css_data.PropertyId.animation_name), animation_name)
+
+## Ported from Libraries/LibWeb/CSS/StyleSheetInvalidation.cpp:442 Web::CSS::element_or_pseudo_references_animation_name.
+func css_element_or_pseudo_references_animation_name(element: DomElement*, animation_name: ak.FlyString) -> bool:
+    if let computed_properties = dom_element_computed_properties(element):
+        if css_references_animation_name_in_properties(computed_properties, animation_name):
+            return true
+
+    for i: u8 in 0..<(u8)css_data.PseudoElement.known_pseudo_element_count:
+        let pseudo_element = (css_data.PseudoElement)i
+        if let computed_properties = dom_element_computed_properties(element, pseudo_element):
+            if css_references_animation_name_in_properties(computed_properties, animation_name):
+                return true
+
+    return false
+
+## invalidate_elements_affected_by_inserted_keyframes_rule's `invalidate_matching_element` lambda.
+func css_invalidate_element_referencing_animation_name(element: DomElement*, animation_name: ak.FlyString) -> TraversalDecision:
+    # A new @keyframes rule only matters for elements or pseudo-elements that were already referencing the
+    # inserted animation-name.
+    if css_element_or_pseudo_references_animation_name(element, animation_name):
+        dom_node_set_needs_style_update(element.dom_node(), true)
+    return TraversalDecision.continue_
+
+## invalidate_elements_affected_by_inserted_keyframes_rule's for_each_shadow_including_inclusive_descendant callback;
+## the capture is the animation name.
+func css_invalidate_shadow_including_element_referencing_animation_name(context: void*?, node: DomNode*) -> TraversalDecision:
+    let animation_name = *(const ak.FlyString*)(context else trap("no captures"))
+    if let element = as_if_dom_element(node):
+        return css_invalidate_element_referencing_animation_name(element, animation_name)
+    return TraversalDecision.continue_
+
+## Ported from Libraries/LibWeb/CSS/StyleSheetInvalidation.cpp:460 Web::CSS::invalidate_elements_affected_by_inserted_keyframes_rule.
+func css_invalidate_elements_affected_by_inserted_keyframes_rule(root: DomNode*, animation_name: ak.FlyString):
+    if dom_node_is_document(root):
+        # Document styles are inherited by existing shadow trees too, so document-scoped @keyframes insertions must
+        # walk the shadow-including tree instead of stopping at shadow hosts.
+        var animation_name_capture = animation_name
+        discard(dom_node_for_each_shadow_including_inclusive_descendant(root, ak.Function1[DomNode*, TraversalDecision](call = css_invalidate_shadow_including_element_referencing_animation_name, context = &animation_name_capture)))
+        return
+
+    # root.for_each_in_inclusive_subtree_of_type<DOM::Element>(invalidate_matching_element)
+    for node in dom_node_inclusive_subtree(root):
+        if let element = as_if_dom_element(node):
+            discard(css_invalidate_element_referencing_animation_name(element, animation_name))
+
+# mark: Shadow-root style sheet effects =========================================================
+
+## The captures of determine_shadow_root_stylesheet_effects_for_sheet's lambdas.
+struct CssShadowRootStylesheetEffectsForSheet:
+    var style_sheet: CssCssStyleSheet*
+    var shadow_root: DomShadowRoot*
+    var slots: ak.Vector[HtmlSlotElement*]
+    var effects: CssShadowRootStylesheetEffects
+
+## determine_shadow_root_stylesheet_effects_for_sheet's `selector_may_affect_assigned_nodes_via_slot_inheritance` lambda.
+func css_selector_may_affect_assigned_nodes_via_slot_inheritance(captures: CssShadowRootStylesheetEffectsForSheet*, selector: const CssSelector*) -> bool:
+    for slot in ak.vector_span(&captures.slots):
+        var node: DomNode*? = slot.dom_node()
+        while let current = node:
+            if current == captures.shadow_root.dom_node():
+                break
+            node = dom_node_parent_node(current)
+            let element = as_if_dom_element(current) else continue
+            var context = SelectorEngineMatchContext(style_sheet_for_rule = captures.style_sheet, subject = element, rule_shadow_root = captures.shadow_root)
+            var abstract_element: DomAbstractElement = ---
+            dom_abstract_element_construct(&abstract_element, element)
+            if selector_engine_matches(selector, abstract_element, dom_document_fragment_host(captures.shadow_root.dom_document_fragment()), &context):
+                return true
+    return false
+
+## Whether every effect is already known (the early returns of determine_shadow_root_stylesheet_effects_for_sheet).
+func css_shadow_root_stylesheet_effects_are_all_set(effects: const CssShadowRootStylesheetEffects*) -> bool:
+    return effects.may_match_shadow_host and effects.may_match_light_dom_under_shadow_host and effects.may_affect_assigned_nodes_via_slots
+
+## determine_shadow_root_stylesheet_effects_for_sheet's for_each_effective_style_producing_rule lambda.
+func css_shadow_root_stylesheet_effects_of_rule(context: void*?, rule: CssRule*):
+    let captures = (CssShadowRootStylesheetEffectsForSheet*)(context else trap("no captures"))
+    let effects = &captures.effects
+    if css_shadow_root_stylesheet_effects_are_all_set(effects):
+        return
+
+    let style_rule = as_if_css_style_rule(rule) else return
+
+    let absolutized_selectors = css_style_rule_absolutized_selectors(style_rule)
+    for selector in ak.vector_span_const(&absolutized_selectors):
+        effects.may_match_shadow_host = effects.may_match_shadow_host or css_selector_contains_pseudo_class(selector, css_data.PseudoClass.host)
+        effects.may_match_light_dom_under_shadow_host = effects.may_match_light_dom_under_shadow_host or css_selector_may_match_light_dom_under_shadow_host_css_selector(selector)
+
+        if not effects.may_affect_assigned_nodes_via_slots and not ak.vector_is_empty(&captures.slots):
+            effects.may_affect_assigned_nodes_via_slots = css_selector_may_affect_assigned_nodes_via_slot_inheritance(captures, selector)
+
+        if css_shadow_root_stylesheet_effects_are_all_set(effects):
+            return
+
+## Ported from Libraries/LibWeb/CSS/StyleSheetInvalidation.cpp:484 Web::CSS::determine_shadow_root_stylesheet_effects_for_sheet.
+func css_determine_shadow_root_stylesheet_effects_for_sheet(style_sheet: CssCssStyleSheet*, shadow_root: DomShadowRoot*) -> CssShadowRootStylesheetEffects:
+    var captures = CssShadowRootStylesheetEffectsForSheet(style_sheet = style_sheet, shadow_root = shadow_root)
+
+    # shadow_root.for_each_in_inclusive_subtree_of_type<HTML::HTMLSlotElement>(...)
+    for node in dom_node_inclusive_subtree(shadow_root.dom_node()):
+        if let slot = as_if_html_slot_element(node):
+            ak.vector_append_t(&captures.slots, slot)
+
+    css_css_style_sheet_for_each_effective_style_producing_rule(style_sheet, ak.Function1[CssRule*, unit](call = css_shadow_root_stylesheet_effects_of_rule, context = &captures))
+
+    return captures.effects
+
+## The captures of determine_shadow_root_stylesheet_effects(ShadowRoot)'s for_each_active_css_style_sheet lambda.
+struct CssShadowRootStylesheetEffectsOfShadowRoot:
+    var shadow_root: DomShadowRoot*
+    var effects: CssShadowRootStylesheetEffects
+
+## determine_shadow_root_stylesheet_effects(ShadowRoot)'s for_each_active_css_style_sheet lambda.
+func css_shadow_root_stylesheet_effects_of_sheet(context: void*?, style_sheet: CssCssStyleSheet*):
+    let captures = (CssShadowRootStylesheetEffectsOfShadowRoot*)(context else trap("no captures"))
+    let sheet_effects = css_determine_shadow_root_stylesheet_effects_for_sheet(style_sheet, captures.shadow_root)
+    captures.effects.may_match_shadow_host = captures.effects.may_match_shadow_host or sheet_effects.may_match_shadow_host
+    captures.effects.may_match_light_dom_under_shadow_host = captures.effects.may_match_light_dom_under_shadow_host or sheet_effects.may_match_light_dom_under_shadow_host
+    captures.effects.may_affect_assigned_nodes_via_slots = captures.effects.may_affect_assigned_nodes_via_slots or sheet_effects.may_affect_assigned_nodes_via_slots
+
+## Ported from Libraries/LibWeb/CSS/StyleSheetInvalidation.cpp:535 Web::CSS::determine_shadow_root_stylesheet_effects.
+pub func css_determine_shadow_root_stylesheet_effects_dom_shadow_root(shadow_root: DomShadowRoot*) -> CssShadowRootStylesheetEffects:
+    var captures = CssShadowRootStylesheetEffectsOfShadowRoot(shadow_root = shadow_root)
+    dom_shadow_root_for_each_active_css_style_sheet(shadow_root, ak.Function1[CssCssStyleSheet*, unit](call = css_shadow_root_stylesheet_effects_of_sheet, context = &captures))
+    return captures.effects
+
+## Ported from Libraries/LibWeb/CSS/StyleSheetInvalidation.cpp:549 Web::CSS::determine_shadow_root_stylesheet_effects.
+pub func css_determine_shadow_root_stylesheet_effects_css_css_style_sheet(style_sheet: CssCssStyleSheet*) -> CssShadowRootStylesheetEffects:
+    var effects: CssShadowRootStylesheetEffects
+
+    let owners = css_css_style_sheet_owning_documents_or_shadow_roots(style_sheet)
+    for owner in ak.hash_table_begin_const(&owners):
+        let document_or_shadow_root = *owner else trap("VERIFY: owner")
+        let shadow_root = as_if_dom_shadow_root(document_or_shadow_root) else continue
+
+        let sheet_effects = css_determine_shadow_root_stylesheet_effects_for_sheet(style_sheet, shadow_root)
+        effects.may_match_shadow_host = effects.may_match_shadow_host or sheet_effects.may_match_shadow_host
+        effects.may_match_light_dom_under_shadow_host = effects.may_match_light_dom_under_shadow_host or sheet_effects.may_match_light_dom_under_shadow_host
+        effects.may_affect_assigned_nodes_via_slots = effects.may_affect_assigned_nodes_via_slots or sheet_effects.may_affect_assigned_nodes_via_slots
+
+        if css_shadow_root_stylesheet_effects_are_all_set(&effects):
+            break
+
+    return effects
+
+## Ported from Libraries/LibWeb/CSS/StyleSheetInvalidation.cpp:570 Web::CSS::invalidate_shadow_host_side_for_style_sheet_change.
+func css_invalidate_shadow_host_side_for_style_sheet_change(shadow_root: DomShadowRoot*, reason: DomStyleInvalidationReason, effects: const CssShadowRootStylesheetEffects*) -> bool:
+    let host = dom_document_fragment_host(shadow_root.dom_document_fragment()) else return false
+
+    if effects.may_match_light_dom_under_shadow_host and not effects.may_match_shadow_host:
+        dom_node_invalidate_style(host.dom_node(), reason)
+    elif effects.may_match_light_dom_under_shadow_host:
+        dom_node_invalidate_style(tree_node_root(host.dom_node()), reason)
+    elif effects.may_affect_assigned_nodes_via_slots:
+        dom_node_invalidate_style(host.dom_node(), reason)
+    elif effects.may_match_shadow_host:
+        dom_node_invalidate_style(host.dom_node(), reason)
+        dom_node_set_needs_style_update(shadow_root.dom_node(), true)
+    else:
+        return false
+
+    return true
+
+# mark: Invalidating the owners of a sheet ======================================================
+
+## The captures of invalidate_style_for_style_sheet_owners' for_each_owning_style_scope lambda.
+struct CssInvalidateStyleForStyleSheetOwners:
+    var reason: DomStyleInvalidationReason
+    var rule_cache_invalidation: CssShouldInvalidateRuleCache
+    var previous_sheet_effects: const CssShadowRootStylesheetEffects*?
+
+## invalidate_style_for_style_sheet_owners' for_each_owning_style_scope lambda.
+func css_invalidate_style_for_style_sheet_owner(context: void*?, style_scope: CssStyleScope*):
+    let captures = (CssInvalidateStyleForStyleSheetOwners*)(context else trap("no captures"))
+    if captures.rule_cache_invalidation == CssShouldInvalidateRuleCache.yes:
+        css_style_scope_invalidate_rule_cache(style_scope)
+
+    dom_node_invalidate_style(css_style_scope_node(style_scope), captures.reason)
+
+    let shadow_root = as_if_dom_shadow_root(css_style_scope_node(style_scope)) else return
+
+    css_invalidate_assigned_elements_for_dirty_slots(shadow_root)
+    let effects = css_determine_shadow_root_stylesheet_effects_dom_shadow_root(shadow_root)
+    let invalidated_host_side = css_invalidate_shadow_host_side_for_style_sheet_change(shadow_root, captures.reason, &effects)
+
+    if not invalidated_host_side:
+        if let previous_sheet_effects = captures.previous_sheet_effects:
+            discard(css_invalidate_shadow_host_side_for_style_sheet_change(shadow_root, captures.reason, previous_sheet_effects))
+
+## Ported from Libraries/LibWeb/CSS/StyleSheetInvalidation.cpp:592 Web::CSS::invalidate_style_for_style_sheet_owners.
+pub func css_invalidate_style_for_style_sheet_owners(style_sheet: CssCssStyleSheet*, reason: DomStyleInvalidationReason, rule_cache_invalidation: CssShouldInvalidateRuleCache, previous_sheet_effects: const CssShadowRootStylesheetEffects*? = none):
+    var captures = CssInvalidateStyleForStyleSheetOwners(reason = reason, rule_cache_invalidation = rule_cache_invalidation, previous_sheet_effects = previous_sheet_effects)
+    css_css_style_sheet_for_each_owning_style_scope(style_sheet, ak.Function1[CssStyleScope*, unit](call = css_invalidate_style_for_style_sheet_owner, context = &captures))
+
+## invalidate_owners_for_inserted_keyframes_rule's callback: `[&](DOM::Node& affected_root) { ... }`; the capture
+## is the rule's name.
+func css_invalidate_tree_for_inserted_keyframes_rule(context: void*?, affected_root: DomNode*):
+    let animation_name = *(const ak.FlyString*)(context else trap("no captures"))
+    css_invalidate_elements_affected_by_inserted_keyframes_rule(affected_root, animation_name)
+
+## Ported from Libraries/LibWeb/CSS/StyleSheetInvalidation.cpp:612 Web::CSS::invalidate_owners_for_inserted_keyframes_rule.
+pub func css_invalidate_owners_for_inserted_keyframes_rule(style_sheet: CssCssStyleSheet*, keyframes_rule: CssKeyframesRule*):
+    let owners = css_css_style_sheet_owning_documents_or_shadow_roots(style_sheet)
+    for owner in ak.hash_table_begin_const(&owners):
+        let document_or_shadow_root = *owner else trap("VERIFY: owner")
+        css_style_scope_invalidate_rule_cache(css_style_scope_of_document_or_shadow_root(document_or_shadow_root))
+
+        if not dom_node_is_shadow_root(document_or_shadow_root) and dom_node_entire_subtree_needs_style_update(document_or_shadow_root):
+            continue
+
+        var include_host = false
+        var include_light_dom_under_shadow_host = false
+        if let shadow_root = as_if_dom_shadow_root(document_or_shadow_root):
+            let effects = css_determine_shadow_root_stylesheet_effects_dom_shadow_root(shadow_root)
+            include_host = effects.may_match_shadow_host
+            include_light_dom_under_shadow_host = effects.may_match_light_dom_under_shadow_host
+
+        var animation_name = css_keyframes_rule_name(keyframes_rule)
+        css_for_each_tree_affected_by_shadow_root_stylesheet_change(document_or_shadow_root, include_host, include_light_dom_under_shadow_host, ak.Function1[DomNode*, unit](call = css_invalidate_tree_for_inserted_keyframes_rule, context = &animation_name))
