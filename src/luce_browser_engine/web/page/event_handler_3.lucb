@@ -1,0 +1,417 @@
+#==============================================================================================
+#
+#   event_handler_3 - Web::EventHandler: mouse up and down, starting a character, word or
+#   paragraph selection, and the default actions of a mouse down
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibWeb/Page/EventHandler.cpp lines 1005-1382 (handle_mouseup,
+#       initiate_character_selection, initiate_word_selection, initiate_paragraph_selection,
+#       run_mousedown_default_actions, handle_mousedown).
+#
+#       Copyright (c) 2020, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2023, Linus Groh <linusg@serenityos.org>
+#       Copyright (c) 2026, Jelle Raaijmakers <jelle@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Mouse up ================================================================================
+
+## handle_mouseup's ScopeGuard: clear the mousedown tracking and stop updating the selection.
+func event_handler_mouseup_cleanup(this: EventHandler*, middle_button_autoscrolled: bool, button: u32):
+    event_handler_clear_mousedown_tracking(this)
+    event_handler_stop_updating_selection(this)
+
+    if middle_button_autoscrolled and button == (u32)UiEventsMouseButton.middle:
+        event_handler_release_middle_button_scroll_handler(this)
+
+## The captures of handle_mouseup's nested navigable dispatch (`[=]`).
+struct EventHandlerMouseupDispatch:
+    var screen_position: gfx.CssPixelPoint
+    var button: u32
+    var buttons: u32
+    var modifiers: u32
+
+## handle_mouseup's dispatch to a nested navigable's event handler.
+func event_handler_mouseup_dispatch(context: void*?, event_handler: EventHandler*, position: gfx.CssPixelPoint) -> EventResult:
+    let captures = (EventHandlerMouseupDispatch*)(context else trap("no captures"))
+    return event_handler_handle_mouseup(event_handler, position, captures.screen_position, captures.button, captures.buttons, captures.modifiers)
+
+## Ported from EventHandler.cpp:1005 Web::EventHandler::handle_mouseup.
+pub func event_handler_handle_mouseup(this: EventHandler*, visual_viewport_position: gfx.CssPixelPoint, screen_position: gfx.CssPixelPoint, button: u32, buttons: u32, modifiers: u32) -> EventResult:
+    var middle_button_autoscrolled = false
+    if let handler = this.m_middle_button_scroll_handler:
+        middle_button_autoscrolled = middle_button_scroll_handler_mouse_has_moved_beyond_dead_zone(handler)
+
+    defer event_handler_mouseup_cleanup(this, middle_button_autoscrolled, button)
+
+    if event_handler_should_ignore_device_input_event(this):
+        if this.m_mousedown_target_is_drag_candidate:
+            let result = event_handler_handle_drag_and_drop_event(this, DragEventType.drop, visual_viewport_position, screen_position, button, buttons, modifiers, ak.Vector[HtmlSelectedFile]())
+            set_page_cursor(html_navigable_page(this.m_navigable), gfx.Cursor.standard_cursor(gfx.StandardCursor.arrow))
+            return result
+
+        return EventResult.dropped
+
+    let document = html_navigable_active_document(this.m_navigable) else return EventResult.dropped
+    if not dom_document_is_fully_active(document):
+        return EventResult.dropped
+
+    let viewport_position = css_visual_viewport_map_to_layout_viewport(dom_document_visual_viewport(document), visual_viewport_position)
+    dom_document_update_layout(document, DomUpdateLayoutReason.event_handler_handle_mouse_up)
+
+    if event_handler_paint_root(this) == none:
+        return EventResult.dropped
+
+    var paintable: PaintPaintable*? = none
+    var chrome_widget: PaintChromeWidget*? = none
+    if let result = event_handler_target_for_mouse_position(this, visual_viewport_position):
+        paintable = result.paintable
+        chrome_widget = result.chrome_widget
+
+    let click_count = this.m_mousedown_click_count
+    if click_count <= 0:
+        return EventResult.dropped
+
+    if paintable == none:
+        assert(chrome_widget == none)
+
+        # NB: Always fire a mouseup event if we've fired a mousedown event. Otherwise, web pages will not have a
+        #     chance to end a drag that went outside the window.
+        if gc.weak_ptr(&this.m_mousedown_target) != none:
+            let document_layout_node = dom_document_layout_node(document) else trap("no layout node")
+            let coordinates = event_handler_compute_mouse_event_coordinates(this, visual_viewport_position, viewport_position, dom_node_paintable(document.dom_node()) else trap("no paintable"), document_layout_node.layout_node())
+            var html_element: DomNode*? = none
+            if let element = dom_document_html_element(document):
+                html_element = element.dom_node()
+            discard(event_handler_dispatch_a_pointer_event_for_a_device_that_supports_hover(this, EventHandlerPointerEventType.pointer_up, html_element, none, coordinates, screen_position, gfx.CssPixelPoint(), button, buttons, modifiers, click_count))
+            return EventResult.handled
+
+        return EventResult.dropped
+
+    let target = paintable else trap("unreachable")
+    let computed_values = paint_paintable_computed_values(target)
+    let pointer_events = css_computed_values_pointer_events(&computed_values.computed_values)
+    if pointer_events == css_data.PointerEvents.none_:
+        return EventResult.cancelled
+
+    var node = dom_node_for_event_dispatch(target)
+    if node == none:
+        return EventResult.dropped
+
+    let captures = new EventHandlerMouseupDispatch(screen_position = screen_position, button = button, buttons = buttons, modifiers = modifiers) else trap("out of memory")
+    if let result = dispatch_event_to_nested_navigable(target, visual_viewport_position, ak.Function2[EventHandler*, gfx.CssPixelPoint, EventResult](call = event_handler_mouseup_dispatch, context = captures)):
+        return result
+
+    # NB: Search for the first parent of the hit target that's an element.
+    #
+    # https://www.w3.org/TR/uievents/#event-type-click
+    # The click event type MUST be dispatched on the topmost event target indicated by the pointer.
+    #
+    # https://www.w3.org/TR/uievents/#topmost-event-target
+    # The topmost event target MUST be the element highest in the rendering order which is capable of being an
+    # event target.
+    var layout_node: LayoutNode*? = none
+    if not parent_element_for_event_dispatch(target, &node, &layout_node):
+        return EventResult.dropped
+    let dispatch_node = node else trap("unreachable")
+
+    let coordinates = event_handler_compute_mouse_event_coordinates(this, visual_viewport_position, viewport_position, target, layout_node else trap("unreachable"))
+    discard(event_handler_dispatch_a_pointer_event_for_a_device_that_supports_hover(this, EventHandlerPointerEventType.pointer_up, dispatch_node, chrome_widget, coordinates, screen_position, gfx.CssPixelPoint(), button, buttons, modifiers, click_count))
+
+    # FIXME: Per spec, the click target should be the nearest common inclusive ancestor of the pointerdown
+    #        and pointerup targets. Currently we require an exact match.
+    # NB: If the middle button was used to scroll, suppress click and activation behavior.
+    if (DomNode*?)dispatch_node == gc.weak_ptr(&this.m_mousedown_target) and not middle_button_autoscrolled:
+        if event_handler_fire_click_events(this, dispatch_node, coordinates, screen_position, button, buttons, modifiers, click_count) and chrome_widget == none:
+            # NB: Event dispatches above may have run JS that invalidated layout.
+            dom_document_update_layout(html_navigable_active_document(this.m_navigable) else trap("no active document"), DomUpdateLayoutReason.event_handler_run_activation_behavior)
+
+            # FIXME: Currently cannot spawn a new top-level browsing context for new tab operations, because the
+            #        new top-level browsing context would be in another process. To fix this, there needs to be
+            #        some way to be able to communicate with browsing contexts in remote WebContent processes, and
+            #        then step 8 of this algorithm needs to be implemented in Navigable::choose_a_navigable:
+            #        https://html.spec.whatwg.org/multipage/document-sequences.html#the-rules-for-choosing-a-navigable
+            event_handler_run_activation_behavior(this, dispatch_node, button, modifiers)
+
+    return EventResult.handled
+
+# mark: Starting a selection ====================================================================
+
+## Ported from EventHandler.cpp:1114 Web::EventHandler::initiate_character_selection.
+pub func event_handler_initiate_character_selection(this: EventHandler*, document: DomDocument*, hit: PaintHitTestResult, user_select: css_data.UserSelect, shift_held: bool) -> bool:
+    let hit_node = paint_paintable_dom_node(hit.paintable else trap("no paintable")) else trap("no DOM node")
+
+    let index = hit.index_in_node
+    if let active_target = dom_document_active_input_events_target(document, hit_node):
+        this.m_mouse_selection_target = active_target
+
+        if shift_held:
+            input_events_target_set_selection_focus(active_target, hit_node, index)
+        else:
+            input_events_target_set_selection_anchor(active_target, hit_node, index)
+    else:
+        this.m_mouse_selection_target = none
+
+        if let selection = dom_document_get_selection(document):
+            let anchor_node = selection_selection_anchor_node(selection)
+            if anchor_node != none and shift_held:
+                set_user_selection(anchor_node, (usize)selection_selection_anchor_offset(selection), hit_node, index, selection, user_select)
+            else:
+                set_user_selection(hit_node, index, hit_node, index, selection, user_select)
+
+    this.m_selection_mode = EventHandlerSelectionMode.character
+    return true
+
+## Ported from EventHandler.cpp:1141 Web::EventHandler::initiate_word_selection.
+pub func event_handler_initiate_word_selection(this: EventHandler*, document: DomDocument*, hit: PaintHitTestResult, user_select: css_data.UserSelect) -> bool:
+    let paintable = hit.paintable else trap("no paintable")
+    if not is_paint_text_paintable(paintable):
+        return false
+
+    let hit_paintable = as_paint_text_paintable(paintable)
+    let hit_node = as_dom_text(paint_paintable_dom_node(paintable) else trap("no DOM node"))
+
+    var previous_boundary: usize = 0
+    var next_boundary: usize = 0
+
+    if dom_text_is_password_input(hit_node):
+        next_boundary = (usize)dom_character_data_length_in_utf16_code_units(hit_node.dom_character_data())
+    else:
+        let segmenter = event_handler_word_segmenter(this)
+        let text = layout_text_node_text_for_rendering(paint_text_paintable_layout_node(hit_paintable))
+        web_unicode.segmenter_set_segmented_text_utf16_view(segmenter, ak.utf16_string_base_utf16_view(&text.utf16_string_base))
+
+        previous_boundary = (usize)(web_unicode.segmenter_previous_boundary(segmenter, hit.index_in_node, web_unicode.SegmenterInclusive.yes) else 0)
+        next_boundary = (usize)(web_unicode.segmenter_next_boundary(segmenter, hit.index_in_node, web_unicode.SegmenterInclusive.no) else (u64)dom_node_length(hit_node.dom_node()))
+
+    this.m_selection_mode = EventHandlerSelectionMode.word
+    this.m_selection_origin = dom_range_create_dom_node(hit_node.dom_node(), (u32)previous_boundary, hit_node.dom_node(), (u32)next_boundary)
+
+    if let target = dom_document_active_input_events_target(document, hit_node.dom_node()):
+        this.m_mouse_selection_target = target
+        input_events_target_set_selection_anchor(target, hit_node.dom_node(), previous_boundary)
+        input_events_target_set_selection_focus(target, hit_node.dom_node(), next_boundary)
+    elif let selection = dom_document_get_selection(document):
+        this.m_mouse_selection_target = none
+        set_user_selection(hit_node.dom_node(), previous_boundary, hit_node.dom_node(), next_boundary, selection, user_select)
+
+    this.m_selection_mode = EventHandlerSelectionMode.word
+    return true
+
+## Ported from EventHandler.cpp:1178 Web::EventHandler::initiate_paragraph_selection.
+pub func event_handler_initiate_paragraph_selection(this: EventHandler*, document: DomDocument*, hit: PaintHitTestResult, user_select: css_data.UserSelect) -> bool:
+    let dom_node = paint_paintable_dom_node(hit.paintable else trap("no paintable")) else trap("no DOM node")
+    if not is_dom_text(dom_node):
+        return false
+
+    let hit_node = as_dom_text(dom_node)
+    let hit_index = hit.index_in_node
+
+    # For input/textarea elements, select the current line (delimited by newlines).
+    if let target = dom_document_active_input_events_target(document, hit_node.dom_node()):
+        let data = dom_character_data_data(hit_node.dom_character_data())
+        let text = ak.utf16_string_base_utf16_view(&data.utf16_string_base)
+        let line_start = find_line_start(text, hit_index)
+        let line_end = find_line_end(text, hit_index)
+
+        this.m_selection_mode = EventHandlerSelectionMode.paragraph
+        this.m_selection_origin = dom_range_create_dom_node(hit_node.dom_node(), (u32)line_start, hit_node.dom_node(), (u32)line_end)
+        this.m_mouse_selection_target = target
+        input_events_target_set_selection_anchor(target, hit_node.dom_node(), line_start)
+        input_events_target_set_selection_focus(target, hit_node.dom_node(), line_end)
+    elif let selection = dom_document_get_selection(document):
+        # For regular content, find paragraph boundaries within the containing block.
+        let origin = find_paragraph_range(hit_node, (u32)hit_index)
+        this.m_selection_origin = origin
+
+        this.m_selection_mode = EventHandlerSelectionMode.paragraph
+        this.m_mouse_selection_target = none
+
+        let range = origin.dom_abstract_range()
+        set_user_selection(dom_abstract_range_start_container(range), (usize)dom_abstract_range_start_offset(range), dom_abstract_range_end_container(range), (usize)dom_abstract_range_end_offset(range), selection, user_select)
+
+    this.m_selection_mode = EventHandlerSelectionMode.paragraph
+    return true
+
+# mark: Mouse down ==============================================================================
+
+## Ported from EventHandler.cpp:1211 Web::EventHandler::run_mousedown_default_actions.
+func event_handler_run_mousedown_default_actions(this: EventHandler*, document: DomDocument*, visual_viewport_position: gfx.CssPixelPoint, viewport_position: gfx.CssPixelPoint, button: u32, modifiers: u32, click_count: i32):
+    if this.m_middle_button_scroll_handler != none:
+        event_handler_release_middle_button_scroll_handler(this)
+        return
+
+    if button == (u32)UiEventsMouseButton.middle:
+        if not page_enable_autoscroll(html_navigable_page(this.m_navigable)):
+            return
+
+        let hit = paint_paintable_box_hit_test(event_handler_paint_root(this) else trap("no paint root"), visual_viewport_position, PaintHitTestType.exact) else return
+        let hit_paintable = hit.paintable else trap("no paintable")
+
+        var node = paint_paintable_dom_node(hit_paintable)
+        while let current = node:
+            if as_if_form_associated_text_control_element(current) != none:
+                return
+            if let anchor = as_if_html_anchor_element(current):
+                if dom_element_has_attribute(anchor.dom_element(), html_attribute_names_href):
+                    return
+            node = dom_node_parent_or_shadow_host_node(current)
+
+        if let container = middle_button_scroll_handler_find_scrollable_ancestor(document, hit_paintable):
+            # make<MiddleButtonScrollHandler>(*container, visual_viewport_position)
+            let handler = new MiddleButtonScrollHandler(m_container_element = container, m_origin = visual_viewport_position, m_mouse_position = visual_viewport_position, m_fractional_delta = gfx.CssPixelPoint(), m_mouse_has_moved_beyond_dead_zone = false) else trap("out of memory")
+            middle_button_scroll_handler_construct(handler, container, visual_viewport_position)
+            this.m_middle_button_scroll_handler = handler
+
+        return
+
+    if button != (u32)UiEventsMouseButton.primary:
+        return
+    if os.macos:
+        if (modifiers & (u32)UiEventsKeyModifier.mod_ctrl) != 0:
+            return
+
+    # https://html.spec.whatwg.org/multipage/interaction.html#data-model:click-focusable-5
+    # When a user activates a click focusable focusable area, the user agent must run the focusing steps on that
+    # focusable area with focus trigger set to "click".
+    # NOTE: Note that focusing is not an activation behavior, i.e. calling the click() method on an element or
+    #       dispatching a synthetic click event on it won't cause the element to get focused.
+    if let focus_candidate = event_handler_focus_candidate_for_position(this, viewport_position):
+        html_run_focusing_steps(focus_candidate, none, HtmlFocusTrigger.click)
+    elif let focused_area = dom_document_focused_area(document):
+        html_run_unfocusing_steps(focused_area)
+
+    # NB: Focusing may have invalidated layout.
+    dom_document_update_layout(document, DomUpdateLayoutReason.event_handler_handle_mouse_down)
+    let paint_root = event_handler_paint_root(this) else return
+
+    # NB: Now we can do selection with a cursor hit test.
+    let cursor_hit = paint_paintable_box_hit_test(paint_root, visual_viewport_position, PaintHitTestType.text_cursor) else return
+    let cursor_paintable = cursor_hit.paintable else trap("no paintable")
+
+    if paint_paintable_dom_node(cursor_paintable) == none:
+        return
+
+    # https://drafts.csswg.org/css-ui/#valdef-user-select-none
+    # Attempting to start a selection in an element where user-select is none, such as by clicking in it or starting a
+    # drag in it, must not cause a pre-existing selection to become unselected or to be affected in any way.
+    let user_select = layout_node_user_select_used_value(paint_paintable_layout_node(cursor_paintable))
+    if user_select == css_data.UserSelect.none_:
+        return
+
+    var selection_started = false
+    if click_count == 3:
+        selection_started = event_handler_initiate_paragraph_selection(this, document, cursor_hit, user_select)
+    elif click_count == 2:
+        selection_started = event_handler_initiate_word_selection(this, document, cursor_hit, user_select)
+    else:
+        selection_started = event_handler_initiate_character_selection(this, document, cursor_hit, user_select, (modifiers & (u32)UiEventsKeyModifier.mod_shift) != 0)
+    if not selection_started:
+        return
+    assert(this.m_selection_mode != EventHandlerSelectionMode.none_)
+
+    if let container = auto_scroll_handler_find_scrollable_ancestor(cursor_paintable):
+        # make<AutoScrollHandler>(m_navigable, *container)
+        let handler = new AutoScrollHandler(m_navigable = this.m_navigable, m_container_element = container, m_mouse_position = gfx.CssPixelPoint(), m_fractional_delta = gfx.CssPixelPoint(), m_active = false) else trap("out of memory")
+        auto_scroll_handler_construct(handler, this.m_navigable, container)
+        this.m_auto_scroll_handler = handler
+
+## The captures of handle_mousedown's nested navigable dispatch (`[=]`).
+struct EventHandlerMousedownDispatch:
+    var screen_position: gfx.CssPixelPoint
+    var button: u32
+    var buttons: u32
+    var modifiers: u32
+    var click_count: i32
+
+## handle_mousedown's dispatch to a nested navigable's event handler.
+func event_handler_mousedown_dispatch(context: void*?, event_handler: EventHandler*, position: gfx.CssPixelPoint) -> EventResult:
+    let captures = (EventHandlerMousedownDispatch*)(context else trap("no captures"))
+    return event_handler_handle_mousedown(event_handler, position, captures.screen_position, captures.button, captures.buttons, captures.modifiers, captures.click_count)
+
+## Ported from EventHandler.cpp:1293 Web::EventHandler::handle_mousedown.
+pub func event_handler_handle_mousedown(this: EventHandler*, visual_viewport_position: gfx.CssPixelPoint, screen_position: gfx.CssPixelPoint, button: u32, buttons: u32, modifiers: u32, click_count: i32) -> EventResult:
+    if event_handler_should_ignore_device_input_event(this):
+        return EventResult.dropped
+
+    let document = html_navigable_active_document(this.m_navigable) else return EventResult.dropped
+    if not dom_document_is_fully_active(document):
+        return EventResult.dropped
+
+    let viewport_position = css_visual_viewport_map_to_layout_viewport(dom_document_visual_viewport(document), visual_viewport_position)
+
+    dom_document_update_layout(document, DomUpdateLayoutReason.event_handler_handle_mouse_down)
+
+    if event_handler_paint_root(this) == none:
+        return EventResult.dropped
+
+    var node: DomNode*? = none
+
+    var paintable: PaintPaintable*? = none
+    var chrome_widget: PaintChromeWidget*? = none
+    if let result = event_handler_target_for_mouse_position(this, visual_viewport_position):
+        paintable = result.paintable
+        chrome_widget = result.chrome_widget
+    else:
+        return EventResult.dropped
+    let target = paintable else trap("no paintable")
+
+    let computed_values = paint_paintable_computed_values(target)
+    let pointer_events = css_computed_values_pointer_events(&computed_values.computed_values)
+    # FIXME: Handle other values for pointer-events.
+    assert(pointer_events != css_data.PointerEvents.none_)
+
+    node = dom_node_for_event_dispatch(target)
+
+    if node == none:
+        return EventResult.dropped
+
+    this.m_mousedown_click_count = click_count
+
+    let captures = new EventHandlerMousedownDispatch(screen_position = screen_position, button = button, buttons = buttons, modifiers = modifiers, click_count = click_count) else trap("out of memory")
+    if let result = dispatch_event_to_nested_navigable(target, visual_viewport_position, ak.Function2[EventHandler*, gfx.CssPixelPoint, EventResult](call = event_handler_mousedown_dispatch, context = captures)):
+        return result
+
+    page_set_focused_navigable(html_navigable_page(this.m_navigable), this.m_navigable)
+
+    # NB: Search for the first parent of the hit target that's an element.
+    #
+    # https://www.w3.org/TR/uievents/#event-type-click
+    # The click event type MUST be dispatched on the topmost event target indicated by the pointer.
+    #
+    # https://www.w3.org/TR/uievents/#topmost-event-target
+    # The topmost event target MUST be the element highest in the rendering order which is capable of being an
+    # event target.
+    var layout_node: LayoutNode*? = none
+    if not parent_element_for_event_dispatch(target, &node, &layout_node):
+        return EventResult.dropped
+    let dispatch_node = node else trap("unreachable")
+
+    this.m_mousedown_target = gc.make_weak(dispatch_node)
+    this.m_mousedown_visual_viewport_position = visual_viewport_position
+
+    let coordinates = event_handler_compute_mouse_event_coordinates(this, visual_viewport_position, viewport_position, target, layout_node else trap("unreachable"))
+    if not event_handler_dispatch_a_pointer_event_for_a_device_that_supports_hover(this, EventHandlerPointerEventType.pointer_down, dispatch_node, chrome_widget, coordinates, screen_position, gfx.CssPixelPoint(), button, buttons, modifiers, click_count):
+        return EventResult.cancelled
+
+    # FIXME: The spec allows this to be fired following mousedown or mouseup. The native behavior on Windows is to
+    #        do so in mouseup, so we should make this configurable by the UI.
+    if button == (u32)UiEventsMouseButton.secondary:
+        event_handler_maybe_show_context_menu(this, dispatch_node, coordinates, screen_position, viewport_position, buttons, modifiers)
+    elif os.macos and button == (u32)UiEventsMouseButton.primary and (modifiers & (u32)UiEventsKeyModifier.mod_ctrl) != 0:
+        event_handler_maybe_show_context_menu(this, dispatch_node, coordinates, screen_position, viewport_position, buttons, modifiers)
+    else:
+        this.m_mousedown_target_is_drag_candidate = button == (u32)UiEventsMouseButton.primary
+
+    # NB: Dispatching an event may have disturbed the world.
+    if html_navigable_active_document(this.m_navigable) != (DomDocument*?)document:
+        return EventResult.accepted
+    dom_document_update_layout(document, DomUpdateLayoutReason.event_handler_handle_mouse_down)
+    if event_handler_paint_root(this) == none:
+        return EventResult.accepted
+
+    if chrome_widget == none:
+        event_handler_run_mousedown_default_actions(this, document, visual_viewport_position, viewport_position, button, modifiers, click_count)
+
+    return EventResult.handled

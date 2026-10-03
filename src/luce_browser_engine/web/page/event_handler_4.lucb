@@ -1,0 +1,438 @@
+#==============================================================================================
+#
+#   event_handler_4 - Web::EventHandler: mouse moves and leaving, drag and drop, pinch zoom,
+#   sequential focus, the focus candidate of a position, keyboard and input events
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibWeb/Page/EventHandler.cpp lines 1384-1799 (handle_mousemove through
+#       input_event).
+#
+#       Copyright (c) 2020, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2023, Linus Groh <linusg@serenityos.org>
+#       Copyright (c) 2026, Jelle Raaijmakers <jelle@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Mouse moves =============================================================================
+
+## handle_mousemove's DRAG_THRESHOLD.
+let event_handler_drag_threshold: i64 = 5
+
+## The captures of handle_mousemove's nested navigable dispatch (`[screen_position, buttons, modifiers]`).
+struct EventHandlerMousemoveDispatch:
+    var screen_position: gfx.CssPixelPoint
+    var buttons: u32
+    var modifiers: u32
+
+## handle_mousemove's dispatch to a nested navigable's event handler.
+func event_handler_mousemove_dispatch(context: void*?, event_handler: EventHandler*, position: gfx.CssPixelPoint) -> EventResult:
+    let captures = (EventHandlerMousemoveDispatch*)(context else trap("no captures"))
+    return event_handler_handle_mousemove(event_handler, position, captures.screen_position, captures.buttons, captures.modifiers)
+
+## Ported from EventHandler.cpp:1384 Web::EventHandler::handle_mousemove.
+pub func event_handler_handle_mousemove(this: EventHandler*, visual_viewport_position: gfx.CssPixelPoint, screen_position: gfx.CssPixelPoint, buttons: u32, modifiers: u32) -> EventResult:
+    if event_handler_should_ignore_device_input_event(this):
+        if this.m_mousedown_target_is_drag_candidate:
+            return event_handler_handle_drag_and_drop_event(this, DragEventType.drag_move, visual_viewport_position, screen_position, (u32)UiEventsMouseButton.primary, buttons, modifiers, ak.Vector[HtmlSelectedFile]())
+        return EventResult.dropped
+
+    let document = html_navigable_active_document(this.m_navigable) else return EventResult.dropped
+    if not dom_document_is_fully_active(document):
+        return EventResult.dropped
+
+    let viewport_position = css_visual_viewport_map_to_layout_viewport(dom_document_visual_viewport(document), visual_viewport_position)
+    dom_document_update_layout(document, DomUpdateLayoutReason.event_handler_handle_mouse_move)
+
+    if event_handler_paint_root(this) == none:
+        return EventResult.dropped
+
+    if this.m_mousedown_target_is_drag_candidate:
+        let drag_threshold = gfx.CssPixels.from_int(event_handler_drag_threshold)
+        let delta = gfx.css_pixel_point_sub(&visual_viewport_position, this.m_mousedown_visual_viewport_position else trap("Optional::operator*() on an empty optional"))
+
+        if delta.m_x.abs().compare(drag_threshold) >= 0 or delta.m_y.abs().compare(drag_threshold) >= 0:
+            let result = event_handler_handle_drag_and_drop_event(this, DragEventType.drag_start, visual_viewport_position, screen_position, (u32)UiEventsMouseButton.primary, buttons, modifiers, ak.Vector[HtmlSelectedFile]())
+
+            if result == EventResult.handled:
+                set_page_cursor(html_navigable_page(this.m_navigable), gfx.Cursor.standard_cursor(gfx.StandardCursor.drag))
+                event_handler_stop_updating_selection(this)
+
+                return EventResult.handled
+
+            if result == EventResult.cancelled:
+                this.m_mousedown_target_is_drag_candidate = false
+
+            # NB: Dispatching an event may have disturbed the world.
+            if html_navigable_active_document(this.m_navigable) != (DomDocument*?)document:
+                return EventResult.accepted
+            dom_document_update_layout(document, DomUpdateLayoutReason.event_handler_handle_mouse_move)
+            if event_handler_paint_root(this) == none:
+                return EventResult.accepted
+
+    var paintable: PaintPaintable*? = none
+    var chrome_widget: PaintChromeWidget*? = none
+
+    if let result = event_handler_target_for_mouse_position(this, visual_viewport_position):
+        paintable = result.paintable
+        chrome_widget = result.chrome_widget
+
+    # ArmedScopeGuard clear_cursor: unless disarmed, the cursor is reset whenever this returns.
+    var clear_cursor_armed = true
+    defer event_handler_clear_cursor_unless_disarmed(this, &clear_cursor_armed)
+
+    if let target = paintable:
+        var node = dom_node_for_event_dispatch(target)
+
+        if node == none:
+            return EventResult.dropped
+
+        let captures = new EventHandlerMousemoveDispatch(screen_position = screen_position, buttons = buttons, modifiers = modifiers) else trap("out of memory")
+        if let result = dispatch_event_to_nested_navigable(target, visual_viewport_position, ak.Function2[EventHandler*, gfx.CssPixelPoint, EventResult](call = event_handler_mousemove_dispatch, context = captures)):
+            clear_cursor_armed = false
+            return result
+
+        let computed_values = paint_paintable_computed_values(target)
+        let pointer_events = css_computed_values_pointer_events(&computed_values.computed_values)
+        # FIXME: Handle other values for pointer-events.
+        assert(pointer_events != css_data.PointerEvents.none_)
+
+        # NB: Search for the first parent of the hit target that's an element.
+        #
+        # https://www.w3.org/TR/uievents/#event-type-click
+        # The click event type MUST be dispatched on the topmost event target indicated by the pointer.
+        #
+        # https://www.w3.org/TR/uievents/#topmost-event-target
+        # The topmost event target MUST be the element highest in the rendering order which is capable of being an
+        # event target.
+        var layout_node: LayoutNode*? = none
+        let found_parent_element = parent_element_for_event_dispatch(target, &node, &layout_node)
+
+        if found_parent_element:
+            let dispatch_node = node else trap("unreachable")
+            event_handler_update_cursor(this, target, dispatch_node, chrome_widget)
+            clear_cursor_armed = false
+
+            let coordinates = event_handler_compute_mouse_event_coordinates(this, visual_viewport_position, viewport_position, target, layout_node else trap("unreachable"))
+            let movement = event_handler_compute_mouse_event_movement(this, screen_position)
+            this.m_mousemove_previous_screen_position = screen_position
+
+            if not event_handler_dispatch_a_pointer_event_for_a_device_that_supports_hover(this, EventHandlerPointerEventType.pointer_move, dispatch_node, chrome_widget, coordinates, screen_position, movement, (u32)UiEventsMouseButton.primary, buttons, modifiers):
+                return EventResult.cancelled
+    elif gc.weak_ptr(&this.m_mousedown_target) != none:
+        # NOTE: In some implementation environments, such as a browser, mousemove events can continue to fire if the
+        #       user began a drag operation (e.g., a mouse button is pressed) and the pointing device has left the
+        #       boundary of the user agent.
+        let document_layout_node = dom_document_layout_node(document) else trap("no layout node")
+        let coordinates = event_handler_compute_mouse_event_coordinates(this, visual_viewport_position, viewport_position, dom_node_paintable(document.dom_node()) else trap("no paintable"), document_layout_node.layout_node())
+        let movement = event_handler_compute_mouse_event_movement(this, screen_position)
+        this.m_mousemove_previous_screen_position = screen_position
+
+        var html_element: DomNode*? = none
+        if let element = dom_document_html_element(document):
+            html_element = element.dom_node()
+        if not event_handler_dispatch_a_pointer_event_for_a_device_that_supports_hover(this, EventHandlerPointerEventType.pointer_move, html_element, none, coordinates, screen_position, movement, (u32)UiEventsMouseButton.primary, buttons, modifiers):
+            return EventResult.cancelled
+
+    # NB: Dispatching an event may have disturbed the world.
+    if html_navigable_active_document(this.m_navigable) != (DomDocument*?)document:
+        return EventResult.accepted
+
+    if this.m_middle_button_scroll_handler == none and not event_handler_is_handling_mouse_selection(this):
+        return EventResult.handled
+
+    dom_document_update_layout(document, DomUpdateLayoutReason.event_handler_handle_mouse_move)
+    if event_handler_paint_root(this) == none:
+        return EventResult.accepted
+
+    if let handler = this.m_middle_button_scroll_handler:
+        middle_button_scroll_handler_update_mouse_position(handler, visual_viewport_position)
+
+    event_handler_update_mouse_selection(this, visual_viewport_position)
+    return EventResult.handled
+
+## handle_mousemove's clear_cursor guard (`update_cursor(nullptr, nullptr, nullptr)` unless disarmed).
+func event_handler_clear_cursor_unless_disarmed(this: EventHandler*, armed: const bool*):
+    if *armed:
+        event_handler_update_cursor(this, none, none, none)
+
+## Ported from EventHandler.cpp:1514 Web::EventHandler::handle_mouseleave.
+pub func event_handler_handle_mouseleave(this: EventHandler*) -> EventResult:
+    if event_handler_should_ignore_device_input_event(this):
+        if this.m_mousedown_target_is_drag_candidate:
+            let result = event_handler_handle_drag_and_drop_event(this, DragEventType.drag_end, gfx.CssPixelPoint(), gfx.CssPixelPoint(), (u32)UiEventsMouseButton.primary, (u32)UiEventsMouseButton.primary, 0, ak.Vector[HtmlSelectedFile]())
+            set_page_cursor(html_navigable_page(this.m_navigable), gfx.Cursor.standard_cursor(gfx.StandardCursor.arrow))
+            return result
+
+        return EventResult.dropped
+
+    let document = html_navigable_active_document(this.m_navigable) else return EventResult.dropped
+    if not dom_document_is_fully_active(document):
+        return EventResult.dropped
+
+    dom_document_update_layout(document, DomUpdateLayoutReason.event_handler_handle_mouse_move)
+
+    if event_handler_paint_root(this) == none:
+        return EventResult.dropped
+
+    event_handler_update_hovered_chrome_widget(this, none)
+    event_handler_update_cursor(this, none, none, none)
+
+    if gc.weak_ptr(&this.m_mousedown_target) == none:
+        event_handler_track_the_effective_position_of_the_legacy_mouse_pointer(this, none)
+    return EventResult.handled
+
+# mark: Drag and drop and pinch =================================================================
+
+## The captures of handle_drag_and_drop_event's nested navigable dispatch
+## (`[type, screen_position, button, buttons, modifiers, &files]`).
+struct EventHandlerDragAndDropDispatch:
+    var type_: DragEventType
+    var screen_position: gfx.CssPixelPoint
+    var button: u32
+    var buttons: u32
+    var modifiers: u32
+    var files: ak.Vector[HtmlSelectedFile]*
+
+## handle_drag_and_drop_event's dispatch to a nested navigable's event handler.
+func event_handler_drag_and_drop_dispatch(context: void*?, event_handler: EventHandler*, position: gfx.CssPixelPoint) -> EventResult:
+    let captures = (EventHandlerDragAndDropDispatch*)(context else trap("no captures"))
+    return event_handler_handle_drag_and_drop_event(event_handler, captures.type_, position, captures.screen_position, captures.button, captures.buttons, captures.modifiers, *captures.files)
+
+## Ported from EventHandler.cpp:1544 Web::EventHandler::handle_drag_and_drop_event.
+pub func event_handler_handle_drag_and_drop_event(this: EventHandler*, type_: DragEventType, visual_viewport_position: gfx.CssPixelPoint, screen_position: gfx.CssPixelPoint, button: u32, buttons: u32, modifiers: u32, a_files: ak.Vector[HtmlSelectedFile]) -> EventResult:
+    var files = a_files
+    let document = html_navigable_active_document(this.m_navigable) else return EventResult.dropped
+    if not dom_document_is_fully_active(document):
+        return EventResult.dropped
+
+    let viewport_position = css_visual_viewport_map_to_layout_viewport(dom_document_visual_viewport(document), visual_viewport_position)
+
+    dom_document_update_layout(document, DomUpdateLayoutReason.event_handler_handle_drag_and_drop)
+
+    if event_handler_paint_root(this) == none:
+        return EventResult.dropped
+
+    var paintable: PaintPaintable*? = none
+    if let result = event_handler_target_for_mouse_position(this, visual_viewport_position):
+        paintable = result.paintable
+    else:
+        return EventResult.dropped
+    let target = paintable else trap("no paintable")
+
+    let node = dom_node_for_event_dispatch(target) else return EventResult.dropped
+
+    let captures = new EventHandlerDragAndDropDispatch(type_ = type_, screen_position = screen_position, button = button, buttons = buttons, modifiers = modifiers, files = &files) else trap("out of memory")
+    if let result = dispatch_event_to_nested_navigable(target, visual_viewport_position, ak.Function2[EventHandler*, gfx.CssPixelPoint, EventResult](call = event_handler_drag_and_drop_dispatch, context = captures)):
+        return result
+
+    let page_offset = event_handler_compute_mouse_event_page_offset(this, viewport_position)
+    let scroll_offset = html_navigable_viewport_scroll_offset(dom_document_navigable(document) else trap("no navigable"))
+    let offset = compute_mouse_event_offset(gfx.css_pixel_point_translated_css_pixel_point(&visual_viewport_position, scroll_offset), target)
+    let realm = bind_platform_object_realm(document.bind_platform_object())
+
+    match type_:
+        .drag_start:
+            return drag_and_drop_event_handler_handle_drag_start(this.m_drag_and_drop_event_handler, realm, gc.weak_ptr(&this.m_mousedown_target), screen_position, page_offset, viewport_position, offset, button, buttons, modifiers, files)
+        .drag_move:
+            return drag_and_drop_event_handler_handle_drag_move(this.m_drag_and_drop_event_handler, realm, node, screen_position, page_offset, viewport_position, offset, button, buttons, modifiers)
+        .drag_end:
+            return drag_and_drop_event_handler_handle_drag_leave(this.m_drag_and_drop_event_handler, realm, screen_position, page_offset, viewport_position, offset, button, buttons, modifiers)
+        .drop:
+            return drag_and_drop_event_handler_handle_drop(this.m_drag_and_drop_event_handler, realm, screen_position, page_offset, viewport_position, offset, button, buttons, modifiers)
+        _:
+            trap("VERIFY_NOT_REACHED")
+
+## Ported from EventHandler.cpp:1593 Web::EventHandler::handle_pinch_event.
+pub func event_handler_handle_pinch_event(this: EventHandler*, point: gfx.CssPixelPoint, scale_delta: f64) -> EventResult:
+    let document = html_navigable_active_document(this.m_navigable) else return EventResult.dropped
+    if not dom_document_is_fully_active(document):
+        return EventResult.dropped
+
+    let visual_viewport = dom_document_visual_viewport(document)
+    css_visual_viewport_zoom(visual_viewport, point, scale_delta)
+    return EventResult.handled
+
+# mark: Sequential focus ========================================================================
+
+## focus_next_element's set_focus_to_first_focusable_element lambda.
+func event_handler_set_focus_to_first_focusable_element(this: EventHandler*) -> EventResult:
+    let document = html_navigable_active_document(this.m_navigable) else trap("no active document")
+    var element = tree_node_first_child_of_type(document.dom_node(), &dom_element_class)
+
+    while let current = element:
+        if dom_event_target_is_focusable(current.dom_event_target()):
+            html_run_focusing_steps(current, none, HtmlFocusTrigger.key)
+            return EventResult.handled
+        element = (DomNode*?)dom_non_document_type_child_node_next_element_in_pre_order(current)
+
+    return EventResult.dropped
+
+## Ported from EventHandler.cpp:1606 Web::EventHandler::focus_next_element.
+func event_handler_focus_next_element(this: EventHandler*) -> EventResult:
+    let document = html_navigable_active_document(this.m_navigable) else return EventResult.dropped
+    if not dom_document_is_fully_active(document):
+        return EventResult.dropped
+
+    var node = dom_document_focused_area(document)
+    if node == none:
+        return event_handler_set_focus_to_first_focusable_element(this)
+
+    node = tree_node_next_in_pre_order(node else trap("unreachable"))
+    while let current = node:
+        if dom_event_target_is_focusable(current.dom_event_target()):
+            break
+        node = tree_node_next_in_pre_order(current)
+
+    let focus_target = node else return event_handler_set_focus_to_first_focusable_element(this)
+
+    html_run_focusing_steps(focus_target, none, HtmlFocusTrigger.key)
+    return EventResult.handled
+
+## focus_previous_element's set_focus_to_last_focusable_element lambda.
+func event_handler_set_focus_to_last_focusable_element(this: EventHandler*) -> EventResult:
+    # FIXME: This often returns the HTML element itself, which has no previous sibling.
+    let document = html_navigable_active_document(this.m_navigable) else trap("no active document")
+    var element = tree_node_last_child_of_type(document.dom_node(), &dom_element_class)
+
+    while let current = element:
+        if dom_event_target_is_focusable(current.dom_event_target()):
+            html_run_focusing_steps(current, none, HtmlFocusTrigger.key)
+            return EventResult.handled
+        element = (DomNode*?)dom_non_document_type_child_node_previous_element_in_pre_order(current)
+
+    return EventResult.dropped
+
+## Ported from EventHandler.cpp:1640 Web::EventHandler::focus_previous_element.
+func event_handler_focus_previous_element(this: EventHandler*) -> EventResult:
+    let document = html_navigable_active_document(this.m_navigable) else return EventResult.dropped
+    if not dom_document_is_fully_active(document):
+        return EventResult.dropped
+
+    var node = dom_document_focused_area(document)
+    if node == none:
+        return event_handler_set_focus_to_last_focusable_element(this)
+
+    node = tree_node_previous_in_pre_order(node else trap("unreachable"))
+    while let current = node:
+        if dom_event_target_is_focusable(current.dom_event_target()):
+            break
+        node = tree_node_previous_in_pre_order(current)
+
+    let focus_target = node else return event_handler_set_focus_to_last_focusable_element(this)
+
+    html_run_focusing_steps(focus_target, none, HtmlFocusTrigger.key)
+    return EventResult.handled
+
+## Ported from EventHandler.cpp:1675 Web::EventHandler::focus_candidate_for_position.
+func event_handler_focus_candidate_for_position(this: const EventHandler*, visual_viewport_position: gfx.CssPixelPoint) -> DomNode*?:
+    let exact_hit = paint_paintable_box_hit_test(event_handler_paint_root_const(this) else trap("no paint root"), visual_viewport_position, PaintHitTestType.exact) else return none
+
+    var focus_dom_node: DomNode*? = none
+    if let hit_paintable = exact_hit.paintable:
+        focus_dom_node = paint_paintable_dom_node(hit_paintable)
+
+    while let current = focus_dom_node:
+        if dom_event_target_is_focusable(current.dom_event_target()):
+            break
+        focus_dom_node = (DomNode*?)dom_node_parent_or_shadow_host(current)
+
+    return focus_dom_node
+
+# mark: Keyboard and input events ===============================================================
+
+## Ported from EventHandler.cpp:1689 Web::should_ignore_keydown_event.
+func should_ignore_keydown_event(code_point: u32, modifiers: u32) -> bool:
+    if (modifiers & ((u32)UiEventsKeyModifier.mod_ctrl | (u32)UiEventsKeyModifier.mod_alt | (u32)UiEventsKeyModifier.mod_super)) != 0:
+        return true
+
+    # FIXME: There are probably also keys with non-zero code points that should be filtered out.
+    return code_point == 0 or code_point == 27
+
+## Ported from EventHandler.cpp:1698 Web::EventHandler::fire_keyboard_event.
+func event_handler_fire_keyboard_event(this: EventHandler*, event_name: ak.FlyString, navigable: HtmlNavigable*, key: UiEventsKeyCode, modifiers: u32, code_point: u32, repeat: bool) -> EventResult:
+    let document = html_navigable_active_document(navigable) else return EventResult.dropped
+    if not dom_document_is_fully_active(document):
+        return EventResult.dropped
+
+    if let focused_area = dom_document_focused_area(document):
+        if is_html_navigable_container(focused_area):
+            let navigable_container = as_html_navigable_container(focused_area)
+            if let content_navigable = html_navigable_container_content_navigable(navigable_container):
+                return event_handler_fire_keyboard_event(this, event_name, content_navigable, key, modifiers, code_point, repeat)
+
+        let event = ui_events_keyboard_event_create_from_platform_event(bind_platform_object_realm(document.bind_platform_object()), event_name, key, modifiers, code_point, repeat)
+        return EventResult.accepted if dom_event_target_dispatch_event(focused_area.dom_event_target(), event) else EventResult.cancelled
+
+    # FIXME: De-duplicate this. This is just to prevent wasting a KeyboardEvent allocation when recursing into an (i)frame.
+    let event = ui_events_keyboard_event_create_from_platform_event(bind_platform_object_realm(document.bind_platform_object()), event_name, key, modifiers, code_point, repeat)
+
+    var target: DomNode* = tree_node_root(document.dom_node())
+    if let body = dom_document_body(document):
+        target = body.dom_node()
+    return EventResult.accepted if dom_event_target_dispatch_event(target.dom_event_target(), event) else EventResult.cancelled
+
+## Ported from EventHandler.cpp:1725 Web::produces_character_value.
+# https://w3c.github.io/uievents/#unicode-character-categories
+func produces_character_value(code_point: u32) -> bool:
+    # A subset of the General Category values that are defined for each Unicode code point. This subset contains all
+    # the Letter (Ll, Lm, Lo, Lt, Lu), Number (Nd, Nl, No), Punctuation (Pc, Pd, Pe, Pf, Pi, Po, Ps) and Symbol (Sc,
+    # Sk, Sm, So) category values.
+    return web_unicode.code_point_has_letter_general_category(code_point) or web_unicode.code_point_has_number_general_category(code_point) or web_unicode.code_point_has_punctuation_general_category(code_point) or web_unicode.code_point_has_symbol_general_category(code_point)
+
+## Ported from EventHandler.cpp:1737 Web::is_enter_key_or_interoperable_enter_key_combo.
+# https://github.com/w3c/uievents/issues/183#issuecomment-448091687
+func is_enter_key_or_interoperable_enter_key_combo(key: UiEventsKeyCode, modifiers: u32) -> bool:
+    if key != UiEventsKeyCode.key_return:
+        return false
+    if modifiers == 0:
+        return true
+    if (modifiers & ((u32)UiEventsKeyModifier.mod_shift | (u32)UiEventsKeyModifier.mod_ctrl)) != 0:
+        return true
+    return false
+
+## Ported from EventHandler.cpp:1748 Web::target_ranges_for_input_event.
+func target_ranges_for_input_event(document: DomDocument*) -> ak.Vector[DomStaticRange*]:
+    var target_ranges = ak.Vector[DomStaticRange*]()
+    if let selection = dom_document_get_selection(document):
+        if not selection_selection_is_collapsed(selection):
+            if let range = selection_selection_range(selection):
+                let abstract_range = range.dom_abstract_range()
+                let static_range = realm_create_dom_static_range(bind_platform_object_realm(document.bind_platform_object()), dom_abstract_range_start_container(abstract_range), dom_abstract_range_start_offset(abstract_range), dom_abstract_range_end_container(abstract_range), dom_abstract_range_end_offset(abstract_range))
+                ak.vector_append_t(&target_ranges, static_range)
+    return target_ranges
+
+## Ported from EventHandler.cpp:1760 Web::EventHandler::input_event.
+func event_handler_input_event(this: EventHandler*, event_name: ak.FlyString, input_type: ak.FlyString, navigable: HtmlNavigable*, code_point_or_string: ak.U32OrUtf16String) -> EventResult:
+    let document = html_navigable_active_document(navigable) else return EventResult.dropped
+    if not dom_document_is_fully_active(document):
+        return EventResult.dropped
+
+    var input_event_init: UiEventsInputEventInit = ---
+    ui_events_input_event_init_init_fields(&input_event_init)
+
+    match code_point_or_string:
+        .u32_(code_point):
+            if not ak.is_unicode_control(code_point):
+                input_event_init.data = ak.utf16_string_from_code_point(code_point)
+        .utf16_string(string):
+            input_event_init.data = string
+
+    input_event_init.input_type = input_type
+
+    let realm = bind_platform_object_realm(document.bind_platform_object())
+    if let focused_area = dom_document_focused_area(document):
+        if is_html_navigable_container(focused_area):
+            let navigable_container = as_html_navigable_container(focused_area)
+            if let content_navigable = html_navigable_container_content_navigable(navigable_container):
+                return event_handler_input_event(this, event_name, input_type, content_navigable, code_point_or_string)
+
+        let event = ui_events_input_event_create_from_platform_event(realm, event_name, input_event_init, target_ranges_for_input_event(document))
+        return EventResult.accepted if dom_event_target_dispatch_event(focused_area.dom_event_target(), (DomEvent*)event) else EventResult.cancelled
+
+    let event = ui_events_input_event_create_from_platform_event(realm, event_name, input_event_init, target_ranges_for_input_event(document))
+
+    if let body = dom_document_body(document):
+        return EventResult.accepted if dom_event_target_dispatch_event(body.dom_event_target(), (DomEvent*)event) else EventResult.cancelled
+
+    return EventResult.accepted if dom_event_target_dispatch_event(tree_node_root(document.dom_node()).dom_event_target(), (DomEvent*)event) else EventResult.cancelled

@@ -1,0 +1,381 @@
+#==============================================================================================
+#
+#   event_handler_5 - Web::EventHandler: key down and up, pasting, gamepads, mouse event
+#   offsets and movement, hit testing, the tracked cells, and the word segmenter
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibWeb/Page/EventHandler.cpp lines 1800-2173 (handle_keydown through
+#       word_segmenter) with the inline functions of EventHandler.h.
+#
+#       Copyright (c) 2020, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2023, Linus Groh <linusg@serenityos.org>
+#       Copyright (c) 2026, Jelle Raaijmakers <jelle@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Key down ================================================================================
+
+## The collapse argument of the cursor movements (`modifiers & Mod_Shift ? No : Yes`).
+func event_handler_collapse_selection(modifiers: u32) -> InputEventsTargetCollapseSelection:
+    if (modifiers & (u32)UiEventsKeyModifier.mod_shift) != 0:
+        return InputEventsTargetCollapseSelection.no
+    return InputEventsTargetCollapseSelection.yes
+
+## Ported from EventHandler.cpp:1800 Web::EventHandler::handle_keydown.
+pub func event_handler_handle_keydown(this: EventHandler*, a_key: UiEventsKeyCode, a_modifiers: u32, code_point: u32, repeat: bool) -> EventResult:
+    var key = a_key
+    var modifiers = a_modifiers
+    let active_document = html_navigable_active_document(this.m_navigable) else return EventResult.dropped
+    if not dom_document_is_fully_active(active_document):
+        return EventResult.dropped
+
+    var dispatch_result = event_handler_fire_keyboard_event(this, ui_events_event_names_keydown, this.m_navigable, key, modifiers, code_point, repeat)
+    if dispatch_result != EventResult.accepted:
+        return dispatch_result
+
+    # https://w3c.github.io/uievents/#event-type-keypress
+    # If supported by a user agent, this event MUST be dispatched when a key is pressed down, if and only if that key
+    # normally produces a character value.
+    # AD-HOC: For web compat and for interop with other engines, we make an exception here for the Enter key. See:
+    #         https://github.com/w3c/uievents/issues/183#issuecomment-448091687 and
+    #         https://github.com/w3c/uievents/issues/266#issuecomment-1887917756
+    if produces_character_value(code_point) or is_enter_key_or_interoperable_enter_key_combo(key, modifiers):
+        dispatch_result = event_handler_fire_keyboard_event(this, ui_events_event_names_keypress, this.m_navigable, key, modifiers, code_point, repeat)
+        if dispatch_result != EventResult.accepted:
+            return dispatch_result
+
+    let document = html_navigable_active_document(this.m_navigable) else trap("no active document")
+
+    if (modifiers & (u32)UiEventsKeyModifier.mod_ctrl) == 0:
+        if key == UiEventsKeyCode.key_tab:
+            if (modifiers & (u32)UiEventsKeyModifier.mod_shift) != 0:
+                return event_handler_focus_previous_element(this)
+            return event_handler_focus_next_element(this)
+
+    # https://html.spec.whatwg.org/multipage/interaction.html#close-requests
+    # FIXME: Close requests should queue a global task on the user interaction task source, given `document`'s relevant global object.
+    if key == UiEventsKeyCode.key_escape:
+        # NB: Exit autoscroll if active before handling other close requests.
+        if this.m_middle_button_scroll_handler != none:
+            event_handler_release_middle_button_scroll_handler(this)
+            return EventResult.handled
+
+        # 1. If document's fullscreen element is not null, then:
+        if dom_document_fullscreen(document):
+            # 1. Fully exit fullscreen given document's node navigable's top-level traversable's active document.
+            let top = html_navigable_top_level_traversable(this.m_navigable) else trap("no top-level traversable")
+            dom_document_fully_exit_fullscreen(html_navigable_active_document(top.html_navigable()) else trap("no active document"))
+            # 2. Return.
+            return EventResult.handled
+
+        # 7. Let closedSomething be the result of processing close watchers on document's relevant global object.
+        let closed_something = html_close_watcher_manager_process_close_watchers(html_window_close_watcher_manager(dom_document_window(document) else trap("no window")))
+
+        # 8. If closedSomething is true, then return.
+        if closed_something:
+            return EventResult.handled
+
+        # 9. Alternative processing: Otherwise, there was nothing watching for a close request. The user agent may
+        #    instead interpret this interaction as some other action, instead of interpreting it as a close request.
+
+    if let target = dom_document_active_input_events_target(document):
+        if key == UiEventsKeyCode.key_backspace:
+            let result = event_handler_input_event(this, ui_events_event_names_beforeinput, ui_events_input_types_delete_content_backward, this.m_navigable, ak.U32OrUtf16String.u32_(code_point))
+            if result == EventResult.cancelled:
+                return result
+            input_events_target_handle_delete(target, ui_events_input_types_delete_content_backward)
+            return EventResult.handled
+
+        if key == UiEventsKeyCode.key_delete:
+            let result = event_handler_input_event(this, ui_events_event_names_beforeinput, ui_events_input_types_delete_content_forward, this.m_navigable, ak.U32OrUtf16String.u32_(code_point))
+            if result == EventResult.cancelled:
+                return result
+            input_events_target_handle_delete(target, ui_events_input_types_delete_content_forward)
+            return EventResult.handled
+
+        if os.macos:
+            if (modifiers & (u32)UiEventsKeyModifier.mod_super) != 0:
+                if key == UiEventsKeyCode.key_left:
+                    key = UiEventsKeyCode.key_home
+                    modifiers &= ~(u32)UiEventsKeyModifier.mod_super
+                if key == UiEventsKeyCode.key_right:
+                    key = UiEventsKeyCode.key_end
+                    modifiers &= ~(u32)UiEventsKeyModifier.mod_super
+
+        if key == UiEventsKeyCode.key_left or key == UiEventsKeyCode.key_right:
+            let collapse = event_handler_collapse_selection(modifiers)
+            if (modifiers & (u32)ui_events_key_modifier_mod_platform_word_jump) == 0:
+                if key == UiEventsKeyCode.key_left:
+                    input_events_target_decrement_cursor_position_offset(target, collapse)
+                else:
+                    input_events_target_increment_cursor_position_offset(target, collapse)
+            else:
+                if key == UiEventsKeyCode.key_left:
+                    input_events_target_decrement_cursor_position_to_previous_word(target, collapse)
+                else:
+                    input_events_target_increment_cursor_position_to_next_word(target, collapse)
+            return EventResult.handled
+
+        if key == UiEventsKeyCode.key_up or key == UiEventsKeyCode.key_down:
+            let collapse = event_handler_collapse_selection(modifiers)
+            if key == UiEventsKeyCode.key_up:
+                input_events_target_decrement_cursor_position_to_previous_line(target, collapse)
+            else:
+                input_events_target_increment_cursor_position_to_next_line(target, collapse)
+            return EventResult.handled
+
+        if key == UiEventsKeyCode.key_home:
+            input_events_target_move_cursor_to_start(target, event_handler_collapse_selection(modifiers))
+            return EventResult.handled
+
+        if key == UiEventsKeyCode.key_end:
+            input_events_target_move_cursor_to_end(target, event_handler_collapse_selection(modifiers))
+            return EventResult.handled
+
+        # Ignore Mod_Keypad when determining behavior - it only indicates key location (numpad vs standard).
+        let significant_modifiers = modifiers & ~(u32)UiEventsKeyModifier.mod_keypad
+        if key == UiEventsKeyCode.key_return and (significant_modifiers == (u32)UiEventsKeyModifier.mod_none or significant_modifiers == (u32)UiEventsKeyModifier.mod_shift):
+            var input_type = ui_events_input_types_insert_paragraph
+            if significant_modifiers == (u32)UiEventsKeyModifier.mod_shift:
+                input_type = ui_events_input_types_insert_line_break
+
+            # Form controls always use insertLineBreak rather than insertParagraph.
+            if as_if_form_associated_text_control_element(input_events_target_as_cell(target)) != none:
+                input_type = ui_events_input_types_insert_line_break
+            # If the editing host is contenteditable="plaintext-only", we force a line break.
+            # NB: We check the selection's editing host rather than focused_area because with nested
+            #     contenteditable elements, the focused element may differ from where the selection is.
+            elif let selection = dom_document_get_selection(document):
+                if let range = selection_selection_range(selection):
+                    if let editing_host = dom_node_editing_host(dom_abstract_range_start_container(range.dom_abstract_range())):
+                        if html_element_content_editable_state(as_html_element(editing_host)) == HtmlContentEditableState.plaintext_only:
+                            input_type = ui_events_input_types_insert_line_break
+
+            let result = event_handler_input_event(this, ui_events_event_names_beforeinput, input_type, this.m_navigable, ak.U32OrUtf16String.u32_(code_point))
+            if result == EventResult.cancelled:
+                return result
+            if input_events_target_handle_return_key(target, input_type) != EventResult.handled:
+                input_events_target_handle_insert(target, input_type, ak.utf16_string_from_code_point(code_point))
+
+            return EventResult.handled
+
+        # FIXME: Text editing shortcut keys (copy/paste etc.) should be handled here.
+        if not should_ignore_keydown_event(code_point, modifiers):
+            let result = event_handler_input_event(this, ui_events_event_names_beforeinput, ui_events_input_types_insert_text, this.m_navigable, ak.U32OrUtf16String.u32_(code_point))
+            if result == EventResult.cancelled:
+                return result
+            input_events_target_handle_insert(target, ui_events_input_types_insert_text, ak.utf16_string_from_code_point(code_point))
+            return EventResult.handled
+    elif let selection = dom_document_get_selection(document):
+        if not selection_selection_is_collapsed(selection) and (modifiers & (u32)UiEventsKeyModifier.mod_shift) != 0:
+            if key == UiEventsKeyCode.key_right:
+                if (modifiers & (u32)ui_events_key_modifier_mod_platform_word_jump) != 0:
+                    selection_selection_move_offset_to_next_word(selection, false)
+                else:
+                    selection_selection_move_offset_to_next_character(selection, false)
+                return EventResult.handled
+            if key == UiEventsKeyCode.key_left:
+                if (modifiers & (u32)ui_events_key_modifier_mod_platform_word_jump) != 0:
+                    selection_selection_move_offset_to_previous_word(selection, false)
+                else:
+                    selection_selection_move_offset_to_previous_character(selection, false)
+                return EventResult.handled
+
+    # FIXME: Implement scroll by line and by page instead of approximating the behavior of other browsers.
+    let arrow_key_scroll_distance: f64 = 100.0
+    let window = dom_document_window(document) else trap("no window")
+    let page_scroll_distance = (f64)(html_window_inner_height(window) - (html_window_outer_height(window) - html_window_inner_height(window)))
+
+    match key:
+        .key_up, .key_down:
+            if modifiers != 0 and modifiers != (u32)ui_events_key_modifier_mod_platform_ctrl:
+                return EventResult.accepted
+            if modifiers != 0:
+                if key == UiEventsKeyCode.key_up:
+                    dom_document_scroll_to_the_beginning_of_the_document(document)
+                else:
+                    discard(html_window_scroll_by_f64(window, 0.0, (f64)ak.i64_max))
+            else:
+                discard(html_window_scroll_by_f64(window, 0.0, -arrow_key_scroll_distance if key == UiEventsKeyCode.key_up else arrow_key_scroll_distance))
+            return EventResult.handled
+        .key_left, .key_right:
+            let history_modifier = (u32)UiEventsKeyModifier.mod_super if os.macos else (u32)UiEventsKeyModifier.mod_alt
+            if modifiers != 0 and modifiers != history_modifier:
+                return EventResult.accepted
+            if modifiers != 0:
+                page_traverse_the_history_by_delta(dom_document_page(document), -1 if key == UiEventsKeyCode.key_left else 1)
+            else:
+                discard(html_window_scroll_by_f64(window, -arrow_key_scroll_distance if key == UiEventsKeyCode.key_left else arrow_key_scroll_distance, 0.0))
+            return EventResult.handled
+        .key_page_up, .key_page_down:
+            if modifiers != (u32)UiEventsKeyModifier.mod_none:
+                return EventResult.accepted
+            discard(html_window_scroll_by_f64(window, 0.0, -page_scroll_distance if key == UiEventsKeyCode.key_page_up else page_scroll_distance))
+            return EventResult.handled
+        .key_home:
+            dom_document_scroll_to_the_beginning_of_the_document(document)
+            return EventResult.handled
+        .key_end:
+            discard(html_window_scroll_by_f64(window, 0.0, (f64)ak.i64_max))
+            return EventResult.handled
+        _:
+            discard(0)
+
+    return EventResult.accepted
+
+## Ported from EventHandler.cpp:2027 Web::EventHandler::handle_keyup.
+pub func event_handler_handle_keyup(this: EventHandler*, key: UiEventsKeyCode, modifiers: u32, code_point: u32, repeat: bool) -> EventResult:
+    # Keyup events as a result of auto-repeat are not fired.
+    # See: https://w3c.github.io/uievents/#events-keyboard-event-order
+    if repeat:
+        return EventResult.dropped
+
+    return event_handler_fire_keyboard_event(this, ui_events_event_names_keyup, this.m_navigable, key, modifiers, code_point, false)
+
+## Ported from EventHandler.cpp:2037 Web::EventHandler::handle_paste.
+pub func event_handler_handle_paste(this: EventHandler*, text: ak.Utf16String) -> EventResult:
+    let active_document = html_navigable_active_document(this.m_navigable) else return EventResult.dropped
+    if not dom_document_is_fully_active(active_document):
+        return EventResult.dropped
+
+    let target = dom_document_active_input_events_target(active_document) else return EventResult.dropped
+
+    let result = event_handler_input_event(this, ui_events_event_names_beforeinput, ui_events_input_types_insert_from_paste, this.m_navigable, ak.U32OrUtf16String.utf16_string(text))
+    if result == EventResult.cancelled:
+        return result
+    input_events_target_handle_insert(target, ui_events_input_types_insert_from_paste, text)
+
+    return EventResult.handled
+
+# mark: Gamepads ================================================================================
+
+## The Navigator of a document's window.
+func event_handler_navigator_of(document: DomDocument*) -> HtmlNavigator*:
+    return html_window_navigator(dom_document_window(document) else trap("no window"))
+
+## Ported from EventHandler.cpp:2055 Web::EventHandler::handle_gamepad_connected.
+func event_handler_handle_gamepad_connected(this: EventHandler*, sdl_joystick_id: u32):
+    if let active_document = html_navigable_active_document(this.m_navigable):
+        gamepad_navigator_gamepad_partial_handle_gamepad_connected(&event_handler_navigator_of(active_document).navigator_gamepad_partial, sdl_joystick_id)
+
+    let children = html_navigable_child_navigables(this.m_navigable)
+    for child_navigable in ak.vector_span_const(&children):
+        event_handler_handle_gamepad_connected(html_navigable_event_handler(child_navigable else trap("no navigable")), sdl_joystick_id)
+
+## Ported from EventHandler.cpp:2065 Web::EventHandler::handle_gamepad_updated.
+func event_handler_handle_gamepad_updated(this: EventHandler*, sdl_joystick_id: u32):
+    if let active_document = html_navigable_active_document(this.m_navigable):
+        gamepad_navigator_gamepad_partial_handle_gamepad_updated(&event_handler_navigator_of(active_document).navigator_gamepad_partial, sdl_joystick_id)
+
+    let children = html_navigable_child_navigables(this.m_navigable)
+    for child_navigable in ak.vector_span_const(&children):
+        event_handler_handle_gamepad_updated(html_navigable_event_handler(child_navigable else trap("no navigable")), sdl_joystick_id)
+
+## Ported from EventHandler.cpp:2075 Web::EventHandler::handle_gamepad_disconnected.
+func event_handler_handle_gamepad_disconnected(this: EventHandler*, sdl_joystick_id: u32):
+    if let active_document = html_navigable_active_document(this.m_navigable):
+        gamepad_navigator_gamepad_partial_handle_gamepad_disconnected(&event_handler_navigator_of(active_document).navigator_gamepad_partial, sdl_joystick_id)
+
+    let children = html_navigable_child_navigables(this.m_navigable)
+    for child_navigable in ak.vector_span_const(&children):
+        event_handler_handle_gamepad_disconnected(html_navigable_event_handler(child_navigable else trap("no navigable")), sdl_joystick_id)
+
+## Ported from EventHandler.cpp:2085 Web::EventHandler::handle_sdl_input_events.
+pub func event_handler_handle_sdl_input_events(this: EventHandler*):
+    while let event = sdl_poll_event():
+        match event.type_:
+            .gamepad_added:
+                event_handler_handle_gamepad_connected(this, event.which)
+            .gamepad_update_complete:
+                event_handler_handle_gamepad_updated(this, event.which)
+            .gamepad_removed:
+                event_handler_handle_gamepad_disconnected(this, event.which)
+            _:
+                discard(0)
+
+# mark: Offsets, movement and targets ===========================================================
+
+## Ported from EventHandler.cpp:2105 Web::EventHandler::compute_mouse_event_page_offset.
+func event_handler_compute_mouse_event_page_offset(this: const EventHandler*, event_client_offset: gfx.CssPixelPoint) -> gfx.CssPixelPoint:
+    # https://w3c.github.io/csswg-drafts/cssom-view/#dom-mouseevent-pagex
+    # FIXME: 1. If the event’s dispatch flag is set, return the horizontal coordinate of the position where the event occurred
+    #           relative to the origin of the initial containing block and terminate these steps.
+
+    # 2. Let offset be the value of the scrollX attribute of the event’s associated Window object, if there is one, or zero otherwise.
+    let document = html_navigable_active_document(this.m_navigable) else trap("no active document")
+    let scroll_offset = html_navigable_viewport_scroll_offset(dom_document_navigable(document) else trap("no navigable"))
+
+    # 3. Return the sum of offset and the value of the event’s clientX attribute.
+    return gfx.css_pixel_point_translated_css_pixel_point(&event_client_offset, scroll_offset)
+
+## Ported from EventHandler.cpp:2118 Web::EventHandler::compute_mouse_event_movement.
+func event_handler_compute_mouse_event_movement(this: const EventHandler*, screen_position: gfx.CssPixelPoint) -> gfx.CssPixelPoint:
+    # https://w3c.github.io/pointerlock/#dom-mouseevent-movementx
+    # The attributes movementX movementY must provide the change in position of the pointer, as if the values of
+    # screenX, screenY, were stored between two subsequent mousemove events eNow and ePrevious and the difference taken
+    # movementX = eNow.screenX-ePrevious.screenX.
+
+    let previous = this.m_mousemove_previous_screen_position else return gfx.CssPixelPoint(m_x = gfx.CssPixels.from_int(0), m_y = gfx.CssPixels.from_int(0))
+    # (When unlocked, the system cursor can exit and re-enter the user agent window. If it does so and the user agent
+    # was not the target of operating system mouse move events then the most recent pointer position will be unknown
+    # to the user agent and movementX/movementY can not be computed and must be set to zero.
+    # FIXME: For this to actually work, m_mousemove_previous_client_offset needs to be cleared when the mouse leaves
+    #        the window.)
+
+    return gfx.CssPixelPoint(m_x = screen_position.m_x.sub(previous.m_x), m_y = screen_position.m_y.sub(previous.m_y))
+
+## Ported from EventHandler.cpp:2136 Web::EventHandler::target_for_mouse_position.
+func event_handler_target_for_mouse_position(this: EventHandler*, position: gfx.CssPixelPoint) -> EventHandlerTarget?:
+    if let result = paint_paintable_box_hit_test(event_handler_paint_root(this) else trap("no paint root"), position, PaintHitTestType.exact):
+        return EventHandlerTarget(paintable = result.paintable, chrome_widget = result.chrome_widget, index_in_node = (i32)result.index_in_node)
+
+    return none
+
+## Ported from EventHandler.cpp:2144 Web::EventHandler::should_ignore_device_input_event.
+func event_handler_should_ignore_device_input_event(this: const EventHandler*) -> bool:
+    # From the moment that the user agent is to initiate the drag-and-drop operation, until the end of the drag-and-drop
+    # operation, device input events (e.g. mouse and keyboard events) must be suppressed.
+    return drag_and_drop_event_handler_has_ongoing_drag_and_drop_operation(this.m_drag_and_drop_event_handler)
+
+## Ported from EventHandler.cpp:2151 Web::EventHandler::visit_edges.
+pub func event_handler_visit_edges(this: const EventHandler*, visitor: gc.CellVisitor*):
+    drag_and_drop_event_handler_visit_edges(this.m_drag_and_drop_event_handler, visitor)
+    gc.cell_visitor_visit_t(visitor, this.m_hovered_chrome_widget)
+    gc.cell_visitor_visit_t(visitor, this.m_captured_chrome_widget)
+    if let target = this.m_mouse_selection_target:
+        gc.cell_visitor_visit_t_2(visitor, input_events_target_as_cell(target))
+    gc.cell_visitor_visit_t(visitor, this.m_selection_origin)
+    gc.cell_visitor_visit_t_2(visitor, this.m_navigable)
+    if let handler = this.m_auto_scroll_handler:
+        auto_scroll_handler_visit_edges(handler, visitor)
+    if let handler = this.m_middle_button_scroll_handler:
+        middle_button_scroll_handler_visit_edges(handler, visitor)
+
+## Ported from EventHandler.cpp:2166 Web::EventHandler::word_segmenter.
+pub func event_handler_word_segmenter(this: EventHandler*) -> web_unicode.Segmenter*:
+    if this.m_word_segmenter == none:
+        let document = html_navigable_active_document(this.m_navigable) else trap("no active document")
+        this.m_word_segmenter = web_unicode.segmenter_clone(dom_document_word_segmenter(document))
+    return this.m_word_segmenter else trap("unreachable")
+
+# mark: EventHandler.h ==========================================================================
+
+## Ported from EventHandler.h:71 Web::EventHandler::is_handling_mouse_selection.
+pub func event_handler_is_handling_mouse_selection(this: const EventHandler*) -> bool:
+    return this.m_selection_mode != EventHandlerSelectionMode.none_
+
+## Ported from EventHandler.h:73 Web::EventHandler::middle_button_scroll_handler.
+pub func event_handler_middle_button_scroll_handler(this: const EventHandler*) -> MiddleButtonScrollHandler*?:
+    return this.m_middle_button_scroll_handler
+
+## Ported from EventHandler.h:90 Web::EventHandler::compute_mouse_event_client_offset.
+pub func event_handler_compute_mouse_event_client_offset(this: const EventHandler*, event_page_position: gfx.CssPixelPoint) -> gfx.CssPixelPoint:
+    # Declared in EventHandler.h but defined nowhere in the donor.
+    trap("Web::EventHandler::compute_mouse_event_client_offset is declared but not defined")
+
+## `m_middle_button_scroll_handler = nullptr`: the handler's destructor runs (OwnPtr).
+func event_handler_release_middle_button_scroll_handler(this: EventHandler*):
+    if let handler = this.m_middle_button_scroll_handler:
+        middle_button_scroll_handler_destruct(handler)
+    this.m_middle_button_scroll_handler = none

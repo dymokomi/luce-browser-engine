@@ -1,0 +1,493 @@
+#==============================================================================================
+#
+#   event_handler_2 - Web::EventHandler: wheel events, chrome widgets, pointer events and the
+#   legacy mouse events they map to, hover, cursors, clicks, activation, context menus and the
+#   tracking state
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibWeb/Page/EventHandler.cpp lines 567-1003 (handle_mousewheel through
+#       clear_per_test_input_state). The UI events (MouseEvent, PointerEvent, WheelEvent) these
+#       functions create come with the UIEvents region; until then their creation traps.
+#
+#       Copyright (c) 2020, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2023, Linus Groh <linusg@serenityos.org>
+#       Copyright (c) 2026, Jelle Raaijmakers <jelle@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Wheel events ============================================================================
+
+## The captures of handle_mousewheel's nested navigable dispatch
+## (`[screen_position, button, buttons, modifiers, wheel_delta_x, wheel_delta_y]`).
+struct EventHandlerMousewheelDispatch:
+    var screen_position: gfx.CssPixelPoint
+    var button: u32
+    var buttons: u32
+    var modifiers: u32
+    var wheel_delta_x: i32
+    var wheel_delta_y: i32
+
+## handle_mousewheel's dispatch to a nested navigable's event handler.
+func event_handler_mousewheel_dispatch(context: void*?, event_handler: EventHandler*, position: gfx.CssPixelPoint) -> EventResult:
+    let captures = (EventHandlerMousewheelDispatch*)(context else trap("no captures"))
+    return event_handler_handle_mousewheel(event_handler, position, captures.screen_position, captures.button, captures.buttons, captures.modifiers, captures.wheel_delta_x, captures.wheel_delta_y)
+
+## `CSSPixelPoint { CSSPixels(vv.page_left()), CSSPixels(vv.page_top()) }`.
+func event_handler_visual_viewport_page_position(document: DomDocument*) -> gfx.CssPixelPoint:
+    let visual_viewport = dom_document_visual_viewport(document)
+    return gfx.CssPixelPoint(m_x = gfx.CssPixels.from_f64(css_visual_viewport_page_left(visual_viewport)), m_y = gfx.CssPixels.from_f64(css_visual_viewport_page_top(visual_viewport)))
+
+## Ported from EventHandler.cpp:567 Web::EventHandler::handle_mousewheel.
+pub func event_handler_handle_mousewheel(this: EventHandler*, visual_viewport_position: gfx.CssPixelPoint, screen_position: gfx.CssPixelPoint, button: u32, buttons: u32, modifiers: u32, a_wheel_delta_x: i32, a_wheel_delta_y: i32) -> EventResult:
+    var wheel_delta_x = a_wheel_delta_x
+    var wheel_delta_y = a_wheel_delta_y
+    if event_handler_should_ignore_device_input_event(this):
+        return EventResult.dropped
+
+    let document = html_navigable_active_document(this.m_navigable) else return EventResult.dropped
+    if not dom_document_is_fully_active(document):
+        return EventResult.dropped
+
+    let viewport_position = css_visual_viewport_map_to_layout_viewport(dom_document_visual_viewport(document), visual_viewport_position)
+
+    dom_document_update_layout(document, DomUpdateLayoutReason.event_handler_handle_mouse_wheel)
+
+    if event_handler_paint_root(this) == none:
+        return EventResult.dropped
+
+    if (modifiers & (u32)UiEventsKeyModifier.mod_shift) != 0:
+        let swapped = wheel_delta_x
+        wheel_delta_x = wheel_delta_y
+        wheel_delta_y = swapped
+
+    var handled_event = EventResult.dropped
+
+    var paintable: PaintPaintable*? = none
+    if let result = event_handler_target_for_mouse_position(this, visual_viewport_position):
+        paintable = result.paintable
+
+    if let target = paintable:
+        var containing_block: PaintPaintable*? = target
+        while let current = containing_block:
+            let handled_scroll_event = paint_paintable_handle_mousewheel(current, visual_viewport_position, buttons, modifiers, wheel_delta_x, wheel_delta_y)
+            if handled_scroll_event:
+                return EventResult.handled
+
+            containing_block = (PaintPaintable*?)paint_paintable_containing_block(current)
+
+        if paint_paintable_handle_mousewheel(target, visual_viewport_position, buttons, modifiers, wheel_delta_x, wheel_delta_y):
+            return EventResult.handled
+
+        var node = dom_node_for_event_dispatch(target)
+
+        if node != none:
+            let captures = new EventHandlerMousewheelDispatch(screen_position = screen_position, button = button, buttons = buttons, modifiers = modifiers, wheel_delta_x = wheel_delta_x, wheel_delta_y = wheel_delta_y) else trap("out of memory")
+            if let result = dispatch_event_to_nested_navigable(target, visual_viewport_position, ak.Function2[EventHandler*, gfx.CssPixelPoint, EventResult](call = event_handler_mousewheel_dispatch, context = captures)):
+                if result == EventResult.handled or result == EventResult.cancelled:
+                    return result
+
+            # NB: Search for the first parent of the hit target that's an element.
+            var layout_node: LayoutNode*? = none
+            if not parent_element_for_event_dispatch(target, &node, &layout_node):
+                return EventResult.dropped
+            let dispatch_node = node else trap("unreachable")
+            let dispatch_layout_node = layout_node else trap("unreachable")
+
+            let page_offset = event_handler_compute_mouse_event_page_offset(this, viewport_position)
+            let offset_paintable = layout_node_first_paintable(dispatch_layout_node) else target
+            let scroll_offset = html_navigable_viewport_scroll_offset(dom_document_navigable(document) else trap("no navigable"))
+            let offset = compute_mouse_event_offset(gfx.css_pixel_point_translated_css_pixel_point(&visual_viewport_position, scroll_offset), offset_paintable)
+            let could_scroll_viewport = paint_paintable_box_could_be_scrolled_by_wheel_event(dom_node_paintable_box(document.dom_node()) else trap("no paintable box"))
+            let wheel_event = ui_events_wheel_event_create_from_platform_event(bind_platform_object_realm(dispatch_node.bind_platform_object()), html_navigable_active_window_proxy(this.m_navigable), ui_events_event_names_wheel, screen_position, page_offset, viewport_position, offset, (f64)wheel_delta_x, (f64)wheel_delta_y, button, buttons, modifiers) else trap("release_value_but_fixme_should_propagate_errors")
+            if dom_event_target_dispatch_event(dispatch_node.dom_event_target(), (DomEvent*)wheel_event):
+                if could_scroll_viewport:
+                    let viewport_scroll_position_before = event_handler_visual_viewport_page_position(document)
+                    discard(html_navigable_scroll_viewport_by_delta(this.m_navigable, gfx.CssPixelPoint(m_x = gfx.CssPixels.from_int((i64)wheel_delta_x), m_y = gfx.CssPixels.from_int((i64)wheel_delta_y))))
+                    let viewport_scroll_position_after = event_handler_visual_viewport_page_position(document)
+                    handled_event = EventResult.accepted
+                    if viewport_scroll_position_before.m_x.raw_value() != viewport_scroll_position_after.m_x.raw_value() or viewport_scroll_position_before.m_y.raw_value() != viewport_scroll_position_after.m_y.raw_value():
+                        handled_event = EventResult.handled
+                else:
+                    handled_event = EventResult.accepted
+            else:
+                handled_event = EventResult.cancelled
+
+    return handled_event
+
+# mark: Chrome widgets and coordinates ==========================================================
+
+## Ported from EventHandler.cpp:646 Web::EventHandler::update_hovered_chrome_widget.
+func event_handler_update_hovered_chrome_widget(this: EventHandler*, widget: PaintChromeWidget*?):
+    if this.m_hovered_chrome_widget == widget:
+        return
+    if let hovered = this.m_hovered_chrome_widget:
+        paint_chrome_widget_mouse_leave(hovered)
+    this.m_hovered_chrome_widget = widget
+    if let hovered = this.m_hovered_chrome_widget:
+        paint_chrome_widget_mouse_enter(hovered)
+
+## Ported from EventHandler.cpp:657 Web::EventHandler::compute_mouse_event_coordinates.
+func event_handler_compute_mouse_event_coordinates(this: const EventHandler*, visual_viewport_position: gfx.CssPixelPoint, viewport_position: gfx.CssPixelPoint, paintable: PaintPaintable*, layout_node: LayoutNode*) -> EventHandlerMouseEventCoordinates:
+    let page_offset = event_handler_compute_mouse_event_page_offset(this, viewport_position)
+    let offset_paintable = layout_node_first_paintable(layout_node) else paintable
+    let document = html_navigable_active_document(this.m_navigable) else trap("no active document")
+    let scroll_offset = html_navigable_viewport_scroll_offset(dom_document_navigable(document) else trap("no navigable"))
+    let offset = compute_mouse_event_offset(gfx.css_pixel_point_translated_css_pixel_point(&visual_viewport_position, scroll_offset), offset_paintable)
+    return EventHandlerMouseEventCoordinates(page_offset = page_offset, visual_viewport_position = visual_viewport_position, viewport_position = viewport_position, offset = offset)
+
+## `has_flag(action, flag)`.
+func event_handler_mouse_action_has(action: PaintMouseAction, flag: PaintMouseAction) -> bool:
+    return ((u8)action & (u8)flag) != 0
+
+## Ported from EventHandler.cpp:666 Web::EventHandler::dispatch_chrome_widget_pointer_event.
+func event_handler_dispatch_chrome_widget_pointer_event(this: EventHandler*, target: PaintChromeWidget*?, type_: ak.FlyString, button: u32, visual_viewport_position: gfx.CssPixelPoint) -> bool:
+    var allow_default_behavior = true
+
+    if let captured = this.m_captured_chrome_widget:
+        let action = paint_chrome_widget_handle_pointer_event(captured, type_, button, visual_viewport_position)
+        if event_handler_mouse_action_has(action, PaintMouseAction.swallow_event):
+            allow_default_behavior = false
+        if event_handler_mouse_action_has(action, PaintMouseAction.capture_input):
+            return allow_default_behavior
+        this.m_captured_chrome_widget = none
+
+    if let widget = target:
+        let action = paint_chrome_widget_handle_pointer_event(widget, type_, button, visual_viewport_position)
+        if event_handler_mouse_action_has(action, PaintMouseAction.swallow_event):
+            allow_default_behavior = false
+        if event_handler_mouse_action_has(action, PaintMouseAction.capture_input):
+            this.m_captured_chrome_widget = widget
+
+    return allow_default_behavior
+
+# mark: Pointer events ==========================================================================
+
+## dispatch_a_pointer_event_for_a_device_that_supports_hover's pointer_event_name lambda.
+func event_handler_pointer_event_name(type_: EventHandlerPointerEventType) -> ak.FlyString:
+    match type_:
+        .pointer_down:
+            return ui_events_event_names_pointerdown
+        .pointer_up:
+            return ui_events_event_names_pointerup
+        .pointer_move:
+            return ui_events_event_names_pointermove
+        .pointer_cancel:
+            return ui_events_event_names_pointercancel
+        _:
+            trap("VERIFY_NOT_REACHED")
+
+## Ported from EventHandler.cpp:691 Web::EventHandler::dispatch_a_pointer_event_for_a_device_that_supports_hover.
+# https://w3c.github.io/pointerevents/#mapping-for-devices-that-support-hover
+func event_handler_dispatch_a_pointer_event_for_a_device_that_supports_hover(this: EventHandler*, type_: EventHandlerPointerEventType, a_node: DomNode*?, chrome_widget: PaintChromeWidget*?, coordinates: EventHandlerMouseEventCoordinates, screen_position: gfx.CssPixelPoint, movement: gfx.CssPixelPoint, button: u32, buttons: u32, modifiers: u32, click_count: i32 = 0) -> bool:
+    let document = html_navigable_active_document(this.m_navigable) else trap("no active document")
+    let realm = bind_platform_object_realm(document.bind_platform_object())
+
+    let pointer_event_name = event_handler_pointer_event_name(type_)
+    let pointer_event = ui_events_pointer_event_create_from_platform_event(realm, html_navigable_active_window_proxy(this.m_navigable), pointer_event_name, screen_position, coordinates.page_offset, coordinates.viewport_position, coordinates.offset, movement, button, buttons, modifiers) else trap("MUST: PointerEvent::create_from_platform_event")
+
+    # FIXME: 1. If the isPrimary property for the pointer event to be dispatched is false then dispatch the
+    #           pointer event and terminate these steps.
+
+    # 2. If the pointer event to be dispatched is a pointerdown, pointerup or pointermove event, or a
+    #    pointerleave event at the window, dispatch compatibility mouse transition events as described in
+    #    "Tracking the effective position of the legacy mouse pointer".
+    if type_ == EventHandlerPointerEventType.pointer_down or type_ == EventHandlerPointerEventType.pointer_up or type_ == EventHandlerPointerEventType.pointer_move:
+        event_handler_track_the_effective_position_of_the_legacy_mouse_pointer(this, a_node)
+
+    # AD-HOC: Update the activated state for the pointed-to element.
+    if button == (u32)UiEventsMouseButton.primary and type_ != EventHandlerPointerEventType.pointer_move:
+        if type_ == EventHandlerPointerEventType.pointer_down:
+            set_node_and_ancestors_being_activated(a_node, true)
+        elif let mousedown_target = gc.weak_ptr(&this.m_mousedown_target):
+            set_node_and_ancestors_being_activated(mousedown_target, false)
+
+    event_handler_update_hovered_chrome_widget(this, chrome_widget)
+
+    # The events above may have changed layout, and chrome widgets are very likely to touch paintables.
+    if chrome_widget != none or this.m_captured_chrome_widget != none:
+        dom_document_update_layout(document, DomUpdateLayoutReason.event_handler_dispatch_chrome_widget_event)
+    if not event_handler_dispatch_chrome_widget_pointer_event(this, chrome_widget, pointer_event_name, button, coordinates.visual_viewport_position):
+        return false
+
+    let node = a_node else trap("no node")
+
+    # FIXME: This will be moved to the click event and need to track the targets of the pointerdown and pointerup events.
+    #        https://github.com/w3c/pointerevents/pull/460
+    light_dismiss_activities(pointer_event, node)
+
+    # 3. Dispatch the pointer event.
+    let pointer_event_cancelled = not dom_event_target_dispatch_event(node.dom_event_target(), (DomEvent*)pointer_event)
+
+    # 4. If the pointer event dispatched was pointerdown and event's canceled flag is set, then set the PREVENT MOUSE
+    #    EVENT flag for this pointerType.
+    if type_ == EventHandlerPointerEventType.pointer_down and pointer_event_cancelled:
+        this.m_prevent_mouse_event = true
+
+    # 5. If the PREVENT MOUSE EVENT flag is not set for this pointerType and the pointer event dispatched was:
+    var run_default_activation_behavior = false
+    if not this.m_prevent_mouse_event:
+        var mouse_event_target: DomEventTarget*? = node.dom_event_target()
+        var mouse_event_name = ui_events_event_names_mouseup
+        match type_:
+            # - pointerdown, then fire a mousedown event.
+            .pointer_down:
+                mouse_event_name = ui_events_event_names_mousedown
+            # - pointermove, then fire a mousemove event.
+            .pointer_move:
+                mouse_event_name = ui_events_event_names_mousemove
+            # - pointerup, then fire a mouseup event.
+            .pointer_up:
+                mouse_event_name = ui_events_event_names_mouseup
+            # - pointercancel, then fire a mouseup event at the window.
+            .pointer_cancel:
+                mouse_event_target = (DomEventTarget*?)dom_document_window(dom_node_document(node))
+                mouse_event_name = ui_events_event_names_mouseup
+            _:
+                trap("VERIFY_NOT_REACHED")
+        let mouse_event = ui_events_mouse_event_create_from_platform_event(bind_platform_object_realm(node.bind_platform_object()), html_navigable_active_window_proxy(this.m_navigable), mouse_event_name, screen_position, coordinates.page_offset, coordinates.viewport_position, coordinates.offset, movement, button, buttons, modifiers, click_count) else trap("release_value_but_fixme_should_propagate_errors")
+        run_default_activation_behavior = dom_event_target_dispatch_event(mouse_event_target else trap("no mouse event target"), (DomEvent*)mouse_event)
+
+    # 6. If the pointer event dispatched was pointerup or pointercancel, clear the PREVENT MOUSE EVENT flag for this
+    #    pointerType.
+    if type_ == EventHandlerPointerEventType.pointer_up or type_ == EventHandlerPointerEventType.pointer_cancel:
+        this.m_prevent_mouse_event = false
+
+    return run_default_activation_behavior
+
+## Ported from EventHandler.cpp:781 Web::EventHandler::track_the_effective_position_of_the_legacy_mouse_pointer.
+func event_handler_track_the_effective_position_of_the_legacy_mouse_pointer(this: EventHandler*, target: DomNode*?):
+    let page = html_navigable_page(this.m_navigable)
+    let document = html_navigable_active_document(this.m_navigable) else trap("no active document")
+
+    # 1. Let T be the target of the pointerdown, pointerup or pointermove event being dispatched. For the pointerleave
+    #    event, unset T.
+
+    # 2. If T and current effective legacy mouse pointer position are both unset or they are equal, terminate these
+    #    steps.
+    if gc.weak_ptr(&this.m_effective_legacy_mouse_pointer_position) == target:
+        return
+
+    # 3. Dispatch mouseover, mouseout, mouseenter and mouseleave events as per [UIEVENTS] for a mouse moving from the
+    #    current effective legacy mouse pointer position to T. Consider an unset value of either current effective
+    #    legacy mouse pointer position or T as an out-of-window mouse position.
+    # FIXME: This is supposed to only fire legacy events. The pointer events should be fired elsewhere.
+    dom_document_set_hovered_node(document, target)
+
+    # 4. Set effective legacy mouse pointer position to T.
+    this.m_effective_legacy_mouse_pointer_position = gc.make_weak(target)
+
+    # AD-HOC: Notify the WebView client about hovered text/links.
+    var hovered_title_element: HtmlElement*? = none
+    if let node = target:
+        hovered_title_element = dom_node_enclosing_html_element_with_attribute(node, html_attribute_names_title)
+    var title: ak.String? = none
+    if let element = hovered_title_element:
+        title = html_element_title(element)
+    if let value = title:
+        page_client_page_did_enter_tooltip_area(page_client(page), ak.byte_string_from_string_view(ak.string_bytes_as_string_view(&value)))
+        page_set_is_in_tooltip_area(page, true)
+    elif page_is_in_tooltip_area(page):
+        page_client_page_did_leave_tooltip_area(page_client(page))
+        page_set_is_in_tooltip_area(page, false)
+
+    var hovered_link_element: HtmlAnchorElement*? = none
+    if let node = target:
+        hovered_link_element = dom_node_enclosing_link_element(node)
+    if let link = hovered_link_element:
+        let href = event_handler_anchor_href(link)
+        if let link_url = dom_document_encoding_parse_url(document, ak.string_bytes_as_string_view(&href)):
+            page_client_page_did_hover_link(page_client(page), link_url)
+            page_set_is_hovering_link(page, true)
+    elif page_is_hovering_link(page):
+        page_client_page_did_unhover_link(page_client(page))
+        page_set_is_hovering_link(page, false)
+
+## `link->href()`: HTMLHyperlinkElementUtils::href of an anchor element.
+func event_handler_anchor_href(link: HtmlAnchorElement*) -> ak.String:
+    return html_hyperlink_element_utils_href(as_if_html_hyperlink_element_utils(link) else trap("an anchor element without HTMLHyperlinkElementUtils"))
+
+# mark: Cursors =================================================================================
+
+## `Gfx::Cursor::operator==` (Variant<StandardCursor, ImageCursor>).
+func event_handler_cursors_equal(a: gfx.Cursor, b: gfx.Cursor) -> bool:
+    match a:
+        .standard_cursor(a_standard):
+            match b:
+                .standard_cursor(b_standard):
+                    return a_standard == b_standard
+                _:
+                    return false
+        .image_cursor(a_image):
+            match b:
+                .image_cursor(b_image):
+                    return gfx.image_cursor_eq(&a_image, b_image)
+                _:
+                    return false
+
+## Ported from EventHandler.cpp:829 Web::set_page_cursor.
+func set_page_cursor(page: Page*, cursor: gfx.Cursor):
+    # FIXME: This check is only approximate. ImageCursors from the same CursorStyleValue share bitmaps, but may
+    #        repaint them. So comparing them does not tell you if they are the same image. Also, the image may
+    #        change even if the hovered node does not.
+    if not event_handler_cursors_equal(page_current_cursor(page), cursor):
+        page_client_page_did_request_cursor_change(page_client(page), cursor)
+        page_set_current_cursor(page, cursor)
+
+## update_cursor's cursor lambda.
+func event_handler_cursor_for(paintable: PaintPaintable*?, host_element: DomNode*?, chrome_widget: PaintChromeWidget*?) -> gfx.Cursor:
+    if let widget = chrome_widget:
+        if let cursor_override = paint_chrome_widget_cursor(widget):
+            return css_to_gfx_cursor(cursor_override)
+
+    if let target = paintable:
+        let computed_values = paint_paintable_computed_values(target)
+        let cursor_data = css_computed_values_cursor(&computed_values.computed_values)
+        let layout_node = paint_paintable_layout_node(target)
+        if layout_node_is_text_node(layout_node) or dom_node_is_editable_or_editing_host(host_element else trap("no host element")):
+            return resolve_cursor(layout_node_parent(layout_node) else trap("no parent layout node"), cursor_data, gfx.StandardCursor.i_beam)
+        if let host = host_element:
+            if dom_node_is_element(host):
+                return resolve_cursor((LayoutNodeWithStyle*)(dom_node_layout_node(host) else trap("no layout node")), cursor_data, gfx.StandardCursor.arrow)
+
+    return gfx.Cursor.standard_cursor(gfx.StandardCursor.arrow)
+
+## Ported from EventHandler.cpp:840 Web::EventHandler::update_cursor.
+func event_handler_update_cursor(this: EventHandler*, paintable: PaintPaintable*?, host_element: DomNode*?, chrome_widget: PaintChromeWidget*?):
+    # AD-HOC: Update the cursor image based on the CSS rules before the steps terminate if the target hasn't changed.
+    let cursor = event_handler_cursor_for(paintable, host_element, chrome_widget)
+
+    set_page_cursor(html_navigable_page(this.m_navigable), cursor)
+
+# mark: Clicks, activation and context menus ====================================================
+
+## Fires a mouse event named `name` from the platform at `node`; whether it was not cancelled.
+func event_handler_fire_mouse_event(this: EventHandler*, node: DomNode*, name: ak.FlyString, coordinates: EventHandlerMouseEventCoordinates, screen_position: gfx.CssPixelPoint, button: u32, buttons: u32, modifiers: u32, click_count: i32) -> bool:
+    let mouse_event = ui_events_mouse_event_create_from_platform_event(bind_platform_object_realm(node.bind_platform_object()), html_navigable_active_window_proxy(this.m_navigable), name, screen_position, coordinates.page_offset, coordinates.viewport_position, coordinates.offset, none, button, buttons, modifiers, click_count) else trap("release_value_but_fixme_should_propagate_errors")
+    return dom_event_target_dispatch_event(node.dom_event_target(), (DomEvent*)mouse_event)
+
+## Ported from EventHandler.cpp:863 Web::EventHandler::fire_click_events.
+func event_handler_fire_click_events(this: EventHandler*, node: DomNode*, coordinates: EventHandlerMouseEventCoordinates, screen_position: gfx.CssPixelPoint, button: u32, buttons: u32, modifiers: u32, click_count: i32) -> bool:
+    var run_activation_behavior = false
+
+    if button == (u32)UiEventsMouseButton.primary:
+        # https://w3c.github.io/pointerevents/#click
+        run_activation_behavior = event_handler_fire_mouse_event(this, node, ui_events_event_names_click, coordinates, screen_position, button, buttons, modifiers, click_count)
+
+        # https://w3c.github.io/uievents/#event-type-dblclick
+        # This event type MUST be dispatched after the event type click if a click and
+        # double click occur simultaneously, and after the event type mouseup otherwise.
+        if click_count == 2:
+            discard(event_handler_fire_mouse_event(this, node, ui_events_event_names_dblclick, coordinates, screen_position, button, buttons, modifiers, click_count))
+    else:
+        # https://w3c.github.io/pointerevents/#auxclick
+        run_activation_behavior = event_handler_fire_mouse_event(this, node, ui_events_event_names_auxclick, coordinates, screen_position, button, buttons, modifiers, click_count)
+
+    return run_activation_behavior
+
+## Ported from EventHandler.cpp:884 Web::EventHandler::run_activation_behavior.
+func event_handler_run_activation_behavior(this: EventHandler*, node: DomNode*, button: u32, modifiers: u32):
+    if let link = dom_node_enclosing_link_element(node):
+        let document = html_navigable_active_document(this.m_navigable) else trap("no active document")
+        let href = event_handler_anchor_href(link)
+        let url = dom_document_encoding_parse_url(document, ak.string_bytes_as_string_view(&href))
+        if let link_url = url:
+            let target = html_anchor_element_target(link)
+            let page = html_navigable_page(this.m_navigable)
+            if button == (u32)UiEventsMouseButton.primary and (modifiers & (u32)ui_events_key_modifier_mod_platform_ctrl) != 0:
+                page_client_page_did_click_link(page_client(page), link_url, ak.byte_string_from_string_view(ak.string_bytes_as_string_view(&target)), modifiers)
+            elif button == (u32)UiEventsMouseButton.middle:
+                page_client_page_did_middle_click_link(page_client(page), link_url, ak.byte_string_from_string_view(ak.string_bytes_as_string_view(&target)), modifiers)
+
+## Ported from EventHandler.cpp:901 Web::EventHandler::maybe_show_context_menu.
+# https://w3c.github.io/uievents/#maybe-show-context-menu
+func event_handler_maybe_show_context_menu(this: EventHandler*, node: DomNode*, coordinates: EventHandlerMouseEventCoordinates, screen_position: gfx.CssPixelPoint, viewport_position: gfx.CssPixelPoint, buttons: u32, modifiers: u32):
+    # AD-HOC: Allow the user to bypass custom context menus by holding shift, like Firefox.
+    if (modifiers & (u32)UiEventsKeyModifier.mod_shift) == 0:
+        # 1. Let menuevent = create a PointerEvent with "contextmenu", target
+        # 2. If native is valid, then set MouseEvent attributes from native.
+        # 3. Let result = dispatch menuevent at target.
+        let result = event_handler_fire_mouse_event(this, node, ui_events_event_names_contextmenu, coordinates, screen_position, (u32)UiEventsMouseButton.secondary, buttons, modifiers, 0)
+
+        # 4. If result is true, then show the UA context menu.
+        if not result:
+            return
+
+    # AD-HOC: The context menu will consume our mouseup on macOS, and it seems that Chromium allows the mouseup to be
+    #         eaten by the context menu. Doing this prevents us from ignoring the cursor leaving the window when the
+    #         context menu is open.
+    event_handler_clear_mousedown_tracking(this)
+
+    # NB: Event dispatches above may have run JS that invalidated layout.
+    let document = html_navigable_active_document(this.m_navigable) else trap("no active document")
+    dom_document_update_layout(document, DomUpdateLayoutReason.event_handler_show_context_menu)
+
+    let page = html_navigable_page(this.m_navigable)
+    let top_level_viewport_position = html_navigable_to_top_level_position(this.m_navigable, viewport_position)
+    if let link = dom_node_enclosing_link_element(node):
+        let href = event_handler_anchor_href(link)
+        let url = dom_document_encoding_parse_url(document, ak.string_bytes_as_string_view(&href))
+        if let link_url = url:
+            let target = html_anchor_element_target(link)
+            page_client_page_did_request_link_context_menu(page_client(page), top_level_viewport_position, link_url, ak.byte_string_from_string_view(ak.string_bytes_as_string_view(&target)), modifiers)
+    else:
+        # AD-HOC: Skip up the tree to the first ancestor that is not a UA shadow DOM node, and use its context menu.
+        #         Media elements' controls' shadow DOM nodes should not have their own context menu, but rather
+        #         activate their parent media element's menu.
+        var context_menu_node = node
+        while let shadow_root = dom_node_containing_shadow_root(context_menu_node):
+            if not dom_shadow_root_is_user_agent_internal(shadow_root):
+                break
+            let host = dom_document_fragment_host(shadow_root.dom_document_fragment()) else trap("VERIFY: shadow_root->host() != nullptr")
+            context_menu_node = host.dom_node()
+
+        if is_html_image_element(context_menu_node):
+            let image_element = as_html_image_element(context_menu_node)
+            let current_src = html_image_element_current_src(image_element)
+            let image_url = dom_document_encoding_parse_url(dom_node_document(context_menu_node), ak.string_bytes_as_string_view(&current_src))
+            if let url = image_url:
+                var bitmap: const gfx.Bitmap*? = none
+                if let immutable_bitmap = html_image_element_immutable_bitmap(image_element):
+                    bitmap = gfx.immutable_bitmap_bitmap(immutable_bitmap)
+
+                page_client_page_did_request_image_context_menu(page_client(page), top_level_viewport_position, url, ak.byte_string_from_str(""), modifiers, bitmap)
+        elif is_html_media_element(context_menu_node):
+            let media_element = as_html_media_element(context_menu_node)
+            let is_video = is_html_video_element(context_menu_node)
+            let current_src = html_media_element_current_src(media_element)
+            let element = media_element.dom_element()
+
+            let menu = PageMediaContextMenu(media_url = dom_document_encoding_parse_url(dom_node_document(context_menu_node), ak.string_bytes_as_string_view(&current_src)) else trap("Optional::operator*() on an empty optional"), is_video = is_video, is_playing = html_media_element_potentially_playing(media_element), is_muted = html_media_element_muted(media_element), has_user_agent_controls = dom_element_has_attribute(element, html_attribute_names_controls), is_looping = dom_element_has_attribute(element, html_attribute_names_loop), is_fullscreen = is_video and dom_element_is_fullscreen_element(element))
+
+            page_did_request_media_context_menu(page, dom_node_unique_id(context_menu_node), top_level_viewport_position, ak.byte_string_from_str(""), modifiers, menu)
+        else:
+            page_client_page_did_request_context_menu(page_client(page), top_level_viewport_position)
+
+# mark: Tracking state ==========================================================================
+
+## Ported from EventHandler.cpp:975 Web::EventHandler::clear_mousedown_tracking.
+pub func event_handler_clear_mousedown_tracking(this: EventHandler*):
+    this.m_mousedown_target = gc.make_weak[DomNode](none)
+    this.m_mousedown_visual_viewport_position = none
+    this.m_mousedown_click_count = 0
+    this.m_mousedown_target_is_drag_candidate = false
+
+## Ported from EventHandler.cpp:983 Web::EventHandler::stop_updating_selection.
+pub func event_handler_stop_updating_selection(this: EventHandler*):
+    this.m_selection_mode = EventHandlerSelectionMode.none_
+    this.m_selection_origin = none
+    this.m_mouse_selection_target = none
+
+    this.m_auto_scroll_handler = none
+
+## Ported from EventHandler.cpp:992 Web::EventHandler::clear_per_test_input_state.
+pub func event_handler_clear_per_test_input_state(this: EventHandler*):
+    event_handler_clear_mousedown_tracking(this)
+    event_handler_stop_updating_selection(this)
+    event_handler_release_middle_button_scroll_handler(this)
+    this.m_prevent_mouse_event = false
+    this.m_hovered_chrome_widget = none
+    this.m_captured_chrome_widget = none
+    this.m_effective_legacy_mouse_pointer_position = gc.make_weak[DomNode](none)
+    drag_and_drop_event_handler_reset(this.m_drag_and_drop_event_handler)
+    this.m_mousemove_previous_screen_position = none
