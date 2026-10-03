@@ -1,0 +1,427 @@
+#==============================================================================================
+#
+#   tests_fonts_2 - focused tests of region r41: what the CSS font oracle does not reach
+#
+#   DESCRIPTION:
+#       The font width buckets, FontWeightRange and FontFaceKey, the computed font cache and
+#       its invalidation (cache entries and the elements that use a family), registering and
+#       unregistering font faces, load_font_face without URL sources and with them (the loaders
+#       by URL, before any fetch), FontLoader's subscribers and its end of loading, a FontFace's
+#       unicode ranges, fonts and ParsedFontFace, unsupported sources, the WOFF2 check of
+#       FontLoading, FontFeatureData's equality and the initial font. The expectations follow
+#       the C++ (FontComputer.cpp, FontFace.cpp, FontLoading.cpp, FontFeatureData.h) line by line.
+#
+#==============================================================================================
+
+# mark: Helpers =================================================================================
+
+## A loaded FontFace of `realm` for the font computer: `family`, a weight range, a slope and a
+## width, the typeface of a test font file and unicode ranges U+0-10FFFF.
+func test_fonts_2_face(realm: Realm*, family: str, min: i32, max: i32, file: str) -> CssFontFace*:
+    let face = test_fonts_face(realm)
+    face.m_family = ak.string_from_str(family)
+    face.m_cached_weight_range = CssFontWeightRange(min = min, max = max)
+    face.m_parsed_font = test_fonts_typeface(file)
+    ak.vector_append_t(&face.m_unicode_ranges, web_fonts.unicode_range_create(0, 0x10FFFF))
+    face.m_status = BindFontFaceLoadStatus.loaded
+    return face
+
+## The FontCascadeList of `declarations` (ComputedProperties::computed_font_list).
+func test_fonts_2_list(realm: Realm*, document: DomDocument*, declarations: str) -> const web_fonts.FontCascadeList*:
+    return css_computed_properties_computed_font_list(tcp_build(realm, declarations), dom_document_font_computer(document))
+
+## The family of a list's first font.
+func test_fonts_2_first_family(list: const web_fonts.FontCascadeList*) -> ak.FlyString:
+    return web_fonts.font_family(web_fonts.font_cascade_list_first(list))
+
+## A record of the typefaces a FontLoader's subscribers were called with.
+struct TestFonts2Calls:
+    var count: i32
+    var last: web_fonts.Typeface*?
+
+## A subscriber that records its calls.
+func test_fonts_2_record(context: void*?, typeface: web_fonts.Typeface*?):
+    let calls = (TestFonts2Calls*)(context else trap("no record"))
+    calls.count += 1
+    calls.last = typeface
+
+## A GC::Function subscriber recording into `calls`.
+func test_fonts_2_subscriber(realm: Realm*, calls: TestFonts2Calls*) -> gc.Function1[web_fonts.Typeface*?, unit]*:
+    return gc.create_function1(realm_heap(realm), ak.Function1[web_fonts.Typeface*?, unit](call = test_fonts_2_record, context = calls))
+
+## A ParsedFontFace with `sources` and the parent rule of an empty @font-face rule.
+func test_fonts_2_parsed_face(realm: Realm*, family: str, sources: ak.Vector[CssParsedFontFaceSource]) -> CssParsedFontFace:
+    let rule = css_font_face_rule_create(realm, css_css_font_face_descriptors_create(realm, ak.Vector[CssDescriptor]()))
+    var ranges: ak.Vector[web_fonts.UnicodeRange]
+    ak.vector_append_t(&ranges, web_fonts.unicode_range_create(0, 0x7F))
+    var face: CssParsedFontFace = ---
+    css_parsed_font_face_construct(&face, rule.css_rule(), ak.fly_string_from_str(family), none, none, none, sources, ranges, none, none, none, css_data.FontDisplay.auto, none, none, none, none)
+    return face
+
+## A url() source.
+func test_fonts_2_url_source(url: str, format_name: str = "") -> CssParsedFontFaceSource:
+    var format_: ak.FlyString?
+    if format_name.length > 0:
+        format_ = ak.fly_string_from_str(format_name)
+    return CssParsedFontFaceSource(local_or_url = .css_url(CssUrl(m_type = CssUrlType.url, m_url = ak.string_from_str(url), m_request_url_modifiers = ak.Vector[CssRequestUrlModifier]())), format_ = format_, tech = ak.Vector[css_data.FontTech]())
+
+## A local() source.
+func test_fonts_2_local_source(name: str) -> CssParsedFontFaceSource:
+    return CssParsedFontFaceSource(local_or_url = .fly_string(ak.fly_string_from_str(name)), format_ = none, tech = ak.Vector[css_data.FontTech]())
+
+# mark: Keys and buckets ========================================================================
+
+test "font_width_bucket_from_percentage: the nearest Gfx::FontWidth, the narrower on a tie (FontComputer.cpp:228)":
+    assert(css_font_width_bucket_from_percentage(100.0) == 5)
+    assert(css_font_width_bucket_from_percentage(0.0) == 1)
+    assert(css_font_width_bucket_from_percentage(-20.0) == 1)
+    assert(css_font_width_bucket_from_percentage(56.25) == 1)
+    assert(css_font_width_bucket_from_percentage(56.3) == 2)
+    assert(css_font_width_bucket_from_percentage(81.25) == 3)
+    assert(css_font_width_bucket_from_percentage(87.4) == 4)
+    assert(css_font_width_bucket_from_percentage(106.25) == 5)
+    assert(css_font_width_bucket_from_percentage(118.75) == 6)
+    assert(css_font_width_bucket_from_percentage(137.5) == 7)
+    assert(css_font_width_bucket_from_percentage(175.0) == 8)
+    assert(css_font_width_bucket_from_percentage(175.1) == 9)
+    assert(css_font_width_bucket_from_percentage(1000.0) == 9)
+
+test "FontWeightRange and FontFaceKey: inclusive ranges, ASCII case-insensitive family names (FontComputer.h:26)":
+    let range = CssFontWeightRange(min = 300, max = 500)
+    assert(css_font_weight_range_contains_inclusive(&range, 300))
+    assert(css_font_weight_range_contains_inclusive(&range, 500))
+    assert(not css_font_weight_range_contains_inclusive(&range, 299))
+    assert(not css_font_weight_range_contains_inclusive(&range, 501))
+    assert(css_font_weight_range_hash(&range) == ak.pair_int_hash(300, 500))
+
+    let a = css_font_face_key_new(ak.fly_string_from_str("Some Font"), range, 0, 100)
+    let b = css_font_face_key_new(ak.fly_string_from_str("SOME font"), range, 0, 100)
+    let c = css_font_face_key_new(ak.fly_string_from_str("Some Font"), range, 1, 100)
+    let d = css_font_face_key_new(ak.fly_string_from_str("Some Font"), range, 0, 75)
+    assert(css_font_face_key_eq(&a, &b))
+    assert(css_font_face_key_hash(&a) == css_font_face_key_hash(&b))
+    assert(not css_font_face_key_eq(&a, &c))
+    assert(not css_font_face_key_eq(&a, &d))
+    var key: CssFontFaceKey
+    css_font_face_key_init_fields(&key)
+    assert(key.width == 100 and key.slope == 0)
+
+test "FontFeatureData's operator== compares every member (FontFeatureData.h:87)":
+    var a: CssFontFeatureData
+    var b: CssFontFeatureData
+    assert(css_font_feature_data_eq(&a, &b))
+    b.font_variant_caps = css_data.FontVariantCaps.small_caps
+    assert(not css_font_feature_data_eq(&a, &b))
+    b = a
+    var alternates = CssFontVariantAlternates(historical_forms = false, font_feature_value_entries = ak.Vector[CssFontFeatureValueKey]())
+    ak.vector_append_t(&alternates.font_feature_value_entries, CssFontFeatureValueKey(type_ = CssFontFeatureValueType.swash, name = ak.fly_string_from_str("x")))
+    b.font_variant_alternates = alternates
+    assert(not css_font_feature_data_eq(&a, &b))
+    var c = a
+    var other_alternates = CssFontVariantAlternates(historical_forms = false, font_feature_value_entries = ak.Vector[CssFontFeatureValueKey]())
+    ak.vector_append_t(&other_alternates.font_feature_value_entries, CssFontFeatureValueKey(type_ = CssFontFeatureValueType.swash, name = ak.fly_string_from_str("x")))
+    c.font_variant_alternates = other_alternates
+    assert(css_font_feature_data_eq(&b, &c))
+    discard(ak.hash_map_set(&c.font_feature_settings, ak.fly_string_from_str("liga"), 0))
+    assert(not css_font_feature_data_eq(&b, &c))
+
+# mark: The font computer =======================================================================
+
+test "compute_font_for_style_values caches by value, and clear_computed_font_cache drops a family's entries (FontComputer.cpp:475, 658)":
+    web_initialize_strings()
+    test_fonts_setup()
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    test_fonts_defer_collections(realm)
+    defer test_fonts_end_deferral(realm)
+    with memory.heap:
+        let document = test_fonts_document(realm)
+        let font_computer = dom_document_font_computer(document)
+        let lato = test_fonts_2_list(realm, document, "font-family: Lato")
+        let lato_again = test_fonts_2_list(realm, document, "font-family: Lato")
+        let tifinagh = test_fonts_2_list(realm, document, "font-family: \"Noto Sans Tifinagh\"")
+        # Equal keys (a font-family value of the same value, another StyleValue) answer the cached list.
+        assert(lato == lato_again)
+        assert(ak.hash_map_size(&font_computer.m_computed_font_cache) == 2)
+
+        css_font_computer_clear_computed_font_cache(font_computer, ak.fly_string_from_str("LATO"))
+        assert(ak.hash_map_size(&font_computer.m_computed_font_cache) == 1)
+        assert(test_fonts_2_list(realm, document, "font-family: \"Noto Sans Tifinagh\"") == tifinagh)
+        let lato_recomputed = test_fonts_2_list(realm, document, "font-family: Lato")
+        assert(lato_recomputed != lato)
+        assert(web_fonts.font_cascade_list_equals(lato_recomputed, lato))
+
+        # Generic families are not font family names: clearing "serif" leaves the list of the keyword.
+        let serif = test_fonts_2_list(realm, document, "font-family: serif")
+        css_font_computer_clear_computed_font_cache(font_computer, ak.fly_string_from_str("serif"))
+        assert(test_fonts_2_list(realm, document, "font-family: serif") == serif)
+
+test "clear_computed_font_cache marks the elements whose font-family names the family (FontComputer.cpp:686)":
+    web_initialize_strings()
+    test_fonts_setup()
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    test_fonts_defer_collections(realm)
+    defer test_fonts_end_deferral(realm)
+    with memory.heap:
+        let document = test_fonts_document(realm)
+        let html = test_document_html_element(realm, document, &html_html_element_class, "html")
+        let uses = test_document_html_element(realm, document, &html_div_element_class, "div")
+        let other = test_document_html_element(realm, document, &html_div_element_class, "div")
+        let unstyled = test_document_html_element(realm, document, &html_div_element_class, "div")
+        test_document_append(document.dom_node(), html.dom_node())
+        test_document_append(html.dom_node(), uses.dom_node())
+        test_document_append(html.dom_node(), other.dom_node())
+        test_document_append(html.dom_node(), unstyled.dom_node())
+        dom_element_set_computed_properties(html, none, tcp_build(realm, "font-family: serif"))
+        dom_element_set_computed_properties(uses, none, tcp_build(realm, "font-family: monospace, \"Web Font\""))
+        dom_element_set_computed_properties(other, none, tcp_build(realm, "font-family: Other"))
+
+        css_font_computer_clear_computed_font_cache(dom_document_font_computer(document), ak.fly_string_from_str("web font"))
+        assert(dom_node_needs_style_update(uses.dom_node()))
+        assert(not dom_node_needs_style_update(other.dom_node()))
+        assert(not dom_node_needs_style_update(unstyled.dom_node()))
+        assert(not dom_node_needs_style_update(html.dom_node()))
+        assert(html.dom_node().m_child_needs_style_update)
+
+        # With a full style update pending, the walk is skipped.
+        dom_node_set_needs_style_update(uses.dom_node(), false)
+        dom_document_set_needs_full_style_update(document, true)
+        css_font_computer_clear_computed_font_cache(dom_document_font_computer(document), ak.fly_string_from_str("Other"))
+        assert(not dom_node_needs_style_update(other.dom_node()))
+
+test "register_font_face and unregister_font_face: one entry per face and key, empty keys removed (FontComputer.cpp:719, 735)":
+    web_initialize_strings()
+    test_fonts_setup()
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    test_fonts_defer_collections(realm)
+    defer test_fonts_end_deferral(realm)
+    with memory.heap:
+        let document = test_fonts_document(realm)
+        let font_computer = dom_document_font_computer(document)
+        let regular = test_fonts_2_face(realm, "Web", 400, 400, "SerenitySans-Regular.ttf")
+        let bold = test_fonts_2_face(realm, "Web", 700, 700, "Lato-Bold.ttf")
+        let regular_too = test_fonts_2_face(realm, "WEB", 400, 400, "NotoSansTifinagh-Regular.otf")
+        css_font_computer_register_font_face(font_computer, regular)
+        css_font_computer_register_font_face(font_computer, regular)
+        css_font_computer_register_font_face(font_computer, bold)
+        css_font_computer_register_font_face(font_computer, regular_too)
+        assert(ak.hash_map_size(&font_computer.m_font_faces) == 2)
+        let regular_key = css_font_computer_font_face_key(regular)
+        let regular_faces = ak.hash_map_get_k(&font_computer.m_font_faces, regular_key) else trap("the regular key")
+        assert(ak.vector_size(regular_faces) == 2)
+
+        # The exact match finds both faces of the key, in registration order.
+        let list = test_fonts_2_list(realm, document, "font-family: web")
+        let entries = web_fonts.font_cascade_list_for_each_font_entry(list)
+        assert(test_fly_is(web_fonts.font_family(entries[0].font), "SerenitySans"))
+        assert(test_fly_is(web_fonts.font_family(entries[1].font), "Noto Sans Tifinagh"))
+
+        css_font_computer_unregister_font_face(font_computer, regular)
+        assert(ak.vector_size(ak.hash_map_get_k(&font_computer.m_font_faces, regular_key) else trap("the regular key")) == 1)
+        css_font_computer_unregister_font_face(font_computer, regular_too)
+        assert(ak.hash_map_get_k(&font_computer.m_font_faces, regular_key) == none)
+        assert(ak.hash_map_size(&font_computer.m_font_faces) == 1)
+        # Unregistering cleared the cache: the family now matches the bold face.
+        assert(test_fly_is(test_fonts_2_first_family(test_fonts_2_list(realm, document, "font-family: web")), "Lato"))
+
+test "load_font_face: no sources or only local() call on_load with null; URL sources share one loader per first URL (FontComputer.cpp:753)":
+    web_initialize_strings()
+    test_fonts_setup()
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    test_fonts_defer_collections(realm)
+    defer test_fonts_end_deferral(realm)
+    with memory.heap:
+        let document = test_fonts_document(realm)
+        let font_computer = dom_document_font_computer(document)
+        var calls = TestFonts2Calls(count = 0, last = none)
+        let subscriber = test_fonts_2_subscriber(realm, &calls)
+
+        let empty = test_fonts_2_parsed_face(realm, "A", ak.Vector[CssParsedFontFaceSource]())
+        assert(css_font_computer_load_font_face(font_computer, &empty, subscriber) == none)
+        assert(calls.count == 1 and calls.last == none)
+        assert(css_font_computer_load_font_face(font_computer, &empty, none) == none)
+
+        var local_sources: ak.Vector[CssParsedFontFaceSource]
+        ak.vector_append_t(&local_sources, test_fonts_2_local_source("Foo"))
+        let local_only = test_fonts_2_parsed_face(realm, "B", local_sources)
+        assert(css_font_computer_load_font_face(font_computer, &local_only, subscriber) == none)
+        assert(calls.count == 2)
+
+        var url_sources: ak.Vector[CssParsedFontFaceSource]
+        ak.vector_append_t(&url_sources, test_fonts_2_local_source("Foo"))
+        ak.vector_append_t(&url_sources, test_fonts_2_url_source("a.ttf"))
+        ak.vector_append_t(&url_sources, test_fonts_2_url_source("b.ttf"))
+        let with_urls = test_fonts_2_parsed_face(realm, "C", url_sources)
+        let loader = css_font_computer_load_font_face(font_computer, &with_urls, subscriber) else trap("a loader")
+        assert(calls.count == 2)
+        assert(test_fly_is(css_font_loader_family_name(loader), "C"))
+        assert(ak.vector_size(&loader.m_urls) == 2)
+        assert(ak.vector_size(&loader.m_subscribers) == 1)
+        let loader_ranges = css_font_loader_unicode_ranges(loader)
+        assert(ak.vector_size(&loader_ranges) == 1)
+        assert(ak.hash_map_size(&font_computer.m_loaders_by_url) == 1)
+        assert(not css_font_loader_is_loading(loader))
+        # The same first URL answers the same loader and subscribes on_load to it.
+        let again = css_font_computer_load_font_face(font_computer, &with_urls, subscriber) else trap("a loader")
+        assert(again == loader)
+        assert(ak.vector_size(&loader.m_subscribers) == 2)
+
+test "FontLoader: the end of loading clears the family's cache and calls the subscribers once (FontComputer.cpp:90, 203)":
+    web_initialize_strings()
+    test_fonts_setup()
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    test_fonts_defer_collections(realm)
+    defer test_fonts_end_deferral(realm)
+    with memory.heap:
+        let document = test_fonts_document(realm)
+        let font_computer = dom_document_font_computer(document)
+        var calls = TestFonts2Calls(count = 0, last = none)
+        let rule_or_declaration = CssRuleOrDeclaration(environment_settings_object = (HtmlEnvironmentSettingsObject*)(void*)realm, value = .css_rule_or_declaration_rule(CssRuleOrDeclarationRule(parent_style_sheet = none)))
+        var ranges: ak.Vector[web_fonts.UnicodeRange]
+        ak.vector_append_t(&ranges, web_fonts.unicode_range_create(0x20, 0x7E))
+        let loader = heap_allocate_css_font_loader(realm_heap(realm), font_computer, rule_or_declaration, ak.fly_string_from_str("Lato"), ranges, ak.Vector[CssUrl](), test_fonts_2_subscriber(realm, &calls))
+
+        # Without a typeface and without URLs, nothing loads.
+        assert(css_font_loader_font_with_point_size(loader, 12.0, web_fonts.FontVariationSettings(), ak.Vector[web_fonts.ShapeFeature]()) == none)
+        assert(not css_font_loader_is_loading(loader))
+
+        let cached = test_fonts_2_list(realm, document, "font-family: Lato")
+        let typeface = test_fonts_typeface("Lato-Bold.ttf")
+        css_font_loader_font_did_load_or_fail(loader, typeface)
+        assert(calls.count == 1 and calls.last == typeface)
+        assert(ak.vector_is_empty(&loader.m_subscribers))
+        assert(loader.m_has_completed)
+        # The loaded family's computed lists were dropped.
+        assert(test_fonts_2_list(realm, document, "font-family: Lato") != cached)
+
+        # A subscriber after completion is called at once.
+        css_font_loader_subscribe(loader, test_fonts_2_subscriber(realm, &calls))
+        assert(calls.count == 2 and calls.last == typeface)
+        let font = css_font_loader_font_with_point_size(loader, 9.0, web_fonts.FontVariationSettings(), ak.Vector[web_fonts.ShapeFeature]()) else trap("a font")
+        assert(test_fly_is(web_fonts.font_family(font), "Lato"))
+        assert(web_fonts.font_point_size(font) == 9.0)
+
+        # A failed load keeps no typeface and still calls the subscribers.
+        var failed_calls = TestFonts2Calls(count = 0, last = typeface)
+        let failing = heap_allocate_css_font_loader(realm_heap(realm), font_computer, rule_or_declaration, ak.fly_string_from_str("X"), ak.Vector[web_fonts.UnicodeRange](), ak.Vector[CssUrl](), test_fonts_2_subscriber(realm, &failed_calls))
+        css_font_loader_font_did_load_or_fail(failing, none)
+        assert(failed_calls.count == 1 and failed_calls.last == none)
+        assert(failing.m_typeface == none)
+
+test "FontComputer::initial_font is the 12pt fallback font, made once (FontComputer.cpp:634)":
+    web_initialize_strings()
+    test_fonts_setup()
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    test_fonts_defer_collections(realm)
+    defer test_fonts_end_deferral(realm)
+    with memory.heap:
+        let document = test_fonts_document(realm)
+        let font = css_font_computer_initial_font(dom_document_font_computer(document))
+        assert(test_fly_is(web_fonts.font_family(font), "SerenitySans"))
+        assert(web_fonts.font_point_size(font) == 12.0)
+        assert(css_font_computer_initial_font(dom_document_font_computer(document)) == font)
+
+# mark: Font faces ==============================================================================
+
+test "FontFace: unicode ranges, its fonts with their ranges, and its ParsedFontFace (FontFace.h:105, FontFace.cpp:315, 395)":
+    web_initialize_strings()
+    test_fonts_setup()
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    test_fonts_defer_collections(realm)
+    defer test_fonts_end_deferral(realm)
+    with memory.heap:
+        let face = test_fonts_face(realm)
+        assert(css_font_face_status(face) == BindFontFaceLoadStatus.unloaded)
+        assert(face.m_cached_weight_range.min == 400 and face.m_cached_weight_range.max == 400 and face.m_cached_width == 100)
+        assert(css_font_face_has_non_default_unicode_range(face))
+        assert(not css_font_face_should_be_registered_with_font_computer(face))
+        assert(css_font_face_font_with_point_size(face, 12.0, web_fonts.FontVariationSettings(), ak.Vector[web_fonts.ShapeFeature]()) == none)
+
+        ak.vector_append_t(&face.m_unicode_ranges, web_fonts.unicode_range_create(0, 0x10FFFF))
+        assert(not css_font_face_has_non_default_unicode_range(face))
+        ak.vector_append_t(&face.m_unicode_ranges, web_fonts.unicode_range_create(0x20, 0x7E))
+        assert(css_font_face_has_non_default_unicode_range(face))
+        ak.vector_clear(&face.m_unicode_ranges)
+        ak.vector_append_t(&face.m_unicode_ranges, web_fonts.unicode_range_create(0x20, 0x7E))
+        assert(css_font_face_has_non_default_unicode_range(face))
+
+        face.m_parsed_font = test_fonts_typeface("SerenitySans-Regular.ttf")
+        let fonts = css_font_face_font_with_point_size(face, 10.5, web_fonts.FontVariationSettings(), ak.Vector[web_fonts.ShapeFeature]()) else trap("fonts")
+        let entries = web_fonts.font_cascade_list_for_each_font_entry(fonts)
+        assert(entries.length == 1)
+        let range_data = entries[0].range_data else trap("range data")
+        assert(web_fonts.unicode_range_min_code_point(&range_data.enclosing_range) == 0x20)
+        assert(web_fonts.unicode_range_max_code_point(&range_data.enclosing_range) == 0x7E)
+        assert(web_fonts.font_point_size(entries[0].font) == 10.5)
+
+        face.m_family = ak.string_from_str("Script Face")
+        face.m_cached_weight_range = CssFontWeightRange(min = 300, max = 600)
+        face.m_cached_slope = 1
+        face.m_cached_width = 75
+        ak.vector_append_t(&face.m_urls, test_fonts_2_url_source("x.woff"))
+        assert(css_font_face_has_urls(face))
+        let parsed = css_font_face_parsed_font_face(face)
+        assert(test_fly_is(css_parsed_font_face_font_family(&parsed), "Script Face"))
+        let weight = css_parsed_font_face_weight(&parsed) else trap("a weight")
+        assert(weight.min == 300 and weight.max == 600)
+        assert((css_parsed_font_face_slope(&parsed) else -1) == 1)
+        assert((css_parsed_font_face_width(&parsed) else -1) == 75)
+        let parsed_sources = css_parsed_font_face_sources(&parsed)
+        assert(ak.vector_size(&parsed_sources) == 1)
+        let parsed_ranges = css_parsed_font_face_unicode_ranges(&parsed)
+        assert(ak.vector_size(&parsed_ranges) == 1)
+        assert(css_parsed_font_face_font_display(&parsed) == css_data.FontDisplay.auto)
+        if let ascent_override = css_parsed_font_face_ascent_override(&parsed):
+            trap("no ascent-override")
+        if let feature_settings = css_parsed_font_face_font_feature_settings(&parsed):
+            trap("no font-feature-settings")
+        assert(is_css_font_face_rule(css_parsed_font_face_parent_rule(&parsed)))
+
+        face.m_status = BindFontFaceLoadStatus.loaded
+        assert(css_font_face_should_be_registered_with_font_computer(face))
+
+test "is_unsupported_source: url() sources with an unsupported format() or an .eot URL; local() never (FontFace.cpp:46)":
+    web_initialize_strings()
+    with memory.heap:
+        let local_source = test_fonts_2_local_source("Foo.eot")
+        assert(not css_is_unsupported_source(&local_source))
+        let ttf = test_fonts_2_url_source("font.ttf")
+        assert(not css_is_unsupported_source(&ttf))
+        let eot = test_fonts_2_url_source("font.eot")
+        assert(css_is_unsupported_source(&eot))
+        let eot_upper = test_fonts_2_url_source("font.EOT")
+        assert(not css_is_unsupported_source(&eot_upper))
+        let eot_as_woff = test_fonts_2_url_source("font.eot", "woff")
+        assert(not css_is_unsupported_source(&eot_as_woff))
+        let embedded = test_fonts_2_url_source("font.ttf", "embedded-opentype")
+        assert(css_is_unsupported_source(&embedded))
+        let svg = test_fonts_2_url_source("font.svg", "svg")
+        assert(css_is_unsupported_source(&svg))
+        let unknown = test_fonts_2_url_source("font.ttf", "nonsense")
+        assert(css_is_unsupported_source(&unknown))
+
+# mark: Font loading ============================================================================
+
+test "requires_off_thread_vector_font_preparation: WOFF2 mime types and the wOF2 signature (FontLoading.cpp:18)":
+    with memory.heap:
+        let woff2_signature = ak.byte_buffer_copy_span_u8(b"wOF2\x00\x01\x00\x00") else trap("out of memory")
+        assert(css_requires_off_thread_vector_font_preparation(woff2_signature))
+        let short = ak.byte_buffer_copy_span_u8(b"wOF") else trap("out of memory")
+        assert(not css_requires_off_thread_vector_font_preparation(short))
+        assert(css_requires_off_thread_vector_font_preparation(short, ak.byte_string_from_str("application/font-woff2")))
+        let ttf = test_fonts_read("SerenitySans-Regular.ttf")
+        assert(not css_requires_off_thread_vector_font_preparation(ttf, ak.byte_string_from_str("font/woff")))
+        # Data that needs no preparation is handed on as it is.
+        match css_prepare_vector_font_data_result(ttf, ak.byte_string_from_str("font/ttf")):
+            .value(prepared):
+                assert(ak.byte_buffer_size(&prepared.data) == ak.byte_buffer_size(&ttf))
+                let essence = prepared.mime_type_essence else trap("an essence")
+                assert(ak.byte_string_eq_string_view(&essence, ak.sv("font/ttf")))
+            .ak_error(_):
+                trap("prepared data")
