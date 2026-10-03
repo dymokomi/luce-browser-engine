@@ -757,7 +757,8 @@ roots (P3: live JS wrappers), and cells that `must_survive_garbage_collection`.
 `Root`/`RootVector`/`RootHashMap`, `ConservativeVector`, `Weak`/`WeakBlock`/`WeakContainer`,
 `DeferGC`, `Function`, the marking visitor, `finalize_unmarked_cells`, `sweep_dead_cells`,
 `sweep_weak_blocks`, post-GC tasks and the collection threshold (`GC_MIN_BYTES_THRESHOLD` 4 MiB,
-then adaptive) are ported with their algorithms. `Cell::Visitor` becomes a struct with a vtable
+then adaptive) are ported with their algorithms, except for the WeakImpl's reference count
+(§3.7). `Cell::Visitor` becomes a struct with a vtable
 (`MarkingVisitor`, `GraphConstructorVisitor`), and the overload set of `visit(...)` becomes named
 helpers:
 
@@ -816,7 +817,8 @@ The rules agents follow:
 4. **Managed pointers may not live only outside the managed heap.** Memory from the C allocator,
    other threads, luce-js's heap, luce-std structures created under another allocator, or OS
    callbacks is not scanned. A managed pointer stored there is kept alive with a `gc.Root`
-   (released explicitly), exactly the donor's rule for `GC::Root`.
+   (released explicitly), exactly the donor's rule for `GC::Root`. A `gc.Weak` is not a managed
+   pointer in this sense: it may live anywhere, managed or not (§3.7).
 5. **Atomic data** (string bytes, `ByteBuffer`, bitmap pixels, glyph masks, `Vector` of scalars
    when hot) is allocated with `ak.alloc_atomic`/`Vector[T].create_atomic()`, so the collector
    neither scans it nor mistakes pixels for pointers.
@@ -917,7 +919,45 @@ What P1 must already have so P3 is not a redesign: `PlatformObject` with `m_real
 split into gather-roots / mark / finalize / sweep functions with embedder hooks; `Realm` and `Vm`
 as cells reachable from `Window` and the main thread.
 
-### 3.7 Alternatives considered
+### 3.7 Weak references
+
+In LibGC a `Weak<T>` holds a reference-counted `WeakImpl` from a weak block. The impl points to
+the cell until the cell dies, then to null. Every copy of a Weak refs the impl and every
+destructor unrefs it, and `sweep_weak_blocks` frees the impls whose count is 0. luce-base has no
+destructors. A Weak is copied as plain bytes wherever C++ copies it: into a `Vector`'s buffer, a
+struct, a return value. Nobody can count those copies.
+
+**Decision: an impl lives exactly as long as its cell, and a Weak remembers the impl's
+generation.**
+
+- A cell has at most one `WeakImpl`, shared by all its Weaks. The heap maps each cell to its
+  impl (`Heap.m_weak_impls`), and `create_weak_impl` answers the existing impl while the cell
+  lives.
+- `WeakBlock::sweep` frees the impl of every dead cell and drops it from the map.
+  `WeakBlock::deallocate` increments the impl's generation (it replaces `m_ref_count`).
+- `gc.Weak[T]` is `{ m_impl, m_generation }`. `weak_ptr` and `weak_impl` answer none when the
+  impl's generation is no longer the Weak's, because the impl went back with its dead cell.
+  This is exactly when the C++ Weak would read null.
+
+A Weak therefore stays valid for as long as anything holds it, wherever that is: a cell, a blob
+(atomic too), the stack, the C heap, a module global, another allocator's memory. Ported code
+copies and stores Weaks as C++ does, with no calls to add and no rule to follow. Impl memory is
+bounded by the number of live cells that something has made a Weak to (C++ is bounded by the
+live Weaks). Nothing is traced, so no scan of the collector looks for weak references.
+`gc/tests_weak_holders` enforces this: it holds Weaks on the stack, in the C heap, in a module
+global and in an atomic blob, through collections that hand the freed impls to other cells.
+The engine's `tests_event_loop` does the same for the event loop's document list.
+
+Options rejected:
+
+| Option | Why not |
+| --- | --- |
+| Recompute the counts during marking (the first port): every scanned word that points into a weak block counts as a reference | Memory the collector does not scan (the C heap, module globals, atomic blobs, frames above a test heap's stack top) loses its impls at the next collection. Its Weaks then read *another* cell. This hit the event loop's document list and r23's tests, which had to run under `with heap`. |
+| Same, plus an explicit external-roots area that C-heap holders register (like `gc.Root`) | A rule every porter must remember for every Weak stored outside a cell. Forgetting it is a silent use-after-recycle that tests rarely catch. |
+| Real reference counting: `weak_copy` / `weak_release` wherever C++ copies or destroys a Weak | Invented calls at every copy, container operation and scope exit: §3.3's reason for managed AK storage, on a smaller scale. A missed release leaks; a missed copy is a use-after-recycle. |
+| A rule that Weaks live only in managed memory or on the stack, with the C-heap holders moved | Cannot be enforced (a Weak is copied as bytes, so no call site sees where it lands). C-heap objects that hold Weaks, such as the agent's custom element reactions stack, would have to move into the heap. |
+
+### 3.8 Alternatives considered
 
 | Alternative | Why not |
 | --- | --- |
