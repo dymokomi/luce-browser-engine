@@ -1,0 +1,313 @@
+#==============================================================================================
+#
+#   layout_state_2 - Layout::LayoutState: used values by layout index, scrollable overflow,
+#                    relative positions of inline fragments and the paint tree
+#
+#   DESCRIPTION:
+#       Port of LibWeb/Layout/LayoutState.cpp (lines 1-360): the constructor, the lookups of a
+#       node's UsedValues (made on first use, with the containing block's), populating a
+#       throwaway state from a paintable or another state, the scrollable overflow of scroll
+#       containers, the relative-position offsets of inline fragments and build_paint_tree.
+#
+#       Copyright (c) 2022-2024, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2024, Sam Atkins <atkinssj@serenityos.org>
+#       Copyright (c) 2024, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Construction and lookups ================================================================
+
+## Ported from Libraries/LibWeb/Layout/LayoutState.cpp:25 Web::Layout::LayoutState::LayoutState.
+pub func layout_state_construct(this: LayoutState*, subtree_root: LayoutNodeWithStyle*):
+    this.m_subtree_root = subtree_root
+
+## Ported from Libraries/LibWeb/Layout/LayoutState.cpp:34 Web::Layout::LayoutState::ensure_capacity.
+pub func layout_state_ensure_capacity(this: LayoutState*, node_count: u32):
+    layout_paged_store_ensure_capacity(&this.m_used_values_store, node_count)
+
+## Ported from Libraries/LibWeb/Layout/LayoutState.cpp:39 Web::Layout::LayoutState::get_mutable.
+pub func layout_state_get_mutable(this: LayoutState*, node: LayoutNodeWithStyle*) -> LayoutStateUsedValues*:
+    return layout_state_ensure_used_values_for(this, node)
+
+## Ported from Libraries/LibWeb/Layout/LayoutState.cpp:44 Web::Layout::LayoutState::get.
+pub func layout_state_get(this: const LayoutState*, node: LayoutNodeWithStyle*) -> const LayoutStateUsedValues*:
+    return layout_state_ensure_used_values_for((LayoutState*)this, node)
+
+## Ported from Libraries/LibWeb/Layout/LayoutState.cpp:49 Web::Layout::LayoutState::populate_from_paintable.
+pub func layout_state_populate_from_paintable(this: LayoutState*, node: LayoutNodeWithStyle*, paintable: PaintPaintableBox*) -> LayoutStateUsedValues*:
+    assert(this.m_subtree_root != none)
+    let index = layout_node_with_style_layout_index(node)
+
+    # NOTE: We skip set_node() here since it performs size resolution that requires a containing block,
+    #       and materialize_from_paintable() overwrites all computed sizes immediately after.
+    let used_values = layout_paged_store_allocate(&this.m_used_values_store, index)
+    used_values.m_node = node
+    layout_state_used_values_materialize_from_paintable(used_values, paintable)
+    return used_values
+
+## Ported from Libraries/LibWeb/Layout/LayoutState.cpp:62 Web::Layout::LayoutState::populate_node_from.
+pub func layout_state_populate_node_from(this: LayoutState*, source: const LayoutState*, node: LayoutNodeWithStyle*) -> LayoutStateUsedValues*:
+    assert(this.m_subtree_root != none)
+    let index = layout_node_with_style_layout_index(node)
+    assert(layout_paged_store_get(&this.m_used_values_store, index) == none)
+
+    let values = layout_paged_store_allocate(&this.m_used_values_store, index)
+    layout_state_used_values_assign(values, layout_state_get(source, node))
+    values.m_containing_block_used_values = none
+    return values
+
+## Ported from Libraries/LibWeb/Layout/LayoutState.cpp:74 Web::Layout::LayoutState::ensure_used_values_for.
+pub func layout_state_ensure_used_values_for(this: LayoutState*, node: LayoutNodeWithStyle*) -> LayoutStateUsedValues*:
+    let index = layout_node_with_style_layout_index(node)
+
+    if let used_values = layout_paged_store_get(&this.m_used_values_store, index):
+        return used_values
+
+    # During subtree layout, only the subtree root and nodes inside the subtree are allowed.
+    if let subtree_root = this.m_subtree_root:
+        assert(subtree_root == node or tree_node_is_inclusive_ancestor_of(subtree_root.layout_node(), node.layout_node()))
+
+    var containing_block_used_values: const LayoutStateUsedValues*? = none
+    if this.m_subtree_root == node:
+        # For the subtree root, ancestor values are not available in the throwaway state.
+        let containing_block = layout_node_containing_block(node.layout_node()) else trap("the subtree root has no containing block")
+        containing_block_used_values = layout_state_try_get_layout_node_with_style(this, containing_block.layout_node_with_style())
+    elif not layout_node_is_viewport(node.layout_node()):
+        let containing_block = layout_node_containing_block(node.layout_node()) else trap("a layout node without a containing block")
+        containing_block_used_values = layout_state_get(this, containing_block.layout_node_with_style())
+
+    let used_values = layout_paged_store_allocate(&this.m_used_values_store, index)
+    layout_state_used_values_set_node(used_values, node, containing_block_used_values)
+    return used_values
+
+## Ported from Libraries/LibWeb/Layout/LayoutState.cpp:97 Web::Layout::LayoutState::try_get.
+pub func layout_state_try_get_layout_node_with_style(this: const LayoutState*, node: LayoutNodeWithStyle*) -> const LayoutStateUsedValues*?:
+    return layout_paged_store_get(&this.m_used_values_store, layout_node_with_style_layout_index(node))
+
+## Ported from Libraries/LibWeb/Layout/LayoutState.cpp:102 Web::Layout::LayoutState::try_get_mutable.
+pub func layout_state_try_get_mutable(this: LayoutState*, node: LayoutNodeWithStyle*) -> LayoutStateUsedValues*?:
+    return layout_paged_store_get(&this.m_used_values_store, layout_node_with_style_layout_index(node))
+
+## Ported from Libraries/LibWeb/Layout/LayoutState.cpp:107 Web::Layout::LayoutState::try_get.
+pub func layout_state_try_get_layout_node(this: const LayoutState*, node: LayoutNode*) -> const LayoutStateUsedValues*?:
+    let node_with_style = as_if_layout_node_with_style(node) else return none
+    return layout_state_try_get_layout_node_with_style(this, node_with_style)
+
+# mark: Scrollable overflow =====================================================================
+
+# https://drafts.csswg.org/css-overflow-3/#scrollable-overflow-region
+# using ContainedBoxesMap = HashMap<Box const*, Vector<Box const*>>;
+
+## Ported from Libraries/LibWeb/Layout/LayoutState.cpp:128 Web::Layout::inline_axis_is_horizontal.
+func layout_inline_axis_is_horizontal(writing_mode: css_data.WritingMode) -> bool:
+    return writing_mode == css_data.WritingMode.horizontal_tb
+
+## Ported from Libraries/LibWeb/Layout/LayoutState.cpp:133 Web::Layout::physical_overflow_directions.
+func layout_physical_overflow_directions(box: LayoutBox*) -> LayoutPhysicalOverflowDirections:
+    let computed_values = &layout_node_computed_values(box.layout_node()).computed_values
+    let inline_axis = LayoutLogicalAxis(
+        is_horizontal = layout_inline_axis_is_horizontal(css_computed_values_writing_mode(computed_values)),
+        is_reverse = css_computed_values_inline_axis_is_reverse(computed_values),
+    )
+    let block_axis = LayoutLogicalAxis(
+        is_horizontal = not inline_axis.is_horizontal,
+        is_reverse = css_computed_values_block_axis_is_reverse(computed_values),
+    )
+
+    let (horizontal_axis, vertical_axis) = layout_physical_overflow_directions_horizontal_and_vertical_axes(box, inline_axis, block_axis)
+    return LayoutPhysicalOverflowDirections(
+        x_positive = not horizontal_axis.is_reverse,
+        y_positive = not vertical_axis.is_reverse,
+    )
+
+## The `horizontal_and_vertical_axes` lambda of physical_overflow_directions.
+func layout_physical_overflow_directions_horizontal_and_vertical_axes(box: LayoutBox*, inline_axis: LayoutLogicalAxis, block_axis: LayoutLogicalAxis) -> (LayoutLogicalAxis, LayoutLogicalAxis):
+    let computed_values = &layout_node_computed_values(box.layout_node()).computed_values
+    let display = layout_node_display(box.layout_node())
+    if not css_display_is_flex_inside(&display):
+        return (inline_axis if inline_axis.is_horizontal else block_axis, block_axis if inline_axis.is_horizontal else inline_axis)
+
+    let flex_direction = css_computed_values_flex_direction(computed_values)
+    let is_row_layout = flex_direction == css_data.FlexDirection.row or flex_direction == css_data.FlexDirection.row_reverse
+
+    var main_axis = inline_axis if is_row_layout else block_axis
+    if flex_direction == css_data.FlexDirection.row_reverse or flex_direction == css_data.FlexDirection.column_reverse:
+        main_axis.is_reverse = not main_axis.is_reverse
+
+    var cross_axis = block_axis if is_row_layout else inline_axis
+    if css_computed_values_flex_wrap(computed_values) == css_data.FlexWrap.wrap_reverse:
+        cross_axis.is_reverse = not cross_axis.is_reverse
+
+    return (main_axis if main_axis.is_horizontal else cross_axis, cross_axis if main_axis.is_horizontal else main_axis)
+
+## Ported from Libraries/LibWeb/Layout/LayoutState.cpp:174 Web::Layout::measure_scrollable_overflow.
+func layout_measure_scrollable_overflow(box: LayoutBox*, contained_boxes_map: const ak.HashMap[LayoutBox*, ak.Vector[LayoutBox*], ak.PtrTraits[LayoutBox]]*) -> gfx.CssPixelRect:
+    let paintable_box = layout_box_paintable_box_const(box) else return gfx.CssPixelRect()
+
+    if let scrollable_overflow_rect = paint_paintable_box_scrollable_overflow_rect(paintable_box):
+        return scrollable_overflow_rect
+
+    # The scrollable overflow area is the union of:
+
+    # - The scroll container’s own padding box.
+    let paintable_absolute_padding_box = paint_paintable_box_absolute_padding_box_rect(paintable_box)
+    var scrollable_overflow_rect = paintable_absolute_padding_box
+    let overflow_directions = layout_physical_overflow_directions(box)
+
+    # - All line boxes directly contained by the scroll container.
+    if let first_paintable = layout_node_first_paintable_const(box.layout_node()):
+        if let paintable_with_lines = as_if_paint_paintable_with_lines(first_paintable):
+            let fragments = paint_paintable_with_lines_fragments(paintable_with_lines)
+            for i in 0..<ak.vector_size(fragments):
+                gfx.css_pixel_rect_unite(&scrollable_overflow_rect, paint_paintable_fragment_absolute_rect(ak.vector_at(fragments, i)))
+
+    var content_overflow_rect = scrollable_overflow_rect
+
+    # - The border boxes of all boxes for which it is the containing block and whose border boxes are positioned not
+    #   wholly in the negative scrollable overflow region,
+    #   FIXME: accounting for transforms by projecting each box onto the plane of the element that establishes its 3D rendering context. [CSS3-TRANSFORMS]
+    if let contained_boxes = ak.hash_map_get_k((ak.HashMap[LayoutBox*, ak.Vector[LayoutBox*], ak.PtrTraits[LayoutBox]]*)contained_boxes_map, box):
+        for child in ak.vector_span(contained_boxes):
+            # https://drafts.csswg.org/css-position/#fixed-positioning-containing-block
+            # [..] As a result, parts of fixed-positioned boxes that extend outside the layout viewport/page area
+            #      cannot be scrolled to and will not print.
+            # FIXME: Properly establish the fixed positioning containing block for `position: fixed`
+            if layout_node_is_fixed_position(child.layout_node()):
+                continue
+
+            let child_paintable_box = layout_box_paintable_box(child) else trap("a contained box without a paintable")
+            let child_border_box = paint_paintable_box_absolute_border_box_rect(child_paintable_box)
+
+            # NOTE: Only boxes that are not wholly in the unreachable scrollable overflow region contribute.
+            let wholly_in_unreachable_x = gfx.css_pixel_rect_right(&child_border_box).lt(gfx.css_pixel_rect_x(&paintable_absolute_padding_box)) if overflow_directions.x_positive else gfx.css_pixel_rect_x(&child_border_box).gt(gfx.css_pixel_rect_right(&paintable_absolute_padding_box))
+            let wholly_in_unreachable_y = gfx.css_pixel_rect_bottom(&child_border_box).lt(gfx.css_pixel_rect_y(&paintable_absolute_padding_box)) if overflow_directions.y_positive else gfx.css_pixel_rect_y(&child_border_box).gt(gfx.css_pixel_rect_bottom(&paintable_absolute_padding_box))
+            if wholly_in_unreachable_x or wholly_in_unreachable_y:
+                continue
+
+            # Border boxes with zero area do not affect the scrollable overflow area.
+            if not gfx.css_pixel_rect_is_empty(&child_border_box):
+                gfx.css_pixel_rect_unite(&scrollable_overflow_rect, child_border_box)
+                gfx.css_pixel_rect_unite(&content_overflow_rect, child_border_box)
+
+            # - The scrollable overflow areas of all of the above boxes (including zero-area boxes and accounting for
+            #   transforms as described above), provided they themselves have overflow: visible (i.e. do not themselves
+            #   trap the overflow) and that scrollable overflow is not already clipped (e.g. by the clip property or the
+            #   contain property).
+            # Scrollable overflow is already clipped by the contain property.
+            if layout_node_has_layout_containment(child.layout_node()) or layout_node_has_paint_containment(child.layout_node()):
+                continue
+
+            let child_computed_values = &layout_node_computed_values(child.layout_node()).computed_values
+            let child_overflow_x = css_computed_values_overflow_x(child_computed_values)
+            let child_overflow_y = css_computed_values_overflow_y(child_computed_values)
+            if child_overflow_x == css_data.Overflow.visible or child_overflow_y == css_data.Overflow.visible:
+                let child_scrollable_overflow = layout_measure_scrollable_overflow(child, contained_boxes_map)
+                if not gfx.css_pixel_rect_is_empty(&child_scrollable_overflow):
+                    if child_overflow_x == css_data.Overflow.visible:
+                        gfx.css_pixel_rect_unite_horizontally(&scrollable_overflow_rect, child_scrollable_overflow)
+                    if child_overflow_y == css_data.Overflow.visible:
+                        gfx.css_pixel_rect_unite_vertically(&scrollable_overflow_rect, child_scrollable_overflow)
+
+    # FIXME: - The margin areas of grid item and flex item boxes for which the box establishes a containing block.
+
+    # - Additional padding added to the scrollable overflow rectangle as necessary to enable scroll positions that
+    #   satisfy the requirements of both place-content: start and place-content: end alignment.
+    var has_scrollable_overflow = not gfx.css_pixel_rect_contains_css_pixel_rect(&paintable_absolute_padding_box, scrollable_overflow_rect) and layout_node_with_style_is_scroll_container(box.layout_node_with_style())
+    if has_scrollable_overflow:
+        var left = gfx.css_pixel_rect_x(&scrollable_overflow_rect)
+        var top = gfx.css_pixel_rect_y(&scrollable_overflow_rect)
+        var right = gfx.css_pixel_rect_right(&scrollable_overflow_rect)
+        var bottom = gfx.css_pixel_rect_bottom(&scrollable_overflow_rect)
+
+        let padding = paint_paintable_box_box_model(paintable_box).padding
+        if overflow_directions.x_positive:
+            right = ak.max(right, gfx.css_pixel_rect_right(&content_overflow_rect).add(padding.right))
+        else:
+            left = ak.min(left, gfx.css_pixel_rect_x(&content_overflow_rect).sub(padding.left))
+
+        if overflow_directions.y_positive:
+            bottom = ak.max(bottom, gfx.css_pixel_rect_bottom(&content_overflow_rect).add(padding.bottom))
+        else:
+            top = ak.min(top, gfx.css_pixel_rect_y(&content_overflow_rect).sub(padding.top))
+
+        scrollable_overflow_rect = gfx.CssPixelRect(gfx.CssPixelPoint(left, top),
+                                                    gfx.CssPixelSize(ak.max(right.sub(left), layout_zero_px()), ak.max(bottom.sub(top), layout_zero_px())))
+
+    # Additionally, due to Web-compatibility constraints (caused by authors exploiting legacy bugs to surreptitiously
+    # hide content from visual readers but not search engines and/or speech output), UAs must clip any content in the
+    # unreachable scrollable overflow region.
+    #
+    # https://drafts.csswg.org/css-overflow-3/#unreachable-scrollable-overflow-region
+    # Unless otherwise adjusted (e.g. by content alignment [css-align-3]), the area beyond the scroll origin in either
+    # axis is considered the unreachable scrollable overflow region: content rendered here is not accessible to the
+    # reader, see § 2.2 Scrollable Overflow.
+    let left = ak.max(gfx.css_pixel_rect_x(&scrollable_overflow_rect), gfx.css_pixel_rect_x(&paintable_absolute_padding_box)) if overflow_directions.x_positive else gfx.css_pixel_rect_x(&scrollable_overflow_rect)
+    let top = ak.max(gfx.css_pixel_rect_y(&scrollable_overflow_rect), gfx.css_pixel_rect_y(&paintable_absolute_padding_box)) if overflow_directions.y_positive else gfx.css_pixel_rect_y(&scrollable_overflow_rect)
+    let right = gfx.css_pixel_rect_right(&scrollable_overflow_rect) if overflow_directions.x_positive else ak.min(gfx.css_pixel_rect_right(&scrollable_overflow_rect), gfx.css_pixel_rect_right(&paintable_absolute_padding_box))
+    let bottom = gfx.css_pixel_rect_bottom(&scrollable_overflow_rect) if overflow_directions.y_positive else ak.min(gfx.css_pixel_rect_bottom(&scrollable_overflow_rect), gfx.css_pixel_rect_bottom(&paintable_absolute_padding_box))
+    if left != gfx.css_pixel_rect_x(&scrollable_overflow_rect) or top != gfx.css_pixel_rect_y(&scrollable_overflow_rect) or right != gfx.css_pixel_rect_right(&scrollable_overflow_rect) or bottom != gfx.css_pixel_rect_bottom(&scrollable_overflow_rect):
+        scrollable_overflow_rect = gfx.CssPixelRect(gfx.CssPixelPoint(left, top),
+                                                    gfx.CssPixelSize(ak.max(right.sub(left), layout_zero_px()), ak.max(bottom.sub(top), layout_zero_px())))
+        has_scrollable_overflow = not gfx.css_pixel_rect_contains_css_pixel_rect(&paintable_absolute_padding_box, scrollable_overflow_rect) and layout_node_with_style_is_scroll_container(box.layout_node_with_style())
+
+    paint_paintable_box_set_overflow_data(paintable_box, PaintPaintableBoxOverflowData(
+        scrollable_overflow_rect = scrollable_overflow_rect,
+        has_scrollable_overflow = has_scrollable_overflow,
+    ))
+
+    return scrollable_overflow_rect
+
+# mark: Relative positions and the paint tree ===================================================
+
+## Ported from Libraries/LibWeb/Layout/LayoutState.cpp:310 Web::Layout::LayoutState::resolve_relative_positions.
+pub func layout_state_resolve_relative_positions(this: LayoutState*):
+    # This function resolves relative position offsets of fragments that belong to inline paintables.
+    # It runs *after* the paint tree has been constructed, so it modifies paintable node & fragment offsets directly.
+    for used_values in layout_paged_store_for_each(&this.m_used_values_store):
+        let node = layout_state_used_values_node(used_values)
+
+        for paintable in ak.intrusive_list_begin(layout_node_paintables(node.layout_node())):
+            if not (is_paint_paintable_with_lines(paintable) and is_layout_inline_node(paint_paintable_layout_node(paintable))):
+                continue
+
+            let inline_paintable = (PaintPaintableWithLines*)paintable
+            let fragments = paint_paintable_with_lines_fragments(inline_paintable)
+            for fragment_index in 0..<ak.vector_size(fragments):
+                let fragment = ak.vector_at(fragments, fragment_index)
+                let fragment_node = paint_paintable_fragment_layout_node(fragment)
+                let fragment_parent = layout_node_parent(fragment_node) else trap("a fragment's node without a parent")
+                if not is_layout_node_with_style_and_box_model_metrics(fragment_parent):
+                    continue
+                # Collect effective relative position offset from inline-flow parent chain.
+                var offset = gfx.CssPixelPoint()
+                var ancestor_or_none: LayoutNodeWithStyle*? = layout_node_parent(fragment_node)
+                while let ancestor = ancestor_or_none:
+                    if not is_layout_node_with_style_and_box_model_metrics(ancestor):
+                        break
+                    let display = layout_node_display(ancestor.layout_node())
+                    if not css_display_is_inline_outside(&display) or not css_display_is_flow_inside(&display):
+                        break
+                    if css_computed_values_position(&layout_node_computed_values(ancestor.layout_node()).computed_values) == css_data.Positioning.relative:
+                        let ancestor_paintable = layout_node_first_paintable(ancestor.layout_node()) else trap("VERIFY: a relatively positioned ancestor without a paintable")
+                        let ancestor_node = as_paint_paintable_box(ancestor_paintable)
+                        let inset = paint_paintable_box_box_model(ancestor_node).inset
+                        gfx.css_pixel_point_translate_by_css_pixels_css_pixels(&offset, inset.left, inset.top)
+                    ancestor_or_none = layout_node_parent(ancestor.layout_node())
+                let fragment_offset = paint_paintable_fragment_offset(fragment)
+                paint_paintable_fragment_set_offset(fragment, gfx.css_pixel_point_translated_css_pixel_point(&fragment_offset, offset))
+
+## Ported from Libraries/LibWeb/Layout/LayoutState.cpp:346 Web::Layout::build_paint_tree.
+func layout_build_paint_tree(node: LayoutNode*, parent_paintable: PaintPaintable*? = none):
+    for paintable in ak.intrusive_list_begin(layout_node_paintables(node)):
+        if let parent = parent_paintable:
+            if not paint_paintable_forms_unconnected_subtree(paintable):
+                assert(tree_node_parent(paintable) == none)
+                tree_node_append_child(parent, paintable)
+        paint_paintable_set_dom_node(paintable, layout_node_dom_node(node))
+        if let dom_node = layout_node_dom_node(node):
+            dom_node_set_paintable(dom_node, paintable)
+    var child_or_none = tree_node_first_child(node)
+    while let child = child_or_none:
+        layout_build_paint_tree(child, layout_node_first_paintable(node))
+        child_or_none = tree_node_next_sibling(child)

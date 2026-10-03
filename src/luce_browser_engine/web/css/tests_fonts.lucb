@@ -19,8 +19,8 @@
 #       root), in a font database with a PathFontProvider over that directory and a FontPlugin in
 #       layout test mode (every generic family is SerenitySans, the symbol font Noto Emoji), as
 #       the oracle has them. The database, its typefaces and their fonts outlive the tests (the
-#       typefaces cache their fonts), so they and everything the font computations allocate come
-#       from the C heap (memory.heap), not from a test's VM heap or buffer.
+#       typefaces cache their fonts) and live in the C heap whatever allocator is current
+#       (DESIGN.md §3.3 rule 7); the tests compute fonts with their VM's heap current.
 #
 #==============================================================================================
 
@@ -33,34 +33,25 @@ let test_fonts_directory: str = "tests/libweb/fonts/"
 var test_fonts_installed: bool
 
 ## The font database of the tests: a PathFontProvider over tests/libweb/fonts, and a FontPlugin
-## in layout test mode, installed once per test run (in the C heap). The plugin is built as
-## FontPlugin's constructor builds it for a provider that is not a PathFontProvider (the oracle's
-## provider), which loads no system font directories.
+## in layout test mode, installed once per test run. The plugin is built as FontPlugin's
+## constructor builds it for a provider that is not a PathFontProvider (the oracle's provider),
+## which loads no system font directories; as an embedder does, the test makes it in the C heap.
 func test_fonts_setup():
     if test_fonts_installed:
         return
-    # The font files' bytes are atomic storage, which ak takes from the newest VM's heap when one
-    # exists; the fonts outlive every test VM, so they come from the C heap too.
-    let atomic_allocator = ak.atomic_allocator
-    ak.atomic_allocator = none
-    defer test_fonts_restore_atomic_allocator(atomic_allocator)
+    let provider = web_fonts.path_font_provider_create()
+    discard(web_fonts.font_database_install_system_font_provider(web_fonts.font_database_the(), (web_fonts.SystemFontProvider*)provider))
+    web_fonts.path_font_provider_load_all_fonts_from_uri(provider, ak.sv("file://tests/libweb/fonts"))
+
+    let plugin = (new PlatformFontPlugin(m_default_fixed_width_font = none, m_is_layout_test_mode = true) in memory.heap) else trap("out of memory")
+    platform_font_plugin_update_generic_fonts(plugin)
+    let default_fixed_width_font_name = platform_font_plugin_generic_font_name(plugin, PlatformGenericFont.ui_monospace, 400, 0)
+    plugin.m_default_fixed_width_font = web_fonts.font_database_get(web_fonts.font_database_the(), default_fixed_width_font_name, 12.0, 400, (u32)web_fonts.FontWidth.normal, 0)
+    assert(plugin.m_default_fixed_width_font != none)
     with memory.heap:
-        let provider = web_fonts.path_font_provider_create()
-        discard(web_fonts.font_database_install_system_font_provider(web_fonts.font_database_the(), (web_fonts.SystemFontProvider*)provider))
-        web_fonts.path_font_provider_load_all_fonts_from_uri(provider, ak.sv("file://tests/libweb/fonts"))
-
-        let plugin = new PlatformFontPlugin(m_default_fixed_width_font = none, m_is_layout_test_mode = true) else trap("out of memory")
-        platform_font_plugin_update_generic_fonts(plugin)
-        let default_fixed_width_font_name = platform_font_plugin_generic_font_name(plugin, PlatformGenericFont.ui_monospace, 400, 0)
-        plugin.m_default_fixed_width_font = web_fonts.font_database_get(web_fonts.font_database_the(), default_fixed_width_font_name, 12.0, 400, (u32)web_fonts.FontWidth.normal, 0)
-        assert(plugin.m_default_fixed_width_font != none)
         ak.vector_append_t(&plugin.m_symbol_font_names, ak.fly_string_from_str("Noto Emoji"))
-        platform_font_plugin_install(plugin)
+    platform_font_plugin_install(plugin)
     test_fonts_installed = true
-
-## The end of test_fonts_setup's C-heap atomic storage.
-func test_fonts_restore_atomic_allocator(allocator: memory.Allocator?):
-    ak.atomic_allocator = allocator
 
 ## The bytes of a test file.
 func test_fonts_read(name: str) -> ak.ByteBuffer:
@@ -90,21 +81,6 @@ func test_fonts_face(realm: Realm*) -> CssFontFace*:
     let font_face = realm_create_css_font_face(realm, realm, idl_create_promise(realm))
     discard(vm_pop_execution_context(vm))
     return font_face
-
-## The fonts the font database makes while a test runs (Typeface::font's cache) are managed
-## memory that only the database, in the C heap, refers to, and the font tests' allocations run
-## in the C heap: no collection runs during a font test. The heap defers collecting until
-## test_fonts_end_deferral, which drops the collection the deferral would run at its end
-## (destroying the VM collects everything without tracing). (The documents and pages are in the
-## heap and can be traced: page/tests_page.)
-func test_fonts_defer_collections(realm: Realm*):
-    gc.heap_defer_gc(realm_heap(realm))
-
-## The end of test_fonts_defer_collections.
-func test_fonts_end_deferral(realm: Realm*):
-    let heap = realm_heap(realm)
-    heap.m_should_gc_when_deferral_ends = false
-    gc.heap_undefer_gc(heap)
 
 # mark: Printing ================================================================================
 
@@ -593,9 +569,8 @@ test "the CSS font cases match the reference build":
     test_fonts_setup()
     let (vm, realm) = web_test_create_vm_and_settings_realm()
     defer web_test_destroy_vm(vm)
-    test_fonts_defer_collections(realm)
-    defer test_fonts_end_deferral(realm)
-    with memory.heap:
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
         var failures = 0
         for test_case in &test_fonts_cases:
             let actual = test_fonts_run(realm, test_case)

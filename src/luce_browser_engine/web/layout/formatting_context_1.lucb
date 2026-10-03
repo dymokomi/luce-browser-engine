@@ -1,0 +1,497 @@
+#==============================================================================================
+#
+#   formatting_context_1 - Layout::FormattingContext: construction, the independent formatting
+#                          contexts boxes create, inside layout and automatic heights
+#
+#   DESCRIPTION:
+#       Port of LibWeb/Layout/FormattingContext.cpp (lines 1-42 and 200-542) and the inline
+#       members of FormattingContext.h: the constructor, the ReplacedFormattingContext and
+#       DummyFormattingContext hacks, create_independent_formatting_context(_if_needed),
+#       layout_inside, greatest_child_width, the physical width of a line box, shrink-to-fit
+#       widths, the replaced size constraint table, automatic heights of absolutely positioned
+#       boxes and of block formatting context roots, and the table wrapper's width and height.
+#       (FormattingContext.cpp's lines 44-198, which formatting context a box creates, were
+#       taken ahead by region r43: formatting_context_box_types.)
+#
+#       A formatting context is not a cell: C++ owns it through OwnPtr (`make<T>(...)`), here
+#       it lives in managed memory. Its virtual destructor matters only for a
+#       BlockFormattingContext, whose ~BlockFormattingContext lays out absolutely positioned
+#       children its parent never asked for; layout_formatting_context_destruct runs it where
+#       C++ destroys an owning pointer (callers `defer` it).
+#
+#       Copyright (c) 2020-2022, Andreas Kling <andreas@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Construction and destruction ============================================================
+
+## Ported from Libraries/LibWeb/Layout/FormattingContext.h:19 Web::Layout::css_clamp.
+# NOTE: We use a custom clamping function here instead of AK::clamp(), since the AK version
+#       will VERIFY(max >= min) and CSS explicitly allows that (see css-values-4.)
+pub func layout_css_clamp[T: luce.Comparable](value: T, min: T, max: T) -> T:
+    return ak.max(min, ak.min(value, max))
+
+## Gives a formatting context the dynamic type of `class_info` (the C++ vptr a constructor sets).
+pub func layout_formatting_context_set_class(this: LayoutFormattingContext*, class_info: const ak.ClassInfo*):
+    this.vtable = (const LayoutFormattingContextVTable*)class_info.vtable
+    this.class_id = class_info.first_id
+
+## `make<T>(...)`'s storage for a formatting context: zeroed, which is what default-constructing its
+## members (empty Vectors and Optionals, null pointers) gives before its constructor runs.
+pub func layout_make_formatting_context_storage[T]() -> T*:
+    let storage = alloc T[1] else trap("out of memory")
+    memory.set(u8[]((u8*)storage.data, sizeof(T)), 0)
+    return &storage[0]
+
+## Ported from Libraries/LibWeb/Layout/FormattingContext.cpp:32 Web::Layout::FormattingContext::FormattingContext.
+pub func layout_formatting_context_construct(this: LayoutFormattingContext*, type_: LayoutFormattingContextType, layout_mode: LayoutMode, state: LayoutState*, context_box: LayoutBox*, parent: LayoutFormattingContext*? = none):
+    layout_formatting_context_set_class(this, &layout_formatting_context_class)
+    this.m_type = type_
+    this.m_layout_mode = layout_mode
+    this.m_parent = parent
+    this.m_context_box = context_box
+    this.m_state = state
+
+## Ported from Libraries/LibWeb/Layout/FormattingContext.cpp:41 Web::Layout::FormattingContext::~FormattingContext: the
+## virtual destructor an OwnPtr<FormattingContext> runs when it goes out of scope. Only BlockFormattingContext's does
+## something; a null pointer is an empty OwnPtr.
+pub func layout_formatting_context_destruct(this: LayoutFormattingContext*?):
+    let context = this else return
+    if let block_formatting_context = as_if_layout_block_formatting_context(context):
+        layout_block_formatting_context_destruct(block_formatting_context)
+
+# mark: The formatting context's members ========================================================
+
+## Ported from Libraries/LibWeb/Layout/FormattingContext.h:103 Web::Layout::FormattingContext::run (virtual).
+pub func layout_formatting_context_run_impl(this: LayoutFormattingContext*, arg0: LayoutAvailableSpace):
+    trap("pure virtual: Web::Layout::FormattingContext::run")
+
+## Ported from Libraries/LibWeb/Layout/FormattingContext.h:106 Web::Layout::FormattingContext::automatic_content_width (virtual).
+# These functions return the automatic content dimensions of the context's root box.
+pub func layout_formatting_context_automatic_content_width_impl(this: LayoutFormattingContext*) -> gfx.CssPixels:
+    trap("pure virtual: Web::Layout::FormattingContext::automatic_content_width")
+
+## Ported from Libraries/LibWeb/Layout/FormattingContext.h:107 Web::Layout::FormattingContext::automatic_content_height (virtual).
+pub func layout_formatting_context_automatic_content_height_impl(this: LayoutFormattingContext*) -> gfx.CssPixels:
+    trap("pure virtual: Web::Layout::FormattingContext::automatic_content_height")
+
+## Ported from Libraries/LibWeb/Layout/FormattingContext.h:109 Web::Layout::FormattingContext::context_box.
+pub func layout_formatting_context_context_box(this: LayoutFormattingContext*) -> LayoutBox*:
+    return this.m_context_box
+
+## Ported from Libraries/LibWeb/Layout/FormattingContext.h:111 Web::Layout::FormattingContext::parent.
+pub func layout_formatting_context_parent(this: LayoutFormattingContext*) -> LayoutFormattingContext*?:
+    return this.m_parent
+
+## Ported from Libraries/LibWeb/Layout/FormattingContext.h:112 Web::Layout::FormattingContext::parent.
+pub func layout_formatting_context_parent_const(this: LayoutFormattingContext*) -> LayoutFormattingContext*?:
+    return this.m_parent
+
+## Ported from Libraries/LibWeb/Layout/FormattingContext.h:114 Web::Layout::FormattingContext::type.
+pub func layout_formatting_context_type(this: LayoutFormattingContext*) -> LayoutFormattingContextType:
+    return this.m_type
+
+## Ported from Libraries/LibWeb/Layout/FormattingContext.h:116 Web::Layout::FormattingContext::inhibits_floating (virtual).
+pub func layout_formatting_context_inhibits_floating_impl(this: LayoutFormattingContext*) -> bool:
+    discard(this)
+    return false
+
+## Ported from Libraries/LibWeb/Layout/FormattingContext.h:131 Web::Layout::FormattingContext::parent_context_did_dimension_child_root_box (virtual).
+pub func layout_formatting_context_parent_context_did_dimension_child_root_box_impl(this: LayoutFormattingContext*):
+    discard(this)
+
+# mark: ReplacedFormattingContext and DummyFormattingContext ====================================
+
+# FIXME: This is a hack. Get rid of it.
+
+## Ported from Libraries/LibWeb/Layout/FormattingContext.cpp:202 Web::Layout::ReplacedFormattingContext::ReplacedFormattingContext.
+pub func layout_replaced_formatting_context_construct(this: LayoutReplacedFormattingContext*, state: LayoutState*, layout_mode: LayoutMode, box: LayoutBox*):
+    layout_formatting_context_construct(this.layout_formatting_context(), LayoutFormattingContextType.internal_replaced, layout_mode, state, box)
+    layout_formatting_context_set_class(this.layout_formatting_context(), &layout_replaced_formatting_context_class)
+
+## Ported from Libraries/LibWeb/Layout/FormattingContext.cpp:206 Web::Layout::ReplacedFormattingContext::automatic_content_width (override).
+pub func layout_replaced_formatting_context_automatic_content_width_impl(base: LayoutFormattingContext*) -> gfx.CssPixels:
+    discard(base)
+    return layout_zero_px()
+
+## Ported from Libraries/LibWeb/Layout/FormattingContext.cpp:207 Web::Layout::ReplacedFormattingContext::automatic_content_height (override).
+pub func layout_replaced_formatting_context_automatic_content_height_impl(base: LayoutFormattingContext*) -> gfx.CssPixels:
+    discard(base)
+    return layout_zero_px()
+
+## Ported from Libraries/LibWeb/Layout/FormattingContext.cpp:208 Web::Layout::ReplacedFormattingContext::run (override).
+pub func layout_replaced_formatting_context_run_impl(base: LayoutFormattingContext*, arg0: LayoutAvailableSpace):
+    discard(base)
+
+# FIXME: This is a hack. Get rid of it.
+
+## Ported from Libraries/LibWeb/Layout/FormattingContext.cpp:213 Web::Layout::DummyFormattingContext::DummyFormattingContext.
+pub func layout_dummy_formatting_context_construct(this: LayoutDummyFormattingContext*, state: LayoutState*, layout_mode: LayoutMode, box: LayoutBox*):
+    layout_formatting_context_construct(this.layout_formatting_context(), LayoutFormattingContextType.internal_dummy, layout_mode, state, box)
+    layout_formatting_context_set_class(this.layout_formatting_context(), &layout_dummy_formatting_context_class)
+
+## Ported from Libraries/LibWeb/Layout/FormattingContext.cpp:217 Web::Layout::DummyFormattingContext::automatic_content_width (override).
+pub func layout_dummy_formatting_context_automatic_content_width_impl(base: LayoutFormattingContext*) -> gfx.CssPixels:
+    discard(base)
+    return layout_zero_px()
+
+## Ported from Libraries/LibWeb/Layout/FormattingContext.cpp:218 Web::Layout::DummyFormattingContext::automatic_content_height (override).
+pub func layout_dummy_formatting_context_automatic_content_height_impl(base: LayoutFormattingContext*) -> gfx.CssPixels:
+    discard(base)
+    return layout_zero_px()
+
+## Ported from Libraries/LibWeb/Layout/FormattingContext.cpp:219 Web::Layout::DummyFormattingContext::run (override).
+pub func layout_dummy_formatting_context_run_impl(base: LayoutFormattingContext*, arg0: LayoutAvailableSpace):
+    discard(base)
+
+# mark: Independent formatting contexts =========================================================
+
+## `make<BlockFormattingContext>(state, layout_mode, root, parent)`.
+pub func layout_make_block_formatting_context(state: LayoutState*, layout_mode: LayoutMode, root: LayoutBlockContainer*, parent: LayoutFormattingContext*?) -> LayoutBlockFormattingContext*:
+    let context = layout_make_formatting_context_storage[LayoutBlockFormattingContext]()
+    layout_block_formatting_context_construct(context, state, layout_mode, root, parent)
+    return context
+
+## `make<DummyFormattingContext>(state, layout_mode, box)`.
+func layout_make_dummy_formatting_context(state: LayoutState*, layout_mode: LayoutMode, box: LayoutBox*) -> LayoutFormattingContext*:
+    let context = layout_make_formatting_context_storage[LayoutDummyFormattingContext]()
+    layout_dummy_formatting_context_construct(context, state, layout_mode, box)
+    return context.layout_formatting_context()
+
+## Ported from Libraries/LibWeb/Layout/FormattingContext.cpp:222 Web::Layout::FormattingContext::create_independent_formatting_context_if_needed.
+pub func layout_formatting_context_create_independent_formatting_context_if_needed(this: LayoutFormattingContext*, state: LayoutState*, layout_mode: LayoutMode, child_box: LayoutBox*) -> LayoutFormattingContext*?:
+    let type_ = layout_formatting_context_formatting_context_type_created_by_box(child_box) else return none
+
+    match type_:
+        .block:
+            return layout_make_block_formatting_context(state, layout_mode, as_layout_block_container(child_box), this).layout_formatting_context()
+        .svg:
+            let context = layout_make_formatting_context_storage[LayoutSvgFormattingContext]()
+            var parent_viewbox_transform: gfx.AffineTransform = ---
+            gfx.affine_transform_construct(&parent_viewbox_transform)
+            layout_svg_formatting_context_construct(context, state, layout_mode, child_box, this, parent_viewbox_transform)
+            return context.layout_formatting_context()
+        .flex:
+            let context = layout_make_formatting_context_storage[LayoutFlexFormattingContext]()
+            layout_flex_formatting_context_construct(context, state, layout_mode, child_box, this)
+            return context.layout_formatting_context()
+        .grid:
+            let context = layout_make_formatting_context_storage[LayoutGridFormattingContext]()
+            layout_grid_formatting_context_construct(context, state, layout_mode, child_box, this)
+            return context.layout_formatting_context()
+        .table:
+            let context = layout_make_formatting_context_storage[LayoutTableFormattingContext]()
+            layout_table_formatting_context_construct(context, state, layout_mode, child_box, this)
+            return context.layout_formatting_context()
+        .replaced_with_children:
+            let context = layout_make_formatting_context_storage[LayoutReplacedWithChildrenFormattingContext]()
+            layout_replaced_with_children_formatting_context_construct(context, state, layout_mode, child_box, this)
+            return context.layout_formatting_context()
+        .internal_replaced:
+            let context = layout_make_formatting_context_storage[LayoutReplacedFormattingContext]()
+            layout_replaced_formatting_context_construct(context, state, layout_mode, child_box)
+            return context.layout_formatting_context()
+        .internal_dummy:
+            return layout_make_dummy_formatting_context(state, layout_mode, child_box)
+        .inline:
+            # IFC should always be created by a parent BFC directly.
+            trap("VERIFY_NOT_REACHED")
+        _:
+            trap("VERIFY_NOT_REACHED")
+
+## Ported from Libraries/LibWeb/Layout/FormattingContext.cpp:254 Web::Layout::FormattingContext::create_independent_formatting_context.
+pub func layout_formatting_context_create_independent_formatting_context(this: LayoutFormattingContext*, state: LayoutState*, layout_mode: LayoutMode, child_box: LayoutBox*) -> LayoutFormattingContext*:
+    if let context = layout_formatting_context_create_independent_formatting_context_if_needed(this, state, layout_mode, child_box):
+        return context
+
+    if let child_block_container = as_if_layout_block_container(child_box):
+        return layout_make_block_formatting_context(state, layout_mode, child_block_container, none).layout_formatting_context()
+
+    # HACK: Instead of crashing in scenarios that assume the formatting context can be created, create a dummy formatting context that does nothing.
+    ak.dbgln("FIXME: An independent formatting context was requested from a Box that does not have a formatting context type. A dummy formatting context will be created instead.")
+    return layout_make_dummy_formatting_context(state, layout_mode, child_box)
+
+## Ported from Libraries/LibWeb/Layout/FormattingContext.cpp:267 Web::Layout::FormattingContext::layout_inside.
+pub func layout_formatting_context_layout_inside(this: LayoutFormattingContext*, child_box: LayoutBox*, layout_mode: LayoutMode, available_space: LayoutAvailableSpace) -> LayoutFormattingContext*?:
+    # OPTIMIZATION: If we're doing intrinsic sizing and `child_box` has definite size in both axes,
+    #               we don't need to layout its insides. The size is resolvable without learning
+    #               the metrics of whatever's inside the box.
+    let used_values = layout_state_get(this.m_state, child_box.layout_node_with_style())
+    if layout_mode == LayoutMode.intrinsic_sizing and used_values.width_constraint == LayoutSizeConstraint.none_ and used_values.height_constraint == LayoutSizeConstraint.none_ and layout_state_used_values_has_definite_width(used_values) and layout_state_used_values_has_definite_height(used_values):
+        return none
+
+    if not layout_node_can_have_children(child_box.layout_node()):
+        return none
+
+    let independent_formatting_context = layout_formatting_context_create_independent_formatting_context_if_needed(this, this.m_state, layout_mode, child_box)
+    if let context = independent_formatting_context:
+        layout_formatting_context_run(context, available_space)
+    else:
+        layout_formatting_context_run(this, available_space)
+
+    return independent_formatting_context
+
+# mark: Widths ==================================================================================
+
+## Ported from Libraries/LibWeb/Layout/FormattingContext.cpp:295 Web::Layout::FormattingContext::greatest_child_width (virtual).
+pub func layout_formatting_context_greatest_child_width_impl(this: LayoutFormattingContext*, box: LayoutBox*) -> gfx.CssPixels:
+    var max_width = layout_zero_px()
+    if layout_node_children_are_inline(box.layout_node()):
+        let line_boxes = &layout_state_get(this.m_state, box.layout_node_with_style()).line_boxes
+        for line_box in ak.vector_span_const(line_boxes):
+            max_width = ak.max(max_width, layout_formatting_context_line_box_physical_width(box, &line_box))
+    else:
+        for child_node in layout_node_children(box.layout_node()):
+            let child = as_if_layout_box(child_node) else continue
+            if not layout_node_is_absolutely_positioned(child.layout_node()):
+                max_width = ak.max(max_width, layout_state_used_values_margin_box_width(layout_state_get(this.m_state, child.layout_node_with_style())))
+    return max_width
+
+## Ported from Libraries/LibWeb/Layout/FormattingContext.cpp:311 Web::Layout::FormattingContext::line_box_physical_width.
+pub func layout_formatting_context_line_box_physical_width(box: LayoutBox*, line_box: const LayoutLineBox*) -> gfx.CssPixels:
+    if css_computed_values_writing_mode(&layout_node_computed_values(box.layout_node()).computed_values) == css_data.WritingMode.horizontal_tb:
+        return layout_line_box_width(line_box)
+
+    var leftmost_fragment_x = layout_zero_px()
+    var rightmost_fragment_x = layout_zero_px()
+    var saw_fragment = false
+    for fragment in ak.vector_span_const(&line_box.m_fragments):
+        let fragment_left = layout_line_box_fragment_offset(&fragment).m_x
+        let fragment_right = fragment_left.add(layout_line_box_fragment_width(&fragment))
+        leftmost_fragment_x = ak.min(leftmost_fragment_x, fragment_left) if saw_fragment else fragment_left
+        rightmost_fragment_x = ak.max(rightmost_fragment_x, fragment_right) if saw_fragment else fragment_right
+        saw_fragment = true
+
+    if not saw_fragment:
+        return layout_zero_px()
+
+    return rightmost_fragment_x.sub(leftmost_fragment_x)
+
+## Ported from Libraries/LibWeb/Layout/FormattingContext.cpp:333 Web::Layout::FormattingContext::calculate_shrink_to_fit_widths.
+pub func layout_formatting_context_calculate_shrink_to_fit_widths(this: LayoutFormattingContext*, box: LayoutBox*) -> LayoutFormattingContextShrinkToFitResult:
+    let preferred_width = layout_formatting_context_calculate_max_content_width(this, box)
+    let preferred_minimum_width = layout_formatting_context_calculate_min_content_width(this, box)
+    return LayoutFormattingContextShrinkToFitResult(preferred_width = preferred_width, preferred_minimum_width = preferred_minimum_width)
+
+## Ported from Libraries/LibWeb/Layout/FormattingContext.cpp:341 Web::Layout::FormattingContext::solve_replaced_size_constraint.
+pub func layout_formatting_context_solve_replaced_size_constraint(this: LayoutFormattingContext*, input_width: gfx.CssPixels, input_height: gfx.CssPixels, box: LayoutBox*, available_space: LayoutAvailableSpace) -> gfx.CssPixelSize:
+    # 10.4 Minimum and maximum widths: 'min-width' and 'max-width'
+    # https://www.w3.org/TR/CSS22/visudet.html#min-max-widths
+
+    let computed_values = &layout_node_computed_values(box.layout_node()).computed_values
+    let computed_min_width = css_computed_values_min_width(computed_values)
+    let computed_max_width = css_computed_values_max_width(computed_values)
+    let computed_min_height = css_computed_values_min_height(computed_values)
+    let computed_max_height = css_computed_values_max_height(computed_values)
+
+    let min_width = layout_zero_px() if css_size_is_auto(&computed_min_width) else layout_formatting_context_calculate_inner_width(this, box, available_space.width, computed_min_width)
+    let specified_max_width = input_width if layout_formatting_context_should_treat_max_width_as_none(this, box, available_space.width) else layout_formatting_context_calculate_inner_width(this, box, available_space.width, computed_max_width)
+    let max_width = ak.max(min_width, specified_max_width)
+
+    let min_height = layout_zero_px() if css_size_is_auto(&computed_min_height) else layout_formatting_context_calculate_inner_height(this, box, available_space, computed_min_height)
+    let specified_max_height = input_height if layout_formatting_context_should_treat_max_height_as_none(this, box, available_space.height) else layout_formatting_context_calculate_inner_height(this, box, available_space, computed_max_height)
+    let max_height = ak.max(min_height, specified_max_height)
+
+    let aspect_ratio = layout_box_preferred_aspect_ratio(box) else trap("solve_replaced_size_constraint without a preferred aspect ratio")
+
+    # These are from the "Constraint Violation" table in spec, but reordered so that each condition is
+    # interpreted as mutually exclusive to any other.
+    if input_width.lt(min_width) and input_height.gt(max_height):
+        return gfx.CssPixelSize(min_width, max_height)
+    if input_width.gt(max_width) and input_height.lt(min_height):
+        return gfx.CssPixelSize(max_width, min_height)
+
+    let zero = layout_zero_px()
+    if input_width.gt(zero) and input_height.gt(zero):
+        let max_width_ratio = max_width.div(input_width)
+        let max_height_ratio = max_height.div(input_height)
+        let min_width_ratio = min_width.div(input_width)
+        let min_height_ratio = min_height.div(input_height)
+        if input_width.gt(max_width) and input_height.gt(max_height) and gfx.css_pixel_fraction_cmp_css_pixel_fraction(&max_width_ratio, max_height_ratio) <= 0:
+            return gfx.CssPixelSize(max_width, ak.max(min_height, max_width.div_fraction(aspect_ratio)))
+        if input_width.gt(max_width) and input_height.gt(max_height) and gfx.css_pixel_fraction_cmp_css_pixel_fraction(&max_width_ratio, max_height_ratio) > 0:
+            return gfx.CssPixelSize(ak.max(min_width, max_height.mul_fraction(aspect_ratio)), max_height)
+        if input_width.lt(min_width) and input_height.lt(min_height) and gfx.css_pixel_fraction_cmp_css_pixel_fraction(&min_width_ratio, min_height_ratio) <= 0:
+            return gfx.CssPixelSize(ak.min(max_width, min_height.mul_fraction(aspect_ratio)), min_height)
+        if input_width.lt(min_width) and input_height.lt(min_height) and gfx.css_pixel_fraction_cmp_css_pixel_fraction(&min_width_ratio, min_height_ratio) > 0:
+            return gfx.CssPixelSize(min_width, ak.min(max_height, min_width.div_fraction(aspect_ratio)))
+
+    if input_width.gt(max_width):
+        return gfx.CssPixelSize(max_width, ak.max(max_width.div_fraction(aspect_ratio), min_height))
+    if input_width.lt(min_width):
+        return gfx.CssPixelSize(min_width, ak.min(min_width.div_fraction(aspect_ratio), max_height))
+    if input_height.gt(max_height):
+        return gfx.CssPixelSize(ak.max(max_height.mul_fraction(aspect_ratio), min_width), max_height)
+    if input_height.lt(min_height):
+        return gfx.CssPixelSize(ak.min(min_height.mul_fraction(aspect_ratio), max_width), min_height)
+
+    return gfx.CssPixelSize(input_width, input_height)
+
+# mark: Automatic heights =======================================================================
+
+## Ported from Libraries/LibWeb/Layout/FormattingContext.cpp:386 Web::Layout::FormattingContext::compute_auto_height_for_absolutely_positioned_element.
+pub func layout_formatting_context_compute_auto_height_for_absolutely_positioned_element(this: LayoutFormattingContext*, box: LayoutBox*, available_space: LayoutAvailableSpace, before_or_after_inside_layout: LayoutFormattingContextBeforeOrAfterInsideLayout) -> gfx.CssPixels?:
+    # NOTE: CSS 2.2 tells us to use the "auto height for block formatting context roots" here.
+    #       That's fine as long as the box is a BFC root.
+    if layout_formatting_context_creates_block_formatting_context(box):
+        if before_or_after_inside_layout == LayoutFormattingContextBeforeOrAfterInsideLayout.before:
+            return none
+        return layout_formatting_context_compute_auto_height_for_block_formatting_context_root(this, box)
+
+    # NOTE: For anything else, we use the fit-content height.
+    #       This should eventually be replaced by the new absolute positioning model:
+    #       https://www.w3.org/TR/css-position-3/#abspos-layout
+    let box_state = layout_state_get(this.m_state, box.layout_node_with_style())
+    return layout_formatting_context_calculate_fit_content_height(this, box, layout_state_used_values_available_inner_space_or_constraints_from(box_state, available_space))
+
+## Ported from Libraries/LibWeb/Layout/FormattingContext.cpp:403 Web::Layout::FormattingContext::compute_auto_height_for_block_formatting_context_root.
+# https://www.w3.org/TR/CSS22/visudet.html#root-height
+pub func layout_formatting_context_compute_auto_height_for_block_formatting_context_root(this: LayoutFormattingContext*, root: LayoutBox*) -> gfx.CssPixels:
+    # 10.6.7 'Auto' heights for block formatting context roots
+    var top: gfx.CssPixels? = none
+    var bottom: gfx.CssPixels? = none
+
+    if layout_node_children_are_inline(root.layout_node()):
+        # If it only has inline-level children, the height is the distance between
+        # the top content edge and the bottom of the bottommost line box.
+        let line_boxes = &layout_state_get(this.m_state, root.layout_node_with_style()).line_boxes
+        top = layout_zero_px()
+        if not ak.vector_is_empty(line_boxes):
+            bottom = layout_line_box_bottom(ak.vector_last_const(line_boxes))
+    else:
+        # If it has block-level children, the height is the distance between
+        # the top margin-edge of the topmost block-level child box
+        # and the bottom margin-edge of the bottommost block-level child box.
+
+        # NOTE: The top margin edge of the topmost block-level child box is the same as the top content edge of the root box.
+        top = layout_zero_px()
+
+        for child_node in layout_node_children(root.layout_node()):
+            let child_box = as_if_layout_box(child_node) else continue
+            # Absolutely positioned children are ignored,
+            # and relatively positioned boxes are considered without their offset.
+            # Note that the child box may be an anonymous block box.
+            if layout_node_is_absolutely_positioned(child_box.layout_node()):
+                continue
+
+            # FIXME: This doesn't look right.
+            if css_computed_values_overflow_y(&layout_node_computed_values(root.layout_node()).computed_values) == css_data.Overflow.visible and layout_node_is_floating(child_box.layout_node()):
+                continue
+
+            let child_box_state = layout_state_get(this.m_state, child_box.layout_node_with_style())
+
+            let child_box_bottom = child_box_state.offset.m_y.add(layout_state_used_values_content_height(child_box_state)).add(layout_state_used_values_margin_box_bottom(child_box_state))
+
+            if bottom == none or child_box_bottom.gt(bottom else trap("unreachable")):
+                bottom = child_box_bottom
+
+    # In addition, if the element has any floating descendants
+    # whose bottom margin edge is below the element's bottom content edge,
+    # then the height is increased to include those edges.
+    let floating_descendants = layout_state_used_values_floating_descendants(layout_state_get(this.m_state, root.layout_node_with_style()))
+    for floating_box_slot in ak.hash_table_begin((ak.HashTable[LayoutBox*, ak.PtrTraits[LayoutBox]]*)floating_descendants):
+        let floating_box = *floating_box_slot
+        # NOTE: Floating box coordinates are relative to their own containing block,
+        #       which may or may not be the BFC root.
+        let margin_box = layout_formatting_context_margin_box_rect_in_ancestor_coordinate_space_layout_box(this, floating_box, root)
+        let floating_box_bottom_margin_edge = gfx.css_pixel_rect_bottom(&margin_box)
+        if bottom == none or floating_box_bottom_margin_edge.gt(bottom else trap("unreachable")):
+            bottom = floating_box_bottom_margin_edge
+
+    return ak.max(gfx.CssPixels.from_f32(0.0), (bottom else layout_zero_px()).sub(top else layout_zero_px()))
+
+# mark: Table wrappers ==========================================================================
+
+## The `for_each_in_subtree_of_type<Box>` search of the table wrapper functions: the first box below `box` whose
+## display is table-inside.
+func layout_formatting_context_table_box_inside_table_wrapper(box: LayoutBox*) -> LayoutBox*?:
+    for node in layout_node_subtree(box.layout_node()):
+        let child_box = as_if_layout_box(node) else continue
+        let display = layout_node_display(child_box.layout_node())
+        if css_display_is_table_inside(&display):
+            return child_box
+    return none
+
+## Ported from Libraries/LibWeb/Layout/FormattingContext.cpp:463 Web::Layout::FormattingContext::compute_table_box_width_inside_table_wrapper.
+# 17.5.2 Table width algorithms: the 'table-layout' property
+# https://www.w3.org/TR/CSS22/tables.html#width-layout
+pub func layout_formatting_context_compute_table_box_width_inside_table_wrapper(this: LayoutFormattingContext*, box: LayoutBox*, available_space: LayoutAvailableSpace) -> gfx.CssPixels:
+    # Table wrapper width should be equal to width of table box it contains
+
+    let computed_values = &layout_node_computed_values(box.layout_node()).computed_values
+
+    let width_of_containing_block = layout_available_size_to_px_or_zero(&available_space.width)
+
+    # If 'margin-left', or 'margin-right' are computed as 'auto', their used value is '0'.
+    let margin = css_computed_values_margin(computed_values)
+    let computed_margin_left = css_length_box_left_const(&margin)
+    let computed_margin_right = css_length_box_right_const(&margin)
+    let margin_left = css_length_percentage_or_auto_to_px_or_zero(&computed_margin_left, box.layout_node(), width_of_containing_block)
+    let margin_right = css_length_percentage_or_auto_to_px_or_zero(&computed_margin_right, box.layout_node(), width_of_containing_block)
+
+    # table-wrapper can't have borders or paddings but it might have margin taken from table-root.
+    let available_width = width_of_containing_block.sub(margin_left).sub(margin_right)
+
+    let table_box = layout_formatting_context_table_box_inside_table_wrapper(box) else trap("VERIFY: a table wrapper without a table box")
+
+    var throwaway_state: LayoutState
+    layout_state_construct(&throwaway_state, box.layout_node_with_style())
+    let containing_block = layout_node_containing_block(box.layout_node()) else trap("a table wrapper without a containing block")
+    discard(layout_state_populate_node_from(&throwaway_state, this.m_state, containing_block.layout_node_with_style()))
+
+    let table_box_state = layout_state_get_mutable(&throwaway_state, table_box.layout_node_with_style())
+    let table_box_computed_values = &layout_node_computed_values(table_box.layout_node()).computed_values
+    let table_padding = css_computed_values_padding(table_box_computed_values)
+    let table_padding_left = css_length_box_left_const(&table_padding)
+    let table_padding_right = css_length_box_right_const(&table_padding)
+    table_box_state.border_left = css_computed_values_border_left(table_box_computed_values).width
+    table_box_state.border_right = css_computed_values_border_right(table_box_computed_values).width
+    table_box_state.padding_left = css_length_percentage_or_auto_to_px_or_zero(&table_padding_left, table_box.layout_node(), width_of_containing_block)
+    table_box_state.padding_right = css_length_percentage_or_auto_to_px_or_zero(&table_padding_right, table_box.layout_node(), width_of_containing_block)
+
+    let context = layout_make_formatting_context_storage[LayoutTableFormattingContext]()
+    layout_table_formatting_context_construct(context, &throwaway_state, LayoutMode.intrinsic_sizing, table_box, this)
+    let actual_table_box_state = layout_state_get(this.m_state, table_box.layout_node_with_style())
+    layout_table_formatting_context_run_until_width_calculation(context, layout_state_used_values_available_inner_space_or_constraints_from(actual_table_box_state, available_space))
+
+    let table_used_width = layout_state_used_values_border_box_width(layout_state_get(&throwaway_state, table_box.layout_node_with_style()))
+    return ak.min(table_used_width, available_width) if layout_available_size_is_definite(&available_space.width) else table_used_width
+
+## Ported from Libraries/LibWeb/Layout/FormattingContext.cpp:507 Web::Layout::FormattingContext::compute_table_box_height_inside_table_wrapper.
+# 17.5.3 Table height algorithms
+# https://www.w3.org/TR/CSS22/tables.html#height-layout
+pub func layout_formatting_context_compute_table_box_height_inside_table_wrapper(this: LayoutFormattingContext*, box: LayoutBox*, available_space: LayoutAvailableSpace) -> gfx.CssPixels:
+    # Table wrapper height should be equal to height of table box it contains
+
+    let computed_values = &layout_node_computed_values(box.layout_node()).computed_values
+
+    let width_of_containing_block = layout_available_size_to_px_or_zero(&available_space.width)
+    let height_of_containing_block = layout_available_size_to_px_or_zero(&available_space.height)
+
+    # If 'margin-top', or 'margin-bottom' are computed as 'auto', their used value is '0'.
+    let margin = css_computed_values_margin(computed_values)
+    let computed_margin_top = css_length_box_top_const(&margin)
+    let computed_margin_bottom = css_length_box_bottom_const(&margin)
+    let resolved_margin_top = css_length_percentage_or_auto_resolved_or_auto(&computed_margin_top, box.layout_node(), width_of_containing_block)
+    let resolved_margin_bottom = css_length_percentage_or_auto_resolved_or_auto(&computed_margin_bottom, box.layout_node(), width_of_containing_block)
+    let margin_top = css_length_or_auto_to_px_or_zero(&resolved_margin_top, box.layout_node())
+    let margin_bottom = css_length_or_auto_to_px_or_zero(&resolved_margin_bottom, box.layout_node())
+
+    # table-wrapper can't have borders or paddings but it might have margin taken from table-root.
+    let available_height = height_of_containing_block.sub(margin_top).sub(margin_bottom)
+
+    var throwaway_state: LayoutState
+    layout_state_construct(&throwaway_state, box.layout_node_with_style())
+    let containing_block = layout_node_containing_block(box.layout_node()) else trap("a table wrapper without a containing block")
+    discard(layout_state_populate_node_from(&throwaway_state, this.m_state, containing_block.layout_node_with_style()))
+
+    let context = layout_formatting_context_create_independent_formatting_context_if_needed(this, &throwaway_state, LayoutMode.intrinsic_sizing, box) else trap("VERIFY: a table wrapper creates no formatting context")
+    defer layout_formatting_context_destruct(context)
+    let box_state = layout_state_get(this.m_state, box.layout_node_with_style())
+    layout_formatting_context_run(context, layout_state_used_values_available_inner_space_or_constraints_from(box_state, available_space))
+
+    let table_box = layout_formatting_context_table_box_inside_table_wrapper(box) else trap("VERIFY: a table wrapper without a table box")
+
+    let table_used_height = layout_state_used_values_border_box_height(layout_state_get(&throwaway_state, table_box.layout_node_with_style()))
+    return ak.min(table_used_height, available_height) if layout_available_size_is_definite(&available_space.height) else table_used_height

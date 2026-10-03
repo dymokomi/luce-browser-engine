@@ -1,0 +1,613 @@
+#==============================================================================================
+#
+#   layout_state_3 - Layout::LayoutState::commit and LayoutState::UsedValues: committing used
+#                    values to paintables, definite sizes and the available inner space
+#
+#   DESCRIPTION:
+#       Port of LibWeb/Layout/LayoutState.cpp (lines 362-949): commit (paintables made or
+#       reused for every laid-out node, their box model metrics, offsets and fragments, the paint
+#       tree, inline paintables' sizes, scrollable overflow and sticky insets), UsedValues'
+#       copy assignment, set_node (which decides definite sizes before layout),
+#       materialize_from_paintable, the content size setters and the available inner space.
+#
+#       Copyright (c) 2022-2024, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2024, Sam Atkins <atkinssj@serenityos.org>
+#       Copyright (c) 2024, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: commit ==================================================================================
+
+## The `transfer_box_model_metrics` lambda of LayoutState::commit.
+func layout_state_commit_transfer_box_model_metrics(box_model: PaintBoxModelMetrics*, used_values: const LayoutStateUsedValues*):
+    box_model.inset = PaintPixelBox(top = used_values.inset_top, right = used_values.inset_right, bottom = used_values.inset_bottom, left = used_values.inset_left)
+    box_model.padding = PaintPixelBox(top = used_values.padding_top, right = used_values.padding_right, bottom = used_values.padding_bottom, left = used_values.padding_left)
+    box_model.border = PaintPixelBox(top = used_values.border_top, right = used_values.border_right, bottom = used_values.border_bottom, left = used_values.border_left)
+    box_model.margin = PaintPixelBox(top = used_values.margin_top, right = used_values.margin_right, bottom = used_values.margin_bottom, left = used_values.margin_left)
+
+## The `try_to_relocate_fragment_in_inline_node` lambda of LayoutState::commit.
+func layout_state_commit_try_to_relocate_fragment_in_inline_node(this: LayoutState*, inline_node_paintables: ak.HashTable[PaintPaintableWithLines*, ak.PtrTraits[PaintPaintableWithLines]]*, fragment: const LayoutLineBoxFragment*, line_index: usize) -> bool:
+    var parent_or_none = layout_node_parent(layout_line_box_fragment_layout_node(fragment))
+    while let parent = parent_or_none:
+        if layout_node_is_atomic_inline(parent.layout_node()):
+            break
+        if is_layout_inline_node(parent):
+            let inline_node = (LayoutInlineNode*)parent
+            let line_paintable = layout_inline_node_create_paintable_for_line_with_index(inline_node, line_index) else trap("no paintable for the line")
+            paint_paintable_with_lines_add_fragment(line_paintable, *fragment)
+            if let used_values = layout_state_try_get_layout_node_with_style(this, inline_node.layout_node_with_style()):
+                layout_state_commit_transfer_box_model_metrics(paint_paintable_box_box_model(line_paintable.paint_paintable_box()), used_values)
+            if not ak.hash_table_contains_t(inline_node_paintables, line_paintable):
+                discard(ak.hash_table_set(inline_node_paintables, line_paintable))
+                layout_node_add_paintable(inline_node.layout_node(), line_paintable.paint_paintable())
+            return true
+        parent_or_none = layout_node_parent(parent.layout_node())
+    return false
+
+## Ported from Libraries/LibWeb/Layout/LayoutState.cpp:362 Web::Layout::LayoutState::commit.
+# Commits the used values produced by layout and builds a paintable tree.
+pub func layout_state_commit(this: LayoutState*, root: LayoutBox*):
+    var parent_paintable: PaintPaintable*? = none
+    if not layout_node_is_viewport(root.layout_node()):
+        if let root_paintable = layout_node_first_paintable(root.layout_node()):
+            if let existing = as_if_paint_paintable_box(root_paintable):
+                parent_paintable = tree_node_parent(existing.paint_paintable())
+                if let parent = parent_paintable:
+                    tree_node_remove_child(parent, existing.paint_paintable())
+
+    # Cache existing paintables before clearing.
+    var paintable_cache: ak.HashMap[LayoutNode*, PaintPaintableBox*, ak.PtrTraits[LayoutNode]]
+    for node in layout_node_inclusive_subtree(root.layout_node()):
+        let first_paintable = layout_node_first_paintable(node) else continue
+        if let paintable_box = as_if_paint_paintable_box(first_paintable):
+            # InlineNodes are excluded because they can span multiple lines, with a separate
+            # InlinePaintable created for each line via create_paintable_for_line_with_index().
+            # This 1:N relationship between layout node and paintables, combined with the
+            # dynamic nature of fragment relocation, makes simple 1:1 caching inapplicable.
+            if not is_layout_inline_node(node):
+                discard(ak.hash_map_set(&paintable_cache, node, paintable_box))
+
+    # Go through the layout tree and detach all paintables. The layout tree should only point to the new paintable tree
+    # which we're about to build.
+    for node in layout_node_inclusive_subtree(root.layout_node()):
+        layout_node_clear_paintables(node)
+
+    # After this point, we should have a clean slate to build the new paint tree.
+
+    var inline_nodes: ak.HashTable[LayoutInlineNode*, ak.PtrTraits[LayoutInlineNode]]
+
+    for node in layout_node_inclusive_subtree(root.layout_node()):
+        if let dom_node = layout_node_dom_node(node):
+            dom_node_clear_paintable(dom_node)
+        if is_layout_inline_node(node) and layout_node_dom_node(node) != none:
+            # Inline nodes might have a continuation chain; add all inline nodes that are part of it.
+            var inline_node_or_none: LayoutNodeWithStyleAndBoxModelMetrics*? = (LayoutNodeWithStyleAndBoxModelMetrics*)node
+            while let inline_node = inline_node_or_none:
+                if is_layout_inline_node(inline_node):
+                    discard(ak.hash_table_set(&inline_nodes, (LayoutInlineNode*)inline_node))
+                inline_node_or_none = layout_node_with_style_and_box_model_metrics_continuation_of_node(inline_node)
+
+    var text_nodes: ak.HashTable[LayoutTextNode*, ak.PtrTraits[LayoutTextNode]]
+    var inline_node_paintables: ak.HashTable[PaintPaintableWithLines*, ak.PtrTraits[PaintPaintableWithLines]]
+
+    for used_values in layout_paged_store_for_each(&this.m_used_values_store):
+        let node = layout_state_used_values_node(used_values)
+
+        if let subtree_root = this.m_subtree_root:
+            if not tree_node_is_inclusive_ancestor_of(subtree_root.layout_node(), node.layout_node()):
+                continue
+
+        var paintable: PaintPaintable*? = none
+
+        # Try to reuse cached paintable for Box nodes
+        if let cached = ak.hash_map_get_k(&paintable_cache, node.layout_node()):
+            let cached_paintable = *cached
+            paint_paintable_box_reset_for_relayout(cached_paintable)
+            paintable = cached_paintable.paint_paintable()
+
+        # Fall back to creating new if no reusable paintable
+        if paintable == none:
+            paintable = layout_node_create_paintable(node.layout_node())
+
+        layout_node_add_paintable(node.layout_node(), paintable)
+
+        # For boxes, transfer all the state needed for painting.
+        let made_paintable = paintable else continue
+        let paintable_box = as_if_paint_paintable_box(made_paintable) else continue
+        layout_state_commit_transfer_box_model_metrics(paint_paintable_box_box_model(paintable_box), used_values)
+
+        paint_paintable_box_set_offset_css_pixel_point(paintable_box, used_values.offset)
+        paint_paintable_box_set_content_size_css_pixels(paintable_box, layout_state_used_values_content_width(used_values), layout_state_used_values_content_height(used_values))
+        if let override_borders_data = layout_state_used_values_override_borders_data(used_values):
+            paint_paintable_box_set_override_borders_data(paintable_box, override_borders_data)
+        if let table_cell_coordinates = layout_state_used_values_table_cell_coordinates(used_values):
+            paint_paintable_box_set_table_cell_coordinates(paintable_box, table_cell_coordinates)
+
+        if let paintable_with_lines = as_if_paint_paintable_with_lines(paintable_box):
+            for line_index in 0..<ak.vector_size(&used_values.line_boxes):
+                let line_box = ak.vector_at(&used_values.line_boxes, line_index)
+                let fragments = layout_line_box_fragments(line_box)
+                for fragment_index in 0..<ak.vector_size(fragments):
+                    let fragment = ak.vector_at(fragments, fragment_index)
+                    if layout_line_box_fragment_is_fully_truncated(fragment):
+                        continue
+                    if let text_node = as_if_layout_text_node(layout_line_box_fragment_layout_node(fragment)):
+                        discard(ak.hash_table_set(&text_nodes, text_node))
+                    let did_relocate_fragment = layout_state_commit_try_to_relocate_fragment_in_inline_node(this, &inline_node_paintables, fragment, line_index)
+                    if not did_relocate_fragment:
+                        paint_paintable_with_lines_add_fragment(paintable_with_lines, *fragment)
+
+        if let svg_graphics_paintable = as_if_paint_svg_graphics_paintable(made_paintable):
+            if let computed_svg_transforms = layout_state_used_values_computed_svg_transforms(used_values):
+                paint_svg_graphics_paintable_set_computed_transforms(svg_graphics_paintable, computed_svg_transforms)
+
+        if let svg_path_paintable = as_if_paint_svg_path_paintable(made_paintable):
+            if let path = layout_state_used_values_computed_svg_path(used_values):
+                paint_svg_path_paintable_set_computed_path(svg_path_paintable, *path)
+
+        let display = layout_node_display(node.layout_node())
+        if css_display_is_grid_inside(&display):
+            paint_paintable_box_set_used_values_for_grid_template_columns(paintable_box, layout_state_used_values_grid_template_columns(used_values))
+            paint_paintable_box_set_used_values_for_grid_template_rows(paintable_box, layout_state_used_values_grid_template_rows(used_values))
+
+    # Create paintables for inline nodes without fragments to make possible querying their geometry.
+    for inline_node_slot in ak.hash_table_begin(&inline_nodes):
+        let inline_node = *inline_node_slot
+        if layout_node_first_paintable(inline_node.layout_node()) != none:
+            continue
+
+        let line_paintable = layout_inline_node_create_paintable_for_line_with_index(inline_node, 0) else trap("no paintable for the line")
+        layout_node_add_paintable(inline_node.layout_node(), line_paintable.paint_paintable())
+        discard(ak.hash_table_set(&inline_node_paintables, line_paintable))
+        if let used_values = layout_state_try_get_layout_node_with_style(this, inline_node.layout_node_with_style()):
+            layout_state_commit_transfer_box_model_metrics(paint_paintable_box_box_model(line_paintable.paint_paintable_box()), used_values)
+
+    # Resolve relative positions for regular boxes (not line box fragments):
+    # NOTE: This needs to occur before fragments are transferred into the corresponding inline paintables, because
+    #       after this transfer, the containing_line_box_fragment will no longer be valid.
+    for used_values in layout_paged_store_for_each(&this.m_used_values_store):
+        let node = layout_state_used_values_node(used_values)
+
+        if not layout_node_is_box(node.layout_node()):
+            continue
+
+        let first_paintable = layout_node_first_paintable(node.layout_node()) else trap("as<PaintableBox>: a box without a paintable")
+        let paintable = as_paint_paintable_box(first_paintable)
+        var offset = gfx.CssPixelPoint()
+
+        if let containing_line_box_fragment = used_values.containing_line_box_fragment:
+            # Atomic inline case:
+            # We know that `node` is an atomic inline because `containing_line_box_fragments` refers to the
+            # line box fragment in the parent block container that contains it.
+            let containing_block = layout_node_containing_block(node.layout_node()) else trap("an atomic inline without a containing block")
+            let containing_block_used_values = layout_state_get(this, containing_block.layout_node_with_style())
+            let line_box = ak.vector_at_const(&containing_block_used_values.line_boxes, containing_line_box_fragment.line_box_index)
+            let fragment = ak.vector_at_const(&line_box.m_fragments, containing_line_box_fragment.fragment_index)
+
+            # The fragment has the final offset for the atomic inline, so we just need to copy it from there.
+            offset = layout_line_box_fragment_offset(fragment)
+        else:
+            # Not an atomic inline, much simpler case.
+            offset = used_values.offset
+
+        # Apply relative position inset if appropriate.
+        if css_computed_values_position(&layout_node_computed_values(node.layout_node()).computed_values) == css_data.Positioning.relative and is_layout_node_with_style_and_box_model_metrics(node):
+            let inset = paint_paintable_box_box_model(paintable).inset
+            gfx.css_pixel_point_translate_by_css_pixels_css_pixels(&offset, inset.left, inset.top)
+        paint_paintable_box_set_offset_css_pixel_point(paintable, offset)
+
+    for text_node_slot in ak.hash_table_begin(&text_nodes):
+        let text_node = *text_node_slot
+        layout_node_add_paintable(text_node.layout_node(), layout_node_create_paintable(text_node.layout_node()))
+
+    layout_build_paint_tree(root.layout_node(), parent_paintable)
+
+    layout_state_resolve_relative_positions(this)
+
+    # Measure size of paintables created for inline nodes.
+    for paintable_with_lines_slot in ak.hash_table_begin(&inline_node_paintables):
+        let paintable_with_lines = *paintable_with_lines_slot
+        if not is_layout_inline_node(paint_paintable_layout_node(paintable_with_lines.paint_paintable())):
+            continue
+
+        var offset: gfx.CssPixelPoint? = none
+        var size = gfx.CssPixelSize()
+        let line_index = paint_paintable_with_lines_line_index(paintable_with_lines)
+        for descendant in paint_paintable_inclusive_subtree(paintable_with_lines.paint_paintable()):
+            let paintable = as_if_paint_paintable_with_lines(descendant) else continue
+            if paint_paintable_with_lines_line_index(paintable) != line_index:
+                continue
+            if is_layout_block_container(paint_paintable_layout_node(paintable.paint_paintable())):
+                continue
+
+            let used_values = layout_state_try_get_layout_node_with_style(this, paint_paintable_box_layout_node_with_style_and_box_metrics(paintable.paint_paintable_box()).layout_node_with_style())
+            if paintable != paintable_with_lines:
+                if let values = used_values:
+                    gfx.css_pixel_size_set_width(&size, size.m_width.add(layout_state_used_values_margin_box_left(values)).add(layout_state_used_values_margin_box_right(values)))
+
+            let fragments = paint_paintable_with_lines_fragments(paintable)
+            if not ak.vector_is_empty(fragments):
+                let first_fragment_offset = paint_paintable_fragment_offset(ak.vector_first(fragments))
+                if offset == none or first_fragment_offset.m_x.lt((offset else trap("unreachable")).m_x):
+                    offset = first_fragment_offset
+                if (PaintPaintable*?)paintable.paint_paintable() == tree_node_first_child(paintable_with_lines.paint_paintable()):
+                    if let values = used_values:
+                        var moved = offset else trap("unreachable: the offset was just set")
+                        gfx.css_pixel_point_translate_by_css_pixels_css_pixels(&moved, layout_state_used_values_margin_box_left(values).neg(), layout_zero_px())
+                        offset = moved
+            for fragment_index in 0..<ak.vector_size(fragments):
+                gfx.css_pixel_size_set_width(&size, size.m_width.add(paint_paintable_fragment_width(ak.vector_at(fragments, fragment_index))))
+
+        let own_fragments = paint_paintable_with_lines_fragments(paintable_with_lines)
+        if let found_offset = offset:
+            var final_offset = found_offset
+            if not ak.vector_is_empty(own_fragments):
+                gfx.css_pixel_point_set_y(&final_offset, paint_paintable_fragment_offset(ak.vector_first(own_fragments)).m_y)
+
+            # FIXME: If this paintable does not have any fragment we do no know the y offset. It should be where text should
+            # start if there had been any for this node. Pick y offset of the leftmost fragment in the inclusive subtree in the meantime.
+            paint_paintable_box_set_offset_css_pixel_point(paintable_with_lines.paint_paintable_box(), final_offset)
+
+        if not ak.vector_is_empty(own_fragments):
+            for fragment_index in 0..<ak.vector_size(own_fragments):
+                gfx.css_pixel_size_set_height(&size, ak.max(size.m_height, paint_paintable_fragment_height(ak.vector_at(own_fragments, fragment_index))))
+        else:
+            gfx.css_pixel_size_set_height(&size, css_computed_values_line_height(&layout_node_computed_values(paint_paintable_layout_node(paintable_with_lines.paint_paintable())).computed_values))
+
+        paint_paintable_box_set_content_size_css_pixel_size(paintable_with_lines.paint_paintable_box(), size)
+
+    # Build a map from each containing block to the boxes it contains.
+    var contained_boxes_map: ak.HashMap[LayoutBox*, ak.Vector[LayoutBox*], ak.PtrTraits[LayoutBox]]
+    for used_values in layout_paged_store_for_each(&this.m_used_values_store):
+        let box = as_if_layout_box(layout_state_used_values_node(used_values)) else continue
+        if layout_box_paintable_box(box) == none:
+            continue
+        if let containing_block = layout_node_containing_block(box.layout_node()):
+            ak.vector_append_t(ak.hash_map_ensure(&contained_boxes_map, containing_block), box)
+
+    # Measure overflow in scroll containers.
+    for used_values in layout_paged_store_for_each(&this.m_used_values_store):
+        let box = as_if_layout_box(layout_state_used_values_node(used_values)) else continue
+        discard(layout_measure_scrollable_overflow(box, &contained_boxes_map))
+
+        # The scroll offset can become invalid if the scrollable overflow rectangle has changed after layout.
+        # For example, if the scroll container has been scrolled to the very end and is then resized to become larger
+        # (scrollable overflow rect become smaller), the scroll offset would be out of bounds.
+        let paintable_box = layout_box_paintable_box(box) else trap("a laid-out box without a paintable")
+        let scroll_offset = paint_paintable_box_scroll_offset(paintable_box)
+        if not gfx.css_pixel_point_is_zero(&scroll_offset):
+            discard(paint_paintable_box_set_scroll_offset(paintable_box, scroll_offset))
+
+    for used_values in layout_paged_store_for_each(&this.m_used_values_store):
+        let node = layout_state_used_values_node(used_values)
+        for paintable in ak.intrusive_list_begin(layout_node_paintables(node.layout_node())):
+            let paintable_box = as_if_paint_paintable_box(paintable) else continue
+
+            if layout_node_is_sticky_position(node.layout_node()):
+                # https://drafts.csswg.org/css-position/#insets
+                # For sticky positioned boxes, the inset is instead relative to the relevant scrollport’s size.
+                # Negative values are allowed.
+
+                let sticky_insets = (new display_list.StickyInsets) else trap("out of memory")
+                let inset = css_computed_values_inset(&layout_node_computed_values(node.layout_node()).computed_values)
+
+                var scrollport_size = gfx.CssPixelSize()
+                if let nearest_scrollable_ancestor = paint_paintable_box_nearest_scrollable_ancestor(paintable_box):
+                    let absolute_rect = paint_paintable_box_absolute_rect(nearest_scrollable_ancestor)
+                    scrollport_size = gfx.css_pixel_rect_size(&absolute_rect)
+
+                let top = css_length_box_top_const(&inset)
+                let right = css_length_box_right_const(&inset)
+                let bottom = css_length_box_bottom_const(&inset)
+                let left = css_length_box_left_const(&inset)
+                if not css_length_percentage_or_auto_is_auto(&top):
+                    sticky_insets.top = css_length_percentage_or_auto_to_px_or_zero(&top, node.layout_node(), scrollport_size.m_height)
+                if not css_length_percentage_or_auto_is_auto(&right):
+                    sticky_insets.right = css_length_percentage_or_auto_to_px_or_zero(&right, node.layout_node(), scrollport_size.m_width)
+                if not css_length_percentage_or_auto_is_auto(&bottom):
+                    sticky_insets.bottom = css_length_percentage_or_auto_to_px_or_zero(&bottom, node.layout_node(), scrollport_size.m_height)
+                if not css_length_percentage_or_auto_is_auto(&left):
+                    sticky_insets.left = css_length_percentage_or_auto_to_px_or_zero(&left, node.layout_node(), scrollport_size.m_width)
+                paint_paintable_box_set_sticky_insets(paintable_box, sticky_insets)
+
+# mark: UsedValues ==============================================================================
+
+## A copy of a LineBox: its fragments are copied too (Vector<LineBox>'s copy constructor copies each LineBox).
+func layout_state_used_values_clone_line_boxes(line_boxes: const ak.Vector[LayoutLineBox]*) -> ak.Vector[LayoutLineBox]:
+    var copy = ak.vector_clone(line_boxes)
+    for index in 0..<ak.vector_size(&copy):
+        let line_box = ak.vector_at(&copy, index)
+        line_box.m_fragments = ak.vector_clone(&line_box.m_fragments)
+    return copy
+
+## Ported from Libraries/LibWeb/Layout/LayoutState.cpp:670 Web::Layout::LayoutState::UsedValues::operator=.
+pub func layout_state_used_values_assign(this: LayoutStateUsedValues*, other: const LayoutStateUsedValues*):
+    if this == other:
+        return
+
+    this.offset = other.offset
+    this.width_constraint = other.width_constraint
+    this.height_constraint = other.height_constraint
+    this.margin_left = other.margin_left
+    this.margin_right = other.margin_right
+    this.margin_top = other.margin_top
+    this.margin_bottom = other.margin_bottom
+    this.border_left = other.border_left
+    this.border_right = other.border_right
+    this.border_top = other.border_top
+    this.border_bottom = other.border_bottom
+    this.padding_left = other.padding_left
+    this.padding_right = other.padding_right
+    this.padding_top = other.padding_top
+    this.padding_bottom = other.padding_bottom
+    this.inset_left = other.inset_left
+    this.inset_right = other.inset_right
+    this.inset_top = other.inset_top
+    this.inset_bottom = other.inset_bottom
+    this.line_boxes = layout_state_used_values_clone_line_boxes(&other.line_boxes)
+    this.containing_line_box_fragment = other.containing_line_box_fragment
+
+    this.m_node = other.m_node
+    this.m_containing_block_used_values = other.m_containing_block_used_values
+    this.m_cumulative_offset = other.m_cumulative_offset
+    this.m_content_width = other.m_content_width
+    this.m_content_height = other.m_content_height
+    this.m_has_definite_width = other.m_has_definite_width
+    this.m_has_definite_height = other.m_has_definite_height
+
+    if let other_rare = other.m_rare:
+        # make<RareData>(*other.m_rare): a copy of the rare data, its table and path copied.
+        let rare = (new LayoutStateUsedValuesRareData(
+            floating_descendants = ak.hash_table_clone(&other_rare.floating_descendants),
+            table_cell_coordinates = other_rare.table_cell_coordinates,
+            computed_svg_path = gfx.path_clone(&other_rare.computed_svg_path),
+            has_computed_svg_path = other_rare.has_computed_svg_path,
+            grid_template_columns = other_rare.grid_template_columns,
+            grid_template_rows = other_rare.grid_template_rows,
+            override_borders_data = other_rare.override_borders_data,
+            computed_svg_transforms = other_rare.computed_svg_transforms,
+            static_position_rect = other_rare.static_position_rect,
+        )) else trap("out of memory")
+        this.m_rare = rare
+    else:
+        this.m_rare = none
+
+## The `adjust_for_box_sizing` lambda of UsedValues::set_node.
+func layout_state_used_values_set_node_adjust_for_box_sizing(this: LayoutStateUsedValues*, containing_block_used_values: const LayoutStateUsedValues*?, unadjusted_pixels: gfx.CssPixels, computed_size: const CssSize*, width: bool) -> gfx.CssPixels:
+    let node = this.m_node else trap("set_node: no node")
+    let computed_values = &layout_node_computed_values(node.layout_node()).computed_values
+
+    # box-sizing: content-box and/or automatic size don't require any adjustment.
+    if css_computed_values_box_sizing(computed_values) == css_data.BoxSizing.content_box or css_size_is_auto(computed_size):
+        return unadjusted_pixels
+
+    # box-sizing: border-box requires us to subtract the relevant border and padding from the size.
+    var border_and_padding = layout_zero_px()
+    let containing_block = containing_block_used_values else trap("box-sizing adjustment without a containing block")
+    let containing_block_width = layout_state_used_values_content_width(containing_block)
+    let padding = css_computed_values_padding(computed_values)
+
+    if width:
+        let padding_left = css_length_box_left_const(&padding)
+        let padding_right = css_length_box_right_const(&padding)
+        border_and_padding = (css_computed_values_border_left(computed_values).width.add(css_length_percentage_or_auto_to_px_or_zero(&padding_left, node.layout_node(), containing_block_width)).add(css_computed_values_border_right(computed_values).width).add(css_length_percentage_or_auto_to_px_or_zero(&padding_right, node.layout_node(), containing_block_width)))
+    else:
+        let padding_top = css_length_box_top_const(&padding)
+        let padding_bottom = css_length_box_bottom_const(&padding)
+        border_and_padding = (css_computed_values_border_top(computed_values).width.add(css_length_percentage_or_auto_to_px_or_zero(&padding_top, node.layout_node(), containing_block_width)).add(css_computed_values_border_bottom(computed_values).width).add(css_length_percentage_or_auto_to_px_or_zero(&padding_bottom, node.layout_node(), containing_block_width)))
+
+    return unadjusted_pixels.sub(border_and_padding)
+
+## The `is_definite_size` lambda of UsedValues::set_node: the resolved definite size (the lambda's out parameter) when
+## the size is definite, none otherwise.
+func layout_state_used_values_set_node_is_definite_size(this: LayoutStateUsedValues*, containing_block_used_values: const LayoutStateUsedValues*?, size: const CssSize*, width: bool) -> gfx.CssPixels?:
+    let node = this.m_node else trap("set_node: no node")
+
+    # A size that can be determined without performing layout; that is,
+    # a <length>,
+    # a measure of text (without consideration of line-wrapping),
+    # a size of the initial containing block,
+    # or a <percentage> or other formula (such as the “stretch-fit” sizing of non-replaced blocks [CSS2]) that is resolved solely against definite sizes.
+
+    var containing_block_has_definite_size = false
+    if let containing_block = containing_block_used_values:
+        containing_block_has_definite_size = layout_state_used_values_has_definite_width(containing_block) if width else layout_state_used_values_has_definite_height(containing_block)
+
+    if css_size_is_auto(size):
+        # NOTE: The width of a non-flex-item block is considered definite if it's auto and the containing block has definite width.
+        let display = layout_node_display(node.layout_node())
+        if width and not layout_node_is_floating(node.layout_node()) and not layout_node_is_absolutely_positioned(node.layout_node()) and css_display_is_block_outside(&display):
+            if let parent = layout_node_parent(node.layout_node()):
+                let parent_display = layout_node_display(parent.layout_node())
+                if not layout_node_is_floating(parent.layout_node()) and (css_display_is_flow_root_inside(&parent_display) or css_display_is_flow_inside(&parent_display)):
+                    if containing_block_has_definite_size:
+                        let containing_block = containing_block_used_values else trap("unreachable: the containing block has a definite size")
+                        let available_width = layout_state_used_values_content_width(containing_block)
+                        return layout_clamp_to_max_dimension_value(
+                            available_width.sub(this.margin_left).sub(this.margin_right).sub(this.padding_left).sub(this.padding_right).sub(this.border_left).sub(this.border_right))
+                    return none
+        return none
+
+    if css_size_is_calculated(size):
+        var context = CssCalculationResolutionContext(
+            length_resolution_context = css_length_resolution_context_for_layout_node(node.layout_node()),
+        )
+        let calculated = css_size_calculated(size)
+        if css_calculated_style_value_contains_percentage(calculated):
+            if not containing_block_has_definite_size:
+                return none
+            let containing_block = containing_block_used_values else trap("unreachable: the containing block has a definite size")
+            let containing_block_size_as_length = layout_state_used_values_content_width(containing_block) if width else layout_state_used_values_content_height(containing_block)
+            context.percentage_basis = .css_length(css_length_make_px_css_pixels(containing_block_size_as_length))
+        let length = css_calculated_style_value_resolve_length(calculated, context) else trap("MUST: a calculated size resolves to a length")
+        return layout_clamp_to_max_dimension_value(layout_state_used_values_set_node_adjust_for_box_sizing(this, containing_block_used_values, css_length_to_px_layout_node(&length, node.layout_node()), size, width))
+
+    if css_size_is_length(size):
+        assert(not css_size_is_auto(size))  # This should have been covered by the Size::is_auto() branch above.
+        let length = css_size_length(size)
+        return layout_clamp_to_max_dimension_value(layout_state_used_values_set_node_adjust_for_box_sizing(this, containing_block_used_values, css_length_to_px_layout_node(&length, node.layout_node()), size, width))
+    if css_size_is_percentage(size):
+        if containing_block_has_definite_size:
+            let containing_block = containing_block_used_values else trap("unreachable: the containing block has a definite size")
+            let containing_block_size = layout_state_used_values_content_width(containing_block) if width else layout_state_used_values_content_height(containing_block)
+            let percentage = css_size_percentage(size)
+            return layout_clamp_to_max_dimension_value(layout_state_used_values_set_node_adjust_for_box_sizing(this, containing_block_used_values, gfx.css_pixels_scaled_f64(&containing_block_size, css_percentage_as_fraction(&percentage)), size, width))
+        return none
+    return none
+
+## Ported from Libraries/LibWeb/Layout/LayoutState.cpp:713 Web::Layout::LayoutState::UsedValues::set_node.
+pub func layout_state_used_values_set_node(this: LayoutStateUsedValues*, node: LayoutNodeWithStyle*, containing_block_used_values: const LayoutStateUsedValues*?):
+    this.m_node = node
+    this.m_containing_block_used_values = containing_block_used_values
+
+    # NOTE: In the code below, we decide if `node` has definite width and/or height.
+    #       This attempts to cover all the *general* cases where CSS considers sizes to be definite.
+    #       If `node` has definite values for min/max-width or min/max-height and a definite
+    #       preferred size in the same axis, we clamp the preferred size here as well.
+    #
+    #       There are additional cases where CSS considers values to be definite. We model all of
+    #       those by having our engine consider sizes to be definite *once they are assigned to
+    #       the UsedValues by calling set_content_width() or set_content_height().
+
+    let computed_values = &layout_node_computed_values(node.layout_node()).computed_values
+
+    let computed_min_width = css_computed_values_min_width(computed_values)
+    let min_width_or_none = layout_state_used_values_set_node_is_definite_size(this, containing_block_used_values, &computed_min_width, true)
+    let computed_max_width = css_computed_values_max_width(computed_values)
+    let max_width_or_none = layout_state_used_values_set_node_is_definite_size(this, containing_block_used_values, &computed_max_width, true)
+
+    let computed_min_height = css_computed_values_min_height(computed_values)
+    let min_height_or_none = layout_state_used_values_set_node_is_definite_size(this, containing_block_used_values, &computed_min_height, false)
+    let computed_max_height = css_computed_values_max_height(computed_values)
+    let max_height_or_none = layout_state_used_values_set_node_is_definite_size(this, containing_block_used_values, &computed_max_height, false)
+
+    let computed_width = css_computed_values_width(computed_values)
+    if let width = layout_state_used_values_set_node_is_definite_size(this, containing_block_used_values, &computed_width, true):
+        this.m_content_width = width
+        this.m_has_definite_width = true
+    else:
+        this.m_has_definite_width = false
+    let computed_height = css_computed_values_height(computed_values)
+    if let height = layout_state_used_values_set_node_is_definite_size(this, containing_block_used_values, &computed_height, false):
+        this.m_content_height = height
+        this.m_has_definite_height = true
+    else:
+        this.m_has_definite_height = false
+
+    if this.m_has_definite_width:
+        if let min_width = min_width_or_none:
+            this.m_content_width = layout_clamp_to_max_dimension_value(ak.max(min_width, this.m_content_width))
+        if let max_width = max_width_or_none:
+            this.m_content_width = layout_clamp_to_max_dimension_value(ak.min(max_width, this.m_content_width))
+
+    if this.m_has_definite_height:
+        if let min_height = min_height_or_none:
+            this.m_content_height = layout_clamp_to_max_dimension_value(ak.max(min_height, this.m_content_height))
+        if let max_height = max_height_or_none:
+            this.m_content_height = layout_clamp_to_max_dimension_value(ak.min(max_height, this.m_content_height))
+
+## Ported from Libraries/LibWeb/Layout/LayoutState.cpp:846 Web::Layout::LayoutState::UsedValues::materialize_from_paintable.
+pub func layout_state_used_values_materialize_from_paintable(this: LayoutStateUsedValues*, paintable: PaintPaintableBox*):
+    let box_model = paint_paintable_box_box_model(paintable)
+
+    layout_state_used_values_set_content_width(this, paint_paintable_box_content_width(paintable))
+    layout_state_used_values_set_content_height(this, paint_paintable_box_content_height(paintable))
+    this.m_has_definite_width = true
+    this.m_has_definite_height = true
+
+    layout_state_used_values_set_content_offset(this, paint_paintable_box_offset(paintable))
+    let absolute_rect = paint_paintable_box_absolute_rect(paintable)
+    this.m_cumulative_offset = gfx.css_pixel_rect_location(&absolute_rect)
+
+    this.margin_left = box_model.margin.left
+    this.margin_right = box_model.margin.right
+    this.margin_top = box_model.margin.top
+    this.margin_bottom = box_model.margin.bottom
+
+    this.padding_left = box_model.padding.left
+    this.padding_right = box_model.padding.right
+    this.padding_top = box_model.padding.top
+    this.padding_bottom = box_model.padding.bottom
+
+    this.border_left = box_model.border.left
+    this.border_right = box_model.border.right
+    this.border_top = box_model.border.top
+    this.border_bottom = box_model.border.bottom
+
+    this.inset_left = box_model.inset.left
+    this.inset_right = box_model.inset.right
+    this.inset_top = box_model.inset.top
+    this.inset_bottom = box_model.inset.bottom
+
+    if let svg_graphics_paintable = as_if_paint_svg_graphics_paintable(paintable):
+        layout_state_used_values_set_computed_svg_transforms(this, paint_svg_graphics_paintable_computed_transforms(svg_graphics_paintable))
+
+## Ported from Libraries/LibWeb/Layout/LayoutState.cpp:882 Web::Layout::LayoutState::UsedValues::set_content_width.
+pub func layout_state_used_values_set_content_width(this: LayoutStateUsedValues*, width: gfx.CssPixels):
+    var new_width = width
+    if new_width.lt(layout_zero_px()):
+        # Negative widths are not allowed in CSS. We have a bug somewhere! Clamp to 0 to avoid doing too much damage.
+        if css_libweb_css_debug:
+            let node = this.m_node else trap("set_content_width: no node")
+            let description = layout_node_debug_description(node.layout_node())
+            ak.dbgln(f"FIXME: Layout calculated a negative width for {ak.string_view_text(ak.string_bytes_as_string_view(&description))}: {new_width.to_double()}")
+        new_width = layout_zero_px()
+    this.m_content_width = layout_clamp_to_max_dimension_value(new_width)
+    # FIXME: We should not do this! Definiteness of widths should be determined early,
+    #        and not changed later (except for some special cases in flex layout..)
+    this.m_has_definite_width = true
+
+## Ported from Libraries/LibWeb/Layout/LayoutState.cpp:895 Web::Layout::LayoutState::UsedValues::set_content_height.
+pub func layout_state_used_values_set_content_height(this: LayoutStateUsedValues*, height: gfx.CssPixels):
+    var new_height = height
+    if new_height.lt(layout_zero_px()):
+        # Negative heights are not allowed in CSS. We have a bug somewhere! Clamp to 0 to avoid doing too much damage.
+        if css_libweb_css_debug:
+            let node = this.m_node else trap("set_content_height: no node")
+            let description = layout_node_debug_description(node.layout_node())
+            ak.dbgln(f"FIXME: Layout calculated a negative height for {ak.string_view_text(ak.string_bytes_as_string_view(&description))}: {new_height.to_double()}")
+        new_height = layout_zero_px()
+    this.m_content_height = layout_clamp_to_max_dimension_value(new_height)
+
+## Ported from Libraries/LibWeb/Layout/LayoutState.cpp:905 Web::Layout::LayoutState::UsedValues::available_width_inside.
+pub func layout_state_used_values_available_width_inside(this: const LayoutStateUsedValues*) -> LayoutAvailableSize:
+    if this.width_constraint == LayoutSizeConstraint.min_content:
+        return layout_available_size_make_min_content()
+    if this.width_constraint == LayoutSizeConstraint.max_content:
+        return layout_available_size_make_max_content()
+    if layout_state_used_values_has_definite_width(this):
+        return layout_available_size_make_definite(this.m_content_width)
+    return layout_available_size_make_indefinite()
+
+## Ported from Libraries/LibWeb/Layout/LayoutState.cpp:916 Web::Layout::LayoutState::UsedValues::available_height_inside.
+pub func layout_state_used_values_available_height_inside(this: const LayoutStateUsedValues*) -> LayoutAvailableSize:
+    if this.height_constraint == LayoutSizeConstraint.min_content:
+        return layout_available_size_make_min_content()
+    if this.height_constraint == LayoutSizeConstraint.max_content:
+        return layout_available_size_make_max_content()
+    if layout_state_used_values_has_definite_height(this):
+        return layout_available_size_make_definite(this.m_content_height)
+    return layout_available_size_make_indefinite()
+
+## Ported from Libraries/LibWeb/Layout/LayoutState.cpp:927 Web::Layout::LayoutState::UsedValues::available_inner_space_or_constraints_from.
+# Returns the available space for content inside this layout box.
+# If the space in an axis is indefinite, and the outer space is an intrinsic sizing constraint,
+# the constraint is used in that axis instead.
+pub func layout_state_used_values_available_inner_space_or_constraints_from(this: const LayoutStateUsedValues*, outer_space: LayoutAvailableSpace) -> LayoutAvailableSpace:
+    var inner_width = layout_state_used_values_available_width_inside(this)
+    var inner_height = layout_state_used_values_available_height_inside(this)
+
+    if layout_available_size_is_indefinite(&inner_width) and layout_available_size_is_intrinsic_sizing_constraint(&outer_space.width):
+        inner_width = outer_space.width
+    if layout_available_size_is_indefinite(&inner_height) and layout_available_size_is_intrinsic_sizing_constraint(&outer_space.height):
+        inner_height = outer_space.height
+    return LayoutAvailableSpace(width = inner_width, height = inner_height)
+
+## Ported from Libraries/LibWeb/Layout/LayoutState.cpp:939 Web::Layout::LayoutState::UsedValues::set_indefinite_content_width.
+pub func layout_state_used_values_set_indefinite_content_width(this: LayoutStateUsedValues*):
+    this.m_has_definite_width = false
+
+## Ported from Libraries/LibWeb/Layout/LayoutState.cpp:944 Web::Layout::LayoutState::UsedValues::set_indefinite_content_height.
+pub func layout_state_used_values_set_indefinite_content_height(this: LayoutStateUsedValues*):
+    this.m_has_definite_height = false

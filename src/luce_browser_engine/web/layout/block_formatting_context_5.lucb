@@ -1,0 +1,564 @@
+#==============================================================================================
+#
+#   block_formatting_context_5 - Layout::BlockFormattingContext: floats, list item markers,
+#                                float intrusions and multi-column widths
+#
+#   DESCRIPTION:
+#       Port of LibWeb/Layout/BlockFormattingContext.cpp (lines 1230-1735): layout_floating_box
+#       (floating to the left or right edge, stacking beside preceding floats or below them,
+#       moving below opposite-side floats that leave no room), the size and position of list
+#       item markers, the space floats use at a given y, their intrusion into a box,
+#       greatest_child_width with floats, and the used column count, width and gap of a
+#       multi-column container. The C++ `float_box` lambda and the lambdas nested in it share
+#       their state through LayoutFloatPlacement.
+#
+#       Copyright (c) 2020-2022, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2025-2026, Jelle Raaijmakers <jelle@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Floating boxes ==========================================================================
+
+## Web::Layout::BlockFormattingContext::FloatSide (Libraries/LibWeb/Layout/BlockFormattingContext.h:124).
+enum LayoutBlockFormattingContextFloatSide as i32:
+    left = 0
+    right = 1
+
+## The state layout_floating_box's `float_box` lambda and its nested lambdas (float_to_edge,
+## position_with_same_side_floats_after_lowering) capture by reference.
+struct LayoutFloatPlacement:
+    var context: LayoutBlockFormattingContext*
+    var box: LayoutBox*
+    var box_state: LayoutStateUsedValues*
+    var available_space: LayoutAvailableSpace
+    var line_builder: LayoutLineBuilder*?
+    var side: LayoutBlockFormattingContextFloatSide
+    var side_data: LayoutBlockFormattingContextFloatSideData*
+    var offset_from_edge: gfx.CssPixels
+    var y: gfx.CssPixels
+    var initial_box_margin_y_in_root: gfx.CssPixels
+    var has_clearance: bool
+
+## The `float_to_edge` lambda of float_box.
+func layout_float_placement_float_to_edge(this: LayoutFloatPlacement*):
+    if this.side == LayoutBlockFormattingContextFloatSide.left:
+        this.offset_from_edge = layout_state_used_values_margin_box_left(this.box_state)
+    else:
+        this.offset_from_edge = layout_state_used_values_content_width(this.box_state).add(layout_state_used_values_margin_box_right(this.box_state))
+
+## The tentative offset of the box beside `preceding_float` and whether it fits there (the loop bodies of float_box).
+func layout_float_placement_beside(this: const LayoutFloatPlacement*, preceding_float: const LayoutBlockFormattingContextFloatingBox*) -> (gfx.CssPixels, bool):
+    let box_state = this.box_state
+    var tentative_offset_from_edge = layout_zero_px()
+    var fits_next_to_preceding_float = false
+    if this.side == LayoutBlockFormattingContextFloatSide.left:
+        tentative_offset_from_edge = ak.max(preceding_float.offset_from_edge.add(layout_state_used_values_content_width(preceding_float.used_values)).add(layout_state_used_values_margin_box_right(preceding_float.used_values)), layout_zero_px()).add(layout_state_used_values_margin_box_left(box_state))
+        if layout_available_size_is_definite(&this.available_space.width):
+            fits_next_to_preceding_float = tentative_offset_from_edge.add(layout_state_used_values_content_width(box_state)).add(layout_state_used_values_margin_box_right(box_state)).le(layout_available_size_to_px_or_zero(&this.available_space.width))
+        elif layout_available_size_is_max_content(&this.available_space.width) or layout_available_size_is_indefinite(&this.available_space.width):
+            fits_next_to_preceding_float = true
+    else:
+        tentative_offset_from_edge = preceding_float.offset_from_edge.add(layout_state_used_values_margin_box_left(preceding_float.used_values)).add(layout_state_used_values_margin_box_right(box_state)).add(layout_state_used_values_content_width(box_state))
+        if layout_available_size_is_definite(&this.available_space.width):
+            fits_next_to_preceding_float = tentative_offset_from_edge.add(layout_state_used_values_margin_box_left(box_state)).le(layout_available_size_to_px_or_zero(&this.available_space.width))
+        elif layout_available_size_is_max_content(&this.available_space.width) or layout_available_size_is_indefinite(&this.available_space.width):
+            fits_next_to_preceding_float = true
+    return (tentative_offset_from_edge, fits_next_to_preceding_float)
+
+## The `position_with_same_side_floats_after_lowering` lambda of float_box.
+func layout_float_placement_position_with_same_side_floats_after_lowering(this: LayoutFloatPlacement*, candidate_box_margin_y_in_root_start: gfx.CssPixels):
+    let base = this.context.layout_formatting_context()
+    let root = layout_block_formatting_context_root(this.context).layout_box()
+    let box_state = this.box_state
+    var candidate_box_margin_y_in_root = candidate_box_margin_y_in_root_start
+    while true:
+        var candidate_current_boxes: ak.Vector[LayoutBlockFormattingContextFloatingBox*]
+        var lowest_margin_edge = candidate_box_margin_y_in_root
+        for existing_float in ak.vector_span(&this.side_data.all_boxes):
+            if not gfx.css_pixel_rect_contains_vertically(&existing_float.margin_box_rect_in_root_coordinate_space, candidate_box_margin_y_in_root):
+                continue
+            ak.vector_append_t(&candidate_current_boxes, existing_float)
+            lowest_margin_edge = ak.max(lowest_margin_edge, gfx.css_pixel_rect_bottom(&existing_float.margin_box_rect_in_root_coordinate_space))
+
+        var candidate_offset_from_edge = layout_zero_px()
+        if this.side == LayoutBlockFormattingContextFloatSide.left:
+            candidate_offset_from_edge = layout_state_used_values_margin_box_left(box_state)
+        else:
+            candidate_offset_from_edge = layout_state_used_values_content_width(box_state).add(layout_state_used_values_margin_box_right(box_state))
+
+        var did_touch_preceding_float = false
+        var did_place_next_to_preceding_float = false
+        var index = ak.vector_size(&candidate_current_boxes)
+        while index > 0:
+            index -= 1
+            let preceding_float = *ak.vector_at(&candidate_current_boxes, index)
+            var tentative_offset_from_edge = layout_zero_px()
+            var fits_next_to_preceding_float = false
+            if this.side == LayoutBlockFormattingContextFloatSide.left:
+                tentative_offset_from_edge = ak.max(preceding_float.offset_from_edge.add(layout_state_used_values_content_width(preceding_float.used_values)).add(layout_state_used_values_margin_box_right(preceding_float.used_values)), layout_zero_px()).add(layout_state_used_values_margin_box_left(box_state))
+                fits_next_to_preceding_float = tentative_offset_from_edge.add(layout_state_used_values_content_width(box_state)).add(layout_state_used_values_margin_box_right(box_state)).le(layout_available_size_to_px_or_zero(&this.available_space.width))
+            else:
+                tentative_offset_from_edge = preceding_float.offset_from_edge.add(layout_state_used_values_margin_box_left(preceding_float.used_values)).add(layout_state_used_values_margin_box_right(box_state)).add(layout_state_used_values_content_width(box_state))
+                fits_next_to_preceding_float = tentative_offset_from_edge.add(layout_state_used_values_margin_box_left(box_state)).le(layout_available_size_to_px_or_zero(&this.available_space.width))
+
+            did_touch_preceding_float = true
+            if not fits_next_to_preceding_float:
+                break
+            candidate_offset_from_edge = tentative_offset_from_edge
+            did_place_next_to_preceding_float = true
+            break
+
+        if (this.has_clearance and not ak.vector_is_empty(&candidate_current_boxes)) or (did_touch_preceding_float and not did_place_next_to_preceding_float):
+            candidate_box_margin_y_in_root = lowest_margin_edge
+            continue
+
+        ak.vector_clear(&this.side_data.current_boxes)
+        for current_float in ak.vector_span(&candidate_current_boxes):
+            ak.vector_append_t(&this.side_data.current_boxes, current_float)
+
+        this.side_data.y_offset = ak.max(layout_zero_px(), candidate_box_margin_y_in_root.sub(this.initial_box_margin_y_in_root))
+        this.offset_from_edge = candidate_offset_from_edge
+        let box_in_root_rect = layout_formatting_context_margin_box_rect_in_ancestor_coordinate_space_layout_state_used_values(base, box_state, root)
+        this.y = box_state.offset.m_y.add(candidate_box_margin_y_in_root).sub(gfx.css_pixel_rect_y(&box_in_root_rect))
+        layout_state_used_values_set_content_y(box_state, this.y)
+        break
+
+## The `float_box` lambda of layout_floating_box: floats the box to `side`.
+func layout_float_placement_float_box(this: LayoutFloatPlacement*):
+    let base = this.context.layout_formatting_context()
+    let root = layout_block_formatting_context_root(this.context).layout_box()
+    let box_state = this.box_state
+    let side_data = this.side_data
+    let computed_values = layout_box_computed(this.box)
+    this.offset_from_edge = layout_zero_px()
+
+    let box_in_root_rect = layout_formatting_context_margin_box_rect_in_ancestor_coordinate_space_layout_state_used_values(base, box_state, root)
+    this.initial_box_margin_y_in_root = gfx.css_pixel_rect_y(&box_in_root_rect)
+    var y_in_root = gfx.css_pixel_rect_y(&box_in_root_rect)
+    this.y = box_state.offset.m_y
+
+    this.has_clearance = false
+    let clear = css_computed_values_clear(computed_values)
+    if this.side == LayoutBlockFormattingContextFloatSide.left:
+        this.has_clearance = clear == css_data.Clear.left or clear == css_data.Clear.both
+    elif this.side == LayoutBlockFormattingContextFloatSide.right:
+        this.has_clearance = clear == css_data.Clear.right or clear == css_data.Clear.both
+
+    if ak.vector_is_empty(&side_data.current_boxes):
+        # This is the first floating box on this side. Go all the way to the edge.
+        layout_float_placement_float_to_edge(this)
+        side_data.y_offset = layout_zero_px()
+    else:
+
+        # NOTE: If we're in inline layout, the LineBuilder has already provided the right Y offset.
+        #       In block layout, we adjust by the side's current Y offset here.
+        if this.line_builder == none:
+            y_in_root = y_in_root.add(side_data.y_offset)
+
+        var did_touch_preceding_float = false
+        var did_place_next_to_preceding_float = false
+
+        # Walk all currently tracked floats on the side we're floating towards.
+        # We're looking for the innermost preceding float that intersects vertically with `box`.
+        var index = ak.vector_size(&side_data.current_boxes)
+        while index > 0:
+            index -= 1
+            let preceding_float = *ak.vector_at(&side_data.current_boxes, index)
+            if not gfx.css_pixel_rect_contains_vertically(&preceding_float.margin_box_rect_in_root_coordinate_space, y_in_root):
+                continue
+            # We found a preceding float that intersects vertically with the current float.
+            # Now we need to find out if there's enough inline-axis space to stack them next to each other.
+            let (tentative_offset_from_edge, fits_next_to_preceding_float) = layout_float_placement_beside(this, preceding_float)
+            did_touch_preceding_float = true
+            if not fits_next_to_preceding_float:
+                break
+            this.offset_from_edge = tentative_offset_from_edge
+            did_place_next_to_preceding_float = true
+            break
+
+        if not did_touch_preceding_float or not did_place_next_to_preceding_float or this.has_clearance:
+            # One of three things happened:
+            # - This box does not touch another floating box.
+            # - We ran out of horizontal space on this "float line", and need to break.
+            # - This box has clearance.
+            # Either way, we float this box all the way to the edge.
+            layout_float_placement_float_to_edge(this)
+            var lowest_margin_edge = layout_zero_px()
+            for current in ak.vector_span(&side_data.current_boxes):
+                let current_rect = layout_formatting_context_margin_box_rect_in_ancestor_coordinate_space_layout_state_used_values(base, current.used_values, root)
+                lowest_margin_edge = ak.max(lowest_margin_edge, gfx.css_pixel_rect_bottom(&current_rect))
+
+            side_data.y_offset = side_data.y_offset.add(ak.max(layout_zero_px(), lowest_margin_edge.sub(y_in_root)))
+
+            # Also, forget all previous boxes floated to this side while since they're no longer relevant.
+            layout_block_formatting_context_float_side_data_clear(side_data)
+
+    # NOTE: If we're in inline layout, the LineBuilder has already provided the right Y offset.
+    #       In block layout, we adjust by the side's current Y offset here.
+    # FIXME: It's annoying that we have different behavior for inline vs block here.
+    #        Find a way to unify the behavior so we don't need to branch here.
+    if this.line_builder == none:
+        this.y = this.y.add(side_data.y_offset)
+
+    # NOTE: We don't set the X position here, that happens later, once we know the root block width.
+    #       See parent_context_did_dimension_child_root_box() for that logic.
+    layout_state_used_values_set_content_y(box_state, this.y)
+
+    # CSS2 9.5.1: "If there is not enough horizontal room for the float, it is shifted downward
+    #              until either it fits or there are no more floats present."
+    # After same-side stacking, check if the float fits horizontally considering opposite-side
+    # floats. If not, push it below the shallowest blocking float and retry.
+    if this.line_builder == none and layout_available_size_is_definite(&this.available_space.width):
+        while true:
+            let current_box_in_root_rect = layout_formatting_context_margin_box_rect_in_ancestor_coordinate_space_layout_state_used_values(base, box_state, root)
+            let space_used_by_floats = layout_block_formatting_context_space_used_and_containing_margin_for_floats(this.context, gfx.css_pixel_rect_y(&current_box_in_root_rect))
+            let containing_block = layout_state_used_values_containing_block_used_values(box_state) else trap("VERIFY: a float without its containing block's used values")
+            let current_containing_block_in_root_rect = layout_formatting_context_content_box_rect_in_ancestor_coordinate_space(base, containing_block, root)
+            let used_by_this_side = this.offset_from_edge.add(layout_state_used_values_content_width(box_state)).add(layout_state_used_values_margin_box_right(box_state)) if this.side == LayoutBlockFormattingContextFloatSide.left else this.offset_from_edge.add(layout_state_used_values_margin_box_left(box_state))
+            var used_by_opposite_side = layout_zero_px()
+            if this.side == LayoutBlockFormattingContextFloatSide.left:
+                let root_content_width = layout_state_used_values_content_width(layout_state_get(base.m_state, root.layout_node_with_style()))
+                used_by_opposite_side = ak.max(layout_zero_px(), space_used_by_floats.right_used_space.add(space_used_by_floats.right_total_containing_margin).sub(root_content_width.sub(gfx.css_pixel_rect_right(&current_containing_block_in_root_rect))))
+            else:
+                used_by_opposite_side = ak.max(layout_zero_px(), space_used_by_floats.left_total_containing_margin.add(space_used_by_floats.left_used_space).sub(gfx.css_pixel_rect_x(&current_containing_block_in_root_rect)))
+            if used_by_this_side.add(used_by_opposite_side).le(layout_available_size_to_px_or_zero(&this.available_space.width)):
+                break
+
+            # Find the shallowest (topmost) opposite-side float blocking us and move below it.
+            let opposite_float_box_or_none = space_used_by_floats.matching_right_float_box if this.side == LayoutBlockFormattingContextFloatSide.left else space_used_by_floats.matching_left_float_box
+            let opposite_float_box = opposite_float_box_or_none else break
+            let opposite_float_used_values = layout_state_get(base.m_state, opposite_float_box.layout_node_with_style())
+            let opposite_float_rect = layout_formatting_context_margin_box_rect_in_ancestor_coordinate_space_layout_state_used_values(base, opposite_float_used_values, root)
+            layout_float_placement_position_with_same_side_floats_after_lowering(this, gfx.css_pixel_rect_bottom(&opposite_float_rect))
+
+    let top_margin_edge = this.y.sub(layout_state_used_values_margin_box_top(box_state))
+    let floating_box = (new LayoutBlockFormattingContextFloatingBox(
+        box = this.box,
+        used_values = box_state,
+        offset_from_edge = this.offset_from_edge,
+        top_margin_edge = top_margin_edge,
+        bottom_margin_edge = this.y.add(layout_state_used_values_content_height(box_state)).add(layout_state_used_values_margin_box_bottom(box_state)),
+        margin_box_rect_in_root_coordinate_space = layout_formatting_context_margin_box_rect_in_ancestor_coordinate_space_layout_state_used_values(base, box_state, root),
+    )) else trap("out of memory")
+    ak.vector_append_t(&side_data.all_boxes, floating_box)
+    ak.vector_append_t(&side_data.current_boxes, floating_box)
+    this.context.m_last_inserted_float = floating_box
+
+    if this.side == LayoutBlockFormattingContextFloatSide.left:
+        side_data.current_width = this.offset_from_edge.add(layout_state_used_values_content_width(box_state)).add(layout_state_used_values_margin_box_right(box_state))
+    else:
+        side_data.current_width = this.offset_from_edge.add(layout_state_used_values_margin_box_left(box_state))
+    side_data.max_width = ak.max(side_data.current_width, side_data.max_width)
+
+## Ported from Libraries/LibWeb/Layout/BlockFormattingContext.cpp:1230 Web::Layout::BlockFormattingContext::layout_floating_box.
+pub func layout_block_formatting_context_layout_floating_box(this: LayoutBlockFormattingContext*, box: LayoutBox*, block_container: LayoutBlockContainer*, available_space: LayoutAvailableSpace, y: gfx.CssPixels, line_builder: LayoutLineBuilder*? = none):
+    let base = this.layout_formatting_context()
+    assert(layout_node_is_floating(box.layout_node()))
+
+    let box_state = layout_state_get_mutable(base.m_state, box.layout_node_with_style())
+    let computed_values = layout_box_computed(box)
+
+    let block_container_state = layout_state_get(base.m_state, block_container.layout_node_with_style())
+    layout_block_formatting_context_resolve_vertical_box_model_metrics(this, box, layout_state_used_values_content_width(block_container_state))
+
+    layout_block_formatting_context_compute_width(this, box, available_space)
+
+    layout_block_formatting_context_resolve_used_height_if_not_treated_as_auto(this, box, available_space)
+
+    # NOTE: Flex containers with `auto` height are treated as `max-content`, so we can compute their height early.
+    let display = layout_node_display(box.layout_node())
+    if layout_box_has_auto_content_box_size(box) or css_display_is_flex_inside(&display):
+        layout_block_formatting_context_resolve_used_height_if_treated_as_auto(this, box, available_space)
+
+    let independent_formatting_context = layout_formatting_context_layout_inside(base, box, base.m_layout_mode, layout_state_used_values_available_inner_space_or_constraints_from(box_state, available_space))
+    defer layout_formatting_context_destruct(independent_formatting_context)
+    layout_block_formatting_context_resolve_used_height_if_treated_as_auto(this, box, available_space, independent_formatting_context)
+
+    # First we place the box normally (to get the right y coordinate.)
+    # If we have a LineBuilder, we're in the middle of inline layout, otherwise this is block layout.
+    if let builder = line_builder:
+        let float_y = layout_line_builder_y_for_float_to_be_inserted_here(builder, box)
+        layout_state_used_values_set_content_y(box_state, float_y.add(layout_state_used_values_margin_box_top(box_state)))
+    else:
+        layout_block_formatting_context_place_block_level_element_in_normal_flow_vertically(this, box, y.add(box_state.margin_top))
+        layout_block_formatting_context_place_block_level_element_in_normal_flow_horizontally(this, box, available_space)
+
+    # Then we float it to the left or right.
+    # FIXME: This algorithm is fundamentally flawed. It tracks left and right floats independently,
+    #        then patches up cross-side interactions after the fact. A better approach would be to
+    #        find the first Y position where the float fits considering ALL existing floats on both
+    #        sides in a single unified pass.
+
+    # Next, float to the left and/or right
+    # FIXME: Honor writing-mode, direction and text-orientation.
+    let float_ = css_computed_values_float(computed_values)
+    if float_ == css_data.Float.left or float_ == css_data.Float.inline_start:
+        var placement = LayoutFloatPlacement(context = this, box = box, box_state = box_state, available_space = available_space, line_builder = line_builder,
+                                             side = LayoutBlockFormattingContextFloatSide.left, side_data = &this.m_left_floats, offset_from_edge = layout_zero_px(),
+                                             y = layout_zero_px(), initial_box_margin_y_in_root = layout_zero_px(), has_clearance = false)
+        layout_float_placement_float_box(&placement)
+    elif float_ == css_data.Float.right or float_ == css_data.Float.inline_end:
+        var placement = LayoutFloatPlacement(context = this, box = box, box_state = box_state, available_space = available_space, line_builder = line_builder,
+                                             side = LayoutBlockFormattingContextFloatSide.right, side_data = &this.m_right_floats, offset_from_edge = layout_zero_px(),
+                                             y = layout_zero_px(), initial_box_margin_y_in_root = layout_zero_px(), has_clearance = false)
+        layout_float_placement_float_box(&placement)
+
+    let root = layout_block_formatting_context_root(this)
+    layout_state_used_values_add_floating_descendant(layout_state_get_mutable(base.m_state, root.layout_node_with_style()), box)
+
+    if let builder = line_builder:
+        layout_line_builder_recalculate_available_space(builder)
+
+    let block_container_rect = layout_formatting_context_content_box_rect_layout_state_used_values(base, block_container_state)
+    layout_formatting_context_compute_inset(base, box.layout_node_with_style_and_box_model_metrics(), gfx.css_pixel_rect_size(&block_container_rect))
+
+    if let context = independent_formatting_context:
+        layout_formatting_context_parent_context_did_dimension_child_root_box(context)
+
+# mark: List item markers =======================================================================
+
+## Ported from Libraries/LibWeb/Layout/BlockFormattingContext.cpp:1492 Web::Layout::BlockFormattingContext::ensure_sizes_correct_for_left_offset_calculation.
+pub func layout_block_formatting_context_ensure_sizes_correct_for_left_offset_calculation(this: LayoutBlockFormattingContext*, list_item_box: LayoutListItemBox*):
+    let marker = layout_list_item_box_marker(list_item_box) else return
+
+    let marker_state = layout_state_get_mutable(this.formatting_context.m_state, marker.layout_node_with_style())
+
+    # If an image is used, the marker's dimensions are the same as the image.
+    if let list_style_image = layout_node_with_style_list_style_image(marker.layout_node_with_style()):
+        layout_state_used_values_set_content_width(marker_state, css_abstract_image_style_value_natural_width(list_style_image) else layout_zero_px())
+        layout_state_used_values_set_content_height(marker_state, css_abstract_image_style_value_natural_height(list_style_image) else layout_zero_px())
+        return
+
+    let marker_size = layout_list_item_marker_box_relative_size(marker)
+    layout_state_used_values_set_content_height(marker_state, marker_size)
+
+    # Text markers use text metrics to determine their width; other markers use square dimensions.
+    let marker_font = layout_node_first_available_font(marker.layout_node())
+    if let marker_text = layout_list_item_marker_box_text(marker):
+        # FIXME: Use per-code-point fonts to measure text.
+        let text = ak.utf16_string_from_utf8_string(&marker_text)
+        let text_width = web_fonts.font_width(marker_font, ak.utf16_string_base_utf16_view(&text.utf16_string_base))
+        layout_state_used_values_set_content_width(marker_state, gfx.css_pixels_nearest_value_for_f32(text_width))
+    else:
+        layout_state_used_values_set_content_width(marker_state, marker_size)
+
+## Ported from Libraries/LibWeb/Layout/BlockFormattingContext.cpp:1522 Web::Layout::BlockFormattingContext::layout_list_item_marker.
+pub func layout_block_formatting_context_layout_list_item_marker(this: LayoutBlockFormattingContext*, list_item_box: LayoutListItemBox*, inline_space_used_before_list_item_elements_formatted: LayoutFormattingContextSpaceUsedByFloats):
+    let marker = layout_list_item_box_marker(list_item_box) else return
+
+    let marker_state = layout_state_get_mutable(this.formatting_context.m_state, marker.layout_node_with_style())
+    let list_item_state = layout_state_get_mutable(this.formatting_context.m_state, list_item_box.layout_node_with_style())
+
+    let marker_text = layout_list_item_marker_box_text(marker)
+
+    # Text markers fit snug against the list item; non-text position themselves at 50% of the font size.
+    var marker_distance = layout_zero_px()
+    if marker_text == none:
+        marker_distance = gfx.css_pixels_nearest_value_for_f32(0.5 * web_fonts.font_pixel_size(layout_node_first_available_font(marker.layout_node())))
+
+    let marker_height = layout_state_used_values_content_height(marker_state)
+    let marker_width = layout_state_used_values_content_width(marker_state)
+
+    let list_item_direction = css_computed_values_direction(layout_box_computed(list_item_box.layout_box()))
+    let marker_offset_x = inline_space_used_before_list_item_elements_formatted.left.sub(marker_distance).sub(marker_width) if list_item_direction == css_data.Direction.ltr else layout_state_used_values_content_width(list_item_state).sub(inline_space_used_before_list_item_elements_formatted.right.sub(marker_distance))
+    let marker_line_height = css_computed_values_line_height(layout_box_computed(marker.layout_box()))
+    let marker_offset_y = ak.max(layout_zero_px(), layout_div_int(marker_line_height.sub(marker_height), 2))
+
+    if layout_list_item_marker_box_list_style_position(marker) == css_data.ListStylePosition.inside:
+        # FIXME: Just adjusting the content width and position for an inside marker is wrong, as it will still position
+        #        the marker outside of the box, instead of treating it more like an inline child on the first line.
+        if list_item_direction == css_data.Direction.ltr:
+            layout_state_used_values_set_content_x(list_item_state, list_item_state.offset.m_x.add(marker_width).add(marker_distance))
+        layout_state_used_values_set_content_width(list_item_state, layout_state_used_values_content_width(list_item_state).sub(marker_width).sub(marker_distance))
+
+    layout_state_used_values_set_content_offset(marker_state, gfx.CssPixelPoint(gfx.round(marker_offset_x), gfx.round(marker_offset_y)))
+
+    if marker_line_height.gt(layout_state_used_values_content_height(list_item_state)):
+        layout_state_used_values_set_content_height(list_item_state, marker_line_height)
+
+# mark: Space used by floats ====================================================================
+
+## Ported from Libraries/LibWeb/Layout/BlockFormattingContext.cpp:1562 Web::Layout::BlockFormattingContext::space_used_and_containing_margin_for_floats.
+pub func layout_block_formatting_context_space_used_and_containing_margin_for_floats(this: LayoutBlockFormattingContext*, y: gfx.CssPixels) -> LayoutFormattingContextSpaceUsedAndContainingMarginForFloats:
+    var space_and_containing_margin = LayoutFormattingContextSpaceUsedAndContainingMarginForFloats(
+        left_used_space = layout_zero_px(),
+        right_used_space = layout_zero_px(),
+        left_total_containing_margin = layout_zero_px(),
+        right_total_containing_margin = layout_zero_px(),
+        matching_left_float_box = none,
+        matching_right_float_box = none,
+    )
+    let root = layout_block_formatting_context_root(this).layout_node_with_style()
+
+    var index = ak.vector_size(&this.m_left_floats.all_boxes)
+    while index > 0:
+        index -= 1
+        let floating_box = *ak.vector_at(&this.m_left_floats.all_boxes, index)
+        # NOTE: The floating box is *not* in the final horizontal position yet, but the size and vertical position is valid.
+        let rect = floating_box.margin_box_rect_in_root_coordinate_space
+        if gfx.css_pixel_rect_contains_vertically(&rect, y):
+            var offset_from_containing_block_chain_margins_between_here_and_root = layout_zero_px()
+            var containing_block_or_none = layout_state_used_values_containing_block_used_values(floating_box.used_values)
+            while let containing_block = containing_block_or_none:
+                if layout_state_used_values_node_const(containing_block) == root:
+                    break
+                offset_from_containing_block_chain_margins_between_here_and_root = offset_from_containing_block_chain_margins_between_here_and_root.add(layout_state_used_values_margin_box_left(containing_block))
+                containing_block_or_none = layout_state_used_values_containing_block_used_values(containing_block)
+            space_and_containing_margin.left_used_space = floating_box.offset_from_edge.add(layout_state_used_values_content_width(floating_box.used_values)).add(layout_state_used_values_margin_box_right(floating_box.used_values))
+            space_and_containing_margin.left_total_containing_margin = offset_from_containing_block_chain_margins_between_here_and_root
+            space_and_containing_margin.matching_left_float_box = floating_box.box
+            break
+
+    index = ak.vector_size(&this.m_right_floats.all_boxes)
+    while index > 0:
+        index -= 1
+        let floating_box = *ak.vector_at(&this.m_right_floats.all_boxes, index)
+        # NOTE: The floating box is *not* in the final horizontal position yet, but the size and vertical position is valid.
+        let rect = floating_box.margin_box_rect_in_root_coordinate_space
+        if gfx.css_pixel_rect_contains_vertically(&rect, y):
+            var offset_from_containing_block_chain_margins_between_here_and_root = layout_zero_px()
+            var containing_block_or_none = layout_state_used_values_containing_block_used_values(floating_box.used_values)
+            while let containing_block = containing_block_or_none:
+                if layout_state_used_values_node_const(containing_block) == root:
+                    break
+                offset_from_containing_block_chain_margins_between_here_and_root = offset_from_containing_block_chain_margins_between_here_and_root.add(layout_state_used_values_margin_box_right(containing_block))
+                containing_block_or_none = layout_state_used_values_containing_block_used_values(containing_block)
+            space_and_containing_margin.right_used_space = floating_box.offset_from_edge.add(layout_state_used_values_margin_box_left(floating_box.used_values))
+            space_and_containing_margin.right_total_containing_margin = offset_from_containing_block_chain_margins_between_here_and_root
+            space_and_containing_margin.matching_right_float_box = floating_box.box
+            break
+
+    return space_and_containing_margin
+
+## Ported from Libraries/LibWeb/Layout/BlockFormattingContext.cpp:1604 Web::Layout::BlockFormattingContext::intrusion_by_floats_into_box.
+pub func layout_block_formatting_context_intrusion_by_floats_into_box_layout_box(this: LayoutBlockFormattingContext*, box: LayoutBox*, y_in_box: gfx.CssPixels) -> LayoutFormattingContextSpaceUsedByFloats:
+    return layout_block_formatting_context_intrusion_by_floats_into_box_layout_state_used_values(this, layout_state_get(this.formatting_context.m_state, box.layout_node_with_style()), y_in_box)
+
+## Ported from Libraries/LibWeb/Layout/BlockFormattingContext.cpp:1609 Web::Layout::BlockFormattingContext::intrusion_by_floats_into_box.
+pub func layout_block_formatting_context_intrusion_by_floats_into_box_layout_state_used_values(this: LayoutBlockFormattingContext*, box_used_values: const LayoutStateUsedValues*, y_in_box: gfx.CssPixels) -> LayoutFormattingContextSpaceUsedByFloats:
+    let base = this.layout_formatting_context()
+    let root = layout_block_formatting_context_root(this)
+    # NOTE: Floats are relative to the BFC root box, not necessarily the containing block of this IFC.
+    let box_in_root_rect = layout_formatting_context_content_box_rect_in_ancestor_coordinate_space(base, box_used_values, root.layout_box())
+    let y_in_root = gfx.css_pixel_rect_y(&box_in_root_rect).add(y_in_box)
+    let space_and_containing_margin = layout_block_formatting_context_space_used_and_containing_margin_for_floats(this, y_in_root)
+
+    var left_intrusion = layout_zero_px()
+    if space_and_containing_margin.matching_left_float_box != none:
+        let left_side_floats_limit_to_right = space_and_containing_margin.left_total_containing_margin.add(space_and_containing_margin.left_used_space)
+        left_intrusion = ak.max(layout_zero_px(), left_side_floats_limit_to_right.sub(gfx.css_pixel_rect_x(&box_in_root_rect)))
+
+    # If we did not match a right float, the right_total_containing_margin will be 0 (as its never set). Since no floats means
+    # no intrusion we would instead want it to be exactly equal to offset_from_containing_block_chain_margins_between_here_and_root.
+    # Since this is not the case we have to explicitly handle this case.
+    var right_intrusion = layout_zero_px()
+    if space_and_containing_margin.matching_right_float_box != none:
+        let right_side_floats_limit_to_right = space_and_containing_margin.right_used_space.add(space_and_containing_margin.right_total_containing_margin)
+        var offset_from_containing_block_chain_margins_between_here_and_root = layout_zero_px()
+        var containing_block_or_none: const LayoutStateUsedValues*? = box_used_values
+        while let containing_block = containing_block_or_none:
+            if layout_state_used_values_node_const(containing_block) == root.layout_node_with_style():
+                break
+            offset_from_containing_block_chain_margins_between_here_and_root = offset_from_containing_block_chain_margins_between_here_and_root.add(layout_state_used_values_margin_box_right(containing_block))
+            containing_block_or_none = layout_state_used_values_containing_block_used_values(containing_block)
+        right_intrusion = ak.max(layout_zero_px(), right_side_floats_limit_to_right.sub(offset_from_containing_block_chain_margins_between_here_and_root))
+
+    return LayoutFormattingContextSpaceUsedByFloats(left = left_intrusion, right = right_intrusion)
+
+## Ported from Libraries/LibWeb/Layout/BlockFormattingContext.cpp:1638 Web::Layout::BlockFormattingContext::greatest_child_width (override).
+pub func layout_block_formatting_context_greatest_child_width_impl(base: LayoutFormattingContext*, box: LayoutBox*) -> gfx.CssPixels:
+    let this = (LayoutBlockFormattingContext*)base
+    # Similar to FormattingContext::greatest_child_width()
+    # but this one takes floats into account!
+    var max_width = this.m_left_floats.max_width.add(this.m_right_floats.max_width)
+    if layout_node_children_are_inline(box.layout_node()):
+        let line_boxes = &layout_state_get(base.m_state, as_layout_block_container(box).layout_node_with_style()).line_boxes
+        for line_box in ak.vector_span_const(line_boxes):
+            var width_here = layout_formatting_context_line_box_physical_width(box, &line_box)
+            let line_top = layout_line_box_bottom(&line_box).sub(layout_line_box_height(&line_box))
+            let line_bottom = layout_line_box_bottom(&line_box)
+            var extra_width_from_left_floats = layout_zero_px()
+            for left_float in ak.vector_span(&this.m_left_floats.all_boxes):
+                # NOTE: Floats directly affect the automatic size of their containing block, but only indirectly anything above in the tree.
+                if layout_node_containing_block(left_float.box.layout_node()) != box:
+                    continue
+                if line_top.lt(left_float.bottom_margin_edge) and line_bottom.gt(left_float.top_margin_edge):
+                    extra_width_from_left_floats = ak.max(extra_width_from_left_floats, left_float.offset_from_edge.add(layout_state_used_values_content_width(left_float.used_values)).add(layout_state_used_values_margin_box_right(left_float.used_values)))
+            var extra_width_from_right_floats = layout_zero_px()
+            for right_float in ak.vector_span(&this.m_right_floats.all_boxes):
+                # NOTE: Floats directly affect the automatic size of their containing block, but only indirectly anything above in the tree.
+                if layout_node_containing_block(right_float.box.layout_node()) != box:
+                    continue
+                if line_top.lt(right_float.bottom_margin_edge) and line_bottom.gt(right_float.top_margin_edge):
+                    extra_width_from_right_floats = ak.max(extra_width_from_right_floats, right_float.offset_from_edge.add(layout_state_used_values_margin_box_left(right_float.used_values)))
+            width_here = width_here.add(extra_width_from_left_floats).add(extra_width_from_right_floats)
+            max_width = ak.max(max_width, width_here)
+    else:
+        for child_node in layout_node_children(box.layout_node()):
+            let child = as_if_layout_box(child_node) else continue
+            if not layout_node_is_absolutely_positioned(child_node):
+                max_width = ak.max(max_width, layout_state_used_values_margin_box_width(layout_state_get(base.m_state, child.layout_node_with_style())))
+    return max_width
+
+# mark: Multi-column containers =================================================================
+
+## Ported from Libraries/LibWeb/Layout/BlockFormattingContext.cpp:1682 Web::Layout::BlockFormattingContext::determine_used_value_for_column_count.
+# https://drafts.csswg.org/css-multicol/#pseudo-algorithm
+# The pseudo-algorithm below determines the used values for column-count (N) and column-width (W). There is
+# one other variable in the pseudo-algorithm: U is the used width of the multi-column container.
+pub func layout_block_formatting_context_determine_used_value_for_column_count(this: LayoutBlockFormattingContext*, U: gfx.CssPixels) -> i32?:
+    let computed_values = layout_box_computed(layout_block_formatting_context_root(this).layout_box())
+    let column_width_value = css_computed_values_column_width(computed_values)
+    let column_count_value = css_computed_values_column_count(computed_values)
+    # (01)  if ((column-width = auto) and (column-count = auto)) then
+    if css_size_is_auto(&column_width_value) and css_column_count_is_auto(&column_count_value):
+        # (02)      exit; /* not a multicol container */
+        return none
+
+    # (03)  if column-width = auto then
+    if css_size_is_auto(&column_width_value):
+        # (04)      N := column-count
+        return css_column_count_value(&column_count_value)
+
+    let column_gap = layout_block_formatting_context_get_column_gap_used_value_for_multicol(this, U)
+    let column_width = layout_block_formatting_context_get_column_width_used_value_for_multicol(this, U)
+    let columns = U.add(column_gap).div(column_width.add(column_gap))
+
+    # (05)  else if column-count = auto then
+    if css_column_count_is_auto(&column_count_value):
+        # (06)      N := max(1,
+        # (07)        floor((U + column-gap)/(column-width + column-gap)))
+        return ak.max(1i32, gfx.css_pixel_fraction_to_int(&columns))
+
+    # (08)  else
+    # (09)      N := min(column-count, max(1,
+    # (10)        floor((U + column-gap)/(column-width + column-gap))))
+    return ak.min(css_column_count_value(&column_count_value), ak.max(1i32, gfx.css_pixel_fraction_to_int(&columns)))
+
+## Ported from Libraries/LibWeb/Layout/BlockFormattingContext.cpp:1712 Web::Layout::BlockFormattingContext::determine_used_value_for_column_width.
+pub func layout_block_formatting_context_determine_used_value_for_column_width(this: LayoutBlockFormattingContext*, U: gfx.CssPixels, N: i32) -> gfx.CssPixels:
+    let column_gap = layout_block_formatting_context_get_column_gap_used_value_for_multicol(this, U)
+    # (11)  W := max(0, (U + column-gap)/N - column-gap)
+    let per_column = gfx.div_css_pixels_int(U.add(column_gap), (i64)N)
+    return ak.max(layout_zero_px(), gfx.css_pixel_fraction_sub(&per_column, column_gap))
+
+## Ported from Libraries/LibWeb/Layout/BlockFormattingContext.cpp:1720 Web::Layout::BlockFormattingContext::get_column_width_used_value_for_multicol.
+# https://drafts.csswg.org/css-multicol-2/#cw
+pub func layout_block_formatting_context_get_column_width_used_value_for_multicol(this: LayoutBlockFormattingContext*, U: gfx.CssPixels) -> gfx.CssPixels:
+    let root = layout_block_formatting_context_root(this)
+    let column_width = css_computed_values_column_width(layout_box_computed(root.layout_box()))
+    # Used values will be clamped to a minimum of '1px'.
+    return ak.max(css_size_to_px(&column_width, root.layout_node(), U), gfx.CssPixels.from_int(1))
+
+## Ported from Libraries/LibWeb/Layout/BlockFormattingContext.cpp:1727 Web::Layout::BlockFormattingContext::get_column_gap_used_value_for_multicol.
+# https://www.w3.org/TR/css-align-3/#column-row-gap
+pub func layout_block_formatting_context_get_column_gap_used_value_for_multicol(this: LayoutBlockFormattingContext*, U: gfx.CssPixels) -> gfx.CssPixels:
+    let root = layout_block_formatting_context_root(this)
+    # The 'normal' represents a used value of '1em' on multi-column containers
+    match css_computed_values_column_gap(layout_box_computed(root.layout_box())):
+        .css_normal_gap(_):
+            let one_em = css_length_new(1.0, css_data.LengthUnit.em)
+            return css_length_to_px_layout_node(&one_em, root.layout_node())
+        .css_length_percentage(gap):
+            return css_percentage_or_to_px(&gap.percentage_or, root.layout_node(), U)
