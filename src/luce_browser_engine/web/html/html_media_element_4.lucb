@@ -1,0 +1,472 @@
+#==============================================================================================
+#
+#   html_media_element_4 - HTML::HTMLMediaElement: the resource fetch algorithm
+#
+#   DESCRIPTION:
+#       Port of LibWeb/HTML/HTMLMediaElement.cpp lines 1120-1518: loading a URL resource
+#       (blob URLs naming a MediaSource load locally), loading a remote resource through Fetch
+#       into an incrementally populated stream (with the processResponse, updateMedia,
+#       processEndOfMedia and error lambdas), loading a local MediaSource, verifying a media
+#       response and restarting the fetch at an offset.
+#
+#       Loading is phase 2: the Fetch, FileAPI and LibMedia calls go to closure stubs.
+#
+#==============================================================================================
+
+# mark: Loading a URL resource ==================================================================
+
+## The captures of `GC::weak_callback(*this, [](auto& self, ...) { ... })` and of the
+## `[weak_self = GC::Weak(self), fetch_generation]` lambdas: the element held weakly and the fetch
+## generation the callback belongs to.
+struct HtmlMediaElementWeakFetchCallback:
+    var weak_self: gc.Weak[HtmlMediaElement]
+    var fetch_generation: u32
+
+    ## The stream's data request callback: `self.restart_fetch_at_offset(offset)`.
+    static func restart_fetch_at_offset(context: void*?, offset: u64):
+        let captures = (HtmlMediaElementWeakFetchCallback*)(context else trap("data request callback: no captures"))
+        let this = gc.weak_ptr(&captures.weak_self) else return
+        html_media_element_restart_fetch_at_offset(this, offset)
+
+## Ported from HTMLMediaElement.cpp:1122 Web::HTML::HTMLMediaElement::load_url_resource.
+# https://html.spec.whatwg.org/multipage/media.html#concept-media-load-resource
+pub func html_media_element_load_url_resource(this: HtmlMediaElement*, url_record: web_url.Url, failure_callback: ak.Function1[ak.String, unit]):
+    # 1. Let mode be remote.
+    # 2. If the algorithm was invoked with media provider object, then set mode to local.
+    # NB: We invoke load_local_resource() directly when a media provider object is being loaded.
+
+    #    Otherwise:
+    # AD-HOC: Skip these steps if the URL is not a blob. Otherwise, we'll access a nonexistent
+    #         blob URL entry below.
+    if let blob_url_entry = web_url.url_blob_url_entry(&url_record):
+        let document = html_media_element_document(this)
+        # 1. Let isTopLevelSelfFetch be false.
+        var is_top_level_self_fetch = false
+        # 2. Let settingsObject be the media element's node document's relevant settings object.
+        let settings_object = dom_document_relevant_settings_object(document)
+        # 3. Let global be the media element's node document's relevant global object.
+        let global_window = as_if_html_window((gc.Cell*)html_relevant_global_object((JsObject*)document))
+        # 4. If all of the following conditions are true:
+        if let window = global_window:
+            # global is a Window object;
+            if let navigable = html_window_navigable(window):
+                # global's navigable is not null;
+                # global's navigable's parent is null; and
+                # settingsObject's creation URL equals the URL record,
+                if html_navigable_parent(navigable) == none and web_url.url_eq(&settings_object.environment.creation_url, url_record):
+                    # then set isTopLevelSelfFetch to true.
+                    is_top_level_self_fetch = true
+
+        # 5. Let stringOrEnvironment be "top-level-self-fetch" if isTopLevelSelfFetch is true; otherwise settingsObject.
+        var string_or_environment: FileApiEnvironmentOrTopLevelSelfFetch = .top_level_self_fetch
+        if not is_top_level_self_fetch:
+            string_or_environment = .environment(settings_object.html_environment())
+
+        # 6. Let object be the result of obtaining a blob object using the URL record's blob URL entry and stringOrEnvironment.
+        let object = file_api_obtain_a_blob_object(blob_url_entry, string_or_environment)
+        # 7. If object is a media provider object,
+        var object_is_media_source = false
+        if let found = object:
+            match found:
+                .media_source(_):
+                    object_is_media_source = true
+                .blob(_):
+                    object_is_media_source = false
+        if object_is_media_source:
+            # then set mode to local.
+
+            # NB: The subsequent steps for local resources are contained in load_local_resource().
+            let blob_entry_object = file_api_resolve_a_blob_url(url_record) else trap("Optional::value() of resolve_a_blob_url")
+            match blob_entry_object:
+                .media_source(media_source):
+                    html_media_element_load_local_resource(this, .media_source_extensions_media_source(media_source), failure_callback)
+                    return
+                .blob(_):
+                    trap("Variant::get<GC::Root<MediaSource>> of a Blob")
+
+    html_media_element_clear_remote_fetch_data(this)
+    let no_fetch_controller: gc.Cell*? = none
+    let fetch_data = new HtmlMediaElementRemoteFetchData(url_record = url_record, stream = none, fetch_controller = gc.make_weak(no_fetch_controller), failure_callback = failure_callback, accepts_byte_ranges = false, offset = 0) else trap("out of memory")
+    this.m_remote_fetch_data = fetch_data
+    fetch_data.url_record = url_record
+    let stream = media_incrementally_populated_stream_create_empty()
+    fetch_data.stream = stream
+    let weak_self = new HtmlMediaElementWeakFetchCallback(weak_self = gc.make_weak(this), fetch_generation = 0) else trap("out of memory")
+    media_incrementally_populated_stream_set_data_request_callback(stream, ak.Function1[u64, unit](call = HtmlMediaElementWeakFetchCallback.restart_fetch_at_offset, context = weak_self))
+    fetch_data.failure_callback = failure_callback
+
+    html_media_element_set_up_playback_manager_for_remote(this)
+
+    html_media_element_load_remote_resource(this, .html_media_element_entire_resource(HtmlMediaElementEntireResource()))
+
+# mark: Loading a remote resource ===============================================================
+
+## The captures of processResponse: `[self = GC::Ref(*this), byte_range = move(byte_range), fetch_generation]`.
+struct HtmlMediaElementProcessResponse:
+    var this: HtmlMediaElement*
+    var byte_range: HtmlMediaElementByteRange
+    var fetch_generation: u32
+
+    ## Fetch's processResponse: verify the response, then incrementally read its body into the stream.
+    static func run(context: void*?, response_: FetchResponse*):
+        let captures = (HtmlMediaElementProcessResponse*)(context else trap("processResponse: no captures"))
+        let this = captures.this
+        let fetch_data = this.m_remote_fetch_data else trap("processResponse: no remote fetch data")
+        let stream = fetch_data.stream else trap("processResponse: no stream")
+
+        # FIXME: If the response is CORS cross-origin, we must use its internal response to query any of its data. See:
+        #        https://github.com/whatwg/html/issues/9355
+        let response = fetch_response_unsafe_response(response_)
+
+        # 1. Let global be the media element's node document's relevant global object.
+        let global = realm_global_object(html_element_realm(this.html_element()))
+
+        if let content_length = http_header_list_extract_length(fetch_response_header_list(response)):
+            let actual_length = fetch_data.offset + content_length
+            media_incrementally_populated_stream_set_expected_size(stream, actual_length)
+
+        if let accept_ranges = http_header_list_extract_header_list_values(fetch_response_header_list(response), ak.sv("Accept-Ranges")):
+            fetch_data.accepts_byte_ranges = false
+            for units in ak.vector_span_const(&accept_ranges):
+                if ak.byte_string_eq_string_view(&units, ak.sv("bytes")):
+                    fetch_data.accepts_byte_ranges = true
+                    break
+
+        # 4. If the result of verifying response given the current media resource and byteRange is false, then abort these steps.
+        # NOTE: We do this step before creating the updateMedia task so that we can invoke the failure callback.
+        if let failure_reason = html_media_element_verify_response_or_get_failure_reason(this, response, captures.byte_range):
+            media_incrementally_populated_stream_close(stream)
+            ak.function1_call(&fetch_data.failure_callback, failure_reason)
+            return
+
+        let heap = gc.cell_heap(this.cell())
+        let weak_captures = new HtmlMediaElementWeakFetchCallback(weak_self = gc.make_weak(this), fetch_generation = captures.fetch_generation) else trap("out of memory")
+
+        # 2. Let updateMedia be to queue a media element task given the media element to run the first appropriate steps from the media data processing
+        #    steps list below. (A new task is used for this so that the work described below occurs relative to the appropriate media element event task
+        #    source rather than using the networking task source.)
+        let update_media = gc.create_function1(heap, ak.Function1[ak.ByteBuffer, unit](call = html_media_element_update_media, context = weak_captures))
+
+        # 3. Let processEndOfMedia be the following step: If the fetching process has completes without errors, including decoding the media data,
+        #    and if all of the data is available to the user agent without network access, then, the user agent must move on to the final step below.
+        #    This might never happen, e.g. when streaming an infinite resource such as web radio, or if the resource is longer than the user agent's
+        #    ability to cache data.
+        let process_end_of_media = gc.create_function0(heap, ak.Function0[unit](call = html_media_element_process_end_of_media, context = weak_captures))
+
+        # 5. Otherwise, incrementally read response's body given updateMedia, processEndOfMedia, an empty algorithm, and global.
+
+        # AD-HOC: We need to pass a non-empty error algorithm in order to invoke the requisite steps.
+        let process_body_error = gc.create_function1(heap, ak.Function1[JsValue, unit](call = html_media_element_process_body_error, context = weak_captures))
+
+        let body = fetch_response_body(response) else trap("VERIFY: response->body()")
+        fetch_body_incrementally_read(body, update_media, process_end_of_media, process_body_error, global)
+
+## The captures of the `[self = weak_self.as_nonnull()] { self->process_media_data(status); }` tasks.
+struct HtmlMediaElementProcessMediaDataTask:
+    var this: HtmlMediaElement*
+    var fetching_status: HtmlMediaElementFetchingStatus
+
+    ## The task's steps.
+    static func run(context: void*?):
+        let captures = (HtmlMediaElementProcessMediaDataTask*)(context else trap("process media data task: no captures"))
+        html_media_element_process_media_data(captures.this, captures.fetching_status)
+
+## `queue_a_media_element_task([self] { self->process_media_data(fetching_status); })`.
+func html_media_element_queue_processing_media_data(this: HtmlMediaElement*, fetching_status: HtmlMediaElementFetchingStatus):
+    let captures = new HtmlMediaElementProcessMediaDataTask(this = this, fetching_status = fetching_status) else trap("out of memory")
+    html_media_element_queue_a_media_element_task(this, ak.Function0[unit](call = HtmlMediaElementProcessMediaDataTask.run, context = captures))
+
+## processResponse's updateMedia: `[weak_self, fetch_generation](ByteBuffer media_data) { ... }`.
+func html_media_element_update_media(context: void*?, media_data: ak.ByteBuffer):
+    let captures = (HtmlMediaElementWeakFetchCallback*)(context else trap("updateMedia: no captures"))
+    let this = gc.weak_ptr(&captures.weak_self) else return
+    if captures.fetch_generation != this.m_current_fetch_generation:
+        return
+    let fetch_data = this.m_remote_fetch_data else trap("updateMedia: no remote fetch data")
+
+    # 6. Update the media data with the contents of response's unsafe response obtained in this fashion. response can be CORS-same-origin or
+    #    CORS-cross-origin; this affects whether subtitles referenced in the media data are exposed in the API and, for video elements, whether
+    #    a canvas gets tainted when the video is drawn on it.
+    media_incrementally_populated_stream_add_chunk_at(fetch_data.stream else trap("updateMedia: no stream"), fetch_data.offset, ak.byte_buffer_bytes_const(&media_data))
+    fetch_data.offset += (u64)ak.byte_buffer_size(&media_data)
+
+    html_media_element_queue_processing_media_data(this, HtmlMediaElementFetchingStatus.ongoing)
+
+## processResponse's processEndOfMedia: `[weak_self, fetch_generation] { ... }`.
+func html_media_element_process_end_of_media(context: void*?):
+    let captures = (HtmlMediaElementWeakFetchCallback*)(context else trap("processEndOfMedia: no captures"))
+    let this = gc.weak_ptr(&captures.weak_self) else return
+    if captures.fetch_generation != this.m_current_fetch_generation:
+        return
+
+    let fetch_data = this.m_remote_fetch_data else trap("processEndOfMedia: no remote fetch data")
+    media_incrementally_populated_stream_close(fetch_data.stream else trap("processEndOfMedia: no stream"))
+    html_media_element_queue_processing_media_data(this, HtmlMediaElementFetchingStatus.complete)
+
+## processResponse's processBodyError: `[weak_self, fetch_generation](JS::Value) { ... }`.
+func html_media_element_process_body_error(context: void*?, error_: JsValue):
+    let captures = (HtmlMediaElementWeakFetchCallback*)(context else trap("processBodyError: no captures"))
+    let this = gc.weak_ptr(&captures.weak_self) else return
+    if captures.fetch_generation != this.m_current_fetch_generation:
+        return
+
+    let fetch_data = this.m_remote_fetch_data else trap("processBodyError: no remote fetch data")
+    media_incrementally_populated_stream_close(fetch_data.stream else trap("processBodyError: no stream"))
+    html_media_element_queue_processing_media_data(this, HtmlMediaElementFetchingStatus.interrupted)
+
+## Ported from HTMLMediaElement.cpp:1186 Web::HTML::HTMLMediaElement::load_remote_resource.
+# https://html.spec.whatwg.org/multipage/media.html#concept-media-load-resource
+pub func html_media_element_load_remote_resource(this: HtmlMediaElement*, byte_range: HtmlMediaElementByteRange):
+    let realm = html_media_element_realm(this)
+    let vm = realm_vm(realm)
+
+    let fetch_data = this.m_remote_fetch_data else trap("load_remote_resource: no remote fetch data")
+    let url_record = fetch_data.url_record
+
+    this.m_current_fetch_generation +%= 1
+    let fetch_generation = this.m_current_fetch_generation
+
+    # 1. Let mode be remote.
+    # 2. If the algorithm was invoked with media provider object, then set mode to local.
+    # 3. If mode is remote, then let the current media resource be the resource given by the URL record passed to this
+    #    algorithm; otherwise, let the current media resource be the resource given by the media provider object.
+    #    Either way, the current media resource is now the element's media resource.
+    # NB: Mode is already determined to be remote, so only the "mode is remote" steps apply.
+
+    # FIXME: 4. Remove all media-resource-specific text tracks from the media element's list of pending text tracks, if any.
+
+    # 5. Run the appropriate steps from the following list:
+    # -> If mode is remote
+    # FIXME: 1. Optionally, run the following substeps. This is the expected behavior if the user agent intends to not attempt to fetch the resource until
+    #           the user requests it explicitly (e.g. as a way to implement the preload attribute's none keyword).
+    #            1. Set the networkState to NETWORK_IDLE.
+    #            2. Queue a media element task given the media element to fire an event named suspend at the element.
+    #            3. Queue a media element task given the media element to set the element's delaying-the-load-event flag to false. This stops delaying
+    #               the load event.
+    #            4. Wait for the task to be run.
+    #            5. Wait for an implementation-defined event (e.g., the user requesting that the media element begin playback).
+    #            6. Set the element's delaying-the-load-event flag back to true (this delays the load event again, in case it hasn't been fired yet).
+    #            7. Set the networkState to NETWORK_LOADING.
+
+    # 2. Let destination be "audio" if the media element is an audio element, or "video" otherwise.
+    var destination = FetchRequestDestination.video
+    if is_html_audio_element(this):
+        destination = FetchRequestDestination.audio
+
+    # 3. Let request be the result of creating a potential-CORS request given current media resource's URL record, destination, and the current state
+    #    of the media element's crossorigin content attribute.
+    let request = html_create_potential_cors_request(vm, url_record, destination, this.m_crossorigin)
+
+    # 4. Set request's client to the media element's node document's relevant settings object.
+    fetch_request_set_client(request, dom_document_relevant_settings_object(html_media_element_document(this)))
+
+    # 5. Set request's initiator type to destination.
+    if destination == FetchRequestDestination.audio:
+        fetch_request_set_initiator_type(request, FetchRequestInitiatorType.audio)
+    else:
+        fetch_request_set_initiator_type(request, FetchRequestInitiatorType.video)
+
+    # 6. Let byteRange, which is "entire resource" or a (number, number or "until end") tuple, be the byte range required to satisfy missing data in
+    #    media data. This value is implementation-defined and may rely on codec, network conditions or other heuristics. The user-agent may determine
+    #    to fetch the resource in full, in which case byteRange would be "entire resource", to fetch from a byte offset until the end, in which case
+    #    byteRange would be (number, "until end"), or to fetch a range between two byte offsets, in which case byteRange would be a (number, number)
+    #    tuple representing the two offsets.
+    # NB: byte_range is passed as a parameter.
+
+    # 7. If byteRange is not "entire resource", then:
+    fetch_data.offset = 0
+
+    match byte_range:
+        .html_media_element_entire_resource(_):
+            fetch_data.offset = 0
+        .html_media_element_until_end(range):
+            # 1. If byteRange[1] is "until end", then add a range header to request given byteRange[0].
+            fetch_request_add_range_header(request, range.first, none)
+            fetch_data.offset = range.first
+            # 2. Otherwise, add a range header to request given byteRange[0] and byteRange[1].
+            # NB: We don't currently have any need to request a range with a delimited end.
+
+    # 8. Fetch request, with processResponse set to the following steps given response response:
+    let captures = new HtmlMediaElementProcessResponse(this = this, byte_range = byte_range, fetch_generation = fetch_generation) else trap("out of memory")
+    let algorithms = fetch_algorithms_create_with_process_response(vm, ak.Function1[FetchResponse*, unit](call = HtmlMediaElementProcessResponse.run, context = captures))
+
+    gc.weak_assign(&fetch_data.fetch_controller, (gc.Cell*?)fetch_fetching_fetch(realm, request, algorithms))
+
+## Ported from HTMLMediaElement.cpp:1349 Web::HTML::HTMLMediaElement::load_local_resource.
+# https://html.spec.whatwg.org/multipage/media.html#concept-media-load-resource
+pub func html_media_element_load_local_resource(this: HtmlMediaElement*, media_provider: HtmlMediaElementMediaProviderObject, failure_callback: ak.Function1[ak.String, unit]):
+    # 1. Let mode be remote.
+    # 2. If the algorithm was invoked with media provider object, then set mode to local.
+    # 3. If mode is remote, then let the current media resource be the resource given by the URL record passed to this
+    #    algorithm; otherwise, let the current media resource be the resource given by the media provider object.
+    #    Either way, the current media resource is now the element's media resource.
+    # NB: The mode is already determined to be local, so only the "mode is local" steps apply.
+
+    # FIXME: 4. Remove all media-resource-specific text tracks from the media element's list of pending text tracks, if any.
+
+    # 5. Run the appropriate steps from the following list:
+    #    -> If mode is remote
+    #    -> Otherwise (mode is local)
+
+    # https://w3c.github.io/media-source/#mediasource-attach
+    # At the beginning of the "Otherwise (mode is local)" section of the resource fetch algorithm,
+    # execute the additional steps, below.
+
+    # 1. If the resource fetch algorithm was invoked with a media provider object that is a MediaSource object, a
+    #    MediaSourceHandle object or a URL record whose object is a MediaSource object, then:
+    match media_provider:
+        .media_source_extensions_media_source(media_source):
+            # FIXME: -> If the media provider object is a URL record whose object is a MediaSource that was constructed in
+            #           a DedicatedWorkerGlobalScope, such as would occur if attempting to use a MediaSource object URL
+            #           from a DedicatedWorkerGlobalScope MediaSource
+            #               Run the "If the media data cannot be fetched at all, due to network errors, causing the user
+            #               agent to give up trying to fetch the resource" steps of the resource fetch algorithm's media
+            #               data processing steps list.
+
+            # FIXME: -> If the media provider object is a MediaSourceHandle whose [[Detached]] internal slot is true
+            #               Run the "If the media data cannot be fetched at all, due to network errors, causing the user
+            #               agent to give up trying to fetch the resource" steps of the resource fetch algorithm's media
+            #               data processing steps list.
+
+            # FIXME: -> If the media provider object is a MediaSourceHandle whose underlying MediaSource's [[has ever been
+            #           attached]] internal slot is true
+            #               Run the "If the media data cannot be fetched at all, due to network errors, causing the user
+            #               agent to give up trying to fetch the resource" steps of the resource fetch algorithm's media
+            #               data processing steps list.
+
+            # -> If readyState is NOT set to "closed"
+            if not media_source_extensions_media_source_ready_state_is_closed(media_source):
+                # Run the "If the media data cannot be fetched at all, due to network errors, causing the user agent to
+                # give up trying to fetch the resource" steps of the resource fetch algorithm's media data processing
+                # steps list.
+                ak.function1_call(&failure_callback, ak.string_from_str("MediaSource is not closed"))
+            # -> Otherwise
+            else:
+                # 1. Set the MediaSource's [[has ever been attached]] internal slot to true.
+                media_source_extensions_media_source_set_has_ever_been_attached(media_source)
+
+                # 2. Set the media element's delaying-the-load-event-flag to false.
+                html_media_element_clear_delaying_the_load_event(this)
+
+                # FIXME: 3. If the MediaSource was constructed in a DedicatedWorkerGlobalScope, then setup worker
+                #           attachment communication and open the MediaSource:
+                #            1. Set [[channel with worker]] to be a new MessageChannel.
+                #            2. Set [[port to worker]] to the port1 value of [[channel with worker]].
+                #            3. Execute StructuredSerializeWithTransfer with the port2 of [[channel with worker]] as both
+                #               the value and the sole member of the transferList, and let the result be serialized port2.
+                #            4. Queue a task on the MediaSource's DedicatedWorkerGlobalScope that will
+                #                1. Execute StructuredDeserializeWithTransfer with serialized port2 and
+                #                   DedicatedWorkerGlobalScope's realm, and set [[port to main]] to be the resulting
+                #                   deserialized clone of the transferred port2 value of [[channel with worker]].
+                #                2. Set the readyState attribute to "open".
+                #                3. Queue a task to fire an event named sourceopen at the MediaSource.
+
+                # Otherwise, the MediaSource was constructed in a Window:
+                # FIXME: 1. Set [[channel with worker]] null.
+                #        2. Set [[port to worker]] null.
+                #        3. Set [[port to main]] null.
+
+                media_source_extensions_media_source_set_assigned_to_media_element(media_source, this)
+                html_media_element_set_up_playback_manager_for_local(this)
+
+                # 4. Set the readyState attribute to "open".
+                # 5. Queue a task to fire an event named sourceopen at the MediaSource.
+                media_source_extensions_media_source_set_ready_state_to_open_and_fire_sourceopen_event(media_source)
+
+                # FIXME: 4. Continue the resource fetch algorithm by running the remaining "Otherwise (mode is local)"
+                #           steps, with these requirements:
+                #            1. Text in the resource fetch algorithm or the media data processing steps list that refers
+                #               to "the download", "bytes received", or "whenever new data for the current media resource
+                #               becomes available" refers to data passed in via appendBuffer().
+                #            2. References to HTTP in the resource fetch algorithm and the media data processing steps
+                #               list shall not apply because the HTMLMediaElement does not fetch media data via HTTP when
+                #               a MediaSource is attached.
+
+                # NB: Since we haven't created a RemoteFetchData instance and assigned it here, we won't do anything
+                #     further with regard to the HTTP fetch. Data received, etc. is handled largely through
+                #     the demuxers that our PlaybackManager is given.
+        _:
+            # FIXME: Support File objects.
+            ak.function1_call(&failure_callback, ak.string_from_str("File objects are not supported"))
+
+    # The resource described by the current media resource, if any, contains the media data. It is
+    # CORS-same-origin.
+    #
+    # If the current media resource is a raw data stream (e.g. from a File object), then to determine the
+    # format of the media resource, the user agent must use the rules for sniffing audio and video
+    # specifically. Otherwise, if the data stream is pre-decoded, then the format is the format given by the
+    # relevant specification.
+    #
+    # Whenever new data for the current media resource becomes available, queue a media element task given the
+    # media element to run the first appropriate steps from the media data processing steps list below.
+    #
+    # When the current media resource is permanently exhausted (e.g. all the bytes of a Blob have been processed),
+    # if there were no decoding errors, then the user agent must move on to the final step below. This might never
+    # happen, e.g. if the current media resource is a MediaStream.
+
+## Ported from HTMLMediaElement.cpp:1466 Web::HTML::HTMLMediaElement::verify_response_or_get_failure_reason.
+# https://html.spec.whatwg.org/multipage/media.html#verify-a-media-response
+pub func html_media_element_verify_response_or_get_failure_reason(this: HtmlMediaElement*, response: FetchResponse*, byte_range: HtmlMediaElementByteRange) -> ak.String?:
+    # 1. If response is a network error, then return false.
+    if fetch_response_is_network_error(response):
+        let message = fetch_response_network_error_message(response)
+        assert(message != none)
+        return message
+
+    # 2. If byteRange is "entire resource", then return true.
+    var is_entire_resource = false
+    match byte_range:
+        .html_media_element_entire_resource(_):
+            is_entire_resource = true
+        .html_media_element_until_end(_):
+            is_entire_resource = false
+    if is_entire_resource:
+        return none
+
+    # 3. Let internalResponse be response's unsafe response.
+    let internal_response = fetch_response_unsafe_response(response)
+
+    # 4. If internalResponse's status is 200, then return true.
+    if fetch_response_status(internal_response) == 200:
+        return none
+
+    # 5. If internalResponse's status is not 206, then return false.
+    if fetch_response_status(internal_response) != 206:
+        var status_builder = ak.string_builder_new()
+        ak.string_builder_append(&status_builder, "Unexpected status code: ")
+        let status_text = ak.string_number_u64((u64)fetch_response_status(internal_response))
+        ak.string_builder_append_string_view(&status_builder, ak.string_bytes_as_string_view(&status_text))
+        return ak.string_builder_to_string(&status_builder) else trap("MUST: String::formatted")
+
+    # 6. If the result of extracting content-range values from internalResponse is failure, then return false.
+    let maybe_content_range = http_header_list_extract_content_range_values(fetch_response_header_list(internal_response))
+    if maybe_content_range == none:
+        var builder = ak.string_builder_new()
+        ak.string_builder_append(&builder, "Failed to extract values from Content-Range: ")
+        if let header = http_header_list_get(fetch_response_header_list(internal_response), ak.sv("Content-Range")):
+            ak.string_builder_append_string_view(&builder, ak.byte_string_view(&header))
+        return ak.string_builder_to_string(&builder) else trap("MUST: String::formatted")
+
+    let content_range = maybe_content_range else trap("unreachable")
+    let fetch_data = this.m_remote_fetch_data else trap("verify_response: no remote fetch data")
+    fetch_data.offset = content_range.first_byte_pos
+    if let complete_length = content_range.complete_length:
+        media_incrementally_populated_stream_set_expected_size(fetch_data.stream else trap("verify_response: no stream"), complete_length)
+
+    return none
+
+## Ported from HTMLMediaElement.cpp:1502 Web::HTML::HTMLMediaElement::restart_fetch_at_offset.
+pub func html_media_element_restart_fetch_at_offset(this: HtmlMediaElement*, offset: u64):
+    let fetch_data = this.m_remote_fetch_data else trap("VERIFY: m_remote_fetch_data")
+
+    if this.m_error != none:
+        return
+
+    if not fetch_data.accepts_byte_ranges:
+        return
+
+    if let fetch_controller = (FetchController*?)gc.weak_ptr(&fetch_data.fetch_controller):
+        fetch_controller_stop_fetch(fetch_controller)
+        gc.weak_assign(&fetch_data.fetch_controller, none)
+
+    html_media_element_load_remote_resource(this, .html_media_element_until_end(HtmlMediaElementUntilEnd(first = offset)))
