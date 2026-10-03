@@ -1,0 +1,422 @@
+#==============================================================================================
+#
+#   tests_promise - tests of the phase-1 promises, sets and maps (DESIGN.md §3.6)
+#
+#   DESCRIPTION:
+#       The JS::Promise, PromiseCapability, JS::Set and JS::Map stand-ins and the WebIDL promise
+#       operations over them, in a principal realm of tests_environments whose VM has the main
+#       thread VM's promise host hooks (web_test_install_agent). They pin the order the
+#       ECMAScript spec and LibJS give: reactions run as microtasks in the order they were
+#       triggered, a derived promise settles one tick later, resolving with a promise takes two
+#       more ticks; the rejection tracker's lists; wait for all; insertion order and SameValue
+#       of sets and maps; and what a collection keeps.
+#
+#==============================================================================================
+
+# mark: Helpers =================================================================================
+
+## A logged reaction step: appends its number to the log, remembers the value it was given and
+## answers `result` (or the value when there is none).
+struct TestPromiseStep:
+    var log: TestHtmlLog*
+    var number: i32
+    var seen: JsValue
+    var result: JsValue?
+
+## The behaviour of a logged reaction step.
+func test_promise_step_call(context: void*?, value: JsValue) -> JsValue:
+    let step = (TestPromiseStep*)(context else trap("no captures"))
+    step.log.entries[step.log.count] = step.number
+    step.log.count += 1
+    step.seen = value
+    return step.result else value
+
+## A logged reaction step `number` (ReactionSteps, a GC::Function) and its record.
+func test_promise_step(vm: Vm*, log: TestHtmlLog*, number: i32, result: JsValue? = none) -> (gc.Function1[JsValue, JsValue]*, TestPromiseStep*):
+    let step = new TestPromiseStep(log = log, number = number, seen = js_undefined(), result = result) else trap("out of memory")
+    return (gc.create_function1(vm_heap(vm), ak.Function1[JsValue, JsValue](call = test_promise_step_call, context = step)), step)
+
+## The JS::Promise of a WebIDL promise.
+func test_promise_object(promise: JsPromiseCapability*) -> JsPromise*:
+    return as_js_promise((gc.Cell*)js_promise_capability_promise(promise))
+
+## Whether a value is the number `expected`.
+func test_promise_is_number(value: JsValue, expected: f64) -> bool:
+    return js_value_is_number(value) and js_value_as_double(value) == expected
+
+## The UniversalGlobalScopeMixin of a test realm's global.
+func test_promise_global_mixin(realm: Realm*) -> HtmlUniversalGlobalScopeMixin*:
+    return html_environment_settings_object_universal_global_scope(html_principal_realm_settings_object(realm))
+
+## How many promises wait in the global's about-to-be-notified rejected promises list.
+func test_promise_about_to_be_notified(realm: Realm*) -> usize:
+    let list = test_promise_global_mixin(realm).m_about_to_be_notified_rejected_promises_list else return 0
+    return ak.vector_size(list)
+
+## Enter `realm` as a TemporaryExecutionContext with callbacks enabled does (prepare to run
+## script and a callback, so that HostMakeJobCallback finds an incumbent settings object).
+func test_promise_enter(realm: Realm*) -> HtmlEnvironmentSettingsObject*:
+    let settings = html_principal_realm_settings_object(realm)
+    html_prepare_to_run_script(settings)
+    html_prepare_to_run_callback(settings)
+    return settings
+
+## Leave what test_promise_enter entered, as the TemporaryExecutionContext's destructor does:
+## cleaning up after running script performs a microtask checkpoint once the execution context
+## stack is empty.
+func test_promise_leave(settings: HtmlEnvironmentSettingsObject*):
+    html_clean_up_after_running_script(settings)
+    html_clean_up_after_running_callback(settings)
+
+# mark: Settling and reacting ===================================================================
+
+test "WebIDL promises: reactions run as microtasks in order, once, with the value":
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    var log = TestHtmlLog()
+    let settings = test_promise_enter(realm)
+
+    let promise = idl_create_promise(realm)
+    assert(js_promise_state(test_promise_object(promise)) == JsPromiseState.pending)
+    assert(js_object_shape_realm(js_promise_capability_promise(promise)) == realm)
+    let (first, first_step) = test_promise_step(vm, &log, 1)
+    let (second, second_step) = test_promise_step(vm, &log, 2)
+    let (on_rejection, rejection_step) = test_promise_step(vm, &log, 9)
+    discard(idl_upon_fulfillment(promise, first))
+    discard(idl_upon_fulfillment(promise, second))
+    discard(idl_upon_rejection(promise, on_rejection))
+
+    # A microtask queued before the resolution runs first; the reactions are jobs queued by
+    # the resolution, in the order they were registered; a microtask queued after runs last.
+    html_queue_a_microtask(none, test_html_log_steps(vm, &log, 10))
+    idl_resolve_promise(realm, promise, js_value_from_f64(42.0))
+    html_queue_a_microtask(none, test_html_log_steps(vm, &log, 20))
+    assert(log.count == 0)
+    assert(idl_is_promise_fulfilled(promise))
+
+    # Resolving or rejecting again does nothing.
+    idl_resolve_promise(realm, promise, js_value_from_f64(7.0))
+    idl_reject_promise(realm, promise, js_value_from_f64(8.0))
+    assert(test_promise_is_number(js_promise_result(test_promise_object(promise)), 42.0))
+
+    test_promise_leave(settings)
+    assert(test_html_log_is(&log, [10, 1, 2, 20]))
+    assert(test_promise_is_number(first_step.seen, 42.0) and test_promise_is_number(second_step.seen, 42.0))
+
+    # Reacting to a settled promise queues the job at once; it runs at the next checkpoint.
+    discard(test_promise_enter(realm))
+    let (late, late_step) = test_promise_step(vm, &log, 3)
+    discard(idl_upon_fulfillment(promise, late))
+    assert(log.count == 4)
+    test_promise_leave(settings)
+    assert(test_html_log_is(&log, [10, 1, 2, 20, 3]))
+    assert(test_promise_is_number(late_step.seen, 42.0))
+    assert(js_value_is_undefined(rejection_step.seen))
+    assert(vm_execution_context_stack(vm).length == 0)
+
+test "WebIDL promises: derived promises settle a tick later, chains interleave":
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    var log = TestHtmlLog()
+    let settings = test_promise_enter(realm)
+
+    # a.then(A1).then(A2) and b.then(B1).then(B2): A1 B1 A2 B2.
+    let a = idl_create_promise(realm)
+    let b = idl_create_promise(realm)
+    let (a1, a1_step) = test_promise_step(vm, &log, 1, js_value_from_f64(100.0))
+    let (a2, a2_step) = test_promise_step(vm, &log, 2)
+    let (b1, b1_step) = test_promise_step(vm, &log, 3)
+    let (b2, b2_step) = test_promise_step(vm, &log, 4)
+    let derived_a = idl_upon_fulfillment(a, a1)
+    discard(idl_upon_fulfillment(derived_a, a2))
+    discard(idl_upon_fulfillment(idl_upon_fulfillment(b, b1), b2))
+    idl_resolve_promise(realm, a, js_value_from_f64(1.0))
+    idl_resolve_promise(realm, b, js_value_from_f64(2.0))
+    test_promise_leave(settings)
+    assert(test_html_log_is(&log, [1, 3, 2, 4]))
+    assert(test_promise_is_number(a1_step.seen, 1.0) and test_promise_is_number(b1_step.seen, 2.0) and test_promise_is_number(b2_step.seen, 2.0))
+    # The derived promise is resolved with A1's result.
+    assert(test_promise_is_number(a2_step.seen, 100.0))
+    assert(test_promise_is_number(js_promise_result(test_promise_object(derived_a)), 100.0))
+
+test "resolving with a promise takes two more ticks (NewPromiseResolveThenableJob, then the reaction)":
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    var log = TestHtmlLog()
+    let settings = test_promise_enter(realm)
+
+    # c.then(C1).then(C2).then(C3), and p resolved with an already fulfilled q.
+    let c = idl_create_promise(realm)
+    let (c1, c1_step) = test_promise_step(vm, &log, 1)
+    let (c2, c2_step) = test_promise_step(vm, &log, 2)
+    let (c3, c3_step) = test_promise_step(vm, &log, 3)
+    discard(idl_upon_fulfillment(idl_upon_fulfillment(idl_upon_fulfillment(c, c1), c2), c3))
+    let q = idl_create_resolved_promise(realm, js_value_from_f64(5.0))
+    let p = idl_create_promise(realm)
+    let (p1, p1_step) = test_promise_step(vm, &log, 4)
+    discard(idl_upon_fulfillment(p, p1))
+
+    idl_resolve_promise(realm, c, js_undefined())
+    idl_resolve_promise(realm, p, js_value_from_object(js_promise_capability_promise(q)))
+    # p is not fulfilled yet: its resolution waits for q.then().
+    assert(js_promise_state(test_promise_object(p)) == JsPromiseState.pending)
+    test_promise_leave(settings)
+    assert(test_html_log_is(&log, [1, 2, 3, 4]))
+    assert(test_promise_is_number(p1_step.seen, 5.0))
+    assert(js_value_is_undefined(c1_step.seen) and js_value_is_undefined(c2_step.seen) and js_value_is_undefined(c3_step.seen))
+    assert(idl_is_promise_fulfilled(p))
+
+test "rejection: upon_rejection gets the reason; a fulfillment reaction's derived promise is rejected":
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    var log = TestHtmlLog()
+    let settings = test_promise_enter(realm)
+
+    let promise = idl_create_promise(realm)
+    let (on_fulfilled, fulfilled_step) = test_promise_step(vm, &log, 1)
+    let (on_rejected, rejected_step) = test_promise_step(vm, &log, 2)
+    let derived = idl_upon_fulfillment(promise, on_fulfilled)
+    let (derived_rejected, derived_step) = test_promise_step(vm, &log, 3)
+    idl_mark_promise_as_handled(idl_upon_rejection(derived, derived_rejected))
+    discard(idl_upon_rejection(promise, on_rejected))
+    idl_reject_promise(realm, promise, js_value_from_f64(13.0))
+    assert(js_promise_state(test_promise_object(promise)) == JsPromiseState.rejected)
+    assert(not idl_is_promise_fulfilled(promise))
+    test_promise_leave(settings)
+
+    # The fulfillment step never runs; the derived promise is rejected with the same reason.
+    assert(test_html_log_is(&log, [2, 3]))
+    assert(js_value_is_undefined(fulfilled_step.seen))
+    assert(test_promise_is_number(rejected_step.seen, 13.0))
+    assert(test_promise_is_number(derived_step.seen, 13.0))
+    assert(js_promise_state(test_promise_object(derived)) == JsPromiseState.rejected)
+
+    # A rejected promise made by create_rejected_promise.
+    discard(test_promise_enter(realm))
+    let rejected = idl_create_rejected_promise(realm, js_value_from_f64(21.0))
+    assert(js_promise_state(test_promise_object(rejected)) == JsPromiseState.rejected)
+    assert(test_promise_is_number(js_promise_result(test_promise_object(rejected)), 21.0))
+    idl_mark_promise_as_handled(rejected)
+    test_promise_leave(settings)
+
+test "HostPromiseRejectionTracker: unhandled rejections wait for notification, handling removes them":
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    var log = TestHtmlLog()
+    let settings = test_promise_enter(realm)
+
+    # Rejected without a handler: "reject" puts it on the about-to-be-notified list.
+    let unhandled = idl_create_promise(realm)
+    idl_reject_promise(realm, unhandled, js_value_from_f64(1.0))
+    assert(test_promise_about_to_be_notified(realm) == 1)
+
+    # A handler added before the checkpoint: "handle" takes it off again.
+    let (on_rejected, rejected_step) = test_promise_step(vm, &log, 1)
+    discard(idl_upon_rejection(unhandled, on_rejected))
+    assert(test_promise_about_to_be_notified(realm) == 0)
+    assert(js_promise_is_handled(test_promise_object(unhandled)))
+
+    # Marked as handled before it is rejected: nothing is tracked.
+    let handled = idl_create_promise(realm)
+    idl_mark_promise_as_handled(handled)
+    idl_reject_promise(realm, handled, js_value_from_f64(2.0))
+    assert(test_promise_about_to_be_notified(realm) == 0)
+
+    # A promise handled only after its rejection was tracked stays on the list until the
+    # checkpoint notifies about it: the list is cleared and a global task queued (it skips
+    # promises handled by then; firing unhandledrejection is phase 3).
+    let late = idl_create_rejected_promise(realm, js_value_from_f64(3.0))
+    assert(test_promise_about_to_be_notified(realm) == 1)
+    idl_mark_promise_as_handled(late)
+    let task_queue = html_event_loop_task_queue(html_main_thread_event_loop())
+    assert(html_task_queue_is_empty(task_queue))
+    test_promise_leave(settings)
+    assert(test_html_log_is(&log, [1]))
+    assert(test_promise_is_number(rejected_step.seen, 1.0))
+    assert(test_promise_global_mixin(realm).m_about_to_be_notified_rejected_promises_list == none)
+    assert(not html_task_queue_is_empty(task_queue))
+
+test "LibJS's default hooks: without LibWeb's, promise jobs wait in the VM's queue until run":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let realm = web_test_create_realm(vm)
+    let context = js_execution_context_create()
+    context.realm = realm
+    vm_push_execution_context(vm, context)
+    var log = TestHtmlLog()
+
+    let promise = idl_create_promise(realm)
+    let (step, step_record) = test_promise_step(vm, &log, 1)
+    discard(idl_upon_fulfillment(promise, step))
+    idl_resolve_promise(realm, promise, js_value_from_bool(true))
+    assert(log.count == 0)
+    assert(not vm_host_promise_job_queue_is_empty(vm))
+    vm_run_queued_promise_jobs(vm)
+    assert(test_html_log_is(&log, [1]))
+    assert(js_value_as_bool(step_record.seen))
+    assert(vm_host_promise_job_queue_is_empty(vm))
+    discard(vm_pop_execution_context(vm))
+
+# mark: Wait for all ============================================================================
+
+## What the wait-for-all steps saw.
+struct TestWaitForAll:
+    var successes: i32
+    var failures: i32
+    var results: ak.Vector[JsValue]
+    var reason: JsValue
+
+## wait_for_all's success steps of a test.
+func test_wait_for_all_success(context: void*?, results: const ak.Vector[JsValue]*):
+    let record = (TestWaitForAll*)(context else trap("no record"))
+    record.successes += 1
+    record.results = ak.vector_clone(results)
+
+## wait_for_all's failure steps of a test.
+func test_wait_for_all_failure(context: void*?, reason: JsValue):
+    let record = (TestWaitForAll*)(context else trap("no record"))
+    record.failures += 1
+    record.reason = reason
+
+## Wait for all of `promises` into `record`.
+func test_wait_for_all(realm: Realm*, promises: const JsPromiseCapability*[], record: TestWaitForAll*):
+    idl_wait_for_all(realm, promises, ak.Function1[const ak.Vector[JsValue]*, unit](call = test_wait_for_all_success, context = record), ak.Function1[JsValue, unit](call = test_wait_for_all_failure, context = record))
+
+test "wait for all: results in the promises' order, the first rejection once, none in a microtask":
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    let settings = test_promise_enter(realm)
+
+    let first = idl_create_promise(realm)
+    let second = idl_create_promise(realm)
+    let third = idl_create_resolved_promise(realm, js_value_from_f64(3.0))
+    var all: const JsPromiseCapability*[3] = [first, second, third]
+    let record = new TestWaitForAll(successes = 0, failures = 0, results = ak.Vector[JsValue](), reason = js_undefined()) else trap("out of memory")
+    test_wait_for_all(realm, all[0..<3], record)
+    idl_resolve_promise(realm, second, js_value_from_f64(2.0))
+    idl_resolve_promise(realm, first, js_value_from_f64(1.0))
+    test_promise_leave(settings)
+    assert(record.successes == 1 and record.failures == 0)
+    assert(ak.vector_size(&record.results) == 3)
+    for i: usize in 0..<3:
+        assert(test_promise_is_number(*ak.vector_at(&record.results, i), (f64)(i + 1)))
+
+    # Two rejections: the failure steps run once, with the first reason.
+    discard(test_promise_enter(realm))
+    let a = idl_create_promise(realm)
+    let b = idl_create_promise(realm)
+    var both: const JsPromiseCapability*[2] = [a, b]
+    let failing = new TestWaitForAll(successes = 0, failures = 0, results = ak.Vector[JsValue](), reason = js_undefined()) else trap("out of memory")
+    test_wait_for_all(realm, both[0..<2], failing)
+    idl_reject_promise(realm, b, js_value_from_f64(7.0))
+    idl_reject_promise(realm, a, js_value_from_f64(8.0))
+    test_promise_leave(settings)
+    assert(failing.successes == 0 and failing.failures == 1)
+    assert(test_promise_is_number(failing.reason, 7.0))
+
+    # No promises: the success steps run with « » in a microtask.
+    discard(test_promise_enter(realm))
+    var none_: const JsPromiseCapability*[1] = [first]
+    let empty = new TestWaitForAll(successes = 0, failures = 0, results = ak.Vector[JsValue](), reason = js_undefined()) else trap("out of memory")
+    test_wait_for_all(realm, none_[0..<0], empty)
+    assert(empty.successes == 0)
+    test_promise_leave(settings)
+    assert(empty.successes == 1 and ak.vector_size(&empty.results) == 0)
+
+# mark: Sets and maps ===========================================================================
+
+test "JS::Set: insertion order, add/has/remove/size, SameValue keys":
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    let set = js_set_create(realm)
+    assert(js_set_set_size(set) == 0)
+    assert(js_object_shape_realm((JsObject*)set) == realm)
+
+    let object = realm_create_bind_platform_object_realm(realm, realm, JsObjectMayInterfereWithIndexedPropertyAccess.no)
+    let object_value = js_value_from_object((JsObject*)object)
+    js_set_set_add(set, js_value_from_f64(3.0))
+    js_set_set_add(set, object_value)
+    js_set_set_add(set, js_value_from_f64(1.0))
+    js_set_set_add(set, js_value_from_f64(3.0))
+    js_set_set_add(set, js_value_from_f64(math.nan))
+    js_set_set_add(set, js_value_from_f64(0.0 - math.nan))
+    assert(js_set_set_size(set) == 4)
+    assert(js_set_set_has(set, object_value))
+    assert(js_set_set_has(set, js_value_from_f64(math.nan)))
+    assert(not js_set_set_has(set, js_value_from_f64(2.0)))
+    # SameValue tells +0 from -0 (Set.prototype.add canonicalizes -0 before it gets here).
+    js_set_set_add(set, js_value_from_f64(0.0))
+    assert(not js_set_set_has(set, js_value_from_f64(-0.0)))
+
+    # Values in insertion order; re-adding does not move a value; removing keeps the others' order.
+    var values = js_set_values(set)
+    assert(ak.vector_size(&values) == 5)
+    assert(test_promise_is_number(*ak.vector_at(&values, 0), 3.0))
+    assert(js_value_as_object(*ak.vector_at(&values, 1)) == (JsObject*)object)
+    assert(test_promise_is_number(*ak.vector_at(&values, 2), 1.0))
+    assert(js_set_set_remove(set, js_value_from_f64(3.0)))
+    assert(not js_set_set_remove(set, js_value_from_f64(3.0)))
+    js_set_set_add(set, js_value_from_f64(3.0))
+    values = js_set_values(set)
+    assert(ak.vector_size(&values) == 5)
+    assert(js_value_as_object(*ak.vector_at(&values, 0)) == (JsObject*)object)
+    assert(test_promise_is_number(*ak.vector_at(&values, 4), 3.0))
+    js_set_set_clear(set)
+    let cleared = js_set_values(set)
+    assert(js_set_set_size(set) == 0 and ak.vector_is_empty(&cleared))
+
+test "JS::Map: map_set replaces in place, entries in insertion order":
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    let map = js_map_create(realm)
+    js_map_map_set(map, js_value_from_f64(2.0), js_value_from_bool(true))
+    js_map_map_set(map, js_null(), js_value_from_f64(5.0))
+    js_map_map_set(map, js_value_from_f64(2.0), js_value_from_bool(false))
+    assert(js_map_map_size(map) == 2)
+    var entries = js_map_entries(map)
+    assert(test_promise_is_number(ak.vector_at(&entries, 0).key, 2.0))
+    assert(not js_value_as_bool(ak.vector_at(&entries, 0).value))
+    assert(js_value_is_null(ak.vector_at(&entries, 1).key))
+    assert(test_promise_is_number(js_map_map_get(map, js_null()) else js_undefined(), 5.0))
+    if let missing = js_map_map_get(map, js_undefined()):
+        trap(f"undefined is not a key: {js_value_is_undefined(missing)}")
+
+# mark: Collections =============================================================================
+
+test "a pending promise's reactions and a set's values live as long as the promise and the set":
+    web_test_clobber_stack()
+    run_pending_promise_collection()
+
+## The cells of a pending promise with a reaction whose step holds a set, kept by the root the
+## caller gets.
+noinline func make_test_pending_promise(vm: Vm*, realm: Realm*, log: TestHtmlLog*) -> (gc.Root[JsPromise], gc.Weak[JsSet], gc.Weak[BindPlatformObject]):
+    # Managed memory is the current allocator, as when the embedder runs the event loop `with heap`.
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        let settings = test_promise_enter(realm)
+        let set = js_set_create(realm)
+        let object = realm_create_bind_platform_object_realm(realm, realm, JsObjectMayInterfereWithIndexedPropertyAccess.no)
+        js_set_set_add(set, js_value_from_object((JsObject*)object))
+        let promise = idl_create_promise(realm)
+        let (step, step_record) = test_promise_step(vm, log, 1, js_value_from_object((JsObject*)set))
+        discard(step_record)
+        discard(idl_upon_fulfillment(promise, step))
+        test_promise_leave(settings)
+        return (gc.root_create(test_promise_object(promise)), gc.make_weak(set), gc.make_weak(object))
+
+noinline func run_pending_promise_collection():
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    var log = TestHtmlLog()
+    var (root, weak_set, weak_object) = make_test_pending_promise(vm, realm, &log)
+    web_test_clobber_stack()
+    gc.heap_collect_garbage(vm_heap(vm))
+    # The promise's reaction keeps its handler, whose step's captures keep the set and its value.
+    assert(web_test_alive(&weak_set))
+    assert(web_test_alive(&weak_object))
+    gc.root_release(&root)
+    web_test_clobber_stack()
+    gc.heap_collect_garbage(vm_heap(vm))
+    assert(not web_test_alive(&weak_set))
+    assert(not web_test_alive(&weak_object))
+    assert(log.count == 0)
+    web_test_destroy_vm(vm)

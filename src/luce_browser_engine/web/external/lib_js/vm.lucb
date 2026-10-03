@@ -45,6 +45,13 @@ pub func vm_create() -> Vm*:
     # Addition (DESIGN.md §3.3 rule 4): the external roots (vm_keep_alive).
     vm.m_external_roots.base.vtable = &js_vm_external_roots_vtable
     gc.conservative_vector_base_construct(&vm.m_external_roots.base, &vm.m_heap)
+
+    # Default hook implementations. These can be overridden by the host, for example, LibWeb overrides the default hooks to place promise jobs on the microtask queue.
+    vm.host_promise_rejection_tracker = vm_promise_rejection_tracker
+    vm.host_call_job_callback = js_call_job_callback
+    vm.host_enqueue_promise_job = vm_enqueue_promise_job
+    vm.host_promise_job_queue_is_empty = vm_promise_job_queue_is_empty
+    vm.host_make_job_callback = vm_default_make_job_callback
     return vm
 
 ## The heap's gather_embedder_roots: the VM's gather_roots (the lambda of VM.cpp:74).
@@ -52,8 +59,8 @@ func vm_gather_roots_callback(context: void*?, roots: gc.GcHashMap[gc.HeapRoot]*
     vm_gather_roots((Vm*)(context else trap("no VM")), roots)
 
 ## Ported from Libraries/LibJS/Runtime/VM.cpp:273 JS::VM::gather_roots: what the VM holds in the
-## heap from outside it. The interned strings, symbols, finalization registries and promise jobs
-## are phase 3; the execution contexts' cells and the pending exception are here.
+## heap from outside it. The interned strings, symbols and finalization registries are phase 3;
+## the execution contexts' cells, the promise jobs and the pending exception are here.
 pub func vm_gather_roots(this: Vm*, roots: gc.GcHashMap[gc.HeapRoot]*):
     # Addition (DESIGN.md §2.10): the pending exception.
     if let pending_exception = this.m_pending_exception:
@@ -64,6 +71,9 @@ pub func vm_gather_roots(this: Vm*, roots: gc.GcHashMap[gc.HeapRoot]*):
 
     for saved_stack in &ak.vector_span(&this.m_saved_execution_context_stacks):
         vm_gather_roots_from_execution_context_stack(saved_stack, roots)
+
+    for job in ak.vector_span(&this.m_promise_jobs):
+        gc.gc_hash_map_set(roots, (usize)job.cell(), gc.HeapRoot(type_ = gc.HeapRootType.vm))
 
 ## Ported from Libraries/LibJS/Runtime/VM.cpp:280 gather_roots_from_execution_context_stack (the
 ## lambda in JS::VM::gather_roots), for one stack.
@@ -113,6 +123,79 @@ func js_vm_external_roots_possible_values_impl(base: gc.ConservativeVectorBase*)
 pub func vm_keep_alive(this: Vm*, pointer: const void*):
     with memory.heap:
         ak.vector_append_t(&this.m_external_roots.values, (u64)(usize)pointer)
+
+# mark: Promise jobs and the host hooks =========================================================
+
+## The default host_make_job_callback (the lambda of VM.cpp:123): JS::make_job_callback.
+func vm_default_make_job_callback(vm: Vm*, function_object: JsFunctionObject*) -> JsJobCallback*:
+    return js_make_job_callback(function_object)
+
+## The default host_promise_job_queue_is_empty (the lambda of VM.cpp:119).
+func vm_promise_job_queue_is_empty(this: Vm*) -> bool:
+    return ak.vector_is_empty(&this.m_promise_jobs)
+
+## Ported from Libraries/LibJS/Runtime/VM.h:393 JS::VM::run_queued_promise_jobs.
+pub func vm_run_queued_promise_jobs(this: Vm*):
+    if ak.vector_is_empty(&this.m_promise_jobs):
+        return
+    vm_run_queued_promise_jobs_impl(this)
+
+## Ported from Libraries/LibJS/Runtime/VM.cpp:460 JS::VM::run_queued_promise_jobs_impl.
+func vm_run_queued_promise_jobs_impl(this: Vm*):
+    while not ak.vector_is_empty(&this.m_promise_jobs):
+        let job = ak.vector_take_first(&this.m_promise_jobs)
+        discard(ak.function0_call(&job.function))
+
+## Ported from Libraries/LibJS/Runtime/VM.cpp:473 JS::VM::enqueue_promise_job:
+## 9.5.4 HostEnqueuePromiseJob ( job, realm ), https://tc39.es/ecma262/#sec-hostenqueuepromisejob
+func vm_enqueue_promise_job(this: Vm*, job: JsPromiseJobFunction*, realm: Realm*?):
+    # An implementation of HostEnqueuePromiseJob must conform to the requirements in 9.5 as well as the following:
+    # - FIXME: If realm is not null, each time job is invoked the implementation must perform implementation-defined steps such that execution is prepared to evaluate ECMAScript code at the time of job's invocation.
+    # - FIXME: Let scriptOrModule be GetActiveScriptOrModule() at the time HostEnqueuePromiseJob is invoked. If realm is not null, each time job is invoked the implementation must perform implementation-defined steps
+    #          such that scriptOrModule is the active script or module at the time of job's invocation.
+    # - Jobs must run in the same order as the HostEnqueuePromiseJob invocations that scheduled them.
+    with memory.heap:
+        ak.vector_append_t(&this.m_promise_jobs, job)
+
+## Ported from Libraries/LibJS/Runtime/VM.cpp:499 JS::VM::promise_rejection_tracker:
+## 27.2.1.9 HostPromiseRejectionTracker ( promise, operation ), https://tc39.es/ecma262/#sec-host-promise-rejection-tracker
+func vm_promise_rejection_tracker(this: Vm*, promise: JsPromise*, operation: JsPromiseRejectionOperation):
+    match operation:
+        .reject:
+            # A promise was rejected without any handlers
+            if let on_promise_unhandled_rejection = this.on_promise_unhandled_rejection:
+                on_promise_unhandled_rejection(this, promise)
+        .handle:
+            # A handler was added to an already rejected promise
+            if let on_promise_rejection_handled = this.on_promise_rejection_handled:
+                on_promise_rejection_handled(this, promise)
+        _:
+            trap("VERIFY_NOT_REACHED")
+
+## `vm.host_promise_rejection_tracker(promise, operation)`.
+pub func vm_host_promise_rejection_tracker(this: Vm*, promise: JsPromise*, operation: JsPromiseRejectionOperation):
+    let hook = this.host_promise_rejection_tracker else trap("VERIFY: host_promise_rejection_tracker")
+    hook(this, promise, operation)
+
+## `vm.host_call_job_callback(callback, this_value, arguments_list)`.
+pub func vm_host_call_job_callback(this: Vm*, callback: JsJobCallback*, this_value: JsValue, arguments_list: const JsValue[]) -> JsValue!:
+    let hook = this.host_call_job_callback else trap("VERIFY: host_call_job_callback")
+    return try hook(this, callback, this_value, arguments_list)
+
+## `vm.host_enqueue_promise_job(job, realm)`.
+pub func vm_host_enqueue_promise_job(this: Vm*, job: JsPromiseJobFunction*, realm: Realm*?):
+    let hook = this.host_enqueue_promise_job else trap("VERIFY: host_enqueue_promise_job")
+    hook(this, job, realm)
+
+## `vm.host_promise_job_queue_is_empty()`.
+pub func vm_host_promise_job_queue_is_empty(this: Vm*) -> bool:
+    let hook = this.host_promise_job_queue_is_empty else trap("VERIFY: host_promise_job_queue_is_empty")
+    return hook(this)
+
+## `vm.host_make_job_callback(callable)`.
+pub func vm_host_make_job_callback(this: Vm*, callable: JsFunctionObject*) -> JsJobCallback*:
+    let hook = this.host_make_job_callback else trap("VERIFY: host_make_job_callback")
+    return hook(this, callable)
 
 # mark: The execution context stack =============================================================
 

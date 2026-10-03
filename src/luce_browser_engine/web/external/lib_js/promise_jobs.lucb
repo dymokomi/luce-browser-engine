@@ -1,0 +1,362 @@
+#==============================================================================================
+#
+#   promise_jobs - promise capabilities, reactions, jobs and job callbacks before luce-js
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibJS/Runtime/PromiseCapability.cpp (lines 1-112) and .h,
+#       PromiseReaction.cpp/.h, PromiseJobs.cpp (lines 1-173) and .h and JobCallback.cpp/.h, the
+#       phase-1 stand-ins of DESIGN.md §3.6 that JS::Promise (promise.lucb) settles and reacts
+#       through. NewPromiseCapability is given a realm's %Promise%, the only constructor LibWeb
+#       passes (WebIDL's realm.intrinsics().promise_constructor()); there is no function object
+#       for it before phase 3, so the realm stands for it, and Construct runs
+#       PromiseConstructor::construct's steps. A job's result is its completion record.
+#
+#       Copyright (c) 2021-2022, Linus Groh <linusg@serenityos.org>
+#       Copyright (c) 2021, Luke Wilde <lukew@serenityos.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: PromiseCapability =======================================================================
+
+## Ported from Libraries/LibJS/Runtime/PromiseCapability.cpp:15 JS::PromiseCapability::create
+## (vm.heap().allocate<PromiseCapability>(promise, resolve, reject)).
+pub func js_promise_capability_create(vm: Vm*, promise: JsObject*, resolve: JsFunctionObject*, reject: JsFunctionObject*) -> JsPromiseCapability*:
+    let heap = vm_heap(vm)
+    let this = (JsPromiseCapability*)web_heap_allocate_cell(heap, &js_promise_capability_class)
+    gc.heap_defer_gc(heap)
+    js_promise_capability_construct(this, promise, resolve, reject)
+    gc.heap_undefer_gc(heap)
+    return this
+
+## Ported from Libraries/LibJS/Runtime/PromiseCapability.cpp:20 JS::PromiseCapability::PromiseCapability.
+pub func js_promise_capability_construct(this: JsPromiseCapability*, promise: JsObject*, resolve: JsFunctionObject*, reject: JsFunctionObject*):
+    this.m_promise = promise
+    this.m_resolve = resolve
+    this.m_reject = reject
+
+## GC_CELL(PromiseCapability, Cell)'s class_name.
+func js_promise_capability_class_name_impl(this: gc.Cell*) -> ak.StringView:
+    return ak.sv("PromiseCapability")
+
+## Ported from Libraries/LibJS/Runtime/PromiseCapability.cpp:27 JS::PromiseCapability::visit_edges (override).
+pub func js_promise_capability_visit_edges_impl(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (JsPromiseCapability*)base
+    gc.cell_visit_edges_impl(base, visitor)
+    js_visit_object(visitor, this.m_promise)
+    js_visit_object(visitor, (JsObject*)this.m_resolve)
+    js_visit_object(visitor, (JsObject*)this.m_reject)
+
+## Ported from Libraries/LibJS/Runtime/PromiseCapability.h:25 JS::PromiseCapability::promise.
+pub func js_promise_capability_promise(this: JsPromiseCapability*) -> JsObject*:
+    return this.m_promise
+
+## Ported from Libraries/LibJS/Runtime/PromiseCapability.h:27 JS::PromiseCapability::resolve.
+pub func js_promise_capability_resolve(this: JsPromiseCapability*) -> JsFunctionObject*:
+    return this.m_resolve
+
+## Ported from Libraries/LibJS/Runtime/PromiseCapability.h:29 JS::PromiseCapability::reject.
+pub func js_promise_capability_reject(this: JsPromiseCapability*) -> JsFunctionObject*:
+    return this.m_reject
+
+## Ported from Libraries/LibJS/Runtime/PromiseCapability.cpp:37 ResolvingFunctions (a cell in
+## the anonymous namespace): the Record NewPromiseCapability's executor fills. Managed memory the
+## executor's captures point to.
+struct JsNewPromiseCapabilityResolvingFunctions:
+    var resolve: JsValue  # C++ default: { js_undefined() }
+    var reject: JsValue  # C++ default: { js_undefined() }
+
+## Ported from Libraries/LibJS/Runtime/PromiseCapability.cpp:69 the executor closure of
+## JS::new_promise_capability (step 4).
+func js_new_promise_capability_executor(context: void*?, vm: Vm*) -> JsValue!:
+    let resolving_functions = (JsNewPromiseCapabilityResolvingFunctions*)(context else trap("no captures"))
+    let resolve = vm_argument(vm, 0)
+    let reject = vm_argument(vm, 1)
+
+    # No idea what other engines say here.
+    # a. If promiseCapability.[[Resolve]] is not undefined, throw a TypeError exception.
+    if not js_value_is_undefined(resolving_functions.resolve):
+        return try vm_throw_completion(vm, IdlSimpleExceptionType.type_error, .string_view(ak.sv("GetCapabilitiesExecutor was called multiple times")))
+
+    # b. If promiseCapability.[[Reject]] is not undefined, throw a TypeError exception.
+    if not js_value_is_undefined(resolving_functions.reject):
+        return try vm_throw_completion(vm, IdlSimpleExceptionType.type_error, .string_view(ak.sv("GetCapabilitiesExecutor was called multiple times")))
+
+    # c. Set promiseCapability.[[Resolve]] to resolve.
+    resolving_functions.resolve = resolve
+
+    # d. Set promiseCapability.[[Reject]] to reject.
+    resolving_functions.reject = reject
+
+    # e. Return undefined.
+    return js_undefined()
+
+## Ported from Libraries/LibJS/Runtime/PromiseCapability.cpp:54 JS::new_promise_capability:
+## 27.2.1.5 NewPromiseCapability ( C ), https://tc39.es/ecma262/#sec-newpromisecapability, for
+## C = `constructor_realm`.[[Intrinsics]].[[%Promise%]] (see the header).
+pub func js_new_promise_capability(vm: Vm*, constructor_realm: Realm*) -> JsPromiseCapability*!:
+    let realm = vm_current_realm(vm) else trap("VERIFY: a current realm")
+
+    # 1. If IsConstructor(C) is false, throw a TypeError exception.
+    # (%Promise% is a constructor.)
+
+    # 2. NOTE: C is assumed to be a constructor function that supports the parameter conventions of the Promise constructor (see 27.2.3.1).
+
+    # 3. Let resolvingFunctions be the Record { [[Resolve]]: undefined, [[Reject]]: undefined }.
+    let resolving_functions = new JsNewPromiseCapabilityResolvingFunctions(resolve = js_undefined(), reject = js_undefined()) else trap("out of memory")
+
+    # 4. Let executorClosure be a new Abstract Closure with parameters (resolve, reject) that captures resolvingFunctions and performs the following steps when called:
+    # 5. Let executor be CreateBuiltinFunction(executorClosure, 2, "", « »).
+    let executor = js_native_function_create(realm, JsNativeFunctionBehaviour(call = js_new_promise_capability_executor, context = resolving_functions), 2, ak.utf16_fly_string_new())
+
+    # 6. Let promise be ? Construct(C, « executor »).
+    let promise = try js_promise_constructor_construct(vm, constructor_realm, js_value_from_object((JsObject*)executor))
+
+    #  7. If IsCallable(resolvingFunctions.[[Resolve]]) is false, throw a TypeError exception.
+    if not js_value_is_function(resolving_functions.resolve):
+        return try vm_throw_completion(vm, IdlSimpleExceptionType.type_error, .string_view(ak.sv("Promise capability resolve value is not a function")))
+
+    # 8. If IsCallable(resolvingFunctions.[[Reject]]) is false, throw a TypeError exception.
+    if not js_value_is_function(resolving_functions.reject):
+        return try vm_throw_completion(vm, IdlSimpleExceptionType.type_error, .string_view(ak.sv("Promise capability reject value is not a function")))
+
+    # 9. Return the PromiseCapability Record { [[Promise]]: promise, [[Resolve]]: resolvingFunctions.[[Resolve]], [[Reject]]: resolvingFunctions.[[Reject]] }.
+    return js_promise_capability_create(vm, (JsObject*)promise, js_value_as_function(resolving_functions.resolve), js_value_as_function(resolving_functions.reject))
+
+# mark: PromiseReaction =========================================================================
+
+## Ported from Libraries/LibJS/Runtime/PromiseReaction.cpp:15 JS::PromiseReaction::create.
+pub func js_promise_reaction_create(vm: Vm*, type_: JsPromiseReactionType, capability: JsPromiseCapability*?, handler: JsJobCallback*?) -> JsPromiseReaction*:
+    let heap = vm_heap(vm)
+    let this = (JsPromiseReaction*)web_heap_allocate_cell(heap, &js_promise_reaction_class)
+    gc.heap_defer_gc(heap)
+    js_promise_reaction_construct(this, type_, capability, handler)
+    gc.heap_undefer_gc(heap)
+    return this
+
+## Ported from Libraries/LibJS/Runtime/PromiseReaction.cpp:20 JS::PromiseReaction::PromiseReaction.
+pub func js_promise_reaction_construct(this: JsPromiseReaction*, type_: JsPromiseReactionType, capability: JsPromiseCapability*?, handler: JsJobCallback*?):
+    this.m_type = type_
+    this.m_capability = capability
+    this.m_handler = handler
+
+## GC_CELL(PromiseReaction, Cell)'s class_name.
+func js_promise_reaction_class_name_impl(this: gc.Cell*) -> ak.StringView:
+    return ak.sv("PromiseReaction")
+
+## Ported from Libraries/LibJS/Runtime/PromiseReaction.cpp:27 JS::PromiseReaction::visit_edges (override).
+pub func js_promise_reaction_visit_edges_impl(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (JsPromiseReaction*)base
+    gc.cell_visit_edges_impl(base, visitor)
+    gc.cell_visitor_visit_t(visitor, this.m_capability)
+    gc.cell_visitor_visit_t(visitor, this.m_handler)
+
+# mark: Promise jobs ============================================================================
+
+## The captures of NewPromiseReactionJob's job (`[&vm, &reaction, argument]`).
+struct JsPromiseReactionJobCaptures:
+    var vm: Vm*
+    var reaction: JsPromiseReaction*
+    var argument: JsValue
+
+## Ported from Libraries/LibJS/Runtime/PromiseJobs.cpp:21 run_reaction_job (static):
+## 27.2.2.1 NewPromiseReactionJob ( reaction, argument ), https://tc39.es/ecma262/#sec-newpromisereactionjob
+func js_run_reaction_job(vm: Vm*, reaction: JsPromiseReaction*, argument: JsValue) -> JsValue!:
+    # a. Let promiseCapability be reaction.[[Capability]].
+    let promise_capability = reaction.m_capability
+
+    # b. Let type be reaction.[[Type]].
+    let type_ = reaction.m_type
+
+    # c. Let handler be reaction.[[Handler]].
+    let handler = reaction.m_handler
+
+    var handler_result: JsCompletion = ---
+
+    # d. If handler is empty, then
+    if handler == none:
+        # i. If type is Fulfill, let handlerResult be NormalCompletion(argument).
+        if type_ == JsPromiseReactionType.fulfill:
+            handler_result = js_completion_from_value(argument)
+        # ii. Else,
+        else:
+            # 1. Assert: type is Reject.
+            assert(type_ == JsPromiseReactionType.reject)
+
+            # 2. Let handlerResult be ThrowCompletion(argument).
+            handler_result = js_throw_completion(argument)
+    # e. Else, let handlerResult be Completion(HostCallJobCallback(handler, undefined, « argument »)).
+    else:
+        let arguments: JsValue[1] = [argument]
+        handler_result = js_host_call_job_callback_completion(vm, handler else trap("VERIFY: a handler"), js_undefined(), arguments)
+
+    # f. If promiseCapability is undefined, then
+    if promise_capability == none:
+        # i. Assert: handlerResult is not an abrupt completion.
+        if js_completion_is_abrupt(&handler_result):
+            trap("MUST_OR_THROW_INTERNAL_ERROR: a reaction job without a capability failed")
+
+        # ii. Return empty.
+        return js_undefined()
+    let capability = promise_capability else trap("VERIFY: a capability")
+
+    # g. Assert: promiseCapability is a PromiseCapability Record.
+
+    # h. If handlerResult is an abrupt completion, then
+    if js_completion_is_abrupt(&handler_result):
+        # i. Return ? Call(promiseCapability.[[Reject]], undefined, « handlerResult.[[Value]] »).
+        let reject_function = js_promise_capability_reject(capability)
+        let reject_arguments: JsValue[1] = [js_completion_value(&handler_result)]
+        return try js_call(vm, reject_function, js_undefined(), reject_arguments)
+    # i. Else,
+    else:
+        # i. Return ? Call(promiseCapability.[[Resolve]], undefined, « handlerResult.[[Value]] »).
+        let resolve_function = js_promise_capability_resolve(capability)
+        let resolve_arguments: JsValue[1] = [js_completion_value(&handler_result)]
+        return try js_call(vm, resolve_function, js_undefined(), resolve_arguments)
+
+## `Completion(HostCallJobCallback(handler, V, argumentsList))`: the call's completion record.
+func js_host_call_job_callback_completion(vm: Vm*, handler: JsJobCallback*, this_value: JsValue, arguments_list: const JsValue[]) -> JsCompletion:
+    let value = vm_host_call_job_callback(vm, handler, this_value, arguments_list) catch:
+        return vm_take_throw_completion(vm)
+    return js_completion_from_value(value)
+
+## NewPromiseReactionJob's job: run_reaction_job, its result as a completion.
+func js_promise_reaction_job_run(context: void*?) -> JsCompletion:
+    let captures = (JsPromiseReactionJobCaptures*)(context else trap("no captures"))
+    let value = js_run_reaction_job(captures.vm, captures.reaction, captures.argument) catch:
+        return vm_take_throw_completion(captures.vm)
+    return js_completion_from_value(value)
+
+## Ported from Libraries/LibJS/Runtime/PromiseJobs.cpp:84 JS::create_promise_reaction_job:
+## 27.2.2.1 NewPromiseReactionJob ( reaction, argument ), https://tc39.es/ecma262/#sec-newpromisereactionjob
+pub func js_create_promise_reaction_job(vm: Vm*, reaction: JsPromiseReaction*, argument: JsValue) -> JsPromiseJob:
+    # 1. Let job be a new Job Abstract Closure with no parameters that captures reaction and argument and performs the following steps when called:
+    #    See run_reaction_job for "the following steps".
+    let captures = new JsPromiseReactionJobCaptures(vm = vm, reaction = reaction, argument = argument) else trap("out of memory")
+    let job = gc.create_function0(vm_heap(vm), ak.Function0[JsCompletion](call = js_promise_reaction_job_run, context = captures))
+
+    # 2. Let handlerRealm be null.
+    var handler_realm: Realm*? = none
+
+    # 3. If reaction.[[Handler]] is not empty, then
+    if let handler = reaction.m_handler:
+        # a. Let getHandlerRealmResult be Completion(GetFunctionRealm(reaction.[[Handler]].[[Callback]])).
+        # b. If getHandlerRealmResult is a normal completion, set handlerRealm to getHandlerRealmResult.[[Value]].
+        # c. Else, set handlerRealm to the current Realm Record.
+        # (GetFunctionRealm of a phase-1 function cannot fail.)
+        handler_realm = js_get_function_realm(vm, handler.m_callback)
+
+        # d. NOTE: handlerRealm is never null unless the handler is undefined. When the handler is a revoked Proxy and no ECMAScript code runs, handlerRealm is used to create error objects.
+
+    # 4. Return the Record { [[Job]]: job, [[Realm]]: handlerRealm }.
+    return JsPromiseJob(job = job, realm = handler_realm)
+
+## The captures of NewPromiseResolveThenableJob's job (`[&vm, &promise_to_resolve, thenable, then]`).
+struct JsPromiseResolveThenableJobCaptures:
+    var vm: Vm*
+    var promise_to_resolve: JsPromise*
+    var thenable: JsValue
+    var then: JsJobCallback*
+
+## Ported from Libraries/LibJS/Runtime/PromiseJobs.cpp:116 run_resolve_thenable_job (static):
+## 27.2.2.2 NewPromiseResolveThenableJob ( promiseToResolve, thenable, then ),
+## https://tc39.es/ecma262/#sec-newpromiseresolvethenablejob
+func js_run_resolve_thenable_job(vm: Vm*, promise_to_resolve: JsPromise*, thenable: JsValue, then: JsJobCallback*) -> JsValue!:
+    # a. Let resolvingFunctions be CreateResolvingFunctions(promiseToResolve).
+    let resolving_functions = js_promise_create_resolving_functions(promise_to_resolve)
+
+    # b. Let thenCallResult be Completion(HostCallJobCallback(then, thenable, « resolvingFunctions.[[Resolve]], resolvingFunctions.[[Reject]] »)).
+    let arguments: JsValue[2] = [js_value_from_object((JsObject*)resolving_functions.resolve), js_value_from_object((JsObject*)resolving_functions.reject)]
+    let then_call_result = vm_host_call_job_callback(vm, then, thenable, arguments) catch:
+        # c. If thenCallResult is an abrupt completion, then
+        let completion = vm_take_throw_completion(vm)
+        # i. Return ? Call(resolvingFunctions.[[Reject]], undefined, « thenCallResult.[[Value]] »).
+        let reject_arguments: JsValue[1] = [js_completion_value(&completion)]
+        return try js_call(vm, resolving_functions.reject, js_undefined(), reject_arguments)
+
+    # d. Return ? thenCallResult.
+    return then_call_result
+
+## NewPromiseResolveThenableJob's job: run_resolve_thenable_job, its result as a completion.
+func js_promise_resolve_thenable_job_run(context: void*?) -> JsCompletion:
+    let captures = (JsPromiseResolveThenableJobCaptures*)(context else trap("no captures"))
+    let value = js_run_resolve_thenable_job(captures.vm, captures.promise_to_resolve, captures.thenable, captures.then) catch:
+        return vm_take_throw_completion(captures.vm)
+    return js_completion_from_value(value)
+
+## Ported from Libraries/LibJS/Runtime/PromiseJobs.cpp:139 JS::create_promise_resolve_thenable_job:
+## 27.2.2.2 NewPromiseResolveThenableJob ( promiseToResolve, thenable, then ),
+## https://tc39.es/ecma262/#sec-newpromiseresolvethenablejob
+pub func js_create_promise_resolve_thenable_job(vm: Vm*, promise_to_resolve: JsPromise*, thenable: JsValue, then: JsJobCallback*) -> JsPromiseJob:
+    # 2. Let getThenRealmResult be Completion(GetFunctionRealm(then.[[Callback]])).
+    # 3. If getThenRealmResult is a normal completion, let thenRealm be getThenRealmResult.[[Value]].
+    # 4. Else, let thenRealm be the current Realm Record.
+    # (GetFunctionRealm of a phase-1 function cannot fail.)
+    let then_realm = js_get_function_realm(vm, then.m_callback)
+
+    # 5. NOTE: thenRealm is never null. When then.[[Callback]] is a revoked Proxy and no code runs, thenRealm is used to create error objects.
+
+    # 1. Let job be a new Job Abstract Closure with no parameters that captures promiseToResolve, thenable, and then and performs the following steps when called:
+    #    See run_resolve_thenable_job() for "the following steps".
+    let captures = new JsPromiseResolveThenableJobCaptures(vm = vm, promise_to_resolve = promise_to_resolve, thenable = thenable, then = then) else trap("out of memory")
+    let job = gc.create_function0(vm_heap(vm), ak.Function0[JsCompletion](call = js_promise_resolve_thenable_job_run, context = captures))
+
+    # 6. Return the Record { [[Job]]: job, [[Realm]]: thenRealm }.
+    return JsPromiseJob(job = job, realm = then_realm)
+
+## Ported from Libraries/LibJS/Runtime/AbstractOperations.cpp JS::get_function_realm:
+## 7.3.24 GetFunctionRealm ( obj ), https://tc39.es/ecma262/#sec-getfunctionrealm. The function
+## objects before phase 3 are native functions, which have a [[Realm]]; bound functions and
+## proxies are phase 3.
+pub func js_get_function_realm(vm: Vm*, function: JsFunctionObject*) -> Realm*:
+    # 1. If obj has a [[Realm]] internal slot, then
+    if let native_function = as_if_js_native_function((gc.Cell*)function):
+        # a. Return obj.[[Realm]].
+        return native_function.m_realm
+    trap("unported (P3): GetFunctionRealm of a bound function or proxy")
+
+# mark: JobCallback =============================================================================
+
+## Ported from Libraries/LibJS/Runtime/JobCallback.cpp:15 JS::JobCallback::create.
+pub func js_job_callback_create(vm: Vm*, callback: JsFunctionObject*, custom_data: void*?) -> JsJobCallback*:
+    let heap = vm_heap(vm)
+    let this = (JsJobCallback*)web_heap_allocate_cell(heap, &js_job_callback_class)
+    gc.heap_defer_gc(heap)
+    this.m_callback = callback
+    this.m_custom_data = custom_data
+    gc.heap_undefer_gc(heap)
+    return this
+
+## GC_CELL(JobCallback, JS::Cell)'s class_name.
+func js_job_callback_class_name_impl(this: gc.Cell*) -> ak.StringView:
+    return ak.sv("JobCallback")
+
+## Ported from Libraries/LibJS/Runtime/JobCallback.cpp:20 JS::JobCallback::visit_edges (override).
+## The custom data is managed memory, scanned with the cell's bytes.
+pub func js_job_callback_visit_edges_impl(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (JsJobCallback*)base
+    gc.cell_visit_edges_impl(base, visitor)
+    js_visit_object(visitor, (JsObject*)this.m_callback)
+
+## Ported from Libraries/LibJS/Runtime/JobCallback.h:31 JS::JobCallback::callback.
+pub func js_job_callback_callback(this: JsJobCallback*) -> JsFunctionObject*:
+    return this.m_callback
+
+## Ported from Libraries/LibJS/Runtime/JobCallback.h:32 JS::JobCallback::custom_data.
+pub func js_job_callback_custom_data(this: JsJobCallback*) -> void*?:
+    return this.m_custom_data
+
+## Ported from Libraries/LibJS/Runtime/JobCallback.cpp:27 JS::make_job_callback:
+## 9.5.2 HostMakeJobCallback ( callback ), https://tc39.es/ecma262/#sec-hostmakejobcallback
+pub func js_make_job_callback(callback: JsFunctionObject*) -> JsJobCallback*:
+    # 1. Return the JobCallback Record { [[Callback]]: callback, [[HostDefined]]: empty }.
+    return js_job_callback_create(js_cell_vm((JsCell*)callback), callback, none)
+
+## Ported from Libraries/LibJS/Runtime/JobCallback.cpp:34 JS::call_job_callback:
+## 9.5.3 HostCallJobCallback ( jobCallback, V, argumentsList ), https://tc39.es/ecma262/#sec-hostcalljobcallback
+pub func js_call_job_callback(vm: Vm*, job_callback: JsJobCallback*, this_value: JsValue, arguments_list: const JsValue[]) -> JsValue!:
+    # 1. Assert: IsCallable(jobCallback.[[Callback]]) is true.
+
+    # 2. Return ? Call(jobCallback.[[Callback]], V, argumentsList).
+    return try js_call(vm, job_callback.m_callback, this_value, arguments_list)
