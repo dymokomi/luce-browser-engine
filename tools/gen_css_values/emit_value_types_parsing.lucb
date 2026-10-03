@@ -1,0 +1,390 @@
+#==============================================================================================
+#
+#   emit_value_types_parsing - the parsers of the value types of ValueTypes.json
+#
+#   DESCRIPTION:
+#       Port of Meta/Generators/generate_libweb_css_value_types_parsing.py (json_is_valid and
+#       generate_implementation_file; the header's ENUMERATE_GENERATED_CSS_VALUE_TYPES only
+#       declares these Parser members) and of the grammar tools it uses,
+#       Meta/Utils/CSSGrammar: the tokenizer and parser of a value definition grammar
+#       (Parser/tokenizer.py, parser.py, component_values.py, grammar_node.py) and the
+#       expression generator (generator.py).
+#
+#       The C++ lambda `parse_<name>_alternatives` is a private function of the same name
+#       after the parser that calls it. A parse function may answer a StyleValue subclass
+#       (parse_string_value answers a StringStyleValue), so every result is returned through
+#       `.css_style_value()`. Luce's parse_custom_ident_value has no default blacklist, so a
+#       <custom-ident> always passes one (an empty span when the grammar gives none). The
+#       C++'s NumericLimits bounds are spelled as their values. Python's SyntaxErrors are
+#       traps.
+#
+#==============================================================================================
+
+# mark: The value definition grammar (Meta/Utils/CSSGrammar) ====================================
+
+## A component value of a grammar (component_values.py): a Type (`<number [1,1000]>`) or a Keyword.
+struct GrammarComponentValue:
+    var is_keyword: bool
+    ## The type's name, or the keyword's value.
+    var name: str
+    var custom_ident_blacklist: StrList
+    var has_range: bool
+    ## The bounds of a numeric type's accepted range, as the code bound_value_to_code writes.
+    var minimum: str
+    var maximum: str
+
+## A grammar node (grammar_node.py): one component value, or `|`-separated alternatives.
+struct GrammarNode:
+    var is_alternatives: bool
+    var component_value: GrammarComponentValue*?
+    var children: GrammarNode*[]
+    var child_count: usize
+
+## Ported from component_values.py is_dimension_type.
+# NB: Keep this up to date with the list of dimensions in Units.json
+func is_dimension_type(type_name: str) -> bool:
+    for name in ["angle", "decibel", "flex", "frequency", "length", "resolution", "time"]:
+        if name == type_name:
+            return true
+    return false
+
+## Ported from component_values.py is_dimension_percentage_mix_type.
+# https://drafts.csswg.org/css-values-4/#mixed-percentages
+func is_dimension_percentage_mix_type(type_name: str) -> bool:
+    for name in ["angle-percentage", "frequency-percentage", "length-percentage", "time-percentage"]:
+        if name == type_name:
+            return true
+    return false
+
+## Ported from component_values.py is_numeric_type.
+# https://drafts.csswg.org/css-values-4/#numeric-data-types
+func is_numeric_type(type_name: str) -> bool:
+    return type_name == "integer" or type_name == "number" or type_name == "percentage" or is_dimension_type(type_name)
+
+## Ported from tokenizer.py is_identifier_character.
+func is_identifier_character(byte: u8) -> bool:
+    return is_lower(byte) or is_upper(byte) or is_digit(byte) or byte == '-'
+
+## The grammar tokenizer and parser (tokenizer.py, parser.py): one pass over the text, since
+## the parser only reads tokens in order.
+struct GrammarParser:
+    var text: str
+    var index: usize
+
+    ## Lexer.peek(): the next byte, or 0 at the end.
+    func peek() -> u8:
+        if self.index >= self.text.length:
+            return 0
+        return self.text.bytes[self.index]
+
+    ## Lexer.consume_specific(text).
+    mutating func consume_specific(expected: str) -> bool:
+        if self.index + expected.length > self.text.length:
+            return false
+        if slice(self.text, self.index, self.index + expected.length) != expected:
+            return false
+        self.index += expected.length
+        return true
+
+    ## Tokenizer.discard_whitespace.
+    mutating func discard_whitespace():
+        while self.index < self.text.length and (self.peek() == ' ' or self.peek() == '\t' or self.peek() == '\n' or self.peek() == '\r'):
+            self.index += 1
+
+    ## Tokenizer.consume_an_identifier.
+    mutating func consume_an_identifier() -> str:
+        let start = self.index
+        while self.index < self.text.length and is_identifier_character(self.peek()):
+            self.index += 1
+        return slice(self.text, start, self.index)
+
+## Ported from tokenizer.py consume_custom_ident_blacklist.
+func consume_custom_ident_blacklist(parser: GrammarParser*) -> StrList!:
+    # NB: This notation isn't yet included in the spec but we use it internally and the CSSWG has resolved to add it in
+    #     https://github.com/w3c/csswg-drafts/issues/11924
+    var blacklist = try StrList.create()
+    parser.discard_whitespace()
+    if not parser.consume_specific("!["):
+        return blacklist
+    while true:
+        parser.discard_whitespace()
+        let ident = parser.consume_an_identifier()
+        if ident.length == 0:
+            trap("Expected identifier in custom-ident blacklist")
+        try blacklist.append(ident)
+        parser.discard_whitespace()
+        if parser.consume_specific("]"):
+            return blacklist
+        if not parser.consume_specific(","):
+            trap("Expected ',' in custom-ident blacklist")
+
+## Ported from tokenizer.py consume_bracketed_range_bound, with generator.py's
+## bound_value_to_code: the bound as code (`is_maximum` picks the infinite bound's sign).
+func consume_bracketed_range_bound(parser: GrammarParser*, type_name: str) -> str!:
+    # Values of -∞ or ∞ must be written without units, even if the value type uses units.
+    if parser.consume_specific("-∞"):
+        return "-2147483648.0" if type_name == "integer" else "-3.4028234663852886e38"
+    if parser.consume_specific("∞"):
+        return "2147483647.0" if type_name == "integer" else "3.4028234663852886e38"
+
+    # FIXME: Do we need to allow non-integer values?
+    # consume_decimal_integer
+    var negative = false
+    if parser.consume_specific("-"):
+        negative = true
+    let start = parser.index
+    while parser.index < parser.text.length and is_digit(parser.peek()):
+        parser.index += 1
+    let digits = slice(parser.text, start, parser.index)
+    if digits.length == 0:
+        trap("Expected decimal integer")
+    var is_zero = true
+    for byte in digits.bytes:
+        if byte != '0':
+            is_zero = false
+
+    if not is_zero and (is_dimension_percentage_mix_type(type_name) or type_name == "length"):
+        trap("Types with units not resolvable at parse time only support zero and infinite bounds")
+
+    # FIXME: Validate and store the unit, for now we drop it and assume it was the relevant canonical unit.
+    let unit_name = parser.consume_an_identifier()
+    if unit_name.length > 0 and not is_dimension_type(type_name) and not is_dimension_percentage_mix_type(type_name):
+        trap("Unexpected unit for unitless bound value")
+    if unit_name.length == 0 and not is_zero and is_dimension_type(type_name):
+        trap("Expected unit for non-zero, non-infinite bound value")
+
+    # `str(float(bound_value))`: the integer's digits (without leading zeros) and ".0".
+    var first_digit: usize = 0
+    while first_digit + 1 < digits.length and digits.bytes[first_digit] == '0':
+        first_digit += 1
+    let sign = "-" if negative and not is_zero else ""
+    return try cat([sign, slice(digits, first_digit, digits.length), ".0"])
+
+## Ported from tokenizer.py consume_a_non_terminal_token: a `<type>` component value.
+func consume_a_non_terminal_token(parser: GrammarParser*) -> GrammarComponentValue*!:
+    assert(parser.consume_specific("<"))
+    let name = parser.consume_an_identifier()
+    if name.length == 0:
+        trap("CSSGrammar::Tokenizer: Expected a type name")
+
+    var custom_ident_blacklist = try StrList.create()
+    if name == "custom-ident":
+        custom_ident_blacklist = try consume_custom_ident_blacklist(parser)
+
+    var has_range = false
+    var minimum = ""
+    var maximum = ""
+    if is_numeric_type(name) or is_dimension_percentage_mix_type(name):
+        # consume_bracketed_range_notation
+        # https://drafts.csswg.org/css-values-4/#css-bracketed-range-notation
+        has_range = true
+        parser.discard_whitespace()
+        # If no range is indicated, either by using the bracketed range notation or in the property description, then
+        # [-∞,∞] is assumed.
+        if not parser.consume_specific("["):
+            minimum = "-2147483648.0" if name == "integer" else "-3.4028234663852886e38"
+            maximum = "2147483647.0" if name == "integer" else "3.4028234663852886e38"
+        else:
+            parser.discard_whitespace()
+            minimum = try consume_bracketed_range_bound(parser, name)
+            parser.discard_whitespace()
+            if not parser.consume_specific(","):
+                trap("Expected ',' in bracketed range notation")
+            parser.discard_whitespace()
+            maximum = try consume_bracketed_range_bound(parser, name)
+            parser.discard_whitespace()
+            if not parser.consume_specific("]"):
+                trap("Expected ']' to close bracketed range notation")
+
+    if not parser.consume_specific(">"):
+        trap("CSSGrammar::Tokenizer: Expected '>'")
+
+    return try new GrammarComponentValue(is_keyword = false, name = name, custom_ident_blacklist = custom_ident_blacklist, has_range = has_range, minimum = minimum, maximum = maximum)
+
+## Ported from parser.py parse_component_value (and the tokenizer's component-value tokens).
+func parse_component_value(parser: GrammarParser*) -> GrammarNode*!:
+    # https://drafts.csswg.org/css-values-4/#component-multipliers
+    # FIXME: Support component multipliers
+    parser.discard_whitespace()
+    let peeked = parser.peek()
+    var component_value: GrammarComponentValue*? = none
+    if peeked == '<':
+        component_value = try consume_a_non_terminal_token(parser)
+    elif is_identifier_character(peeked):
+        # consume_a_keyword_token
+        let value = parser.consume_an_identifier()
+        component_value = try new GrammarComponentValue(is_keyword = true, name = value, custom_ident_blacklist = try StrList.create(), has_range = false, minimum = "", maximum = "")
+    else:
+        trap("CSSGrammar::Parser: Expected a component value")
+    var children: GrammarNode*[]
+    return try new GrammarNode(is_alternatives = false, component_value = component_value, children = children, child_count = 0)
+
+## Ported from parser.py parse_value_definition_grammar and parse_alternatives.
+func parse_value_definition_grammar(input: str) -> GrammarNode*!:
+    var parser = GrammarParser(text = input, index = 0)
+    let first = try parse_component_value(&parser)
+    var children = try new (GrammarNode*?)[8]
+    children[0] = first
+    var count: usize = 1
+    parser.discard_whitespace()
+    while parser.consume_specific("|"):
+        if count == children.length:
+            trap("too many alternatives")
+        children[count] = try parse_component_value(&parser)
+        count += 1
+        parser.discard_whitespace()
+    if parser.index < input.length:
+        trap("CSSGrammar::Parser: Unexpected trailing input")
+    if count == 1:
+        return first
+    var nodes = try alloc GrammarNode*[count]
+    for index in 0..<count:
+        nodes[index] = children[index] else trap("an alternative")
+    return try new GrammarNode(is_alternatives = true, component_value = none, children = nodes, child_count = count)
+
+# mark: The expression generator (Meta/Utils/CSSGrammar/generator.py) ============================
+
+## Ported from generator.py generate_css_parser_expression_for_type_component_value and
+## generate_css_parser_expression_for_keyword_component_value: `let <name> = parse_..._value(...)`.
+func generate_css_parser_expression_for_component_value(out: Out*, indent: str, cpp_name: str, component_value: const GrammarComponentValue*) -> !:
+    if component_value.is_keyword:
+        let keyword_name = try luce_case(try title_casify(component_value.name))
+        try out.line(f"{indent}let {cpp_name} = css_parser_parse_specific_keyword_value(this, tokens, css_data.Keyword.{keyword_name})")
+        return
+
+    let type_name = try snake_casify(component_value.name)
+    var additional_arguments = try strings.Builder.create()
+    if component_value.name == "custom-ident":
+        let blacklist = component_value.custom_ident_blacklist
+        if blacklist.count > 0:
+            var idents = try strings.Builder.create()
+            for index in 0..<blacklist.count:
+                if index > 0:
+                    try idents.put(", ")
+                try idents.put(try cat(["ak.sv(", try literal(blacklist.at(index)), ")"]))
+            try out.line(f"{indent}let {cpp_name}_blacklist: ak.StringView[{blacklist.count}] = [{idents.view()}]")
+        else:
+            try out.line(f"{indent}var {cpp_name}_blacklist: ak.StringView[]")
+        try additional_arguments.put(try cat([", ", cpp_name, "_blacklist"]))
+    if component_value.has_range:
+        let accepted_range = try cat([", CssNumericRange(min = ", component_value.minimum, ", max = ", component_value.maximum, ")"])
+        try additional_arguments.put(accepted_range)
+        # NB: Pass the accepted range twice for dimension-percentage mixes, once for the dimension and once for the percentage.
+        if is_dimension_percentage_mix_type(component_value.name):
+            try additional_arguments.put(accepted_range)
+    try out.line(f"{indent}let {cpp_name} = css_parser_parse_{type_name}_value(this, tokens{additional_arguments.view()})")
+
+## `if (<name>) return <name>;` (and the final `return <name>;`) with a StyleValue result.
+func put_return_if_present(out: Out*, indent: str, name: str) -> !:
+    try out.line(f"{indent}if let {name}_value = {name}:")
+    try out.line(f"{indent}    return {name}_value.css_style_value()")
+
+## Ported from generator.py generate_css_parser_expression_for_grammar_node: the expression's
+## statements in the parser's body; alternatives go to the lambda's function, emitted later.
+func generate_css_parser_expression_for_grammar_node(out: Out*, cpp_name: str, grammar_node: const GrammarNode*) -> !:
+    if grammar_node.is_alternatives:
+        try out.line(f"    let {cpp_name} = css_parser_parse_{cpp_name}_alternatives(this, tokens)")
+        return
+    try generate_css_parser_expression_for_component_value(out, "    ", cpp_name, grammar_node.component_value else trap("a component value"))
+
+## Ported from generator.py generate_css_parser_expression_for_alternatives: the lambda
+## `parse_<name>_alternatives`, as a function.
+func generate_css_parser_expression_for_alternatives(out: Out*, value_name: str, cpp_name: str, grammar_node: const GrammarNode*) -> !:
+    try out.blank()
+    try out.line(f"## The lambda `parse_{cpp_name}_alternatives` of Parser::parse_{value_name}_value.")
+    try out.line(f"func css_parser_parse_{cpp_name}_alternatives(this: CssParser*, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssStyleValue*?:")
+    for index in 0..<grammar_node.child_count:
+        let alternative = grammar_node.children[index]
+        if alternative.is_alternatives:
+            trap("Unhandled grammar node: nested alternatives")
+        var alternative_name_builder = try strings.Builder.create()
+        discard(try alternative_name_builder.write(f"{cpp_name}_alternative_{index}"))
+        let alternative_name = alternative_name_builder.view()
+        try generate_css_parser_expression_for_component_value(out, "    ", alternative_name, alternative.component_value else trap("a component value"))
+        try put_return_if_present(out, "    ", alternative_name)
+        try out.blank()
+    try out.line("    return none")
+
+# mark: The fragment ============================================================================
+
+## Ported from generate_libweb_css_value_types_parsing.py value_type_name_to_snake_case: `<symbol>` is `symbol`.
+func value_type_name_to_snake_case(value_type_name: str) -> str!:
+    return try snake_casify(slice(value_type_name, 1, value_type_name.length - 1))
+
+## Ported from generate_libweb_css_value_types_parsing.py json_is_valid.
+func value_types_json_is_valid(value_type_data: const Json*) -> bool!:
+    var is_valid = true
+    var most_recent_value_type_name = ""
+    for index in 0..<value_type_data.count:
+        let value_type_name = value_type_data.key(index)
+        if try lower(value_type_name) < try lower(most_recent_value_type_name):
+            print(f"ValueTypes.json: Value type `{value_type_name}` is in the wrong position. Please keep this list alphabetical!")
+            is_valid = false
+        most_recent_value_type_name = value_type_name
+
+        let value_type_definition = value_type_data.at(index)
+        if value_type_definition.kind != JsonKind.object:
+            print(f"ValueTypes.json: Value type `{value_type_name}` is not an object")
+            is_valid = false
+            continue
+        if let spec = value_type_definition.get("spec"):
+            if spec.kind != JsonKind.string:
+                print(f"ValueTypes.json: Value type `{value_type_name}` has a spec field that is not a string")
+                is_valid = false
+        else:
+            print(f"ValueTypes.json: Value type `{value_type_name}` is missing a spec link")
+            is_valid = false
+        if let grammar = value_type_definition.get("grammar"):
+            if grammar.kind != JsonKind.string:
+                print(f"ValueTypes.json: Value type `{value_type_name}` has a grammar field that is not a string")
+                is_valid = false
+        else:
+            print(f"ValueTypes.json: Value type `{value_type_name}` is missing a grammar")
+            is_valid = false
+        for field_index in 0..<value_type_definition.count:
+            let field_name = value_type_definition.key(field_index)
+            if field_name == "spec" or field_name == "grammar" or field_name == "__comment":
+                continue
+            print(f"ValueTypes.json: Value type `{value_type_name}` has an unexpected field `{field_name}`")
+            is_valid = false
+    return is_valid
+
+## Emit generated/generated_value_types_parsing.lucb from ValueTypes.json.
+func emit_value_types_parsing(value_type_data: const Json*) -> str!:
+    if value_type_data.kind != JsonKind.object:
+        trap("ValueTypes.json: expected a JSON object")
+    if not try value_types_json_is_valid(value_type_data):
+        trap("ValueTypes.json is not valid")
+
+    var out = try Out.create()
+    try put_header(&out, "generated_value_types_parsing", "the parsers of the value types ValueTypes.json defines", [
+        "Generated by tools/gen_css_values from data/css/ValueTypes.json; do not edit. The C++",
+        "it stands for, at Ladybird 47c82b38d0, is",
+        "Build/Libraries/LibWeb/CSS/Parser/GeneratedValueTypesParsing.cpp, written by",
+        "Meta/Generators/generate_libweb_css_value_types_parsing.py: one Parser member per",
+        "value type, which ENUMERATE_GENERATED_CSS_VALUE_TYPES declares in Parser.h.",
+        "",
+        "Copyright (c) 2026, Callum Law <callumlaw1709@outlook.com>",
+        "Copyright (c) 2026 the luce-browser authors.",
+        "SPDX-License-Identifier: BSD-2-Clause (see data/css/LICENSE)",
+    ])
+
+    for index in 0..<value_type_data.count:
+        let value_type_name = value_type_data.key(index)
+        let value_type_definition = value_type_data.at(index)
+        let spec_link = (value_type_definition.get("spec") else trap("a spec link")).string()
+        let grammar = (value_type_definition.get("grammar") else trap("a grammar")).string()
+        let name_snake_case = try value_type_name_to_snake_case(value_type_name)
+        let grammar_node = try parse_value_definition_grammar(grammar)
+
+        try out.blank()
+        try out.line(f"## Ported from Build/Libraries/LibWeb/CSS/Parser/GeneratedValueTypesParsing.cpp Web::CSS::Parser::Parser::parse_{name_snake_case}_value.")
+        try out.line(f"# {spec_link}")
+        try out.line(f"pub func css_parser_parse_{name_snake_case}_value(this: CssParser*, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssStyleValue*?:")
+        try out.line(f"    # {value_type_name} = {grammar}")
+        try generate_css_parser_expression_for_grammar_node(&out, name_snake_case, grammar_node)
+        try put_return_if_present(&out, "    ", name_snake_case)
+        try out.line("    return none")
+        if grammar_node.is_alternatives:
+            try generate_css_parser_expression_for_alternatives(&out, name_snake_case, name_snake_case, grammar_node)
+    return out.text()
