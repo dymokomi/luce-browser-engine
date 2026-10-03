@@ -1,0 +1,600 @@
+#==============================================================================================
+#
+#   parser_2 - the CSS parser: consuming rules, blocks and component values
+#
+#   DESCRIPTION:
+#       Port of LibWeb/CSS/Parser/Parser.cpp (lines 557-1171): consume a stylesheet's
+#       contents, an at-rule, a qualified rule, a block and its contents, a component value
+#       (and its "do nothing" variant), a list of component values, a simple block and a
+#       function, from https://drafts.csswg.org/css-syntax/#consumer-algorithms.
+#
+#       The C++ templates over TokenStream<T> are explicitly specialized for consume_a_component_value
+#       (and its "do nothing" variant): a stream of ComponentValues is already grouped into blocks
+#       and functions. A luce-base generic cannot be specialized, so the per-T steps below choose
+#       between the two token types by size (they differ, which a module assert checks), the way
+#       the template's specializations are chosen by type.
+#
+#       Copyright (c) 2018-2024, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2021-2026, Sam Atkins <sam@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: The per-T steps of the templates ========================================================
+
+# Token and ComponentValue are told apart by size.
+assert(sizeof(css_syntax.Token) != sizeof(css_syntax.ComponentValue), "the per-T steps tell Token and ComponentValue apart by size")
+
+## Whether the template parameter T is ComponentValue (otherwise it is Token).
+func css_parser_token_type_is_component_value[T]() -> bool:
+    let size = sizeof(T)
+    return size == sizeof(css_syntax.ComponentValue)
+
+## A consumed T as a ComponentValue: C++'s implicit `ComponentValue(Token)`, or the value itself.
+func css_parser_component_value_from[T](token: const T*) -> css_syntax.ComponentValue:
+    if css_parser_token_type_is_component_value[T]():
+        return *(const css_syntax.ComponentValue*)token
+    return css_syntax.component_value_from_token(*(const css_syntax.Token*)token)
+
+## `(Token)token` on a consumed T: ComponentValue's `operator Token()`, or the token itself.
+func css_parser_token_from[T](token: const T*) -> css_syntax.Token:
+    if css_parser_token_type_is_component_value[T]():
+        return css_syntax.component_value_to_token((const css_syntax.ComponentValue*)token)
+    return *(const css_syntax.Token*)token
+
+## `consume_a_component_value(input)` on a TokenStream<T>: the specialization for T.
+func css_parser_consume_a_component_value[T: css_syntax.TokenStreamToken[T]](this: CssParser*, input: css_syntax.TokenStream[T]*) -> css_syntax.ComponentValue:
+    if css_parser_token_type_is_component_value[T]():
+        return css_parser_consume_a_component_value_component_value(this, (css_syntax.TokenStream[css_syntax.ComponentValue]*)input)
+    return css_parser_consume_a_component_value_token(this, (css_syntax.TokenStream[css_syntax.Token]*)input)
+
+## `consume_a_component_value_and_do_nothing(input)` on a TokenStream<T>: the specialization for T.
+func css_parser_consume_a_component_value_and_do_nothing[T: css_syntax.TokenStreamToken[T]](this: CssParser*, input: css_syntax.TokenStream[T]*):
+    if css_parser_token_type_is_component_value[T]():
+        css_parser_consume_a_component_value_and_do_nothing_component_value(this, (css_syntax.TokenStream[css_syntax.ComponentValue]*)input)
+    else:
+        css_parser_consume_a_component_value_and_do_nothing_token(this, (css_syntax.TokenStream[css_syntax.Token]*)input)
+
+# mark: Rules ===================================================================================
+
+## Ported from Libraries/LibWeb/CSS/Parser/Parser.cpp:559 Web::CSS::Parser::Parser::consume_a_stylesheets_contents.
+# https://drafts.csswg.org/css-syntax/#consume-stylesheet-contents
+func css_parser_consume_a_stylesheets_contents[T: css_syntax.TokenStreamToken[T]](this: CssParser*, input: css_syntax.TokenStream[T]*) -> ak.Vector[css_syntax.Rule]:
+    # To consume a stylesheet’s contents from a token stream input:
+
+    # Let rules be an initially empty list of rules.
+    var rules = ak.Vector[css_syntax.Rule]()
+
+    # Process input:
+    while true:
+        let token = css_syntax.token_stream_next_token(input)
+
+        # <whitespace-token>
+        if token.token_stream_is(.whitespace):
+            # Discard a token from input.
+            css_syntax.token_stream_discard_a_token(input)
+            continue
+
+        # <EOF-token>
+        if token.token_stream_is(.end_of_file):
+            # Return rules.
+            return rules
+
+        # <CDO-token>
+        # <CDC-token>
+        if token.token_stream_is(.cdo) or token.token_stream_is(.cdc):
+            # Discard a token from input.
+            css_syntax.token_stream_discard_a_token(input)
+            continue
+
+        # <at-keyword-token>
+        if token.token_stream_is(.at_keyword):
+            # Consume an at-rule from input. If anything is returned, append it to rules.
+            if let at_rule = css_parser_consume_an_at_rule(this, input):
+                ak.vector_append_t(&rules, css_syntax.Rule.at_rule(at_rule))
+            continue
+
+        # anything else
+        # Consume a qualified rule from input. If a rule is returned, append it to rules.
+        match css_parser_consume_a_qualified_rule(this, input):
+            .qualified_rule(qualified_rule): ak.vector_append_t(&rules, css_syntax.Rule.qualified_rule(qualified_rule))
+            _: discard(input)
+
+## Ported from Libraries/LibWeb/CSS/Parser/Parser.cpp:611 Web::CSS::Parser::Parser::consume_an_at_rule.
+# https://drafts.csswg.org/css-syntax/#consume-at-rule
+func css_parser_consume_an_at_rule[T: css_syntax.TokenStreamToken[T]](this: CssParser*, input: css_syntax.TokenStream[T]*, nested: CssParserNested = CssParserNested.no) -> css_syntax.AtRule?:
+    # To consume an at-rule from a token stream input, given an optional bool nested (default false):
+
+    # Assert: The next token is an <at-keyword-token>.
+    assert(css_syntax.token_stream_next_token(input).token_stream_is(.at_keyword))
+
+    # Consume a token from input, and let rule be a new at-rule with its name set to the returned token’s value,
+    # its prelude initially set to an empty list, and no declarations or child rules.
+    let consumed_name = css_syntax.token_stream_consume_a_token(input)
+    let name_token = css_parser_token_from(&consumed_name)
+    var rule = css_syntax.AtRule(
+        name = css_syntax.token_at_keyword(&name_token),
+        prelude = ak.Vector[css_syntax.ComponentValue](),
+        child_rules_and_lists_of_declarations = ak.Vector[css_syntax.RuleOrListOfDeclarations](),
+        is_block_rule = false,
+    )
+
+    # Process input:
+    while true:
+        let token = css_syntax.token_stream_next_token(input)
+
+        # <semicolon-token>
+        # <EOF-token>
+        if token.token_stream_is(.semicolon) or token.token_stream_is(.end_of_file):
+            # Discard a token from input. If rule is valid in the current context, return it; otherwise return nothing.
+            css_syntax.token_stream_discard_a_token(input)
+            if css_parser_is_valid_in_the_current_context_at_rule(this, &rule):
+                return rule
+            return none
+
+        # <}-token>
+        if token.token_stream_is(.close_curly):
+            # If nested is true:
+            if nested == CssParserNested.yes:
+                # If rule is valid in the current context, return it.
+                if css_parser_is_valid_in_the_current_context_at_rule(this, &rule):
+                    return rule
+                # Otherwise, return nothing.
+                return none
+            # Otherwise, consume a token and append the result to rule’s prelude.
+            else:
+                let consumed = css_syntax.token_stream_consume_a_token(input)
+                ak.vector_append_t(&rule.prelude, css_parser_component_value_from(&consumed))
+            continue
+
+        # <{-token>
+        if token.token_stream_is(.open_curly):
+            # Consume a block from input, and assign the result to rule’s child rules.
+            ak.vector_append_t(&this.m_rule_context, css_rule_context_type_for_at_rule(rule.name))
+            rule.child_rules_and_lists_of_declarations = css_parser_consume_a_block(this, input)
+            rule.is_block_rule = true
+            discard(ak.vector_take_last(&this.m_rule_context))
+
+            # If rule is valid in the current context, return it. Otherwise, return nothing.
+            if css_parser_is_valid_in_the_current_context_at_rule(this, &rule):
+                return rule
+            return none
+
+        # anything else
+        # Consume a component value from input and append the returned value to rule’s prelude.
+        ak.vector_append_t(&rule.prelude, css_parser_consume_a_component_value(this, input))
+
+## Ported from Libraries/LibWeb/CSS/Parser/Parser.cpp:682 Web::CSS::Parser::Parser::consume_a_qualified_rule.
+# https://drafts.csswg.org/css-syntax/#consume-qualified-rule
+func css_parser_consume_a_qualified_rule[T: css_syntax.TokenStreamToken[T]](this: CssParser*, input: css_syntax.TokenStream[T]*, stop_token: css_syntax.TokenType? = none, nested: CssParserNested = CssParserNested.no) -> EmptyOrQualifiedRuleOrCssParserInvalidRuleError:
+    # To consume a qualified rule, from a token stream input, given an optional token stop token and an optional bool nested (default false):
+
+    # Let rule be a new qualified rule with its prelude, declarations, and child rules all initially set to empty lists.
+    var rule = css_syntax.QualifiedRule(
+        prelude = ak.Vector[css_syntax.ComponentValue](),
+        declarations = ak.Vector[css_syntax.Declaration](),
+        child_rules = ak.Vector[css_syntax.RuleOrListOfDeclarations](),
+    )
+
+    # NOTE: Qualified rules inside @keyframes are a keyframe rule.
+    #       We'll assume all others are style rules.
+    let type_of_qualified_rule = CssRuleContext.keyframe if (not ak.vector_is_empty(&this.m_rule_context) and *ak.vector_last(&this.m_rule_context) == CssRuleContext.at_keyframes) else CssRuleContext.style
+
+    # Process input:
+    while true:
+        let token = css_syntax.token_stream_next_token(input)
+
+        # <EOF-token>
+        # stop token (if passed)
+        if token.token_stream_is(.end_of_file) or (stop_token != none and token.token_stream_is(stop_token else trap("unreachable"))):
+            # This is a parse error. Return nothing.
+            log_parse_error()
+            return EmptyOrQualifiedRuleOrCssParserInvalidRuleError.empty
+
+        # <}-token>
+        if token.token_stream_is(.close_curly):
+            # This is a parse error. If nested is true, return nothing. Otherwise, consume a token and append the result to rule’s prelude.
+            log_parse_error()
+            if nested == CssParserNested.yes:
+                return EmptyOrQualifiedRuleOrCssParserInvalidRuleError.empty
+            let consumed = css_syntax.token_stream_consume_a_token(input)
+            ak.vector_append_t(&rule.prelude, css_parser_component_value_from(&consumed))
+            continue
+
+        # <{-token>
+        if token.token_stream_is(.open_curly):
+            # If the first two non-<whitespace-token> values of rule’s prelude are an <ident-token> whose value starts with "--"
+            # followed by a <colon-token>, then:
+            var prelude_tokens = css_syntax.token_stream_create(rule.prelude)
+            css_syntax.token_stream_discard_whitespace(&prelude_tokens)
+            let first_non_whitespace = css_syntax.token_stream_consume_a_token(&prelude_tokens)
+            css_syntax.token_stream_discard_whitespace(&prelude_tokens)
+            let second_non_whitespace = css_syntax.token_stream_consume_a_token(&prelude_tokens)
+            var starts_custom_property = false
+            if css_syntax.component_value_is(&first_non_whitespace, .ident) and css_syntax.component_value_is(&second_non_whitespace, .colon):
+                let first_ident = css_component_value_ident(&first_non_whitespace)
+                starts_custom_property = ak.fly_string_starts_with_bytes(&first_ident, ak.sv("--"))
+            if starts_custom_property:
+                # If nested is true, consume the remnants of a bad declaration from input, with nested set to true, and return nothing.
+                if nested == CssParserNested.yes:
+                    css_parser_consume_the_remnants_of_a_bad_declaration(this, input, CssParserNested.yes)
+                    return EmptyOrQualifiedRuleOrCssParserInvalidRuleError.empty
+
+                # If nested is false, consume a block from input, and return nothing.
+                discard(css_parser_consume_a_block(this, input))
+                return EmptyOrQualifiedRuleOrCssParserInvalidRuleError.empty
+
+            # Otherwise, consume a block from input, and let child rules be the result.
+            ak.vector_append_t(&this.m_rule_context, type_of_qualified_rule)
+            rule.child_rules = css_parser_consume_a_block(this, input)
+            discard(ak.vector_take_last(&this.m_rule_context))
+
+            # If the first item of child rules is a list of declarations, remove it from child rules and assign it to rule’s declarations.
+            if not ak.vector_is_empty(&rule.child_rules):
+                match *ak.vector_first(&rule.child_rules):
+                    .vector_declaration(declarations):
+                        discard(ak.vector_take_first(&rule.child_rules))
+                        rule.declarations = declarations
+                    .rule(_): discard(rule)
+
+            # If any remaining items of child rules are lists of declarations, replace them with nested declarations rules
+            # containing the list as its sole child. Assign child rules to rule’s child rules.
+            # NOTE: We do this later, when converting the QualifiedRule to a CSSRule type.
+
+            # If rule is valid in the current context, return it; otherwise return an invalid rule error.
+            if css_parser_is_valid_in_the_current_context_qualified_rule(this, &rule):
+                return EmptyOrQualifiedRuleOrCssParserInvalidRuleError.qualified_rule(rule)
+            return EmptyOrQualifiedRuleOrCssParserInvalidRuleError.css_parser_invalid_rule_error(CssParserInvalidRuleError())
+
+        # anything else
+        # Consume a component value from input and append the result to rule’s prelude.
+        ak.vector_append_t(&rule.prelude, css_parser_consume_a_component_value(this, input))
+
+# mark: Blocks ==================================================================================
+
+## Ported from Libraries/LibWeb/CSS/Parser/Parser.cpp:774 Web::CSS::Parser::Parser::consume_a_block.
+# https://drafts.csswg.org/css-syntax/#consume-block
+func css_parser_consume_a_block[T: css_syntax.TokenStreamToken[T]](this: CssParser*, input: css_syntax.TokenStream[T]*) -> ak.Vector[css_syntax.RuleOrListOfDeclarations]:
+    # To consume a block, from a token stream input:
+
+    # Assert: The next token is a <{-token>.
+    assert(css_syntax.token_stream_next_token(input).token_stream_is(.open_curly))
+
+    # Discard a token from input.
+    css_syntax.token_stream_discard_a_token(input)
+    # Consume a block’s contents from input and let rules be the result.
+    let rules = css_parser_consume_a_blocks_contents(this, input)
+    # Discard a token from input.
+    css_syntax.token_stream_discard_a_token(input)
+
+    # Return rules.
+    return rules
+
+## The `flush_declarations` lambda of consume_a_blocks_contents.
+func css_parser_flush_declarations(rules: ak.Vector[css_syntax.RuleOrListOfDeclarations]*, declarations: ak.Vector[css_syntax.Declaration]*):
+    if not ak.vector_is_empty(declarations):
+        ak.vector_append_t(rules, css_syntax.RuleOrListOfDeclarations.vector_declaration(*declarations))
+        *declarations = ak.Vector[css_syntax.Declaration]()
+
+## The `consume_qualified_rule` lambda of consume_a_blocks_contents.
+func css_parser_consume_qualified_rule_into[T: css_syntax.TokenStreamToken[T]](this: CssParser*, input: css_syntax.TokenStream[T]*, rules: ak.Vector[css_syntax.RuleOrListOfDeclarations]*, declarations: ak.Vector[css_syntax.Declaration]*):
+    match css_parser_consume_a_qualified_rule(this, input, css_syntax.TokenType.semicolon, CssParserNested.yes):
+        .empty: discard(rules)
+        .css_parser_invalid_rule_error(_): css_parser_flush_declarations(rules, declarations)
+        .qualified_rule(rule):
+            css_parser_flush_declarations(rules, declarations)
+            ak.vector_append_t(rules, css_syntax.RuleOrListOfDeclarations.rule(css_syntax.Rule.qualified_rule(rule)))
+
+## Ported from Libraries/LibWeb/CSS/Parser/Parser.cpp:794 Web::CSS::Parser::Parser::consume_a_blocks_contents.
+# https://drafts.csswg.org/css-syntax/#consume-block-contents
+func css_parser_consume_a_blocks_contents[T: css_syntax.TokenStreamToken[T]](this: CssParser*, input: css_syntax.TokenStream[T]*) -> ak.Vector[css_syntax.RuleOrListOfDeclarations]:
+    # To consume a block’s contents from a token stream input:
+
+    # Let rules be an empty list, containing either rules or lists of declarations.
+    var rules = ak.Vector[css_syntax.RuleOrListOfDeclarations]()
+
+    # Let decls be an empty list of declarations.
+    var declarations = ak.Vector[css_syntax.Declaration]()
+
+    # Process input:
+    while true:
+        let token = css_syntax.token_stream_next_token(input)
+
+        # <whitespace-token>
+        # <semicolon-token>
+        if token.token_stream_is(.whitespace) or token.token_stream_is(.semicolon):
+            # Discard a token from input.
+            css_syntax.token_stream_discard_a_token(input)
+            continue
+
+        # <EOF-token>
+        # <}-token>
+        if token.token_stream_is(.end_of_file) or token.token_stream_is(.close_curly):
+            # AD-HOC: If decls is not empty, append it to rules.
+            # Spec issue: https://github.com/w3c/csswg-drafts/issues/11017
+            if not ak.vector_is_empty(&declarations):
+                ak.vector_append_t(&rules, css_syntax.RuleOrListOfDeclarations.vector_declaration(declarations))
+            # Return rules.
+            return rules
+
+        # <at-keyword-token>
+        if token.token_stream_is(.at_keyword):
+            # If decls is not empty, append it to rules, and set decls to a fresh empty list of declarations.
+            if not ak.vector_is_empty(&declarations):
+                ak.vector_append_t(&rules, css_syntax.RuleOrListOfDeclarations.vector_declaration(declarations))
+                declarations = ak.Vector[css_syntax.Declaration]()
+
+            # Consume an at-rule from input, with nested set to true.
+            # If a rule was returned, append it to rules.
+            if let at_rule = css_parser_consume_an_at_rule(this, input, CssParserNested.yes):
+                ak.vector_append_t(&rules, css_syntax.RuleOrListOfDeclarations.rule(css_syntax.Rule.at_rule(at_rule)))
+
+            continue
+
+        # anything else
+        # OPTIMIZATION: Look ahead to determine if this can be a declaration (ident whitespace* ':').
+        #               If not, skip straight to qualified rule parsing, avoiding the expensive
+        #               mark/restore cycle and consume_the_remnants_of_a_bad_declaration.
+        var could_be_declaration = false
+        if token.token_stream_is(.ident):
+            var lookahead: usize = 1
+            while css_syntax.token_stream_peek_token(input, lookahead).token_stream_is(.whitespace):
+                lookahead += 1
+            could_be_declaration = css_syntax.token_stream_peek_token(input, lookahead).token_stream_is(.colon)
+
+        if could_be_declaration:
+            # Mark input.
+            css_syntax.token_stream_mark(input)
+
+            # Consume a declaration from input, with nested set to true.
+            # If a declaration was returned, append it to decls, and discard a mark from input.
+            if let declaration = css_parser_consume_a_declaration(this, input, CssParserNested.yes):
+                ak.vector_append_t(&declarations, declaration)
+                css_syntax.token_stream_discard_a_mark(input)
+
+            # Otherwise, restore a mark from input, then consume a qualified rule from input,
+            # with nested set to true, and <semicolon-token> as the stop token.
+            else:
+                css_syntax.token_stream_restore_a_mark(input)
+                css_parser_consume_qualified_rule_into(this, input, &rules, &declarations)
+        else:
+            # Not a declaration, go straight to qualified rule parsing.
+            css_parser_consume_qualified_rule_into(this, input, &rules, &declarations)
+
+# mark: Component values ========================================================================
+
+## Ported from Libraries/LibWeb/CSS/Parser/Parser.cpp:895 Web::CSS::Parser::Parser::consume_a_component_value<ComponentValue>.
+pub func css_parser_consume_a_component_value_component_value(this: CssParser*, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> css_syntax.ComponentValue:
+    discard(this)
+    # Note: This overload is called once tokens have already been converted into component values,
+    #       so we do not need to do the work in the more general overload.
+    return css_syntax.token_stream_consume_a_token(tokens)
+
+## Ported from Libraries/LibWeb/CSS/Parser/Parser.cpp:905 Web::CSS::Parser::Parser::consume_a_component_value<Token>.
+# 5.4.7. Consume a component value
+# https://drafts.csswg.org/css-syntax/#consume-component-value
+pub func css_parser_consume_a_component_value_token(this: CssParser*, input: css_syntax.TokenStream[css_syntax.Token]*) -> css_syntax.ComponentValue:
+    # To consume a component value from a token stream input:
+
+    # Process input:
+    let token = css_syntax.token_stream_next_token(input)
+
+    # <{-token>
+    # <[-token>
+    # <(-token>
+    if css_syntax.token_is(&token, .open_curly) or css_syntax.token_is(&token, .open_square) or css_syntax.token_is(&token, .open_paren):
+        # Consume a simple block from input and return the result.
+        return css_syntax.component_value_from_simple_block(css_parser_consume_a_simple_block(this, input))
+
+    # <function-token>
+    if css_syntax.token_is(&token, .function):
+        # Consume a function from input and return the result.
+        return css_syntax.component_value_from_function(css_parser_consume_a_function(this, input))
+
+    # anything else
+    # Consume a token from input and return the result.
+    return css_syntax.component_value_from_token(css_syntax.token_stream_consume_a_token(input))
+
+## Ported from Libraries/LibWeb/CSS/Parser/Parser.cpp:936 Web::CSS::Parser::Parser::consume_a_component_value_and_do_nothing<ComponentValue>.
+pub func css_parser_consume_a_component_value_and_do_nothing_component_value(this: CssParser*, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*):
+    discard(this)
+    # AD-HOC: To avoid unnecessary allocations, we explicitly define a "do nothing" variant that discards the result immediately.
+    # Note: This overload is called once tokens have already been converted into component values,
+    #       so we do not need to do the work in the more general overload.
+    css_syntax.token_stream_discard_a_token(tokens)
+
+## Ported from Libraries/LibWeb/CSS/Parser/Parser.cpp:947 Web::CSS::Parser::Parser::consume_a_component_value_and_do_nothing<Token>.
+# 5.4.7. Consume a component value
+# https://drafts.csswg.org/css-syntax/#consume-component-value
+pub func css_parser_consume_a_component_value_and_do_nothing_token(this: CssParser*, input: css_syntax.TokenStream[css_syntax.Token]*):
+    # AD-HOC: To avoid unnecessary allocations, we explicitly define a "do nothing" variant that discards the result immediately.
+    # To consume a component value from a token stream input:
+
+    # Process input:
+    let token = css_syntax.token_stream_next_token(input)
+
+    # <{-token>
+    # <[-token>
+    # <(-token>
+    if css_syntax.token_is(&token, .open_curly) or css_syntax.token_is(&token, .open_square) or css_syntax.token_is(&token, .open_paren):
+        # Consume a simple block from input and return the result.
+        css_parser_consume_a_simple_block_and_do_nothing(this, input)
+        return
+
+    # <function-token>
+    if css_syntax.token_is(&token, .function):
+        # Consume a function from input and return the result.
+        css_parser_consume_a_function_and_do_nothing(this, input)
+        return
+
+    # anything else
+    # Consume a token from input and return the result.
+    css_syntax.token_stream_discard_a_token(input)
+
+## Ported from Libraries/LibWeb/CSS/Parser/Parser.cpp:982 Web::CSS::Parser::Parser::consume_a_list_of_component_values.
+func css_parser_consume_a_list_of_component_values[T: css_syntax.TokenStreamToken[T]](this: CssParser*, input: css_syntax.TokenStream[T]*, stop_token: css_syntax.TokenType? = none, nested: CssParserNested = CssParserNested.no) -> ak.Vector[css_syntax.ComponentValue]:
+    # To consume a list of component values from a token stream input, given an optional token stop token
+    # and an optional boolean nested (default false):
+
+    # Let values be an empty list of component values.
+    var values = ak.Vector[css_syntax.ComponentValue]()
+
+    # Process input:
+    while true:
+        let token = css_syntax.token_stream_next_token(input)
+
+        # <eof-token>
+        # stop token (if passed)
+        if token.token_stream_is(.end_of_file) or (stop_token != none and token.token_stream_is(stop_token else trap("unreachable"))):
+            # Return values.
+            return values
+
+        # <}-token>
+        if token.token_stream_is(.close_curly):
+            # If nested is true, return values.
+            if nested == CssParserNested.yes:
+                return values
+            # Otherwise, this is a parse error. Consume a token from input and append the result to values.
+            else:
+                log_parse_error()
+                let consumed = css_syntax.token_stream_consume_a_token(input)
+                ak.vector_append_t(&values, css_parser_component_value_from(&consumed))
+
+        # anything else
+        # Consume a component value from input, and append the result to values.
+        ak.vector_append_t(&values, css_parser_consume_a_component_value(this, input))
+
+## Ported from Libraries/LibWeb/CSS/Parser/Parser.cpp:1023 Web::CSS::Parser::Parser::consume_a_simple_block.
+# https://drafts.csswg.org/css-syntax/#consume-simple-block
+pub func css_parser_consume_a_simple_block(this: CssParser*, input: css_syntax.TokenStream[css_syntax.Token]*) -> css_syntax.SimpleBlock:
+    # To consume a simple block from a token stream input:
+
+    # Assert: the next token of input is <{-token>, <[-token>, or <(-token>.
+    let next = css_syntax.token_stream_next_token(input)
+    assert(css_syntax.token_is(&next, .open_curly) or css_syntax.token_is(&next, .open_square) or css_syntax.token_is(&next, .open_paren))
+
+    # Let ending token be the mirror variant of the next token. (E.g. if it was called with <[-token>, the ending token is <]-token>.)
+    let ending_token = css_syntax.token_mirror_variant(&next)
+
+    # Let block be a new simple block with its associated token set to the next token and with its value initially set to an empty list.
+    var block = css_syntax.SimpleBlock(
+        token = css_syntax.token_stream_next_token(input),
+        value = ak.Vector[css_syntax.ComponentValue](),
+        end_token = css_syntax.token_new(),
+    )
+
+    # Discard a token from input.
+    css_syntax.token_stream_discard_a_token(input)
+
+    # Process input:
+    while true:
+        let token = css_syntax.token_stream_next_token(input)
+
+        # <eof-token>
+        # ending token
+        if css_syntax.token_is(&token, .end_of_file) or css_syntax.token_is(&token, ending_token):
+            # Discard a token from input. Return block.
+            # AD-HOC: Store the token instead as the "end token"
+            block.end_token = css_syntax.token_stream_consume_a_token(input)
+            return block
+
+        # anything else
+        # Consume a component value from input and append the result to block’s value.
+        ak.vector_append_t(&block.value, css_parser_consume_a_component_value_token(this, input))
+
+## Ported from Libraries/LibWeb/CSS/Parser/Parser.cpp:1065 Web::CSS::Parser::Parser::consume_a_simple_block_and_do_nothing.
+# https://drafts.csswg.org/css-syntax/#consume-simple-block
+pub func css_parser_consume_a_simple_block_and_do_nothing(this: CssParser*, input: css_syntax.TokenStream[css_syntax.Token]*):
+    # AD-HOC: To avoid unnecessary allocations, we explicitly define a "do nothing" variant that discards the result immediately.
+    # To consume a simple block from a token stream input:
+
+    # Assert: the next token of input is <{-token>, <[-token>, or <(-token>.
+    let next = css_syntax.token_stream_next_token(input)
+    assert(css_syntax.token_is(&next, .open_curly) or css_syntax.token_is(&next, .open_square) or css_syntax.token_is(&next, .open_paren))
+
+    # Let ending token be the mirror variant of the next token. (E.g. if it was called with <[-token>, the ending token is <]-token>.)
+    let ending_token = css_syntax.token_mirror_variant(&next)
+
+    # Let block be a new simple block with its associated token set to the next token and with its value initially set to an empty list.
+
+    # Discard a token from input.
+    css_syntax.token_stream_discard_a_token(input)
+
+    # Process input:
+    while true:
+        let token = css_syntax.token_stream_next_token(input)
+
+        # <eof-token>
+        # ending token
+        if css_syntax.token_is(&token, .end_of_file) or css_syntax.token_is(&token, ending_token):
+            # Discard a token from input. Return block.
+            css_syntax.token_stream_discard_a_token(input)
+            return
+
+        # anything else
+        # Consume a component value from input and append the result to block’s value.
+        css_parser_consume_a_component_value_and_do_nothing_token(this, input)
+
+## Ported from Libraries/LibWeb/CSS/Parser/Parser.cpp:1103 Web::CSS::Parser::Parser::consume_a_function.
+# https://drafts.csswg.org/css-syntax/#consume-function
+pub func css_parser_consume_a_function(this: CssParser*, input: css_syntax.TokenStream[css_syntax.Token]*) -> css_syntax.Function:
+    # To consume a function from a token stream input:
+
+    # Assert: The next token is a <function-token>.
+    let next = css_syntax.token_stream_next_token(input)
+    assert(css_syntax.token_is(&next, .function))
+
+    # Consume a token from input, and let function be a new function with its name equal the returned token’s value,
+    # and a value set to an empty list.
+    let name_token = css_syntax.token_stream_consume_a_token(input)
+    var function = css_syntax.Function(
+        name = css_syntax.token_function(&name_token),
+        value = ak.Vector[css_syntax.ComponentValue](),
+        name_token = name_token,
+        end_token = css_syntax.token_new(),
+    )
+
+    # Process input:
+    while true:
+        let token = css_syntax.token_stream_next_token(input)
+
+        # <eof-token>
+        # <)-token>
+        if css_syntax.token_is(&token, .end_of_file) or css_syntax.token_is(&token, .close_paren):
+            # Discard a token from input. Return function.
+            # AD-HOC: Store the token instead as the "end token"
+            function.end_token = css_syntax.token_stream_consume_a_token(input)
+            return function
+
+        # anything else
+        # Consume a component value from input and append the result to function’s value.
+        ak.vector_append_t(&function.value, css_parser_consume_a_component_value_token(this, input))
+
+## Ported from Libraries/LibWeb/CSS/Parser/Parser.cpp:1141 Web::CSS::Parser::Parser::consume_a_function_and_do_nothing.
+# https://drafts.csswg.org/css-syntax/#consume-function
+pub func css_parser_consume_a_function_and_do_nothing(this: CssParser*, input: css_syntax.TokenStream[css_syntax.Token]*):
+    # AD-HOC: To avoid unnecessary allocations, we explicitly define a "do nothing" variant that discards the result immediately.
+    # To consume a function from a token stream input:
+
+    # Assert: The next token is a <function-token>.
+    let next = css_syntax.token_stream_next_token(input)
+    assert(css_syntax.token_is(&next, .function))
+
+    # Consume a token from input, and let function be a new function with its name equal the returned token’s value,
+    # and a value set to an empty list.
+    css_syntax.token_stream_discard_a_token(input)
+
+    # Process input:
+    while true:
+        let token = css_syntax.token_stream_next_token(input)
+
+        # <eof-token>
+        # <)-token>
+        if css_syntax.token_is(&token, .end_of_file) or css_syntax.token_is(&token, .close_paren):
+            # Discard a token from input. Return function.
+            css_syntax.token_stream_discard_a_token(input)
+            return
+
+        # anything else
+        # Consume a component value from input and append the result to function’s value.
+        css_parser_consume_a_component_value_and_do_nothing_token(this, input)

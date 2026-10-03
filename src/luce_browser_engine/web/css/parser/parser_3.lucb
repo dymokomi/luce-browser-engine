@@ -1,0 +1,442 @@
+#==============================================================================================
+#
+#   parser_3 - the CSS parser: declarations and the "parse a ..." entry points
+#
+#   DESCRIPTION:
+#       Port of LibWeb/CSS/Parser/Parser.cpp (lines 1173-1628): consume a declaration and the
+#       remnants of a bad one; parse a rule, a block's contents, a declaration, a component
+#       value, a (comma-separated) list of component values; and the CSSOM's "parse a CSS
+#       declaration block" for properties and for descriptors.
+#
+#       Copyright (c) 2018-2024, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2021-2026, Sam Atkins <sam@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Declarations ============================================================================
+
+## The `contains_a_curly_block_and_non_whitespace` lambda of consume_a_declaration (step 8's
+## second clause).
+func css_parser_contains_a_curly_block_and_non_whitespace(declaration_value: const ak.Vector[css_syntax.ComponentValue]*) -> bool:
+    var contains_curly_block = false
+    var contains_non_whitespace = false
+    for value in ak.vector_span_const(declaration_value):
+        if css_component_value_is_curly_block(&value):
+            if contains_non_whitespace:
+                return true
+            contains_curly_block = true
+            continue
+
+        if not css_syntax.component_value_is(&value, .whitespace):
+            if contains_curly_block:
+                return true
+            contains_non_whitespace = true
+            continue
+    return false
+
+## `value.is_block() && value.block().is_curly()`.
+func css_component_value_is_curly_block(value: const css_syntax.ComponentValue*) -> bool:
+    if not css_syntax.component_value_is_block(value):
+        return false
+    let block = css_syntax.component_value_block(value)
+    return css_syntax.simple_block_is_curly(&block)
+
+## Ported from Libraries/LibWeb/CSS/Parser/Parser.cpp:1175 Web::CSS::Parser::Parser::consume_a_declaration.
+# https://drafts.csswg.org/css-syntax/#consume-declaration
+func css_parser_consume_a_declaration[T: css_syntax.TokenStreamToken[T]](this: CssParser*, input: css_syntax.TokenStream[T]*, nested: CssParserNested = CssParserNested.no, save_full_text: CssParserSaveOriginalText = CssParserSaveOriginalText.no) -> css_syntax.Declaration?:
+    # To consume a declaration from a token stream input, given an optional bool nested (default false):
+
+    # TODO: As noted in the "Implementation note" below https://drafts.csswg.org/css-syntax/#consume-block-contents
+    #       there are ways we can optimise this by early-exiting.
+
+    # Let decl be a new declaration, with an initially empty name and a value set to an empty list.
+    var declaration = css_syntax.Declaration(
+        name = ak.fly_string_new(),
+        value = ak.Vector[css_syntax.ComponentValue](),
+        important = css_syntax.Important.no,
+    )
+    let start_token_index = css_syntax.token_stream_current_index(input)
+
+    # 1. If the next token is an <ident-token>, consume a token from input and set decl’s name to the token’s value.
+    if css_syntax.token_stream_next_token(input).token_stream_is(.ident):
+        let consumed = css_syntax.token_stream_consume_a_token(input)
+        let name_token = css_parser_token_from(&consumed)
+        declaration.name = css_syntax.token_ident(&name_token)
+    #    Otherwise, consume the remnants of a bad declaration from input, with nested, and return nothing.
+    else:
+        css_parser_consume_the_remnants_of_a_bad_declaration(this, input, nested)
+        return none
+
+    # 2. Discard whitespace from input.
+    css_syntax.token_stream_discard_whitespace(input)
+
+    # 3. If the next token is a <colon-token>, discard a token from input.
+    if css_syntax.token_stream_next_token(input).token_stream_is(.colon):
+        css_syntax.token_stream_discard_a_token(input)
+    #    Otherwise, consume the remnants of a bad declaration from input, with nested, and return nothing.
+    else:
+        css_parser_consume_the_remnants_of_a_bad_declaration(this, input, nested)
+        return none
+
+    # 4. Discard whitespace from input.
+    css_syntax.token_stream_discard_whitespace(input)
+
+    # 5. Consume a list of component values from input, with nested, and with <semicolon-token> as the stop token,
+    #    and set decl’s value to the result.
+    declaration.value = css_parser_consume_a_list_of_component_values(this, input, css_syntax.TokenType.semicolon, nested)
+
+    # 6. If the last two non-<whitespace-token>s in decl’s value are a <delim-token> with the value "!"
+    #    followed by an <ident-token> with a value that is an ASCII case-insensitive match for "important",
+    #    remove them from decl’s value and set decl’s important flag.
+    if ak.vector_size(&declaration.value) >= 2:
+        # NOTE: Walk backwards from the end until we find "important"
+        var important_index: usize? = none
+        var i = ak.vector_size(&declaration.value) - 1
+        while i > 0:
+            let value = ak.vector_at_const(&declaration.value, i)
+            if css_syntax.component_value_is_ident(value, ak.sv("important")):
+                important_index = i
+                break
+            if not css_syntax.component_value_is(value, .whitespace):
+                break
+            i -= 1
+
+        # NOTE: Walk backwards from important until we find "!"
+        if let important_at = important_index:
+            var bang_index: usize? = none
+            var j = important_at - 1
+            while j > 0:
+                let value = ak.vector_at_const(&declaration.value, j)
+                if css_syntax.component_value_is_delim(value, (u32)'!'):
+                    bang_index = j
+                    break
+                if css_syntax.component_value_is(value, .whitespace):
+                    j -= 1
+                    continue
+                break
+
+            if let bang_at = bang_index:
+                ak.vector_remove(&declaration.value, important_at)
+                ak.vector_remove(&declaration.value, bang_at)
+                declaration.important = css_syntax.Important.yes
+
+    # 7. While the last item in decl’s value is a <whitespace-token>, remove that token.
+    while not ak.vector_is_empty(&declaration.value) and css_syntax.component_value_is(ak.vector_last(&declaration.value), .whitespace):
+        discard(ak.vector_take_last(&declaration.value))
+
+    # 8. If decl’s name is a custom property name string, then set decl’s original text to the segment
+    #    of the original source text string corresponding to the tokens of decl’s value.
+    if css_data.is_invalid_custom_property_name_string(ak.fly_string_bytes_as_string_view(&declaration.name)):
+        return none
+    if css_data.is_a_custom_property_name_string(ak.fly_string_bytes_as_string_view(&declaration.name)):
+        # TODO: If we could reach inside the source string that the TokenStream uses, we could grab this as
+        #       a single substring instead of having to reconstruct it.
+        var original_text = ak.string_builder_new()
+        for value in ak.vector_span_const(&declaration.value):
+            let text = css_syntax.component_value_original_source_text(&value)
+            ak.string_builder_append_string_view(&original_text, ak.string_bytes_as_string_view(&text))
+        declaration.original_value_text = ak.string_builder_to_string_without_validation(&original_text)
+    #    Otherwise, if decl’s value contains a top-level simple block with an associated token of <{-token>,
+    #    and also contains any other non-<whitespace-token> value, return nothing.
+    #    (That is, a top-level {}-block is only allowed as the entire value of a non-custom property.)
+    elif css_parser_contains_a_curly_block_and_non_whitespace(&declaration.value):
+        return none
+    #    Otherwise, if decl’s name is an ASCII case-insensitive match for "unicode-range", consume the value of
+    #    a unicode-range descriptor from the segment of the original source text string corresponding to the
+    #    tokens returned by the consume a list of component values call, and replace decl’s value with the result.
+    #    FIXME: Special unicode-range handling (the C++ branch is empty)
+
+    # 9. If decl is valid in the current context, return it; otherwise return nothing.
+    if css_parser_is_valid_in_the_current_context_declaration(this, &declaration):
+        # AD-HOC: Assemble source tokens.
+        if save_full_text == CssParserSaveOriginalText.yes:
+            var original_full_text = ak.string_builder_new()
+            for token in css_syntax.token_stream_tokens_since(input, start_token_index):
+                let text = token.token_stream_to_string()
+                ak.string_builder_append_string_view(&original_full_text, ak.string_bytes_as_string_view(&text))
+
+            declaration.original_full_text = ak.string_builder_to_string_without_validation(&original_full_text)
+        return declaration
+    return none
+
+## Ported from Libraries/LibWeb/CSS/Parser/Parser.cpp:1327 Web::CSS::Parser::Parser::consume_the_remnants_of_a_bad_declaration.
+# https://drafts.csswg.org/css-syntax/#consume-the-remnants-of-a-bad-declaration
+func css_parser_consume_the_remnants_of_a_bad_declaration[T: css_syntax.TokenStreamToken[T]](this: CssParser*, input: css_syntax.TokenStream[T]*, nested: CssParserNested):
+    # To consume the remnants of a bad declaration from a token stream input, given a bool nested:
+
+    # Process input:
+    while true:
+        let token = css_syntax.token_stream_next_token(input)
+
+        # <eof-token>
+        # <semicolon-token>
+        if token.token_stream_is(.end_of_file) or token.token_stream_is(.semicolon):
+            # Discard a token from input, and return nothing.
+            css_syntax.token_stream_discard_a_token(input)
+            return
+
+        # <}-token>
+        if token.token_stream_is(.close_curly):
+            # If nested is true, return nothing. Otherwise, discard a token.
+            if nested == CssParserNested.yes:
+                return
+            css_syntax.token_stream_discard_a_token(input)
+            continue
+
+        # anything else
+        # Consume a component value from input, and do nothing.
+        css_parser_consume_a_component_value_and_do_nothing(this, input)
+
+# mark: Parse a rule, a block's contents, a declaration =========================================
+
+## Ported from Libraries/LibWeb/CSS/Parser/Parser.cpp:1361 Web::CSS::Parser::Parser::parse_as_css_rule.
+pub func css_parser_parse_as_css_rule(this: CssParser*) -> CssRule*?:
+    if let rule = css_parser_parse_a_rule(this, &this.m_token_stream):
+        return css_parser_convert_to_rule[CssNestedDeclarations](this, rule, CssParserNested.no)
+    return none
+
+## Ported from Libraries/LibWeb/CSS/Parser/Parser.cpp:1370 Web::CSS::Parser::Parser::parse_a_rule.
+# https://drafts.csswg.org/css-syntax/#parse-rule
+func css_parser_parse_a_rule[T: css_syntax.TokenStreamToken[T]](this: CssParser*, input: css_syntax.TokenStream[T]*) -> css_syntax.Rule?:
+    # To parse a rule from input:
+    var rule: css_syntax.Rule? = none
+
+    # 1. Normalize input, and set input to the result.
+    # NOTE: This is done when initializing the Parser.
+
+    # 2. Discard whitespace from input.
+    css_syntax.token_stream_discard_whitespace(input)
+
+    # 3. If the next token from input is an <EOF-token>, return a syntax error.
+    if css_syntax.token_stream_next_token(input).token_stream_is(.end_of_file):
+        return none
+    #    Otherwise, if the next token from input is an <at-keyword-token>,
+    #    consume an at-rule from input, and let rule be the return value.
+    elif css_syntax.token_stream_next_token(input).token_stream_is(.at_keyword):
+        # Donor quirk: the C++ consumes the at-rule from the parser's own token stream, not from input.
+        if let at_rule = css_parser_consume_an_at_rule(this, &this.m_token_stream):
+            rule = css_syntax.Rule.at_rule(at_rule)
+    #    Otherwise, consume a qualified rule from input and let rule be the return value.
+    #    If nothing or an invalid rule error was returned, return a syntax error.
+    else:
+        match css_parser_consume_a_qualified_rule(this, input):
+            .qualified_rule(qualified_rule): rule = css_syntax.Rule.qualified_rule(qualified_rule)
+            _: discard(input)
+
+        if rule == none:
+            return none
+
+    # 4. Discard whitespace from input.
+    css_syntax.token_stream_discard_whitespace(input)
+
+    # 5. If the next token from input is an <EOF-token>, return rule. Otherwise, return a syntax error.
+    if css_syntax.token_stream_next_token(input).token_stream_is(.end_of_file):
+        return rule
+    return none
+
+## Ported from Libraries/LibWeb/CSS/Parser/Parser.cpp:1412 Web::CSS::Parser::Parser::parse_a_blocks_contents.
+# https://drafts.csswg.org/css-syntax/#parse-block-contents
+func css_parser_parse_a_blocks_contents[T: css_syntax.TokenStreamToken[T]](this: CssParser*, input: css_syntax.TokenStream[T]*) -> ak.Vector[css_syntax.RuleOrListOfDeclarations]:
+    # To parse a block’s contents from input:
+
+    # 1. Normalize input, and set input to the result.
+    # NOTE: Done by constructing the Parser.
+
+    # 2. Consume a block’s contents from input, and return the result.
+    return css_parser_consume_a_blocks_contents(this, input)
+
+## Ported from Libraries/LibWeb/CSS/Parser/Parser.cpp:1423 Web::CSS::Parser::Parser::parse_as_supports_condition.
+pub func css_parser_parse_as_supports_condition(this: CssParser*) -> CssStyleProperty?:
+    ak.vector_append_t(&this.m_rule_context, CssRuleContext.supports_condition)
+    let maybe_declaration = css_parser_parse_a_declaration(this, &this.m_token_stream)
+    discard(ak.vector_take_last(&this.m_rule_context))
+    if let declaration = maybe_declaration:
+        if let property_and_name = css_parser_convert_to_style_property(this, &declaration):
+            return property_and_name.property
+    return none
+
+## Ported from Libraries/LibWeb/CSS/Parser/Parser.cpp:1437 Web::CSS::Parser::Parser::parse_a_declaration.
+# https://drafts.csswg.org/css-syntax/#parse-declaration
+func css_parser_parse_a_declaration[T: css_syntax.TokenStreamToken[T]](this: CssParser*, input: css_syntax.TokenStream[T]*) -> css_syntax.Declaration?:
+    # To parse a declaration from input:
+
+    # 1. Normalize input, and set input to the result.
+    # Note: This is done when initializing the Parser.
+
+    # 2. Discard whitespace from input.
+    css_syntax.token_stream_discard_whitespace(input)
+
+    # 3. Consume a declaration from input. If anything was returned, return it. Otherwise, return a syntax error.
+    if let declaration = css_parser_consume_a_declaration(this, input):
+        return declaration
+    # FIXME: Syntax error
+    return none
+
+# mark: Parse component values ==================================================================
+
+## Ported from Libraries/LibWeb/CSS/Parser/Parser.cpp:1454 Web::CSS::Parser::Parser::parse_as_component_value.
+pub func css_parser_parse_as_component_value(this: CssParser*) -> css_syntax.ComponentValue?:
+    return css_parser_parse_a_component_value(this, &this.m_token_stream)
+
+## Ported from Libraries/LibWeb/CSS/Parser/Parser.cpp:1461 Web::CSS::Parser::Parser::parse_a_component_value.
+# https://drafts.csswg.org/css-syntax/#parse-component-value
+func css_parser_parse_a_component_value[T: css_syntax.TokenStreamToken[T]](this: CssParser*, input: css_syntax.TokenStream[T]*) -> css_syntax.ComponentValue?:
+    # To parse a component value from input:
+
+    # 1. Normalize input, and set input to the result.
+    # Note: This is done when initializing the Parser.
+
+    # 2. Discard whitespace from input.
+    css_syntax.token_stream_discard_whitespace(input)
+
+    # 3. If input is empty, return a syntax error.
+    # FIXME: Syntax error
+    if css_syntax.token_stream_is_empty(input):
+        return none
+
+    # 4. Consume a component value from input and let value be the return value.
+    let value = css_parser_consume_a_component_value(this, input)
+
+    # 5. Discard whitespace from input.
+    css_syntax.token_stream_discard_whitespace(input)
+
+    # 6. If input is empty, return value. Otherwise, return a syntax error.
+    if css_syntax.token_stream_is_empty(input):
+        return value
+    # FIXME: Syntax error
+    return none
+
+## Ported from Libraries/LibWeb/CSS/Parser/Parser.cpp:1491 Web::CSS::Parser::Parser::parse_a_list_of_component_values.
+# https://drafts.csswg.org/css-syntax/#parse-list-of-component-values
+func css_parser_parse_a_list_of_component_values[T: css_syntax.TokenStreamToken[T]](this: CssParser*, input: css_syntax.TokenStream[T]*) -> ak.Vector[css_syntax.ComponentValue]:
+    # To parse a list of component values from input:
+
+    # 1. Normalize input, and set input to the result.
+    # Note: This is done when initializing the Parser.
+
+    # 2. Consume a list of component values from input, and return the result.
+    return css_parser_consume_a_list_of_component_values(this, input)
+
+## Ported from Libraries/LibWeb/CSS/Parser/Parser.cpp:1504 Web::CSS::Parser::Parser::parse_a_comma_separated_list_of_component_values.
+# https://drafts.csswg.org/css-syntax/#parse-comma-separated-list-of-component-values
+func css_parser_parse_a_comma_separated_list_of_component_values[T: css_syntax.TokenStreamToken[T]](this: CssParser*, input: css_syntax.TokenStream[T]*) -> ak.Vector[ak.Vector[css_syntax.ComponentValue]]:
+    # To parse a comma-separated list of component values from input:
+
+    # 1. Normalize input, and set input to the result.
+    # Note: This is done when initializing the Parser.
+
+    # 2. Let groups be an empty list.
+    var groups = ak.Vector[ak.Vector[css_syntax.ComponentValue]]()
+
+    # 3. While input is not empty:
+    var just_consumed_comma = false
+    while not css_syntax.token_stream_is_empty(input):
+
+        # 1. Consume a list of component values from input, with <comma-token> as the stop token, and append the result to groups.
+        ak.vector_append_t(&groups, css_parser_consume_a_list_of_component_values(this, input, css_syntax.TokenType.comma))
+
+        # 2. Discard a token from input.
+        just_consumed_comma = css_syntax.token_stream_consume_a_token(input).token_stream_is(.comma)
+
+    # AD-HOC: Also append an empty group if there was a trailing comma.
+    # Some related spec discussion: https://github.com/w3c/csswg-drafts/issues/11254
+    if just_consumed_comma:
+        ak.vector_append_t(&groups, ak.Vector[css_syntax.ComponentValue]())
+
+    # 4. Return groups.
+    return groups
+
+# mark: Parse a CSS declaration block ===========================================================
+
+## The captures of the `[&](PropertyID longhand_property_id, StyleValue const& longhand_value)`
+## lambda inside parse_as_property_declaration_block's expand_shorthands.
+struct CssParserExpandShorthandsCaptures:
+    var expanded_properties: ak.Vector[CssStyleProperty]*
+    var important: css_syntax.Important
+
+## The lambda: append the longhand with the shorthand's importance.
+func css_parser_expand_shorthands_append_longhand(context: void*?, longhand_property_id: css_data.PropertyId, longhand_value: CssStyleValue*):
+    let captures = (CssParserExpandShorthandsCaptures*)(context else trap("no captures"))
+    ak.vector_append_t(captures.expanded_properties, CssStyleProperty(
+        important = captures.important,
+        property_id = longhand_property_id,
+        value = longhand_value,
+    ))
+
+## The `expand_shorthands` lambda of parse_as_property_declaration_block.
+func css_parser_expand_shorthands(properties: const ak.Vector[CssStyleProperty]*) -> ak.Vector[CssStyleProperty]:
+    var expanded_properties = ak.Vector[CssStyleProperty]()
+    for property in ak.vector_span_const(properties):
+        if css_data.property_is_shorthand(property.property_id):
+            var captures = CssParserExpandShorthandsCaptures(expanded_properties = &expanded_properties, important = property.important)
+            css_style_computer_for_each_property_expanding_shorthands(property.property_id, property.value,
+                                                                      ak.Function2[css_data.PropertyId, CssStyleValue*, unit](call = css_parser_expand_shorthands_append_longhand, context = &captures))
+        else:
+            ak.vector_append_t(&expanded_properties, property)
+    return expanded_properties
+
+## Ported from Libraries/LibWeb/CSS/Parser/Parser.cpp:1535 Web::CSS::Parser::Parser::parse_as_property_declaration_block.
+# https://drafts.csswg.org/cssom/#parse-a-css-declaration-block
+pub func css_parser_parse_as_property_declaration_block(this: CssParser*) -> CssParserPropertiesAndCustomProperties:
+    # 1. Let declarations be the returned declarations from invoking parse a block’s contents with string.
+    let declarations_and_at_rules = css_parser_parse_a_blocks_contents(this, &this.m_token_stream)
+
+    # 2. Let parsed declarations be a new empty list.
+    var parsed_declarations = CssParserPropertiesAndCustomProperties()
+
+    # 3. For each item declaration in declarations, follow these substeps:
+    for rule_or_list in ak.vector_span_const(&declarations_and_at_rules):
+        match rule_or_list:
+            .rule(_):
+                continue
+            .vector_declaration(rule_declarations):
+                let list = ak.vector_span_const(&rule_declarations)
+                for declaration in &list:
+                    # 1. Let parsed declaration be the result of parsing declaration according to the appropriate CSS
+                    #    specifications, dropping parts that are said to be ignored. If the whole declaration is dropped, let
+                    #    parsed declaration be null.
+                    # 2. If parsed declaration is not null, append it to parsed declarations.
+                    css_parser_extract_property(this, declaration, &parsed_declarations)
+    parsed_declarations.properties = css_parser_expand_shorthands(&parsed_declarations.properties)
+
+    # 4. Return parsed declarations.
+    return parsed_declarations
+
+## Ported from Libraries/LibWeb/CSS/Parser/Parser.cpp:1582 Web::CSS::Parser::Parser::parse_as_descriptor_declaration_block.
+# https://drafts.csswg.org/cssom/#parse-a-css-declaration-block
+pub func css_parser_parse_as_descriptor_declaration_block(this: CssParser*, at_rule_id: css_data.AtRuleId) -> ak.Vector[CssDescriptor]:
+    let context_type = match at_rule_id:
+        .font_face => CssRuleContext.at_font_face
+        .function => CssRuleContext.at_function
+        .page => CssRuleContext.at_page
+        .property => CssRuleContext.at_property
+        # NB: We don't actually have a `CSSDescriptors` for `@counter-style` so this function shouldn't ever be
+        #     called with `AtRuleID::CounterStyle`.
+        .counter_style => trap("VERIFY_NOT_REACHED")
+        _ => trap("VERIFY_NOT_REACHED")
+
+    # 1. Let declarations be the returned declarations from invoking parse a block’s contents with string.
+    ak.vector_append_t(&this.m_rule_context, context_type)
+    let declarations_and_at_rules = css_parser_parse_a_blocks_contents(this, &this.m_token_stream)
+    discard(ak.vector_take_last(&this.m_rule_context))
+
+    # 2. Let parsed declarations be a new empty list.
+    var parsed_declarations = ak.Vector[CssDescriptor]()
+
+    # 3. For each item declaration in declarations, follow these substeps:
+    for rule_or_list in ak.vector_span_const(&declarations_and_at_rules):
+        match rule_or_list:
+            .rule(_):
+                continue
+            .vector_declaration(rule_declarations):
+                for declaration in ak.vector_span_const(&rule_declarations):
+                    # 1. Let parsed declaration be the result of parsing declaration according to the appropriate CSS
+                    #    specifications, dropping parts that are said to be ignored. If the whole declaration is dropped, let
+                    #    parsed declaration be null.
+                    # 2. If parsed declaration is not null, append it to parsed declarations.
+                    if let parsed_declaration = css_parser_convert_to_descriptor(this, at_rule_id, declaration):
+                        ak.vector_append_t(&parsed_declarations, parsed_declaration)
+
+    # 4. Return parsed declarations.
+    return parsed_declarations
