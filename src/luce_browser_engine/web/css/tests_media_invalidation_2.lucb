@@ -1,0 +1,264 @@
+#==============================================================================================
+#
+#   tests_media_invalidation_2 - invalidation outcomes on DOM trees (region r42)
+#
+#   DESCRIPTION:
+#       The `outcome` oracle cases (tests_media_invalidation_cases) build a tree in a new HTML
+#       document from a tree spec (`name#id.class[attr=value](children) 'text'`) with the DOM's
+#       own entry points (create_element, set_attribute_value, append_child), make a style
+#       sheet its author sheet, build the rule cache (with the four user-agent sheets, @media
+#       blocks included), match every element against the sheet's selectors collecting the
+#       selector involvement metadata (as collect_matching_rules does), clear every style flag,
+#       run the case's mutations (set or remove an attribute, append, insert before, remove),
+#       then perform the pending :has() and descendant invalidations as Document::update_style
+#       does, and print which nodes need a style update (N), have a child that needs one (C) or
+#       need their entire subtree updated (E).
+#
+#       The sheet is put in the document's StyleSheetList by hand: StyleSheetList::add_sheet
+#       loads the sheet's fonts (FontComputer, region r41); the oracle does the same by hand.
+#
+#==============================================================================================
+
+# mark: Building trees ==========================================================================
+
+## The state of the tree spec parser.
+struct TestOutcomeTreeParser:
+    var document: DomDocument*
+    var text: const u8[]
+    var pos: usize
+
+## Whether `ch` is part of a name or an id (the oracle's `word`).
+func test_outcome_is_word_byte(ch: u8) -> bool:
+    return (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '-' or ch == '_'
+
+## The next name or id.
+func test_outcome_word(parser: TestOutcomeTreeParser*) -> ak.StringView:
+    let start = parser.pos
+    while parser.pos < parser.text.length and test_outcome_is_word_byte(parser.text[parser.pos]):
+        parser.pos += 1
+    return ak.string_view_from_bytes(parser.text[start..<parser.pos])
+
+## Skips spaces.
+func test_outcome_skip_spaces(parser: TestOutcomeTreeParser*):
+    while parser.pos < parser.text.length and parser.text[parser.pos] == ' ':
+        parser.pos += 1
+
+## The index of the first `ch` at or after `start`.
+func test_outcome_find(text: const u8[], start: usize, ch: u8) -> usize:
+    var i = start
+    while text[i] != ch:
+        i += 1
+    return i
+
+## A FlyString of bytes.
+func test_outcome_fly(view: ak.StringView) -> ak.FlyString:
+    return ak.fly_string_from_utf8_without_validation(ak.string_view_bytes(&view))
+
+## A String of bytes.
+func test_outcome_string(view: ak.StringView) -> ak.String:
+    return ak.string_from_utf8_without_validation(ak.string_view_bytes(&view))
+
+## The next node of the spec, with its children (the oracle's `node`).
+func test_outcome_node(parser: TestOutcomeTreeParser*) -> DomNode*:
+    if parser.text[parser.pos] == '\'':
+        let end = test_outcome_find(parser.text, parser.pos + 1, '\'')
+        let data = ak.string_view_from_bytes(parser.text[parser.pos + 1..<end])
+        parser.pos = end + 1
+        return dom_document_create_text_node(parser.document, ak.utf16_string_from_utf8_string_view(data)).dom_node()
+    let name = test_outcome_word(parser)
+    let element = dom_create_element(parser.document, test_outcome_fly(name), namespace_html) else trap("MUST: create_element")
+    while parser.pos < parser.text.length and (parser.text[parser.pos] == '#' or parser.text[parser.pos] == '.' or parser.text[parser.pos] == '['):
+        let kind = parser.text[parser.pos]
+        parser.pos += 1
+        if kind == '[':
+            var eq = parser.pos
+            while parser.text[eq] != '=' and parser.text[eq] != ']':
+                eq += 1
+            let attribute = ak.string_view_from_bytes(parser.text[parser.pos..<eq])
+            var value = ak.sv("")
+            if parser.text[eq] == '=':
+                let close = test_outcome_find(parser.text, eq, ']')
+                value = ak.string_view_from_bytes(parser.text[eq + 1..<close])
+                parser.pos = close + 1
+            else:
+                parser.pos = eq + 1
+            dom_element_set_attribute_value(element, test_outcome_fly(attribute), test_outcome_string(value))
+            continue
+        let value = test_outcome_word(parser)
+        let attribute_name = html_attribute_names_id if kind == '#' else html_attribute_names_class
+        var combined = test_outcome_string(value)
+        if kind == '.':
+            if let existing = dom_element_get_attribute(element, attribute_name):
+                var builder = ak.string_builder_new()
+                ak.string_builder_append_string_view(&builder, ak.string_bytes_as_string_view(&existing))
+                ak.string_builder_append(&builder, " ")
+                ak.string_builder_append_string_view(&builder, value)
+                combined = ak.string_builder_to_string_without_validation(&builder)
+        dom_element_set_attribute_value(element, attribute_name, combined)
+    if parser.pos < parser.text.length and parser.text[parser.pos] == '(':
+        parser.pos += 1
+        while true:
+            test_outcome_skip_spaces(parser)
+            if parser.text[parser.pos] == ')':
+                parser.pos += 1
+                break
+            discard(dom_node_append_child(element.dom_node(), test_outcome_node(parser)) else trap("MUST: append_child"))
+    return element.dom_node()
+
+## The node a tree spec describes (the oracle's `parse_tree`).
+func test_outcome_parse_tree(document: DomDocument*, spec: ak.StringView) -> DomNode*:
+    var parser = TestOutcomeTreeParser(document = document, text = ak.string_view_bytes(&spec), pos = 0)
+    test_outcome_skip_spaces(&parser)
+    return test_outcome_node(&parser)
+
+## The element whose id is `id`.
+func test_outcome_element_by_id(document: DomDocument*, id: ak.StringView) -> DomElement*:
+    for node in dom_node_subtree(document.dom_node()):
+        let element = as_if_dom_element(node) else continue
+        if let element_id = dom_element_id(element):
+            if ak.string_view_eq_string_view(&id, ak.fly_string_bytes_as_string_view(&element_id)):
+                return element
+    trap("no element with that id")
+
+# mark: The case ================================================================================
+
+## The oracle's `clear_style_flags`.
+func test_outcome_clear_style_flags(document: DomDocument*):
+    for node in dom_node_inclusive_subtree(document.dom_node()):
+        node.m_needs_style_update = false
+        node.m_child_needs_style_update = false
+        node.m_entire_subtree_needs_style_update = false
+    document.m_needs_full_style_update = false
+    document.m_needs_invalidation_of_elements_affected_by_has = false
+    ak.ordered_hash_map_clear(&dom_document_style_scope(document).m_pending_has_invalidations)
+    ak.hash_map_clear(&dom_document_style_invalidator(document).m_pending_invalidations)
+
+## The oracle's `node_label`.
+func test_outcome_node_label(builder: ak.StringBuilder*, node: DomNode*):
+    if let element = as_if_dom_element(node):
+        let local_name = dom_element_local_name(element)
+        ak.string_builder_append_string_view(builder, ak.fly_string_bytes_as_string_view(&local_name))
+        if let id = dom_element_id(element):
+            ak.string_builder_append(builder, "#")
+            ak.string_builder_append_string_view(builder, ak.fly_string_bytes_as_string_view(&id))
+    elif is_dom_text(node):
+        ak.string_builder_append(builder, "text")
+    else:
+        ak.string_builder_append(builder, "document")
+
+## The oracle's `print_style_flags`.
+func test_outcome_print_style_flags(out: ak.StringBuilder*, document: DomDocument*):
+    test_media_invalidation_labeled(out, 1, "full: ", test_media_invalidation_bool(dom_document_needs_full_style_update(document)))
+    for node in dom_node_inclusive_subtree(document.dom_node()):
+        var builder = ak.string_builder_new()
+        test_outcome_node_label(&builder, node)
+        ak.string_builder_append(&builder, " ")
+        ak.string_builder_append(&builder, "N" if dom_node_needs_style_update(node) else "-")
+        ak.string_builder_append(&builder, "C" if dom_node_child_needs_style_update(node) else "-")
+        ak.string_builder_append(&builder, "E" if dom_node_entire_subtree_needs_style_update(node) else "-")
+        test_media_invalidation_line(out, 1, ak.string_builder_string_view(&builder))
+
+## The captures of test_outcome_collect_involvement_metadata's rule walk.
+struct TestOutcomeMetadataCaptures:
+    var sheet: CssCssStyleSheet*
+    var element: DomElement*
+
+## The oracle's for_each_effective_style_producing_rule lambda: every selector of a style rule matched with the
+## involvement metadata collected.
+func test_outcome_match_rule(context: void*?, rule: CssRule*):
+    let captures = (TestOutcomeMetadataCaptures*)(context else trap("no captures"))
+    let style_rule = as_if_css_style_rule(rule) else return
+    let selectors = css_style_rule_absolutized_selectors(style_rule)
+    for selector in ak.vector_span_const(&selectors):
+        var match_context = SelectorEngineMatchContext(style_sheet_for_rule = captures.sheet, subject = captures.element, collect_per_element_selector_involvement_metadata = true)
+        var abstract_element: DomAbstractElement = ---
+        dom_abstract_element_construct(&abstract_element, captures.element)
+        discard(selector_engine_matches(selector, abstract_element, none, &match_context))
+
+## The oracle's `collect_involvement_metadata`.
+func test_outcome_collect_involvement_metadata(document: DomDocument*, sheet: CssCssStyleSheet*):
+    for node in dom_node_subtree(document.dom_node()):
+        let element = as_if_dom_element(node) else continue
+        var captures = TestOutcomeMetadataCaptures(sheet = sheet, element = element)
+        css_css_style_sheet_for_each_effective_style_producing_rule(sheet, ak.Function1[CssRule*, unit](call = test_outcome_match_rule, context = &captures))
+
+## The oracle's `run_mutation`.
+func test_outcome_run_mutation(out: ak.StringBuilder*, document: DomDocument*, mutation: ak.StringView):
+    let bytes = ak.string_view_bytes(&mutation)
+    var space: usize = 0
+    while bytes[space] != ' ':
+        space += 1
+    let verb = ak.string_view_from_bytes(bytes[0..<space])
+    var second = space + 2
+    while second < bytes.length and bytes[second] != ' ':
+        second += 1
+    let id = ak.string_view_from_bytes(bytes[space + 2..<second])
+    let argument = ak.string_view_from_bytes(bytes[second + 1..] if second < bytes.length else bytes[bytes.length..])
+    let element = test_outcome_element_by_id(document, id)
+    if ak.string_view_equals(&verb, "attr"):
+        let argument_bytes = ak.string_view_bytes(&argument)
+        var name_end: usize = 0
+        while name_end < argument_bytes.length and argument_bytes[name_end] != ' ':
+            name_end += 1
+        let name = ak.string_view_from_bytes(argument_bytes[0..<name_end])
+        let value = ak.string_view_from_bytes(argument_bytes[name_end + 1..] if name_end < argument_bytes.length else argument_bytes[argument_bytes.length..])
+        dom_element_set_attribute_value(element, test_outcome_fly(name), test_outcome_string(value))
+    elif ak.string_view_equals(&verb, "rmattr"):
+        dom_element_remove_attribute(element, test_outcome_fly(argument))
+    elif ak.string_view_equals(&verb, "append"):
+        discard(dom_node_append_child(element.dom_node(), test_outcome_parse_tree(document, argument)) else trap("MUST: append_child"))
+    elif ak.string_view_equals(&verb, "before"):
+        let parent = tree_node_parent(element.dom_node()) else trap("no parent")
+        dom_node_insert_before(parent, test_outcome_parse_tree(document, argument), element.dom_node())
+    elif ak.string_view_equals(&verb, "remove"):
+        dom_node_remove(element.dom_node())
+    else:
+        test_media_invalidation_labeled(out, 1, "unknown mutation ", verb)
+
+## A document for an outcome case: test_html_setup's heap document with what Document::Document creates for
+## style (its StyleScope, a StyleComputer and a StyleInvalidator).
+func test_outcome_document(realm: Realm*) -> DomDocument*:
+    let document = test_html_heap_document(realm)
+    document.m_style_invalidator = heap_allocate_css_style_invalidator(realm_heap(realm))
+    css_style_scope_construct(&document.m_style_scope, document.dom_node())
+    document.m_style_computer = test_style_computer_create(realm, document)
+    return document
+
+## The oracle's `run_outcome`.
+func test_media_invalidation_outcome(out: ak.StringBuilder*, realm: Realm*, tree: str, css: str, mutations: str):
+    let document = test_outcome_document(realm)
+    discard(dom_node_append_child(document.dom_node(), test_outcome_parse_tree(document, ak.sv(tree))) else trap("MUST: append_child"))
+    let sheet = parse_css_stylesheet(test_media_invalidation_params(realm), ak.sv(css))
+    ak.vector_append_t(&dom_document_style_sheets(document).m_sheets, sheet)
+    discard(ak.hash_table_set(&sheet.m_owning_documents_or_shadow_roots, document.dom_node()))
+    css_style_scope_invalidate_rule_cache(dom_document_style_scope(document))
+    css_style_scope_build_rule_cache_if_needed(dom_document_style_scope(document))
+    test_outcome_collect_involvement_metadata(document, sheet)
+    test_outcome_clear_style_flags(document)
+
+    let mutation_bytes = mutations.bytes
+    var start: usize = 0
+    for i in 0..<mutation_bytes.length + 1:
+        if i == mutation_bytes.length or mutation_bytes[i] == ';':
+            test_outcome_run_mutation(out, document, ak.string_view_from_bytes(mutation_bytes[start..<i]))
+            start = i + 1
+
+    if document.m_needs_invalidation_of_elements_affected_by_has:
+        document.m_needs_invalidation_of_elements_affected_by_has = false
+        css_invalidation_invalidate_style_for_pending_has_mutations(document)
+    css_style_invalidator_invalidate(dom_document_style_invalidator(document), document.dom_node())
+    test_outcome_print_style_flags(out, document)
+
+## The four user-agent style sheets, @media blocks included, parsed in `realm` as default_stylesheet() and its siblings
+## parse them in internal_css_realm() (which needs a Window, region r28).
+func test_media_invalidation_install_user_agent_sheets(realm: Realm*):
+    css_default_stylesheet_sheet = test_media_invalidation_user_agent_sheet(realm, css_default_stylesheet_source)
+    css_quirks_mode_stylesheet_sheet = test_media_invalidation_user_agent_sheet(realm, css_quirks_mode_stylesheet_source)
+    css_mathml_stylesheet_sheet = test_media_invalidation_user_agent_sheet(realm, css_mathml_stylesheet_source)
+    css_svg_stylesheet_sheet = test_media_invalidation_user_agent_sheet(realm, css_svg_stylesheet_source)
+
+## A user-agent style sheet parsed as css_parse_user_agent_stylesheet parses it, in `realm`.
+func test_media_invalidation_user_agent_sheet(realm: Realm*, source: str) -> gc.Root[CssCssStyleSheet]:
+    var params: CssParsingParams = ---
+    css_parsing_params_construct_realm_css_is_ua_style_sheet(&params, realm, CssIsUaStyleSheet.yes)
+    return gc.root_create(parse_css_stylesheet(params, ak.sv(source)))

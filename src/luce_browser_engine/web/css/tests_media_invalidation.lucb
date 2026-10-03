@@ -1,0 +1,317 @@
+#==============================================================================================
+#
+#   tests_media_invalidation - tests of media queries, @supports, @container and the
+#                              invalidation sets of selectors and style sheets (region r42)
+#
+#   DESCRIPTION:
+#       Ladybird has no unit tests for these files. The oracle cases
+#       (tests_media_invalidation_cases) run the reference build's LibWeb on the same inputs
+#       (luce-browser-tools, oracles/luce-browser-engine/media_invalidation); the test below runs
+#       each through the port and compares the output:
+#       - media: a media query list's serialization, each query's to_string(), its evaluation
+#         against a document without a Window (media features answer false there; the media
+#         type and `not` still decide) and MediaQuery::dump;
+#       - supports: CSS.supports()-style conditions, their serialization, match and dump;
+#       - container: the container queries of @container rules;
+#       - invalidation: StyleInvalidationData::build_invalidation_sets_for_selector over a
+#         selector list: every property's invalidation plan (descendant and sibling rules,
+#         recursively) and the :has() metadata maps;
+#       - sheetset: the StyleSheetInvalidationSet of a sheet's style rules, with its anchor rules;
+#       - lightdom: selector_may_match_light_dom_under_shadow_host of a selector text.
+#       Sets are printed with their properties sorted (AK's Formatter<InvalidationSet> writes no
+#       separator, a donor quirk kept in css_invalidation_set_format).
+#
+#==============================================================================================
+
+# mark: Output helpers ==========================================================================
+
+## The parsing parameters of the cases: the realm only.
+func test_media_invalidation_params(realm: Realm*) -> CssParsingParams:
+    var params: CssParsingParams = ---
+    css_parsing_params_construct_realm_css_parsing_mode(&params, realm)
+    return params
+
+## Append `text` to `out`, indented by `indent` levels of two spaces, and a line feed (the oracle's `line`).
+func test_media_invalidation_line(out: ak.StringBuilder*, indent: i32, text: ak.StringView):
+    for _ in 0..<indent:
+        ak.string_builder_append(out, "  ")
+    ak.string_builder_append_string_view(out, text)
+    ak.string_builder_append_u8(out, '\n')
+
+## A line `<label><text>`.
+func test_media_invalidation_labeled(out: ak.StringBuilder*, indent: i32, label: str, text: ak.StringView):
+    var builder = ak.string_builder_new()
+    ak.string_builder_append(&builder, label)
+    ak.string_builder_append_string_view(&builder, text)
+    test_media_invalidation_line(out, indent, ak.string_builder_string_view(&builder))
+
+## A line `<label><String>`.
+func test_media_invalidation_labeled_string(out: ak.StringBuilder*, indent: i32, label: str, text: ak.String):
+    test_media_invalidation_labeled(out, indent, label, ak.string_bytes_as_string_view(&text))
+
+## "true" or "false".
+func test_media_invalidation_bool(value: bool) -> ak.StringView:
+    return ak.sv("true") if value else ak.sv("false")
+
+## The oracle's `print_dump_lines`: each non-empty line of a dump as `dump: <line>`.
+func test_media_invalidation_dump_lines(out: ak.StringBuilder*, indent: i32, dumped: ak.StringView):
+    let bytes = ak.string_view_bytes(&dumped)
+    var start: usize = 0
+    for i in 0..<bytes.length + 1:
+        if i == bytes.length or bytes[i] == '\n':
+            if i > start:
+                test_media_invalidation_labeled(out, indent, "dump: ", ak.string_view_from_bytes(bytes[start..<i]))
+            start = i + 1
+
+# mark: Media queries, @supports, @container ====================================================
+
+## The oracle's `run_media`.
+func test_media_invalidation_media(out: ak.StringBuilder*, realm: Realm*, document: DomDocument*, text: str):
+    let list = parse_media_query_list(test_media_invalidation_params(realm), ak.sv(text))
+    test_media_invalidation_labeled_string(out, 1, "list: ", css_serialize_a_media_query_list(list))
+    for query in ak.vector_span_const(&list):
+        test_media_invalidation_labeled_string(out, 1, "query: ", css_media_query_to_string(query))
+        let matches = css_media_query_evaluate(query, document)
+        test_media_invalidation_labeled(out, 2, "matches: ", test_media_invalidation_bool(matches))
+        var builder = ak.string_builder_new()
+        css_media_query_dump(query, &builder, 0)
+        test_media_invalidation_dump_lines(out, 2, ak.string_builder_string_view(&builder))
+
+## The oracle's `run_supports`.
+func test_media_invalidation_supports(out: ak.StringBuilder*, realm: Realm*, text: str):
+    let maybe_supports = parse_css_supports(test_media_invalidation_params(realm), ak.sv(text))
+    if maybe_supports == none:
+        test_media_invalidation_line(out, 1, ak.sv("none"))
+        return
+    let supports = maybe_supports else trap("unreachable")
+    test_media_invalidation_labeled_string(out, 1, "text: ", css_supports_to_string(supports))
+    test_media_invalidation_labeled(out, 1, "matches: ", test_media_invalidation_bool(css_supports_matches(supports)))
+    var builder = ak.string_builder_new()
+    css_supports_dump(supports, &builder, 0)
+    test_media_invalidation_dump_lines(out, 1, ak.string_builder_string_view(&builder))
+
+## The oracle's `run_container`.
+func test_media_invalidation_container(out: ak.StringBuilder*, realm: Realm*, css: str):
+    let sheet = parse_css_stylesheet(test_media_invalidation_params(realm), ak.sv(css))
+    let rules = css_css_style_sheet_rules(sheet)
+    for rule in ak.vector_span(&rules.m_rules):
+        let container = as_if_css_container_rule(rule) else continue
+        for condition in &ak.vector_span(&container.m_conditions):
+            if condition.container_query == none:
+                test_media_invalidation_line(out, 1, ak.sv("no query"))
+                continue
+            let query = condition.container_query else trap("unreachable")
+            test_media_invalidation_labeled_string(out, 1, "query: ", css_container_query_to_string(query))
+            test_media_invalidation_labeled(out, 2, "matches: ", test_media_invalidation_bool(css_container_query_matches(query)))
+            var builder = ak.string_builder_new()
+            css_container_query_dump(query, &builder, 0)
+            test_media_invalidation_dump_lines(out, 2, ak.string_builder_string_view(&builder))
+
+# mark: Invalidation data =======================================================================
+
+## `a < b` on Strings (std::sort's order of std::strings: bytes, then length).
+func test_media_invalidation_string_less(context: void*?, a: const ak.String*, b: const ak.String*) -> bool:
+    let a_view = ak.string_bytes_as_string_view(a)
+    return ak.string_view_lt(&a_view, ak.string_bytes_as_string_view(b))
+
+## `strings`, sorted.
+func test_media_invalidation_sort(strings: ak.Vector[ak.String]*):
+    ak.quick_sort_t_collection_t_less_than(ak.vector_span(strings), ak.Function2[const ak.String*, const ak.String*, bool](call = test_media_invalidation_string_less, context = none))
+
+## The oracle's `property_text`.
+func test_media_invalidation_property_text(property: const CssInvalidationSetProperty*) -> ak.String:
+    var builder = ak.string_builder_new()
+    css_invalidation_set_property_format(&builder, property)
+    return ak.string_builder_to_string_without_validation(&builder)
+
+## The oracle's `set_text`: `[p q ...]`, sorted.
+func test_media_invalidation_set_text(set: const CssInvalidationSet*) -> ak.String:
+    var properties: ak.Vector[ak.String]
+    for property in css_invalidation_set_properties(set):
+        ak.vector_append_t(&properties, test_media_invalidation_property_text(&property))
+    test_media_invalidation_sort(&properties)
+    var builder = ak.string_builder_new()
+    ak.string_builder_append(&builder, "[")
+    for (i, property) in ak.vector_span(&properties).indexed():
+        if i != 0:
+            ak.string_builder_append(&builder, " ")
+        ak.string_builder_append_string_view(&builder, ak.string_bytes_as_string_view(&property))
+    ak.string_builder_append(&builder, "]")
+    return ak.string_builder_to_string_without_validation(&builder)
+
+## The match side of a rule: `any` or its set.
+func test_media_invalidation_match_text(builder: ak.StringBuilder*, match_any: bool, match_set: const CssInvalidationSet*):
+    if match_any:
+        ak.string_builder_append(builder, "any")
+    else:
+        let set = test_media_invalidation_set_text(match_set)
+        ak.string_builder_append_string_view(builder, ak.string_bytes_as_string_view(&set))
+
+## The oracle's `plan_text`, recursively.
+func test_media_invalidation_plan_text(builder: ak.StringBuilder*, plan: const CssInvalidationPlan*):
+    ak.string_builder_append(builder, "{")
+    if plan.invalidate_self:
+        ak.string_builder_append(builder, "self ")
+    if plan.invalidate_whole_subtree:
+        ak.string_builder_append(builder, "subtree ")
+    for rule in &ak.vector_span_const(&plan.descendant_rules):
+        ak.string_builder_append(builder, "desc(")
+        test_media_invalidation_match_text(builder, rule.match_any, &rule.match_set)
+        ak.string_builder_append(builder, " => ")
+        test_media_invalidation_plan_text(builder, rule.payload)
+        ak.string_builder_append(builder, ") ")
+    for rule in &ak.vector_span_const(&plan.sibling_rules):
+        ak.string_builder_append(builder, "adjacent(" if rule.reach == CssSiblingInvalidationReach.adjacent else "subsequent(")
+        test_media_invalidation_match_text(builder, rule.match_any, &rule.match_set)
+        ak.string_builder_append(builder, " => ")
+        test_media_invalidation_plan_text(builder, rule.payload)
+        ak.string_builder_append(builder, ") ")
+    ak.string_builder_append(builder, "}")
+
+## The metadata of one :has() feature: ` <relative selector>/<scope>` each.
+func test_media_invalidation_has_line(name: str, key: ak.StringView, metadata: const ak.Vector[CssHasInvalidationMetadata]*) -> ak.String:
+    var builder = ak.string_builder_new()
+    ak.string_builder_append(&builder, name)
+    ak.string_builder_append(&builder, " ")
+    ak.string_builder_append_string_view(&builder, key)
+    ak.string_builder_append(&builder, ":")
+    for entry in ak.vector_span_const(metadata):
+        ak.string_builder_append(&builder, " ")
+        if let selector = entry.relative_selector:
+            let serialized = css_selector_serialize(selector)
+            ak.string_builder_append_string_view(&builder, ak.string_bytes_as_string_view(&serialized))
+        else:
+            ak.string_builder_append(&builder, "-")
+        let scope = ak.string_number_i64((i64)(u8)entry.scope)
+        ak.string_builder_append(&builder, "/")
+        ak.string_builder_append_string_view(&builder, ak.string_bytes_as_string_view(&scope))
+    return ak.string_builder_to_string_without_validation(&builder)
+
+## The oracle's `print_has_map` for a map keyed by name.
+func test_media_invalidation_has_map(out: ak.StringBuilder*, name: str, map: const ak.HashMap[ak.FlyString, ak.Vector[CssHasInvalidationMetadata], ak.FlyStringTraits]*):
+    var lines: ak.Vector[ak.String]
+    for entry in ak.hash_map_begin_const(map):
+        ak.vector_append_t(&lines, test_media_invalidation_has_line(name, ak.fly_string_bytes_as_string_view(&entry.key), &entry.value))
+    test_media_invalidation_sort(&lines)
+    for line in ak.vector_span(&lines):
+        test_media_invalidation_line(out, 1, ak.string_bytes_as_string_view(&line))
+
+## The oracle's `print_invalidation_data`.
+func test_media_invalidation_print_data(out: ak.StringBuilder*, data: const CssStyleInvalidationData*):
+    var plans: ak.Vector[ak.String]
+    for entry in ak.hash_map_begin_const(&data.invalidation_plans):
+        var builder = ak.string_builder_new()
+        ak.string_builder_append(&builder, "plan ")
+        css_invalidation_set_property_format(&builder, &entry.key)
+        ak.string_builder_append(&builder, " ")
+        test_media_invalidation_plan_text(&builder, entry.value)
+        ak.vector_append_t(&plans, ak.string_builder_to_string_without_validation(&builder))
+    test_media_invalidation_sort(&plans)
+    for plan in ak.vector_span(&plans):
+        test_media_invalidation_line(out, 1, ak.string_bytes_as_string_view(&plan))
+    test_media_invalidation_has_map(out, "has-id", &data.ids_used_in_has_selectors)
+    test_media_invalidation_has_map(out, "has-class", &data.class_names_used_in_has_selectors)
+    test_media_invalidation_has_map(out, "has-attribute", &data.attribute_names_used_in_has_selectors)
+    test_media_invalidation_has_map(out, "has-tag", &data.tag_names_used_in_has_selectors)
+    var pseudo_lines: ak.Vector[ak.String]
+    for entry in ak.hash_map_begin_const(&data.pseudo_classes_used_in_has_selectors):
+        ak.vector_append_t(&pseudo_lines, test_media_invalidation_has_line("has-pseudo", css_data.pseudo_class_name(entry.key), &entry.value))
+    test_media_invalidation_sort(&pseudo_lines)
+    for line in ak.vector_span(&pseudo_lines):
+        test_media_invalidation_line(out, 1, ak.string_bytes_as_string_view(&line))
+    if data.has_selectors_sensitive_to_featureless_subtree_changes:
+        test_media_invalidation_line(out, 1, ak.sv("featureless-sensitive"))
+
+## The oracle's `run_invalidation`.
+func test_media_invalidation_invalidation(out: ak.StringBuilder*, realm: Realm*, text: str):
+    let maybe_selectors = parse_selector(test_media_invalidation_params(realm), ak.sv(text))
+    if maybe_selectors == none:
+        test_media_invalidation_line(out, 1, ak.sv("invalid"))
+        return
+    let selectors = maybe_selectors else trap("unreachable")
+    var data: CssStyleInvalidationData
+    for selector in ak.vector_span_const(&selectors):
+        css_style_invalidation_data_build_invalidation_sets_for_selector(&data, selector)
+    test_media_invalidation_print_data(out, &data)
+
+## An anchor rule's selector, or `-`.
+func test_media_invalidation_anchor_selector(builder: ak.StringBuilder*, selector: CssSelector*?):
+    if let anchor_selector = selector:
+        let serialized = css_selector_serialize(anchor_selector)
+        ak.string_builder_append_string_view(builder, ak.string_bytes_as_string_view(&serialized))
+    else:
+        ak.string_builder_append(builder, "-")
+
+## The oracle's `run_sheet_set`.
+func test_media_invalidation_sheet_set(out: ak.StringBuilder*, realm: Realm*, css: str):
+    let sheet = parse_css_stylesheet(test_media_invalidation_params(realm), ak.sv(css))
+    var result: CssStyleSheetInvalidationSet
+    let rules = css_css_style_sheet_rules(sheet)
+    for rule in ak.vector_span(&rules.m_rules):
+        if let style_rule = as_if_css_style_rule(rule):
+            css_extend_style_sheet_invalidation_set_with_style_rule(&result, style_rule)
+    test_media_invalidation_labeled_string(out, 1, "set ", test_media_invalidation_set_text(&result.invalidation_set))
+    test_media_invalidation_labeled(out, 1, "may-match-shadow-host ", test_media_invalidation_bool(result.may_match_shadow_host))
+    test_media_invalidation_labeled(out, 1, "may-match-light-dom ", test_media_invalidation_bool(result.may_match_light_dom_under_shadow_host))
+    for rule in &ak.vector_span(&result.pseudo_element_rules):
+        var builder = ak.string_builder_new()
+        let set = test_media_invalidation_set_text(&rule.anchor_set)
+        ak.string_builder_append(&builder, "pseudo-element-rule ")
+        ak.string_builder_append_string_view(&builder, ak.string_bytes_as_string_view(&set))
+        ak.string_builder_append(&builder, " ")
+        test_media_invalidation_anchor_selector(&builder, rule.anchor_selector)
+        test_media_invalidation_line(out, 1, ak.string_builder_string_view(&builder))
+    for rule in &ak.vector_span(&result.trailing_universal_rules):
+        var builder = ak.string_builder_new()
+        let set = test_media_invalidation_set_text(&rule.anchor_set)
+        ak.string_builder_append(&builder, "trailing-universal-rule ")
+        ak.string_builder_append_string_view(&builder, ak.string_bytes_as_string_view(&set))
+        ak.string_builder_append(&builder, " ")
+        test_media_invalidation_anchor_selector(&builder, rule.anchor_selector)
+        let combinator = ak.string_number_i64((i64)(i32)rule.combinator)
+        ak.string_builder_append(&builder, " ")
+        ak.string_builder_append_string_view(&builder, ak.string_bytes_as_string_view(&combinator))
+        test_media_invalidation_line(out, 1, ak.string_builder_string_view(&builder))
+
+## Runs one oracle case through the port.
+func test_media_invalidation_run(realm: Realm*, document: DomDocument*, test_case: const TestMediaInvalidationCase*) -> ak.String:
+    var out = ak.string_builder_new()
+    let argument = test_case.arguments[0]
+    match test_case.mode:
+        "media": test_media_invalidation_media(&out, realm, document, argument)
+        "supports": test_media_invalidation_supports(&out, realm, argument)
+        "container": test_media_invalidation_container(&out, realm, argument)
+        "invalidation": test_media_invalidation_invalidation(&out, realm, argument)
+        "sheetset": test_media_invalidation_sheet_set(&out, realm, argument)
+        "lightdom":
+            let may_match = css_selector_may_match_light_dom_under_shadow_host_string_view(ak.sv(argument))
+            test_media_invalidation_labeled(&out, 1, "may-match-light-dom ", test_media_invalidation_bool(may_match))
+        "outcome": test_media_invalidation_outcome(&out, realm, argument, test_case.arguments[1], test_case.arguments[2])
+        _: test_media_invalidation_line(&out, 1, ak.sv("unknown mode"))
+    return ak.string_builder_to_string_without_validation(&out)
+
+## Ends the DeferGC of the oracle test without the collection it held back.
+func test_media_invalidation_end_defer_gc(heap: gc.Heap*):
+    heap.m_should_gc_when_deferral_ends = false
+    gc.heap_undefer_gc(heap)
+
+test "media queries, @supports, @container and invalidation sets match the reference build on the oracle cases":
+    let (vm, realm, document) = test_html_setup()
+    defer web_test_destroy_vm(vm)
+    # The test document's and realm's pages live outside the heap (r17's test_document_page), so a collection cannot
+    # mark them: the cases run under DeferGC, and the collection it held back is dropped (the VM's destruction
+    # collects everything).
+    gc.heap_defer_gc(vm_heap(vm))
+    defer test_media_invalidation_end_defer_gc(vm_heap(vm))
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        test_media_invalidation_install_user_agent_sheets(realm)
+        defer test_style_computer_release_user_agent_sheets()
+        var failures = 0
+        for test_case in &test_media_invalidation_cases:
+            let actual = test_media_invalidation_run(realm, document, test_case)
+            if not ak.string_eq_string_view(&actual, ak.sv(test_case.expected)):
+                let actual_view = ak.string_bytes_as_string_view(&actual)
+                print(f"case {test_case.mode} {test_case.arguments[0]}\nexpected:\n{test_case.expected}actual:\n{(str)ak.string_view_bytes(&actual_view)}")
+                failures += 1
+        assert(failures == 0)
