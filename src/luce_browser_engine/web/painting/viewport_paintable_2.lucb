@@ -1,0 +1,461 @@
+#==============================================================================================
+#
+#   viewport_paintable_2 - Painting::ViewportPaintable: visual contexts, scroll state and
+#                          selection states
+#
+#   DESCRIPTION:
+#       Port of LibWeb/Painting/ViewportPaintable.cpp (lines 175-596): the device-pixel CSS
+#       transform, perspective and overflow clip of a box, the accumulated visual context tree
+#       (effects, transforms, CSS clips, clip paths, perspectives, overflow clips and scrolls of
+#       every paintable box), refreshing sticky and scroll offsets, and the selection state of
+#       each paintable for a range.
+#
+#       Copyright (c) 2023, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2024-2026, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Transforms and clips =======================================================================
+
+## Ported from Libraries/LibWeb/Painting/ViewportPaintable.cpp:175 Web::Painting::effective_css_clip_rect.
+func paint_effective_css_clip_rect(css_clip: gfx.CssPixelRect) -> gfx.CssPixelRect:
+    let zero = gfx.CssPixels.from_int(0)
+    if gfx.css_pixel_rect_width(&css_clip).lt(zero) or gfx.css_pixel_rect_height(&css_clip).lt(zero):
+        return gfx.CssPixelRect(gfx.CssPixelPoint(), gfx.CssPixelSize())
+    return css_clip
+
+## Ported from Libraries/LibWeb/Painting/ViewportPaintable.cpp:186 Web::Painting::scale_matrix_for_device_pixels.
+# Converts a CSS-pixel-space 4x4 matrix to device-pixel-space.
+# - Translation column (column 3, rows 0-2) is scaled up by DPR
+# - Perspective row (row 3, columns 0-2) is scaled down by DPR
+# - All other elements are unaffected (the scale factors cancel out)
+func paint_scale_matrix_for_device_pixels(matrix: gfx.FloatMatrix4X4, scale: f32) -> gfx.FloatMatrix4X4:
+    var result = matrix
+    *gfx.float_matrix4_x4_at(&result, 0, 3) *= scale
+    *gfx.float_matrix4_x4_at(&result, 1, 3) *= scale
+    *gfx.float_matrix4_x4_at(&result, 2, 3) *= scale
+    *gfx.float_matrix4_x4_at(&result, 3, 0) /= scale
+    *gfx.float_matrix4_x4_at(&result, 3, 1) /= scale
+    *gfx.float_matrix4_x4_at(&result, 3, 2) /= scale
+    return result
+
+## `matrix * transform->to_matrix(paintable_box).release_value()`.
+func paint_multiply_by_transformation(matrix: gfx.FloatMatrix4X4, transform: CssTransformationStyleValue*, paintable_box: PaintPaintableBox*?) -> gfx.FloatMatrix4X4:
+    let transform_matrix = css_transformation_style_value_to_matrix(transform, paintable_box) else trap("release_value: the transformation has no matrix")
+    return gfx.float_matrix4_x4_mul(&matrix, transform_matrix)
+
+## Ported from Libraries/LibWeb/Painting/ViewportPaintable.cpp:197 Web::Painting::compute_transform.
+func paint_compute_transform(paintable_box: PaintPaintableBox*, computed_values: const CssComputedValues*, pixel_ratio: f64) -> display_list.TransformData?:
+    if not paint_paintable_box_has_css_transform(paintable_box):
+        return none
+
+    var matrix = gfx.float_matrix4_x4_identity()
+    if let translate = css_computed_values_translate(computed_values):
+        matrix = paint_multiply_by_transformation(matrix, translate, paintable_box)
+    if let rotate = css_computed_values_rotate(computed_values):
+        matrix = paint_multiply_by_transformation(matrix, rotate, paintable_box)
+    if let scale_transform = css_computed_values_scale(computed_values):
+        matrix = paint_multiply_by_transformation(matrix, scale_transform, paintable_box)
+    var transformations = css_computed_values_transformations(computed_values)
+    for transform in ak.vector_span(&transformations):
+        matrix = paint_multiply_by_transformation(matrix, transform, paintable_box)
+    let css_transform_origin = css_computed_values_transform_origin(computed_values)
+    let reference_box = paint_paintable_box_transform_reference_box(paintable_box)
+    let layout_node = paint_paintable_layout_node(paintable_box.paint_paintable())
+    let origin = gfx.CssPixelPoint(
+        gfx.css_pixel_rect_left(&reference_box).add(css_percentage_or_to_px(&css_transform_origin.x.percentage_or, layout_node, gfx.css_pixel_rect_width(&reference_box))),
+        gfx.css_pixel_rect_top(&reference_box).add(css_percentage_or_to_px(&css_transform_origin.y.percentage_or, layout_node, gfx.css_pixel_rect_height(&reference_box))),
+    )
+    let scale = (f32)pixel_ratio
+    let device_origin = gfx.FloatPoint(m_x = origin.m_x.to_float() * scale, m_y = origin.m_y.to_float() * scale)
+    return display_list.TransformData(matrix = paint_scale_matrix_for_device_pixels(matrix, scale), origin = device_origin)
+
+## `Gfx::translation_matrix(Vector3<float>(x, y, 0))`.
+func paint_translation_matrix_xy(x: f32, y: f32) -> gfx.FloatMatrix4X4:
+    return gfx.translation_matrix(gfx.FloatVector3(m_data = [x, y, 0.0]))
+
+## Ported from Libraries/LibWeb/Painting/ViewportPaintable.cpp:223 Web::Painting::compute_perspective_matrix.
+# https://drafts.csswg.org/css-transforms-2/#perspective-matrix
+func paint_compute_perspective_matrix(paintable_box: PaintPaintableBox*, computed_values: const CssComputedValues*) -> gfx.FloatMatrix4X4?:
+    let perspective = css_computed_values_perspective(computed_values) else return none
+
+    # The perspective matrix is computed as follows:
+
+    # 1. Start with the identity matrix.
+    # 2. Translate by the computed X and Y values of 'perspective-origin'
+    # https://drafts.csswg.org/css-transforms-2/#perspective-origin-property
+    # Percentages: refer to the size of the reference box
+    let reference_box = paint_paintable_box_transform_reference_box(paintable_box)
+    let perspective_origin_value = css_computed_values_perspective_origin(computed_values)
+    let perspective_origin = css_position_resolved(&perspective_origin_value, paint_paintable_layout_node(paintable_box.paint_paintable()), reference_box)
+    let computed_x = perspective_origin.m_x.to_float()
+    let computed_y = perspective_origin.m_y.to_float()
+    var perspective_matrix = paint_translation_matrix_xy(computed_x, computed_y)
+
+    # 3. Multiply by the matrix that would be obtained from the 'perspective()' transform function, where the
+    #    length is provided by the value of the perspective property
+    # NB: Length values less than 1px being clamped to 1px is handled by the perspective() function already.
+    # FIXME: Create the matrix directly.
+    var values: ak.Vector[CssStyleValue*]
+    ak.vector_append_t(&values, css_length_style_value_create(css_length_make_px_css_pixels(perspective)).css_style_value())
+    let perspective_function = css_transformation_style_value_create(css_data.PropertyId.transform, css_data.TransformFunction.perspective, values)
+    perspective_matrix = paint_multiply_by_transformation(perspective_matrix, perspective_function, none)
+
+    # 4. Translate by the negated computed X and Y values of 'perspective-origin'
+    perspective_matrix = gfx.float_matrix4_x4_mul(&perspective_matrix, paint_translation_matrix_xy(-computed_x, -computed_y))
+    return perspective_matrix
+
+## Ported from Libraries/LibWeb/Painting/ViewportPaintable.cpp:250 Web::Painting::compute_clip_data.
+func paint_compute_clip_data(paintable_box: PaintPaintableBox*, computed_values: const CssComputedValues*, converter: const PaintDevicePixelConverter*) -> display_list.ClipData?:
+    var overflow_x = css_computed_values_overflow_x(computed_values)
+    var overflow_y = css_computed_values_overflow_y(computed_values)
+
+    # https://drafts.csswg.org/css-contain-2/#paint-containment
+    # 1. The contents of the element including any ink or scrollable overflow must be clipped to the overflow clip
+    #    edge of the paint containment box, taking corner clipping into account. This does not include the creation of
+    #    any mechanism to access or indicate the presence of the clipped content; nor does it inhibit the creation of
+    #    any such mechanism through other properties, such as overflow, resize, or text-overflow.
+    #    NOTE: This clipping shape respects overflow-clip-margin, allowing an element with paint containment
+    #          to still slightly overflow its normal bounds.
+    if layout_node_has_paint_containment(paint_paintable_layout_node(paintable_box.paint_paintable())):
+        # NOTE: Note: The behavior is described in this paragraph is equivalent to changing 'overflow-x: visible' into
+        #       'overflow-x: clip' and 'overflow-y: visible' into 'overflow-y: clip' at used value time, while leaving other
+        #       values of 'overflow-x' and 'overflow-y' unchanged.
+        overflow_x = css_data.Overflow.clip
+        overflow_y = css_data.Overflow.clip
+
+    let has_hidden_overflow = overflow_x != css_data.Overflow.visible or overflow_y != css_data.Overflow.visible
+
+    if has_hidden_overflow and paint_paintable_box_overflow_property_applies(paintable_box):
+        var clip_rect = paint_paintable_box_absolute_padding_box_rect(paintable_box)
+
+        # https://drafts.csswg.org/css-overflow-3/#propdef-overflow
+        # 'clip'
+        #    This value indicates that the box’s content is clipped to its overflow clip edge
+        let overflow_clip_edge = paint_paintable_box_overflow_clip_edge_rect(paintable_box)
+        let max_value = gfx.CssPixels.from_int(gfx.css_pixels_max_integer_value)
+        if overflow_x == css_data.Overflow.visible:
+            gfx.css_pixel_rect_set_left(&clip_rect, gfx.CssPixels.from_int(0))
+            gfx.css_pixel_rect_set_right(&clip_rect, max_value)
+        elif overflow_x == css_data.Overflow.clip:
+            gfx.css_pixel_rect_set_left(&clip_rect, gfx.css_pixel_rect_left(&overflow_clip_edge))
+            gfx.css_pixel_rect_set_right(&clip_rect, gfx.css_pixel_rect_right(&overflow_clip_edge))
+        if overflow_y == css_data.Overflow.visible:
+            gfx.css_pixel_rect_set_top(&clip_rect, gfx.CssPixels.from_int(0))
+            gfx.css_pixel_rect_set_bottom(&clip_rect, max_value)
+        elif overflow_y == css_data.Overflow.clip:
+            gfx.css_pixel_rect_set_top(&clip_rect, gfx.css_pixel_rect_top(&overflow_clip_edge))
+            gfx.css_pixel_rect_set_bottom(&clip_rect, gfx.css_pixel_rect_bottom(&overflow_clip_edge))
+
+        # https://drafts.csswg.org/css-overflow-3/#corner-clipping
+        # As mentioned in CSS Backgrounds 3 § 4.3 Corner Clipping, the clipping region established by 'overflow' can be
+        # rounded:
+        # - When 'overflow-x' and 'overflow-y' compute to 'hidden', 'scroll', or 'auto', the clipping region is rounded
+        #   based on the border radius, adjusted to the padding edge, as described in CSS Backgrounds 3 § 4.2 Corner
+        #   Shaping.
+        # - When both 'overflow-x' and 'overflow-y' compute to 'clip', the clipping region is rounded as described in § 3.2
+        #   Expanding Clipping Bounds: the 'overflow-clip-margin' property.
+        # - However, when one of 'overflow-x' or 'overflow-y' computes to 'clip' and the other computes to 'visible', the
+        #   clipping region is not rounded.
+        # FIXME: Adjust the border radii for the overflow-clip-margin case. (see https://drafts.csswg.org/css-overflow-4/#valdef-overflow-clip-margin-length-0 )
+        var radii = display_list.BorderRadiiData()
+        if overflow_x != css_data.Overflow.visible and overflow_y != css_data.Overflow.visible:
+            radii = paint_paintable_box_normalized_border_radii_data(paintable_box, PaintPaintableBoxShrinkRadiiForBorders.yes)
+        return display_list.ClipData(rect = paint_device_pixel_converter_rounded_device_rect(converter, clip_rect), corner_radii = border_radii_data_as_corners(&radii, *converter))
+
+    return none
+
+# mark: Accumulated visual contexts ================================================================
+
+## The `make_effects_data` lambda of ViewportPaintable::assign_accumulated_visual_contexts.
+func paint_viewport_paintable_make_effects_data(box: PaintPaintableBox*, pixel_ratio: f64) -> display_list.EffectsData?:
+    let computed_values = &paint_paintable_computed_values(box.paint_paintable()).computed_values
+    let gfx_filter = paint_to_gfx_filter(paint_paintable_box_filter(box), pixel_ratio)
+    let effects = display_list.EffectsData(
+        opacity = css_computed_values_opacity(computed_values),
+        blend_mode = paint_mix_blend_mode_to_compositing_and_blending_operator(css_computed_values_mix_blend_mode(computed_values)),
+        gfx_filter = gfx_filter,
+    )
+    if not display_list.effects_data_needs_layer(&effects):
+        return none
+    return effects
+
+## The fill rule of a basic shape (the visit in assign_accumulated_visual_contexts).
+func paint_basic_shape_fill_rule(basic_shape: CssBasicShape) -> gfx.WindingRule:
+    match basic_shape:
+        .css_polygon(polygon): return polygon.fill_rule
+        .css_path(path): return path.fill_rule
+        _: return gfx.WindingRule.nonzero
+
+## Ported from Libraries/LibWeb/Painting/ViewportPaintable.cpp:304 Web::Painting::ViewportPaintable::assign_accumulated_visual_contexts.
+pub func paint_viewport_paintable_assign_accumulated_visual_contexts(this: PaintViewportPaintable*):
+    let tree = display_list.accumulated_visual_context_tree_create()
+    this.m_visual_context_tree = tree
+
+    let document = paint_paintable_document(this.paint_paintable())
+    let pixel_ratio = page_client_device_pixels_per_css_pixel(page_client(dom_document_page(document)))
+    var converter: PaintDevicePixelConverter = ---
+    paint_device_pixel_converter_construct(&converter, pixel_ratio)
+    let scale = (f32)pixel_ratio
+
+    # Create visual viewport transform as root (if not identity)
+    this.m_visual_viewport_context_index = 0
+    let transform = css_visual_viewport_transform(dom_document_visual_viewport(document))
+    if not gfx.affine_transform_is_identity(&transform):
+        let matrix = paint_scale_matrix_for_device_pixels(gfx.affine_transform_to_matrix(&transform), scale)
+        this.m_visual_viewport_context_index = display_list.accumulated_visual_context_tree_append(tree, display_list.VisualContextData.transform_data(display_list.TransformData(matrix = matrix, origin = gfx.FloatPoint(m_x = 0.0, m_y = 0.0))), 0)
+
+    let own_scroll_frame_index = paint_paintable_box_own_scroll_frame_index(this.paint_paintable_box())
+    var viewport_state_for_descendants = this.m_visual_viewport_context_index
+    if own_scroll_frame_index != 0:
+        viewport_state_for_descendants = display_list.accumulated_visual_context_tree_append(tree, display_list.VisualContextData.scroll_data(display_list.ScrollData(scroll_frame_index = own_scroll_frame_index, is_sticky = false)), this.m_visual_viewport_context_index)
+    paint_paintable_box_set_accumulated_visual_context(this.paint_paintable_box(), 0)
+    paint_paintable_box_set_accumulated_visual_context_for_descendants(this.paint_paintable_box(), viewport_state_for_descendants)
+
+    # for_each_in_subtree_of_type<PaintableBox>
+    for paintable in paint_paintable_subtree(this.paint_paintable()):
+        let paintable_box = as_if_paint_paintable_box(paintable) else continue
+        let parent = tree_node_parent(paintable) else continue
+        let visual_parent = as_if_paint_paintable_box(parent) else continue
+
+        # Resolve filters before make_effects_data reads them.
+        let paintable_box_computed_values = &paint_paintable_computed_values(paintable).computed_values
+        let filter = css_computed_values_filter(paintable_box_computed_values)
+        if css_filter_has_filters(&filter):
+            paint_paintable_box_set_filter(paintable_box, paint_resolve_css_filter(filter, paintable_box))
+        else:
+            paint_paintable_box_set_filter(paintable_box, PaintResolvedCssFilter())
+
+        var inherited_state: u64 = 0
+
+        if paint_paintable_is_fixed_position(paintable):
+            inherited_state = this.m_visual_viewport_context_index
+        elif paint_paintable_is_absolutely_positioned(paintable):
+            # For position: absolute, use containing block's state to correctly escape scroll containers.
+            let containing = paint_paintable_containing_block(paintable) else trap("an absolutely positioned box without a containing block")
+            inherited_state = paint_paintable_box_accumulated_visual_context_for_descendants_index(containing)
+
+            # Abspos elements escape scroll containers and overflow clips of non-positioned
+            # ancestors, but cannot escape stacking contexts created by intermediate effects
+            # (opacity, mix-blend-mode, isolation). Walk from visual parent to containing
+            # block and collect these intermediate effects.
+            # NOTE: transforms/perspectives/filters establish containing blocks for abspos,
+            #       so they cannot appear as intermediates.
+            var intermediate_effects: ak.Vector[display_list.EffectsData]
+            var ancestor_or_none: PaintPaintable*? = visual_parent.paint_paintable()
+            while let ancestor = ancestor_or_none:
+                if ancestor == containing.paint_paintable():
+                    break
+                ancestor_or_none = tree_node_parent(ancestor)
+                let ancestor_box = as_if_paint_paintable_box(ancestor) else continue
+                if let effects = paint_viewport_paintable_make_effects_data(ancestor_box, pixel_ratio):
+                    ak.vector_append_t(&intermediate_effects, effects)
+            var index = ak.vector_size(&intermediate_effects)
+            while index > 0:
+                index -= 1
+                inherited_state = display_list.accumulated_visual_context_tree_append(tree, display_list.VisualContextData.effects_data(*ak.vector_at(&intermediate_effects, index)), inherited_state)
+        else:
+            # For position: relative/static, use visual parent's state directly.
+            # This avoids duplicate transform/perspective allocations that would occur with
+            # the containing block + intermediate walk approach.
+            inherited_state = paint_paintable_box_accumulated_visual_context_for_descendants_index(visual_parent)
+
+        # Build this element's own state from inherited state.
+        var own_state = inherited_state
+
+        if paint_paintable_is_sticky_position(paintable):
+            # For sticky elements, use enclosing_scroll_frame which holds the sticky frame.
+            # own_scroll_frame may be a different scroll frame if the sticky element also has scrollable overflow.
+            let sticky_idx = paint_paintable_box_enclosing_scroll_frame_index(paintable_box)
+            if sticky_idx != 0 and display_list.scroll_frame_is_sticky(display_list.scroll_state_frame_at(&this.m_scroll_state, sticky_idx)):
+                own_state = display_list.accumulated_visual_context_tree_append(tree, display_list.VisualContextData.scroll_data(display_list.ScrollData(scroll_frame_index = sticky_idx, is_sticky = true)), own_state)
+
+        let computed_values = &paint_paintable_computed_values(paintable).computed_values
+
+        if let effects = paint_viewport_paintable_make_effects_data(paintable_box, pixel_ratio):
+            own_state = display_list.accumulated_visual_context_tree_append(tree, display_list.VisualContextData.effects_data(effects), own_state)
+
+        if let transform_data = paint_compute_transform(paintable_box, computed_values, pixel_ratio):
+            paint_paintable_box_set_has_non_invertible_css_transform(paintable_box, not gfx.float_matrix4_x4_is_invertible(&transform_data.matrix))
+            own_state = display_list.accumulated_visual_context_tree_append(tree, display_list.VisualContextData.transform_data(transform_data), own_state)
+        else:
+            paint_paintable_box_set_has_non_invertible_css_transform(paintable_box, false)
+
+        if let css_clip = paint_paintable_box_get_clip_rect(paintable_box):
+            let effective_rect = paint_effective_css_clip_rect(css_clip)
+            own_state = display_list.accumulated_visual_context_tree_append(tree, display_list.VisualContextData.clip_data(display_list.ClipData(rect = paint_device_pixel_converter_rounded_device_rect(&converter, effective_rect), corner_radii = display_list.CornerRadii())), own_state)
+
+        # FIXME: Support other geometry boxes. See: https://drafts.fxtf.org/css-masking/#typedef-geometry-box
+        if let clip_path = css_computed_values_clip_path(computed_values):
+            if css_clip_path_reference_is_basic_shape(&clip_path):
+                let masking_area = paint_paintable_box_absolute_border_box_rect(paintable_box)
+                let reference_box = gfx.CssPixelRect(gfx.CssPixelPoint(), gfx.css_pixel_rect_size(&masking_area))
+                let basic_shape = css_clip_path_reference_basic_shape(&clip_path)
+                var path = css_basic_shape_style_value_to_path(basic_shape, reference_box, paint_paintable_layout_node(paintable))
+                let top_left = gfx.css_pixel_rect_top_left(&masking_area)
+                gfx.path_offset(&path, gfx.FloatPoint(m_x = top_left.m_x.to_float(), m_y = top_left.m_y.to_float()))
+                let fill_rule = paint_basic_shape_fill_rule(css_basic_shape_style_value_basic_shape(basic_shape))
+                var device_transform = gfx.AffineTransform()
+                gfx.affine_transform_construct(&device_transform)
+                discard(gfx.affine_transform_set_scale_f32(&device_transform, scale, scale))
+                let device_path = gfx.path_copy_transformed(&path, device_transform)
+                let device_bounding_rect = paint_device_pixel_converter_rounded_device_rect(&converter, masking_area)
+                own_state = display_list.accumulated_visual_context_tree_append(tree, display_list.VisualContextData.clip_path_data(display_list.ClipPathData(path = device_path, bounding_rect = device_bounding_rect, fill_rule = fill_rule)), own_state)
+
+        paint_paintable_box_set_accumulated_visual_context(paintable_box, own_state)
+
+        # Build state for descendants: own state + perspective + clip + scroll.
+        var state_for_descendants = own_state
+
+        if let perspective_matrix = paint_compute_perspective_matrix(paintable_box, computed_values):
+            let scaled_matrix = paint_scale_matrix_for_device_pixels(perspective_matrix, scale)
+            state_for_descendants = display_list.accumulated_visual_context_tree_append(tree, display_list.VisualContextData.perspective_data(display_list.PerspectiveData(matrix = scaled_matrix)), state_for_descendants)
+
+        if let clip_data = paint_compute_clip_data(paintable_box, computed_values, &converter):
+            state_for_descendants = display_list.accumulated_visual_context_tree_append(tree, display_list.VisualContextData.clip_data(clip_data), state_for_descendants)
+
+        let box_own_scroll_frame_index = paint_paintable_box_own_scroll_frame_index(paintable_box)
+        if box_own_scroll_frame_index != 0:
+            let is_sticky_without_scrollable_overflow = paint_paintable_is_sticky_position(paintable) and paint_paintable_box_enclosing_scroll_frame_index(paintable_box) == box_own_scroll_frame_index
+            if not is_sticky_without_scrollable_overflow:
+                state_for_descendants = display_list.accumulated_visual_context_tree_append(tree, display_list.VisualContextData.scroll_data(display_list.ScrollData(scroll_frame_index = box_own_scroll_frame_index, is_sticky = false)), state_for_descendants)
+
+        paint_paintable_box_set_accumulated_visual_context_for_descendants(paintable_box, state_for_descendants)
+
+# mark: Scroll state ===============================================================================
+
+## Ported from Libraries/LibWeb/Painting/ViewportPaintable.cpp:451 Web::Painting::ViewportPaintable::refresh_scroll_state.
+pub func paint_viewport_paintable_refresh_scroll_state(this: PaintViewportPaintable*):
+    if not this.m_needs_to_refresh_scroll_state:
+        return
+    this.m_needs_to_refresh_scroll_state = false
+
+    for entry in display_list.scroll_state_for_each_sticky_frame(&this.m_scroll_state):
+        let idx = entry.index
+        let frame = entry.frame
+        let nearest_scrolling_ancestor_index = display_list.scroll_state_nearest_scrolling_ancestor(&this.m_scroll_state, idx)
+        if nearest_scrolling_ancestor_index == 0 or not display_list.scroll_frame_has_sticky_constraints(frame):
+            continue
+
+        let sticky_data = display_list.scroll_frame_sticky_constraints(frame)
+        let sticky_insets = sticky_data.insets
+        let scroll_ancestor_paintable = scroll_frame_paintable_box(display_list.scroll_state_frame_at(&this.m_scroll_state, nearest_scrolling_ancestor_index))
+
+        # For nested sticky elements, the parent sticky's offset is applied via cumulative_offset.
+        # We need to adjust all position calculations to account for this, so we work in the
+        # coordinate space where the parent sticky is at its current (offset) position.
+        var parent_sticky_offset = gfx.CssPixelPoint()
+        let parent_idx = display_list.scroll_frame_parent_index(frame)
+        if parent_idx != 0 and display_list.scroll_frame_is_sticky(display_list.scroll_state_frame_at(&this.m_scroll_state, parent_idx)):
+            parent_sticky_offset = display_list.scroll_state_cumulative_offset(&this.m_scroll_state, parent_idx)
+
+        let sticky_position_in_ancestor = gfx.css_pixel_point_add(&sticky_data.position_relative_to_scroll_ancestor, parent_sticky_offset)
+
+        var containing_block_region = sticky_data.containing_block_region
+        if sticky_data.needs_parent_offset_adjustment:
+            gfx.css_pixel_rect_translate_by_css_pixel_point(&containing_block_region, parent_sticky_offset)
+        let min_offset_within_containing_block = gfx.css_pixel_rect_top_left(&containing_block_region)
+        let max_offset_within_containing_block = gfx.CssPixelPoint(
+            gfx.css_pixel_rect_right(&containing_block_region).sub(sticky_data.border_box_size.m_width),
+            gfx.css_pixel_rect_bottom(&containing_block_region).sub(sticky_data.border_box_size.m_height))
+
+        let scrollport_rect = gfx.CssPixelRect(paint_paintable_box_scroll_offset(scroll_ancestor_paintable), sticky_data.scrollport_size)
+        var sticky_offset = gfx.CssPixelPoint()
+
+        if let top = sticky_insets.top:
+            if gfx.css_pixel_rect_top(&scrollport_rect).gt(sticky_position_in_ancestor.m_y.sub(top)):
+                gfx.css_pixel_point_set_y(&sticky_offset, ak.min(gfx.css_pixel_rect_top(&scrollport_rect).add(top), max_offset_within_containing_block.m_y).sub(sticky_position_in_ancestor.m_y))
+        if let left = sticky_insets.left:
+            if gfx.css_pixel_rect_left(&scrollport_rect).gt(sticky_position_in_ancestor.m_x.sub(left)):
+                gfx.css_pixel_point_set_x(&sticky_offset, ak.min(gfx.css_pixel_rect_left(&scrollport_rect).add(left), max_offset_within_containing_block.m_x).sub(sticky_position_in_ancestor.m_x))
+        if let bottom = sticky_insets.bottom:
+            if gfx.css_pixel_rect_bottom(&scrollport_rect).lt(sticky_position_in_ancestor.m_y.add(sticky_data.border_box_size.m_height).add(bottom)):
+                gfx.css_pixel_point_set_y(&sticky_offset, ak.max(gfx.css_pixel_rect_bottom(&scrollport_rect).sub(sticky_data.border_box_size.m_height).sub(bottom), min_offset_within_containing_block.m_y).sub(sticky_position_in_ancestor.m_y))
+        if let right = sticky_insets.right:
+            if gfx.css_pixel_rect_right(&scrollport_rect).lt(sticky_position_in_ancestor.m_x.add(sticky_data.border_box_size.m_width).add(right)):
+                gfx.css_pixel_point_set_x(&sticky_offset, ak.max(gfx.css_pixel_rect_right(&scrollport_rect).sub(sticky_data.border_box_size.m_width).sub(right), min_offset_within_containing_block.m_x).sub(sticky_position_in_ancestor.m_x))
+
+        display_list.scroll_frame_set_own_offset(frame, sticky_offset)
+
+    for entry in display_list.scroll_state_for_each_scroll_frame(&this.m_scroll_state):
+        let scroll_offset = paint_paintable_box_scroll_offset(scroll_frame_paintable_box(entry.frame))
+        display_list.scroll_frame_set_own_offset(entry.frame, gfx.css_pixel_point_neg(&scroll_offset))
+
+    let document = paint_paintable_document(this.paint_paintable())
+    this.m_scroll_state_snapshot = display_list.scroll_state_snapshot(&this.m_scroll_state, page_client_device_pixels_per_css_pixel(page_client(dom_document_page(document))))
+
+# mark: Selection ==================================================================================
+
+## Ported from Libraries/LibWeb/Painting/ViewportPaintable.cpp:515 Web::Painting::ViewportPaintable::selection.
+pub func paint_viewport_paintable_selection(this: PaintViewportPaintable*) -> SelectionSelection*?:
+    return dom_document_get_selection(paint_paintable_document(this.paint_paintable()))
+
+## Ported from Libraries/LibWeb/Painting/ViewportPaintable.cpp:520 Web::Painting::ViewportPaintable::recompute_selection_states.
+pub func paint_viewport_paintable_recompute_selection_states(this: PaintViewportPaintable*, range: DomRange*):
+    # 1. Start by resetting the selection state of all layout nodes to None.
+    for paintable in paint_paintable_inclusive_subtree(this.paint_paintable()):
+        paint_paintable_set_selection_state(paintable, PaintPaintableSelectionState.none_)
+
+    let abstract_range = range.dom_abstract_range()
+    let start_container = dom_abstract_range_start_container(abstract_range)
+    let end_container = dom_abstract_range_end_container(abstract_range)
+    let start_node = dom_abstract_range_start(abstract_range).node
+    let end_node = dom_abstract_range_end(abstract_range).node
+
+    # 2. If the selection starts and ends in the same node:
+    if start_container == end_container:
+        # 1. If the selection starts and ends at the same offset, return.
+        if dom_abstract_range_start_offset(abstract_range) == dom_abstract_range_end_offset(abstract_range):
+            # NOTE: A zero-length selection should not be visible.
+            return
+
+        # 2. If it's a text node, mark it as StartAndEnd and return.
+        if is_dom_text(start_container) and not dom_node_is_inert(start_node):
+            if let paintable = dom_node_unsafe_paintable(start_container):
+                paint_paintable_set_selection_state(paintable, PaintPaintableSelectionState.start_and_end)
+            return
+
+    # 3. Mark the selection start node as Start (if text) or Full (if anything else).
+    if let paintable = dom_node_unsafe_paintable(start_container):
+        if not dom_node_is_inert(start_node):
+            if is_dom_text(start_container):
+                paint_paintable_set_selection_state(paintable, PaintPaintableSelectionState.start)
+            else:
+                paint_paintable_set_selection_state(paintable, PaintPaintableSelectionState.full)
+
+    # 4. Mark the nodes between the start and end of the selection as Full.
+    var start_at = tree_node_child_at_index(start_container, (usize)dom_abstract_range_start_offset(abstract_range))
+    # If the start container has no child at that index, we need to start on the node right after the start container.
+    if start_at == none:
+        if let last_child = tree_node_last_child(start_container):
+            start_at = tree_node_next_in_pre_order(last_child)
+        else:
+            start_at = tree_node_next_in_pre_order(start_container)
+
+    let stop_at = tree_node_child_at_index(end_container, (usize)dom_abstract_range_end_offset(abstract_range))
+    # Only stop at the end container if it has no children that may need to be included.
+    var node_or_none = start_at
+    while let node = node_or_none:
+        if node_or_none == stop_at or (node == end_container and not tree_node_has_children(end_container)):
+            break
+        node_or_none = tree_node_next_in_pre_order_t(node, end_container)
+        if dom_node_is_inert(node):
+            continue
+        if let paintable = dom_node_unsafe_paintable(node):
+            paint_paintable_set_selection_state(paintable, PaintPaintableSelectionState.full)
+
+    # 5. Mark the selection end node as End if it is a text node.
+    if let paintable = dom_node_unsafe_paintable(end_container):
+        if not dom_node_is_inert(end_node) and is_dom_text(end_container):
+            paint_paintable_set_selection_state(paintable, PaintPaintableSelectionState.end)
+
+## Ported from Libraries/LibWeb/Painting/ViewportPaintable.cpp:585 Web::Painting::ViewportPaintable::handle_mousewheel (override).
+pub func paint_viewport_paintable_handle_mousewheel_impl(base: PaintPaintable*, arg0: gfx.CssPixelPoint, arg1: u32, arg2: u32, wheel_delta_x: i32, wheel_delta_y: i32) -> bool:
+    discard(base)
+    discard(arg0)
+    discard(arg1)
+    discard(arg2)
+    discard(wheel_delta_x)
+    discard(wheel_delta_y)
+    return false
