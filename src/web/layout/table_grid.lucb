@@ -1,0 +1,243 @@
+#==============================================================================================
+#
+#   table_grid - Layout::TableGrid: the slots of a table, its rows and its cells
+#
+#   DESCRIPTION:
+#       Port of LibWeb/Layout/TableGrid.cpp (lines 1-174) and TableGrid.h: the table-part
+#       predicates (taken ahead by region r43, which the TreeBuilder's table fixup needs), the
+#       children of a box that match one of them, and the forming of a table
+#       (https://html.spec.whatwg.org/multipage/tables.html#forming-a-table): the column
+#       count, the occupied slots, and the rows and cells with their coordinates and spans,
+#       which the TableFormattingContext and the TreeBuilder's missing cells fixup use.
+#
+#       `for_each_child_box_matching` takes the callback as a capture struct (TreeBuilder's
+#       fixup, DESIGN.md §2.7); the table formatting context walks the same children with the
+#       `layout_table_grid_child_boxes_matching` loop (DESIGN.md §2.9).
+#
+#       Copyright (c) 2023, the SerenityOS developers.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: TableGrid.h's inline members ============================================================
+
+## Ported from Libraries/LibWeb/Layout/TableGrid.h:55 Web::Layout::TableGrid::column_count.
+pub func layout_table_grid_column_count(this: const LayoutTableGrid*) -> usize:
+    return this.m_column_count
+
+## Ported from Libraries/LibWeb/Layout/TableGrid.h:56 Web::Layout::TableGrid::occupancy_grid.
+pub func layout_table_grid_occupancy_grid(this: const LayoutTableGrid*) -> ak.HashMap[LayoutTableGridGridPosition, bool, LayoutTableGridGridPositionTraits]:
+    return this.m_occupancy_grid
+
+## Ported from Libraries/LibWeb/Layout/TableGrid.h:58 Web::Layout::TableGrid::is_table_row_group.
+pub func layout_table_grid_is_table_row_group(node: LayoutNode*) -> bool:
+    let display = layout_node_display(node)
+    return css_display_is_table_row_group(&display) or css_display_is_table_header_group(&display) or css_display_is_table_footer_group(&display)
+
+## Ported from Libraries/LibWeb/Layout/TableGrid.h:64 Web::Layout::TableGrid::is_table_row.
+pub func layout_table_grid_is_table_row(node: LayoutNode*) -> bool:
+    let display = layout_node_display(node)
+    return css_display_is_table_row(&display)
+
+## Ported from Libraries/LibWeb/Layout/TableGrid.h:69 Web::Layout::TableGrid::is_table_column_group.
+pub func layout_table_grid_is_table_column_group(node: LayoutNode*) -> bool:
+    let display = layout_node_display(node)
+    return css_display_is_table_column_group(&display)
+
+## The callback of TableGrid::for_each_child_box_matching: a capture struct whose `call` is the C++ lambda's body,
+## called with each child box that matches (DESIGN.md §2.7).
+pub interface LayoutTableGridChildBoxCallback:
+    mutating func call(child_box: LayoutBox*)
+
+## `for child_box in layout_table_grid_child_boxes_matching(parent, matcher)`: the children of `parent` that are boxes
+## and for which `matcher` answers true, in order. TableGrid::for_each_child_box_matching's traversal
+## (`parent.for_each_child_of_type<Box>` with the matcher) as a loop (DESIGN.md §2.9).
+pub struct LayoutTableGridChildBoxesMatching: luce.Iterable[LayoutBox*, LayoutTableGridChildBoxesMatchingIterator]:
+    pub var parent: LayoutBox*
+    pub var matcher: func(LayoutNode*) -> bool
+
+    func iterator() -> LayoutTableGridChildBoxesMatchingIterator:
+        return LayoutTableGridChildBoxesMatchingIterator(next_node = self.parent.layout_node().tree_node.m_first_child, matcher = self.matcher)
+
+## The iterator of LayoutTableGridChildBoxesMatching.
+pub struct LayoutTableGridChildBoxesMatchingIterator: luce.Iterator[LayoutBox*]:
+    pub var next_node: LayoutNode*?
+    pub var matcher: func(LayoutNode*) -> bool
+
+    mutating func next() -> LayoutBox*?:
+        while let node = self.next_node:
+            self.next_node = node.tree_node.m_next_sibling
+            let child_box = as_if_layout_box(node) else continue
+            if self.matcher(child_box.layout_node()):
+                return child_box
+        return none
+
+## The child boxes of `parent` that match `matcher` (see LayoutTableGridChildBoxesMatching).
+pub func layout_table_grid_child_boxes_matching(parent: LayoutBox*, matcher: func(LayoutNode*) -> bool) -> LayoutTableGridChildBoxesMatching:
+    return LayoutTableGridChildBoxesMatching(parent = parent, matcher = matcher)
+
+## Ported from Libraries/LibWeb/Layout/TableGrid.h:75 Web::Layout::TableGrid::for_each_child_box_matching (of a Box const&).
+pub func layout_table_grid_for_each_child_box_matching[TCallback: LayoutTableGridChildBoxCallback](parent: LayoutBox*, matcher: func(LayoutNode*) -> bool, callback: TCallback*):
+    for child_box in layout_table_grid_child_boxes_matching(parent, matcher):
+        callback.call(child_box)
+
+## Ported from Libraries/LibWeb/Layout/TableGrid.h:85 Web::Layout::TableGrid::for_each_child_box_matching (of a Box&).
+## Layout boxes have no const overloads here: this is the overload above.
+pub func layout_table_grid_for_each_child_box_matching_2[TCallback: LayoutTableGridChildBoxCallback](parent: LayoutBox*, matcher: func(LayoutNode*) -> bool, callback: TCallback*):
+    layout_table_grid_for_each_child_box_matching(parent, matcher, callback)
+
+# mark: Forming a table =========================================================================
+
+## The locals of TableGrid::calculate_row_column_grid that its `process_row` and `process_col_group` lambdas capture by
+## reference.
+struct LayoutTableGridCalculateRowColumnGridLocals:
+    var table_grid: LayoutTableGrid*
+    var cells: ak.Vector[LayoutTableGridCell]*
+    var rows: ak.Vector[LayoutTableGridRow]*
+    var x_width: usize
+    var y_height: usize
+    var y_current: usize
+    var max_cell_x: usize
+    var max_cell_y: usize
+
+## The `process_row` lambda of TableGrid::calculate_row_column_grid.
+# Implements https://html.spec.whatwg.org/multipage/tables.html#algorithm-for-processing-rows
+func layout_table_grid_process_row(locals: LayoutTableGridCalculateRowColumnGridLocals*, row: LayoutBox*, row_group: LayoutBox*? = none):
+    # 1. If yheight is equal to ycurrent, then increase yheight by 1. (ycurrent is never greater than yheight.)
+    if locals.y_height == locals.y_current:
+        locals.y_height += 1
+
+    # 2. Let xcurrent be 0.
+    var x_current: usize = 0
+
+    # FIXME: 3. Run the algorithm for growing downward-growing cells.
+
+    # 4. If the tr element being processed has no td or th element children, then increase ycurrent by 1, abort
+    #    this set of steps, and return to the algorithm above.
+    # NB: The remaining steps already accomplish the same thing in this case.
+
+    # 5. Let current cell be the first td or th element child in the tr element being processed.
+    for child in layout_node_children(row.layout_node()):
+        # NB: This actually applies to children with `display: table-cell`, not just td/th elements.
+        let child_display = layout_node_display(child)
+        if not css_display_is_table_cell(&child_display):
+            continue
+
+        let current_cell = as_layout_box(child)
+
+        # 6. Cells: While x_current is less than x_width and the slot with coordinate (x_current, y_current)
+        #    already has a cell assigned to it, increase x_current by 1.
+        while x_current < locals.x_width and ak.hash_map_contains_k(&locals.table_grid.m_occupancy_grid, LayoutTableGridGridPosition(x = x_current, y = locals.y_current)):
+            x_current += 1
+
+        # 7. If xcurrent is equal to xwidth, increase xwidth by 1. (xcurrent is never greater than xwidth.)
+        if x_current == locals.x_width:
+            locals.x_width += 1
+
+        # NB: Steps 8 and 9 are implemented in HTMLTableCellElement.col_span() and HTMLTableCellElement.row_spam() respectively.
+        var colspan: usize = 1
+        var rowspan: usize = 1
+        if let cell_dom_node = layout_node_dom_node(current_cell.layout_node()):
+            if let table_cell = as_if_html_table_cell_element(cell_dom_node):
+                colspan = html_table_cell_element_col_span(table_cell)
+                rowspan = html_table_cell_element_row_span(table_cell)
+
+        # 10. Let cell grows downward be false.
+        var cell_grows_downward = false
+
+        # 11. If rowspan is zero, then set cell grows downward to true and set rowspan to 1.
+        if rowspan == 0:
+            cell_grows_downward = true
+            rowspan = 1
+
+        # 12. If xwidth < xcurrent+colspan, then let xwidth be xcurrent+colspan.
+        if locals.x_width < x_current + colspan:
+            locals.x_width = x_current + colspan
+
+        # 13. If yheight < ycurrent+rowspan, then let yheight be ycurrent+rowspan.
+        if locals.y_height < locals.y_current + rowspan:
+            locals.y_height = locals.y_current + rowspan
+
+        # 14. Let the slots with coordinates (x, y) such that xcurrent ≤ x < xcurrent+colspan and
+        #     ycurrent ≤ y < ycurrent+rowspan be covered by a new cell c, anchored at (xcurrent, ycurrent),
+        #     which has width colspan and height rowspan, corresponding to the current cell element.
+        #     If the current cell element is a th element, let this new cell c be a header cell;
+        #     otherwise, let it be a data cell.
+        #     To establish which header cells apply to the current cell element, use the algorithm for
+        #     assigning header cells described in the next section.
+        #     If any of the slots involved already had a cell covering them, then this is a table model error.
+        #     Those slots now have two cells overlapping.
+        # NB: We don't distinguish between header and data cells here.
+        for y in locals.y_current..<locals.y_current + rowspan:
+            for x in x_current..<x_current + colspan:
+                discard(ak.hash_map_set(&locals.table_grid.m_occupancy_grid, LayoutTableGridGridPosition(x = x, y = y), true))
+        ak.vector_append_t(locals.cells, LayoutTableGridCell(box = current_cell, column_index = x_current, row_index = locals.y_current, column_span = colspan, row_span = rowspan))
+        locals.max_cell_x = ak.max(x_current, locals.max_cell_x)
+        locals.max_cell_y = ak.max(locals.y_current, locals.max_cell_y)
+
+        # 15. If cell grows downward is true, then add the tuple {c, xcurrent, colspan} to the list of downward-growing cells.
+        # FIXME: Add the tuple. (C++ leaves `if (cell_grows_downward) { }` empty.)
+        discard(cell_grows_downward)
+
+        # 16. Increase xcurrent by colspan.
+        x_current += colspan
+
+        # NB: Step 17 is handled below, outside of this loop.
+
+        # 18. Let current cell be the next td or th element child in the tr element being processed.
+        # 19. Return to the step labeled cells.
+        # NB: Handled by the loop.
+
+    # 17. If current cell is the last td or th element child in the tr element being processed, then increase
+    #    ycurrent by 1, abort this set of steps, and return to the algorithm above.
+    var is_collapsed = css_computed_values_visibility(layout_box_computed(row)) == css_data.Visibility.collapse
+    if let group = row_group:
+        is_collapsed = is_collapsed or css_computed_values_visibility(layout_box_computed(group)) == css_data.Visibility.collapse
+    ak.vector_append_t(locals.rows, LayoutTableGridRow(box = row, is_collapsed = is_collapsed))
+    locals.y_current += 1
+
+## Ported from Libraries/LibWeb/Layout/TableGrid.cpp:13 Web::Layout::TableGrid::calculate_row_column_grid.
+## Calculates and answers the grid, and appends its rows and cells to `rows` and `cells`.
+pub func layout_table_grid_calculate_row_column_grid_vector(box: LayoutBox*, cells: ak.Vector[LayoutTableGridCell]*, rows: ak.Vector[LayoutTableGridRow]*) -> LayoutTableGrid:
+    # Implements https://html.spec.whatwg.org/multipage/tables.html#forming-a-table
+    var table_grid = LayoutTableGrid()
+
+    var locals = LayoutTableGridCalculateRowColumnGridLocals(table_grid = &table_grid, cells = cells, rows = rows, x_width = 0, y_height = 0, y_current = 0, max_cell_x = 0, max_cell_y = 0)
+
+    # The `process_col_group` lambda.
+    for column_group_box in layout_table_grid_child_boxes_matching(box, layout_table_grid_is_table_column_group):
+        let dom_node = layout_node_dom_node(column_group_box.layout_node()) else trap("a column group box without a DOM node")
+        for descendant in dom_node_subtree(dom_node):
+            # NB: Called during table layout tree construction.
+            let descendant_layout_node = dom_node_unsafe_layout_node(descendant) else continue
+            let descendant_display = layout_node_display(descendant_layout_node)
+            if css_display_is_table_column(&descendant_display):
+                var span: u32 = 1
+                if let col_element = as_if_html_table_col_element(descendant):
+                    span = html_table_col_element_span(col_element)
+                locals.x_width += span
+
+    # The `process_row_group` lambda and the rows outside row groups.
+    for child in layout_node_children(box.layout_node()):
+        let child_box = as_if_layout_box(child) else continue
+        if layout_table_grid_is_table_row_group(child):
+            for row_box in layout_table_grid_child_boxes_matching(child_box, layout_table_grid_is_table_row):
+                layout_table_grid_process_row(&locals, row_box, child_box)
+        elif layout_table_grid_is_table_row(child):
+            layout_table_grid_process_row(&locals, child_box)
+
+    table_grid.m_column_count = locals.x_width
+
+    for cell in &ak.vector_span(cells):
+        # Clip spans to the end of the table.
+        cell.row_span = ak.min(cell.row_span, ak.vector_size(rows) - cell.row_index)
+        cell.column_span = ak.min(cell.column_span, table_grid.m_column_count - cell.column_index)
+
+    return table_grid
+
+## Ported from Libraries/LibWeb/Layout/TableGrid.cpp:167 Web::Layout::TableGrid::calculate_row_column_grid.
+## The overload for callers that don't care about rows and cells (currently the layout tree builder).
+pub func layout_table_grid_calculate_row_column_grid(box: LayoutBox*) -> LayoutTableGrid:
+    var cells = ak.Vector[LayoutTableGridCell]()
+    var rows = ak.Vector[LayoutTableGridRow]()
+    return layout_table_grid_calculate_row_column_grid_vector(box, &cells, &rows)

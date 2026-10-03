@@ -1,0 +1,345 @@
+#==============================================================================================
+#
+#   table_formatting_context_5 - Layout::TableFormattingContext: running the table layout, and
+#                                the row-or-column accessors of the measures
+#
+#   DESCRIPTION:
+#       Port of LibWeb/Layout/TableFormattingContext.cpp (lines 1704-1992): the table layout up
+#       to the table width (which the table wrapper's width also asks for), placing the
+#       absolutely positioned descendants once the parent has dimensioned the table, `run` (the
+#       captions, the columns' widths, the rows' heights and the positions), the automatic
+#       content sizes, the specializations of the direction-agnostic accessors for rows and
+#       columns, the border spacing, and the static position of a table's descendants.
+#
+#       The templates over RowOrColumn take a LayoutTableDimension (see
+#       table_formatting_context_1): `X<Row>` is `X_row`, `X<Column>` is `X_column`, and `X`
+#       chooses between them.
+#
+#       Copyright (c) 2020, Andreas Kling <andreas@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Running the layout ======================================================================
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:1704 Web::Layout::TableFormattingContext::run_until_width_calculation.
+pub func layout_table_formatting_context_run_until_width_calculation(this: LayoutTableFormattingContext*, available_space: LayoutAvailableSpace):
+    this.m_available_space = available_space
+
+    # Determine the number of rows/columns the table requires.
+    let table_grid = layout_table_grid_calculate_row_column_grid_vector(layout_formatting_context_context_box(this.layout_formatting_context()), &this.m_cells, &this.m_rows)
+    layout_table_formatting_context_finish_grid_initialization(this, &table_grid)
+
+    layout_table_formatting_context_border_conflict_resolution(this)
+
+    # Compute the minimum width of each column.
+    layout_table_formatting_context_compute_cell_measures(this)
+    layout_table_formatting_context_compute_outer_content_sizes(this)
+    layout_table_formatting_context_compute_table_measures(this, LayoutTableDimension.column)
+
+    # https://www.w3.org/TR/css-tables-3/#row-layout
+    # Since during row layout the specified heights of cells in the row were ignored and cells that were spanning more than one rows
+    # have not been sized correctly, their height will need to be eventually distributed to the set of rows they spanned. This is done
+    # by running the same algorithm as the column measurement, with the span=1 value being initialized (for min-content) with the largest
+    # of the resulting height of the previous row layout, the height specified on the corresponding table-row (if any), and the largest
+    # height specified on cells that span this row only (the algorithm starts by considering cells of span 2 on top of that assignment).
+    layout_table_formatting_context_compute_table_measures(this, LayoutTableDimension.row)
+
+    # Compute the width of the table.
+    layout_table_formatting_context_compute_table_width(this)
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:1730 Web::Layout::TableFormattingContext::parent_context_did_dimension_child_root_box (override).
+pub func layout_table_formatting_context_parent_context_did_dimension_child_root_box_impl(base: LayoutFormattingContext*):
+    let this = (LayoutTableFormattingContext*)base
+    if base.m_layout_mode != LayoutMode.normal:
+        return
+
+    # context_box().for_each_in_subtree_of_type<Box const>(...)
+    var descendants = layout_node_subtree(layout_formatting_context_context_box(base).layout_node()).iterator()
+    while let node = descendants.next():
+        let box = as_if_layout_box(node) else continue
+        if layout_node_is_absolutely_positioned(box.layout_node()):
+            # FIXME: calculate_static_position_rect() is not aware of how to correctly calculate static position for
+            #        a box nested inside a table, but we need to set some value, so layout_absolutely_positioned_element()
+            #        won't crash trying to access it.
+            layout_state_used_values_set_static_position_rect(layout_state_get_mutable(base.m_state, box.layout_node_with_style()), layout_table_formatting_context_calculate_static_position_rect(this, box))
+
+        if layout_formatting_context_formatting_context_type_created_by_box(box) != none:
+            descendants.skip_children()
+
+    layout_formatting_context_layout_absolutely_positioned_children(base)
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:1753 Web::Layout::TableFormattingContext::run (override).
+pub func layout_table_formatting_context_run_impl(base: LayoutFormattingContext*, available_space: LayoutAvailableSpace):
+    let this = (LayoutTableFormattingContext*)base
+    let state = base.m_state
+    let table_box = layout_table_formatting_context_table_box(this)
+    # FORMATTING_CONTEXT_TRACE() traces only in LIBWEB_LAYOUT_DEBUG builds.
+    this.m_available_space = available_space
+
+    layout_table_formatting_context_run_until_width_calculation(this, available_space)
+
+    if layout_available_size_is_intrinsic_sizing_constraint(&available_space.width) and not layout_available_size_is_intrinsic_sizing_constraint(&available_space.height):
+        return
+
+    let table_state = layout_state_get(state, table_box.layout_node_with_style())
+    let caption_available_space = LayoutAvailableSpace(
+        width = layout_available_size_make_definite(layout_clamp_to_max_dimension_value(layout_state_used_values_border_box_width(table_state))),
+        height = available_space.height,
+    )
+
+    var total_captions_height = layout_table_formatting_context_run_caption_layout(this, css_data.CaptionSide.top, caption_available_space)
+
+    # Distribute the width of the table among columns.
+    layout_table_formatting_context_distribute_width_to_columns(this)
+
+    layout_table_formatting_context_compute_table_height(this)
+
+    layout_table_formatting_context_distribute_height_to_rows(this)
+
+    layout_table_formatting_context_position_row_boxes(this)
+    layout_table_formatting_context_position_cell_boxes(this)
+
+    layout_state_used_values_set_content_height(layout_state_get_mutable(state, table_box.layout_node_with_style()), this.m_table_height)
+
+    total_captions_height = total_captions_height.add(layout_table_formatting_context_run_caption_layout(this, css_data.CaptionSide.bottom, caption_available_space))
+
+    # Table captions are positioned between the table margins and its borders (outside the grid box borders) as described in
+    # https://www.w3.org/TR/css-tables-3/#bounding-box-assignment
+    # A visual representation of this model can be found at https://www.w3.org/TR/css-tables-3/images/table_container.png
+    let table_box_state = layout_state_get_mutable(state, table_box.layout_node_with_style())
+    table_box_state.margin_bottom = table_box_state.margin_bottom.add(total_captions_height)
+
+    this.m_automatic_content_height = this.m_table_height
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:1793 Web::Layout::TableFormattingContext::automatic_content_width (override).
+pub func layout_table_formatting_context_automatic_content_width_impl(base: LayoutFormattingContext*) -> gfx.CssPixels:
+    let this = (LayoutTableFormattingContext*)base
+    return layout_state_used_values_content_width(layout_state_get(base.m_state, layout_table_formatting_context_table_box(this).layout_node_with_style()))
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:1798 Web::Layout::TableFormattingContext::automatic_content_height (override).
+pub func layout_table_formatting_context_automatic_content_height_impl(base: LayoutFormattingContext*) -> gfx.CssPixels:
+    let this = (LayoutTableFormattingContext*)base
+    return this.m_automatic_content_height
+
+# mark: Direction-agnostic accessors ============================================================
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:1804 Web::Layout::TableFormattingContext::cell_span<Row>.
+func layout_table_formatting_context_cell_span_row(cell: const LayoutTableGridCell*) -> usize:
+    return cell.row_span
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:1810 Web::Layout::TableFormattingContext::cell_span<Column>.
+func layout_table_formatting_context_cell_span_column(cell: const LayoutTableGridCell*) -> usize:
+    return cell.column_span
+
+## `cell_span<RowOrColumn>(cell)`.
+func layout_table_formatting_context_cell_span(dimension: LayoutTableDimension, cell: const LayoutTableGridCell*) -> usize:
+    if dimension == LayoutTableDimension.row:
+        return layout_table_formatting_context_cell_span_row(cell)
+    return layout_table_formatting_context_cell_span_column(cell)
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:1816 Web::Layout::TableFormattingContext::cell_index<Row>.
+func layout_table_formatting_context_cell_index_row(cell: const LayoutTableGridCell*) -> usize:
+    return cell.row_index
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:1822 Web::Layout::TableFormattingContext::cell_index<Column>.
+func layout_table_formatting_context_cell_index_column(cell: const LayoutTableGridCell*) -> usize:
+    return cell.column_index
+
+## `cell_index<RowOrColumn>(cell)`.
+func layout_table_formatting_context_cell_index(dimension: LayoutTableDimension, cell: const LayoutTableGridCell*) -> usize:
+    if dimension == LayoutTableDimension.row:
+        return layout_table_formatting_context_cell_index_row(cell)
+    return layout_table_formatting_context_cell_index_column(cell)
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:1828 Web::Layout::TableFormattingContext::cell_min_size<Row>.
+func layout_table_formatting_context_cell_min_size_row(cell: const LayoutTableGridCell*) -> gfx.CssPixels:
+    return cell.outer_min_height
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:1834 Web::Layout::TableFormattingContext::cell_min_size<Column>.
+func layout_table_formatting_context_cell_min_size_column(cell: const LayoutTableGridCell*) -> gfx.CssPixels:
+    return cell.outer_min_width
+
+## `cell_min_size<RowOrColumn>(cell)`.
+func layout_table_formatting_context_cell_min_size(dimension: LayoutTableDimension, cell: const LayoutTableGridCell*) -> gfx.CssPixels:
+    if dimension == LayoutTableDimension.row:
+        return layout_table_formatting_context_cell_min_size_row(cell)
+    return layout_table_formatting_context_cell_min_size_column(cell)
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:1840 Web::Layout::TableFormattingContext::cell_max_size<Row>.
+func layout_table_formatting_context_cell_max_size_row(cell: const LayoutTableGridCell*) -> gfx.CssPixels:
+    return cell.outer_max_height
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:1846 Web::Layout::TableFormattingContext::cell_max_size<Column>.
+func layout_table_formatting_context_cell_max_size_column(cell: const LayoutTableGridCell*) -> gfx.CssPixels:
+    return cell.outer_max_width
+
+## `cell_max_size<RowOrColumn>(cell)`.
+func layout_table_formatting_context_cell_max_size(dimension: LayoutTableDimension, cell: const LayoutTableGridCell*) -> gfx.CssPixels:
+    if dimension == LayoutTableDimension.row:
+        return layout_table_formatting_context_cell_max_size_row(cell)
+    return layout_table_formatting_context_cell_max_size_column(cell)
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:1852 Web::Layout::TableFormattingContext::cell_percentage_contribution<Row>.
+func layout_table_formatting_context_cell_percentage_contribution_row(cell: const LayoutTableGridCell*) -> f64:
+    # Definition of percentage contribution: https://www.w3.org/TR/css-tables-3/#percentage-contribution
+    let computed_values = layout_box_computed(cell.box)
+    let max_height = css_computed_values_max_height(computed_values)
+    let height = css_computed_values_height(computed_values)
+    let max_height_percentage = layout_table_formatting_context_percentage_value(&max_height) if css_size_is_percentage(&max_height) else math.infinity
+    let height_percentage = layout_table_formatting_context_percentage_value(&height) if css_size_is_percentage(&height) else 0.0
+    return ak.min_f64(height_percentage, max_height_percentage)
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:1862 Web::Layout::TableFormattingContext::cell_percentage_contribution<Column>.
+func layout_table_formatting_context_cell_percentage_contribution_column(cell: const LayoutTableGridCell*) -> f64:
+    # Definition of percentage contribution: https://www.w3.org/TR/css-tables-3/#percentage-contribution
+    let computed_values = layout_box_computed(cell.box)
+    let max_width = css_computed_values_max_width(computed_values)
+    let width = css_computed_values_width(computed_values)
+    let max_width_percentage = layout_table_formatting_context_percentage_value(&max_width) if css_size_is_percentage(&max_width) else math.infinity
+    let width_percentage = layout_table_formatting_context_percentage_value(&width) if css_size_is_percentage(&width) else 0.0
+    return ak.min_f64(width_percentage, max_width_percentage)
+
+## `cell_percentage_contribution<RowOrColumn>(cell)`.
+func layout_table_formatting_context_cell_percentage_contribution(dimension: LayoutTableDimension, cell: const LayoutTableGridCell*) -> f64:
+    if dimension == LayoutTableDimension.row:
+        return layout_table_formatting_context_cell_percentage_contribution_row(cell)
+    return layout_table_formatting_context_cell_percentage_contribution_column(cell)
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:1872 Web::Layout::TableFormattingContext::cell_has_intrinsic_percentage<Row>.
+func layout_table_formatting_context_cell_has_intrinsic_percentage_row(cell: const LayoutTableGridCell*) -> bool:
+    let height = css_computed_values_height(layout_box_computed(cell.box))
+    return css_size_is_percentage(&height)
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:1878 Web::Layout::TableFormattingContext::cell_has_intrinsic_percentage<Column>.
+func layout_table_formatting_context_cell_has_intrinsic_percentage_column(cell: const LayoutTableGridCell*) -> bool:
+    let width = css_computed_values_width(layout_box_computed(cell.box))
+    return css_size_is_percentage(&width)
+
+## `cell_has_intrinsic_percentage<RowOrColumn>(cell)`.
+func layout_table_formatting_context_cell_has_intrinsic_percentage(dimension: LayoutTableDimension, cell: const LayoutTableGridCell*) -> bool:
+    if dimension == LayoutTableDimension.row:
+        return layout_table_formatting_context_cell_has_intrinsic_percentage_row(cell)
+    return layout_table_formatting_context_cell_has_intrinsic_percentage_column(cell)
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:1884 Web::Layout::TableFormattingContext::initialize_intrinsic_percentages_from_rows_or_columns<Row>.
+func layout_table_formatting_context_initialize_intrinsic_percentages_from_rows_or_columns_row(this: LayoutTableFormattingContext*):
+    for row in &ak.vector_span(&this.m_rows):
+        let computed_values = layout_box_computed(row.box)
+        # Definition of percentage contribution: https://www.w3.org/TR/css-tables-3/#percentage-contribution
+        let max_height = css_computed_values_max_height(computed_values)
+        let height = css_computed_values_height(computed_values)
+        let max_height_percentage = layout_table_formatting_context_percentage_value(&max_height) if css_size_is_percentage(&max_height) else math.infinity
+        let height_percentage = layout_table_formatting_context_percentage_value(&height) if css_size_is_percentage(&height) else 0.0
+        row.has_intrinsic_percentage = css_size_is_percentage(&max_height) or css_size_is_percentage(&height)
+        row.intrinsic_percentage = ak.min_f64(height_percentage, max_height_percentage)
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:1897 Web::Layout::TableFormattingContext::initialize_intrinsic_percentages_from_rows_or_columns<Column>.
+func layout_table_formatting_context_initialize_intrinsic_percentages_from_rows_or_columns_column(this: LayoutTableFormattingContext*):
+    var column_index: usize = 0
+    for column_group_box in layout_table_grid_child_boxes_matching(layout_table_formatting_context_table_box(this), layout_is_table_column_group):
+        for column_box in layout_table_grid_child_boxes_matching(column_group_box, layout_is_table_column_layout_box):
+            let computed_values = layout_box_computed(column_box)
+            # Definition of percentage contribution: https://www.w3.org/TR/css-tables-3/#percentage-contribution
+            let max_width = css_computed_values_max_width(computed_values)
+            let width = css_computed_values_width(computed_values)
+            let max_width_percentage = layout_table_formatting_context_percentage_value(&max_width) if css_size_is_percentage(&max_width) else math.infinity
+            let width_percentage = layout_table_formatting_context_percentage_value(&width) if css_size_is_percentage(&width) else 0.0
+            ak.vector_at(&this.m_columns, column_index).has_intrinsic_percentage = css_size_is_percentage(&max_width) or css_size_is_percentage(&width)
+            ak.vector_at(&this.m_columns, column_index).intrinsic_percentage = ak.min_f64(width_percentage, max_width_percentage)
+            let span = layout_table_formatting_context_column_span_attribute(column_box.layout_node())
+            column_index += span
+
+## `initialize_intrinsic_percentages_from_rows_or_columns<RowOrColumn>()`.
+func layout_table_formatting_context_initialize_intrinsic_percentages_from_rows_or_columns(this: LayoutTableFormattingContext*, dimension: LayoutTableDimension):
+    if dimension == LayoutTableDimension.row:
+        layout_table_formatting_context_initialize_intrinsic_percentages_from_rows_or_columns_row(this)
+    else:
+        layout_table_formatting_context_initialize_intrinsic_percentages_from_rows_or_columns_column(this)
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:1916 Web::Layout::TableFormattingContext::initialize_intrinsic_percentages_from_cells.
+func layout_table_formatting_context_initialize_intrinsic_percentages_from_cells(this: LayoutTableFormattingContext*, dimension: LayoutTableDimension):
+    for cell in &ak.vector_span(&this.m_cells):
+        let cell_span_value = layout_table_formatting_context_cell_span(dimension, cell)
+        let cell_start_rc_index = layout_table_formatting_context_cell_index(dimension, cell)
+        let cell_end_rc_index = cell_start_rc_index + cell_span_value
+        if layout_table_formatting_context_cell_has_intrinsic_percentage(dimension, cell):
+            for rc_index in cell_start_rc_index..<cell_end_rc_index:
+                *layout_table_formatting_context_table_row_or_column(this, dimension, rc_index).has_intrinsic_percentage = true
+            if cell_span_value != 1:
+                continue
+        else:
+            continue
+        let rc_index = layout_table_formatting_context_cell_index(dimension, cell)
+        let row_or_column = layout_table_formatting_context_table_row_or_column(this, dimension, rc_index)
+        *row_or_column.has_intrinsic_percentage = true
+        *row_or_column.intrinsic_percentage = ak.max_f64(layout_table_formatting_context_cell_percentage_contribution(dimension, cell), *row_or_column.intrinsic_percentage)
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:1941 Web::Layout::TableFormattingContext::border_spacing<Row>.
+func layout_table_formatting_context_border_spacing_row(this: LayoutTableFormattingContext*) -> gfx.CssPixels:
+    return layout_table_formatting_context_border_spacing_vertical(this)
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:1947 Web::Layout::TableFormattingContext::border_spacing<Column>.
+func layout_table_formatting_context_border_spacing_column(this: LayoutTableFormattingContext*) -> gfx.CssPixels:
+    return layout_table_formatting_context_border_spacing_horizontal(this)
+
+## `border_spacing<RowOrColumn>()`.
+func layout_table_formatting_context_border_spacing(this: LayoutTableFormattingContext*, dimension: LayoutTableDimension) -> gfx.CssPixels:
+    if dimension == LayoutTableDimension.row:
+        return layout_table_formatting_context_border_spacing_row(this)
+    return layout_table_formatting_context_border_spacing_column(this)
+
+# mark: Border spacing and static positions =====================================================
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:1952 Web::Layout::TableFormattingContext::border_spacing_horizontal.
+func layout_table_formatting_context_border_spacing_horizontal(this: LayoutTableFormattingContext*) -> gfx.CssPixels:
+    let table_box = layout_table_formatting_context_table_box(this)
+    let computed_values = layout_box_computed(table_box)
+    # When a table is laid out in collapsed-borders mode, the border-spacing of the table-root is ignored (as if it was set to 0px):
+    # https://www.w3.org/TR/css-tables-3/#collapsed-style-overrides
+    if css_computed_values_border_collapse(computed_values) == css_data.BorderCollapse.collapse:
+        return layout_zero_px()
+    let border_spacing_horizontal = css_computed_values_border_spacing_horizontal(computed_values)
+    return css_length_to_px_layout_node(&border_spacing_horizontal, table_box.layout_node())
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:1962 Web::Layout::TableFormattingContext::border_spacing_vertical.
+func layout_table_formatting_context_border_spacing_vertical(this: LayoutTableFormattingContext*) -> gfx.CssPixels:
+    let table_box = layout_table_formatting_context_table_box(this)
+    let computed_values = layout_box_computed(table_box)
+    # When a table is laid out in collapsed-borders mode, the border-spacing of the table-root is ignored (as if it was set to 0px):
+    # https://www.w3.org/TR/css-tables-3/#collapsed-style-overrides
+    if css_computed_values_border_collapse(computed_values) == css_data.BorderCollapse.collapse:
+        return layout_zero_px()
+    let border_spacing_vertical = css_computed_values_border_spacing_vertical(computed_values)
+    return css_length_to_px_layout_node(&border_spacing_vertical, table_box.layout_node())
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:1972 Web::Layout::TableFormattingContext::calculate_static_position_rect.
+pub func layout_table_formatting_context_calculate_static_position_rect(this: LayoutTableFormattingContext*, box: LayoutBox*) -> LayoutStaticPositionRect:
+    discard(this)
+    discard(box)
+    # FIXME: Implement static position calculation for table descendants instead of always returning a rectangle with zero position and size.
+    var static_position = LayoutStaticPositionRect()
+    static_position.rect = gfx.CssPixelRect(gfx.CssPixelPoint(layout_zero_px(), layout_zero_px()), gfx.CssPixelSize(layout_zero_px(), layout_zero_px()))
+    return static_position
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:1981 Web::Layout::TableFormattingContext::table_rows_or_columns<Row>.
+func layout_table_formatting_context_table_rows_or_columns_row(this: LayoutTableFormattingContext*) -> ak.Vector[LayoutTableGridRow]*:
+    return &this.m_rows
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:1987 Web::Layout::TableFormattingContext::table_rows_or_columns<Column>.
+func layout_table_formatting_context_table_rows_or_columns_column(this: LayoutTableFormattingContext*) -> ak.Vector[LayoutTableFormattingContextColumn]*:
+    return &this.m_columns
+
+## `table_rows_or_columns<RowOrColumn>().size()`.
+func layout_table_formatting_context_table_rows_or_columns_size(this: LayoutTableFormattingContext*, dimension: LayoutTableDimension) -> usize:
+    if dimension == LayoutTableDimension.row:
+        return ak.vector_size(layout_table_formatting_context_table_rows_or_columns_row(this))
+    return ak.vector_size(layout_table_formatting_context_table_rows_or_columns_column(this))
+
+## `table_rows_or_columns<RowOrColumn>()[index]`: the members of the row or column the templates use.
+func layout_table_formatting_context_table_row_or_column(this: LayoutTableFormattingContext*, dimension: LayoutTableDimension, index: usize) -> LayoutTableFormattingContextRowOrColumn:
+    if dimension == LayoutTableDimension.row:
+        let row = ak.vector_at(layout_table_formatting_context_table_rows_or_columns_row(this), index)
+        return LayoutTableFormattingContextRowOrColumn(min_size = &row.min_size, max_size = &row.max_size, has_intrinsic_percentage = &row.has_intrinsic_percentage, intrinsic_percentage = &row.intrinsic_percentage)
+    let column = ak.vector_at(layout_table_formatting_context_table_rows_or_columns_column(this), index)
+    return LayoutTableFormattingContextRowOrColumn(min_size = &column.min_size, max_size = &column.max_size, has_intrinsic_percentage = &column.has_intrinsic_percentage, intrinsic_percentage = &column.intrinsic_percentage)

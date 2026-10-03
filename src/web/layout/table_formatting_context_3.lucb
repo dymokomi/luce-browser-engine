@@ -1,0 +1,357 @@
+#==============================================================================================
+#
+#   table_formatting_context_3 - Layout::TableFormattingContext: the table height, the rows'
+#                                heights and the positions of rows, row groups and cells
+#
+#   DESCRIPTION:
+#       Port of LibWeb/Layout/TableFormattingContext.cpp (lines 907-1274): the two passes of
+#       row and cell layout that compute the table height
+#       (https://www.w3.org/TR/css-tables-3/#computing-the-table-height), the distribution of
+#       the table height to the rows, the bounding boxes of rows, row groups and cells
+#       (https://www.w3.org/TR/css-tables-3/#bounding-box-assignment) with the cells' vertical
+#       alignment, and whether the table is laid out in fixed mode.
+#
+#       Copyright (c) 2020, Andreas Kling <andreas@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: The table height ========================================================================
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:907 Web::Layout::TableFormattingContext::compute_table_height.
+func layout_table_formatting_context_compute_table_height(this: LayoutTableFormattingContext*):
+    let base = this.layout_formatting_context()
+    let state = base.m_state
+    let table_box = layout_table_formatting_context_table_box(this)
+    let rows = ak.vector_span(&this.m_rows)
+    let cells = ak.vector_span(&this.m_cells)
+
+    # First pass of row height calculation:
+    for row in &rows:
+        if row.is_collapsed:
+            row.base_height = layout_zero_px()
+            continue
+        let row_computed_height = css_computed_values_height(layout_box_computed(row.box))
+        if css_size_is_length(&row_computed_height):
+            let row_containing_block = layout_node_containing_block(row.box.layout_node()) else trap("a table row without a containing block")
+            let height_of_containing_block = layout_state_used_values_content_height(layout_state_get(state, row_containing_block.layout_node_with_style()))
+            let row_used_height = css_size_to_px(&row_computed_height, row.box.layout_node(), height_of_containing_block)
+            row.base_height = ak.max(row.base_height, row_used_height)
+
+    # First pass of cells layout:
+    for cell in &cells:
+        let row = ak.vector_at(&this.m_rows, cell.row_index)
+        let cell_state = layout_state_get_mutable(state, cell.box.layout_node_with_style())
+
+        var span_width = layout_zero_px()
+        for i in 0..<cell.column_span:
+            span_width = span_width.add(ak.vector_at(&this.m_columns, cell.column_index + i).used_width)
+
+        let containing_block_used_values = layout_state_used_values_containing_block_used_values(cell_state) else trap("a table cell without containing block used values")
+        let width_of_containing_block = layout_state_used_values_content_width(containing_block_used_values)
+        let height_of_containing_block = layout_state_used_values_content_height(containing_block_used_values)
+
+        let cell_computed_values = layout_box_computed(cell.box)
+        let padding = css_computed_values_padding(cell_computed_values)
+        cell_state.padding_top = layout_table_formatting_context_to_px_or_zero(css_length_box_top_const(&padding), cell.box, width_of_containing_block)
+        cell_state.padding_bottom = layout_table_formatting_context_to_px_or_zero(css_length_box_bottom_const(&padding), cell.box, width_of_containing_block)
+        cell_state.padding_left = layout_table_formatting_context_to_px_or_zero(css_length_box_left_const(&padding), cell.box, width_of_containing_block)
+        cell_state.padding_right = layout_table_formatting_context_to_px_or_zero(css_length_box_right_const(&padding), cell.box, width_of_containing_block)
+
+        if css_computed_values_border_collapse(layout_box_computed(table_box)) == css_data.BorderCollapse.separate:
+            cell_state.border_top = css_computed_values_border_top(cell_computed_values).width
+            cell_state.border_bottom = css_computed_values_border_bottom(cell_computed_values).width
+            cell_state.border_left = css_computed_values_border_left(cell_computed_values).width
+            cell_state.border_right = css_computed_values_border_right(cell_computed_values).width
+
+        if not row.is_collapsed:
+            let cell_computed_height = css_computed_values_height(cell_computed_values)
+            if css_size_is_length(&cell_computed_height):
+                let cell_used_height = css_size_to_px(&cell_computed_height, cell.box.layout_node(), height_of_containing_block)
+                layout_state_used_values_set_content_height(cell_state, cell_used_height.sub(layout_state_used_values_border_box_top(cell_state)).sub(layout_state_used_values_border_box_bottom(cell_state)))
+
+                row.base_height = ak.max(row.base_height, cell_used_height)
+
+        # Compute cell width as specified by https://www.w3.org/TR/css-tables-3/#bounding-box-assignment:
+        # The position of any table-cell, table-track, or table-track-group box within the table is defined as the rectangle whose width/height is the sum of:
+        # - the widths/heights of all spanned visible columns/rows
+        # - the horizontal/vertical border-spacing times the amount of spanned visible columns/rows minus one
+        # FIXME: Account for visibility.
+        layout_state_used_values_set_content_width(cell_state, span_width.sub(layout_state_used_values_border_box_left(cell_state)).sub(layout_state_used_values_border_box_right(cell_state)).add(layout_table_formatting_context_mul_count(layout_table_formatting_context_border_spacing_horizontal(this), cell.column_span - 1)))
+        if let independent_formatting_context = layout_formatting_context_layout_inside(base, cell.box, base.m_layout_mode, layout_state_used_values_available_inner_space_or_constraints_from(cell_state, layout_table_formatting_context_available_space(this))):
+            # The OwnPtr is destroyed at the end of this block.
+            defer layout_formatting_context_destruct(independent_formatting_context)
+            layout_state_used_values_set_content_height(cell_state, layout_formatting_context_automatic_content_height(independent_formatting_context))
+            layout_formatting_context_parent_context_did_dimension_child_root_box(independent_formatting_context)
+
+        cell.baseline = layout_formatting_context_box_baseline(base, cell.box)
+
+        # Implements https://www.w3.org/TR/css-tables-3/#computing-the-table-height
+
+        # The minimum height of a row is the maximum of:
+        # - the computed height (if definite, percentages being considered 0px) of its corresponding table-row (if nay)
+        # - the computed height of each cell spanning the current row exclusively (if definite, percentages being treated as 0px), and
+        # - the minimum height (ROWMIN) required by the cells spanning the row.
+        # Note that we've already applied the first rule at the top of the method.
+        if not row.is_collapsed:
+            if cell.row_span == 1:
+                row.base_height = ak.max(row.base_height, layout_state_used_values_border_box_height(cell_state))
+            row.base_height = ak.max(row.base_height, ak.vector_at(&this.m_rows, cell.row_index).min_size)
+            row.baseline = ak.max(row.baseline, cell.baseline)
+
+    var sum_rows_height = layout_zero_px()
+    for row in &rows:
+        sum_rows_height = sum_rows_height.add(row.base_height)
+
+    this.m_table_height = sum_rows_height
+
+    let table_computed_values = layout_box_computed(table_box)
+    let table_computed_height = css_computed_values_height(table_computed_values)
+    if not css_size_is_auto(&table_computed_height):
+        # If the table has a height property with a value other than auto, it is treated as a minimum height for the
+        # table grid, and will eventually be distributed to the height of the rows if their collective minimum height
+        # ends up smaller than this number.
+        let height_of_table_containing_block = layout_table_formatting_context_table_wrapper_containing_block_height(this)
+        var specified_table_height = css_size_to_px(&table_computed_height, table_box.layout_node(), height_of_table_containing_block)
+        if css_computed_values_box_sizing(table_computed_values) == css_data.BoxSizing.border_box:
+            let table_state = layout_state_get(state, table_box.layout_node_with_style())
+            specified_table_height = specified_table_height.sub(layout_state_used_values_border_box_top(table_state).add(layout_state_used_values_border_box_bottom(table_state)))
+        this.m_table_height = ak.max(this.m_table_height, specified_table_height)
+
+    for row in &rows:
+        # Reference size is the largest of
+        # - its initial base height and
+        # - its new base height (the one evaluated during the second layout pass, where percentages used in
+        #   rowgroups/rows/cells' specified heights were resolved according to the table height, instead of
+        #   being ignored as 0px).
+
+        # Assign reference size to base size. Later, the reference size might change to a larger value during
+        # the second pass of rows layout.
+        row.reference_height = row.base_height
+
+    # Second pass of rows height calculation:
+    # At this point, percentage row height can be resolved because the final table height is calculated.
+    for row in &rows:
+        if row.is_collapsed:
+            row.reference_height = layout_zero_px()
+            continue
+        let row_computed_height = css_computed_values_height(layout_box_computed(row.box))
+        if css_size_is_percentage(&row_computed_height):
+            let row_used_height = css_size_to_px(&row_computed_height, row.box.layout_node(), this.m_table_height)
+            row.reference_height = ak.max(row.reference_height, row_used_height)
+        else:
+            continue
+
+    # Second pass cells layout:
+    # At this point, percentage cell height can be resolved because the final table height is calculated.
+    for cell in &cells:
+        let row = ak.vector_at(&this.m_rows, cell.row_index)
+        let cell_state = layout_state_get_mutable(state, cell.box.layout_node_with_style())
+
+        var span_width = layout_zero_px()
+        for i in 0..<cell.column_span:
+            span_width = span_width.add(ak.vector_at(&this.m_columns, cell.column_index + i).used_width)
+
+        let cell_computed_height = css_computed_values_height(layout_box_computed(cell.box))
+        if css_size_is_percentage(&cell_computed_height):
+            let cell_used_height = css_size_to_px(&cell_computed_height, cell.box.layout_node(), this.m_table_height)
+            layout_state_used_values_set_content_height(cell_state, cell_used_height.sub(layout_state_used_values_border_box_top(cell_state)).sub(layout_state_used_values_border_box_bottom(cell_state)))
+
+            if not row.is_collapsed:
+                row.reference_height = ak.max(row.reference_height, cell_used_height)
+        else:
+            continue
+
+        layout_state_used_values_set_content_width(cell_state, span_width.sub(layout_state_used_values_border_box_left(cell_state)).sub(layout_state_used_values_border_box_right(cell_state)).add(layout_table_formatting_context_mul_count(layout_table_formatting_context_border_spacing_horizontal(this), cell.column_span - 1)))
+        if let independent_formatting_context = layout_formatting_context_layout_inside(base, cell.box, base.m_layout_mode, layout_state_used_values_available_inner_space_or_constraints_from(cell_state, layout_table_formatting_context_available_space(this))):
+            # The OwnPtr is destroyed at the end of this block.
+            defer layout_formatting_context_destruct(independent_formatting_context)
+            layout_formatting_context_parent_context_did_dimension_child_root_box(independent_formatting_context)
+
+        cell.baseline = layout_formatting_context_box_baseline(base, cell.box)
+
+        if not row.is_collapsed:
+            row.reference_height = ak.max(row.reference_height, layout_state_used_values_border_box_height(cell_state))
+            row.baseline = ak.max(row.baseline, cell.baseline)
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:1069 Web::Layout::TableFormattingContext::distribute_height_to_rows.
+func layout_table_formatting_context_distribute_height_to_rows(this: LayoutTableFormattingContext*):
+    let rows = ak.vector_span(&this.m_rows)
+    var sum_reference_height = layout_zero_px()
+    var number_of_visible_rows: usize = 0
+    for row in &rows:
+        sum_reference_height = sum_reference_height.add(row.reference_height)
+        if not row.is_collapsed:
+            number_of_visible_rows += 1
+
+    if sum_reference_height == layout_zero_px():
+        return
+
+    var rows_with_auto_height = ak.Vector[LayoutTableGridRow*]()
+    for row in &rows:
+        let row_computed_height = css_computed_values_height(layout_box_computed(row.box))
+        if css_size_is_auto(&row_computed_height) and not row.is_collapsed:
+            ak.vector_append_t(&rows_with_auto_height, row)
+
+    if this.m_table_height.le(sum_reference_height):
+        # If the table height is equal or smaller than sum of reference sizes, the final height assigned to each row
+        # will be the weighted mean of the base and the reference size that yields the correct total height.
+
+        for row in &rows:
+            if row.is_collapsed:
+                row.final_height = layout_zero_px()
+                continue
+            let weight = gfx.div_css_pixels_f64(row.reference_height, sum_reference_height.to_double())
+            let final_height = gfx.mul_css_pixels_f64(this.m_table_height, weight)
+            row.final_height = gfx.css_pixels_nearest_value_for_f64(final_height)
+    elif ak.vector_size(&rows_with_auto_height) > 0:
+        # Else, if the table owns any “auto-height” row (a row whose size is only determined by its content size and
+        # none of the specified heights), each non-auto-height row receives its reference height and auto-height rows
+        # receive their reference size plus some increment which is equal to the height missing to amount to the
+        # specified table height divided by the amount of such rows.
+
+        for row in &rows:
+            row.final_height = row.reference_height
+
+        let auto_height_rows_increment = layout_table_formatting_context_div_count(this.m_table_height.sub(sum_reference_height), ak.vector_size(&rows_with_auto_height))
+        for row in ak.vector_span(&rows_with_auto_height):
+            row.final_height = row.final_height.add(auto_height_rows_increment)
+    else:
+        # Else, all rows receive their reference size plus some increment which is equal to the height missing to
+        # amount to the specified table height divided by the amount of rows.
+
+        let increment = layout_table_formatting_context_div_count(this.m_table_height.sub(sum_reference_height), number_of_visible_rows)
+        for row in &rows:
+            if row.is_collapsed:
+                row.final_height = layout_zero_px()
+                continue
+            row.final_height = row.reference_height.add(increment)
+
+    # Add undistributable space due to border spacing: https://www.w3.org/TR/css-tables-3/#computing-undistributable-space.
+    this.m_table_height = this.m_table_height.add(layout_table_formatting_context_mul_count(layout_table_formatting_context_border_spacing_vertical(this), number_of_visible_rows + 1))
+
+# mark: Positions ===============================================================================
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:1134 Web::Layout::TableFormattingContext::position_row_boxes.
+func layout_table_formatting_context_position_row_boxes(this: LayoutTableFormattingContext*):
+    let state = this.formatting_context.m_state
+    let table_box = layout_table_formatting_context_table_box(this)
+    let table_state = layout_state_get(state, table_box.layout_node_with_style())
+
+    var row_top_offset = table_state.offset.m_y.add(layout_table_formatting_context_border_spacing_vertical(this))
+    let row_left_offset = table_state.border_left.add(table_state.padding_left).add(layout_table_formatting_context_border_spacing_horizontal(this))
+    for y in 0..<ak.vector_size(&this.m_rows):
+        let row = ak.vector_at(&this.m_rows, y)
+        let row_state = layout_state_get_mutable(state, row.box.layout_node_with_style())
+        var row_width = layout_zero_px()
+        for column in ak.vector_span(&this.m_columns):
+            row_width = row_width.add(column.used_width)
+        if ak.vector_size(&this.m_columns) >= 2:
+            row_width = row_width.add(layout_table_formatting_context_mul_count(layout_table_formatting_context_border_spacing_horizontal(this), ak.vector_size(&this.m_columns) - 1))
+
+        layout_state_used_values_set_content_height(row_state, row.final_height)
+        layout_state_used_values_set_content_width(row_state, row_width)
+        layout_state_used_values_set_content_x(row_state, row_left_offset)
+        layout_state_used_values_set_content_y(row_state, row_top_offset)
+        if not row.is_collapsed:
+            row_top_offset = row_top_offset.add(layout_state_used_values_content_height(row_state).add(layout_table_formatting_context_border_spacing_vertical(this)))
+
+    var row_group_top_offset = table_state.offset.m_y.add(layout_table_formatting_context_border_spacing_vertical(this))
+    let row_group_left_offset = table_state.border_left.add(table_state.padding_left).add(layout_table_formatting_context_border_spacing_horizontal(this))
+    for row_group_box in layout_table_grid_child_boxes_matching(table_box, layout_table_grid_is_table_row_group):
+        var row_group_height = layout_zero_px()
+        var row_group_width = layout_zero_px()
+
+        let row_group_box_state = layout_state_get_mutable(state, row_group_box.layout_node_with_style())
+        layout_state_used_values_set_content_x(row_group_box_state, row_group_left_offset)
+        layout_state_used_values_set_content_y(row_group_box_state, row_group_top_offset)
+
+        var num_rows: i32 = 0
+        for row in layout_table_grid_child_boxes_matching(row_group_box, layout_table_grid_is_table_row):
+            let row_state = layout_state_get(state, row.layout_node_with_style())
+            row_group_height = row_group_height.add(layout_state_used_values_border_box_height(row_state))
+            row_group_width = ak.max(row_group_width, layout_state_used_values_border_box_width(row_state))
+            num_rows += 1
+        if num_rows >= 2:
+            row_group_height = row_group_height.add(gfx.mul_int_css_pixels(num_rows - 1, layout_table_formatting_context_border_spacing_vertical(this)))
+
+        layout_state_used_values_set_content_height(row_group_box_state, row_group_height)
+        layout_state_used_values_set_content_width(row_group_box_state, row_group_width)
+
+        row_group_top_offset = row_group_top_offset.add(row_group_height.add(layout_table_formatting_context_border_spacing_vertical(this) if num_rows > 0 else layout_zero_px()))
+
+    let total_content_height = ak.max(row_top_offset, row_group_top_offset).sub(table_state.offset.m_y).sub(table_state.padding_top)
+    this.m_table_height = ak.max(total_content_height, this.m_table_height)
+
+## The `cell_is_anonymous_wrapper_for_flex_or_grid` lambda of TableFormattingContext::position_cell_boxes.
+# When a table cell is an anonymous wrapper around a flex or grid container (e.g., a <td> with display:flex is
+# wrapped in an anonymous table-cell box per CSS Tables 3), the cell should be aligned to the top. This allows
+# the flex/grid container to fill the cell and handle alignment of its children via its own properties.
+func layout_table_formatting_context_cell_is_anonymous_wrapper_for_flex_or_grid(cell: const LayoutTableGridCell*) -> bool:
+    if not layout_node_is_anonymous(cell.box.layout_node()):
+        return false
+    let child = cell.box.layout_node().tree_node.m_first_child else return false
+    if child.tree_node.m_next_sibling != none:
+        return false
+    let display = css_computed_values_display(&layout_node_computed_values(child).computed_values)
+    return css_display_is_flex_inside(&display) or css_display_is_grid_inside(&display)
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:1188 Web::Layout::TableFormattingContext::position_cell_boxes.
+func layout_table_formatting_context_position_cell_boxes(this: LayoutTableFormattingContext*):
+    let state = this.formatting_context.m_state
+    var left_column_offset = layout_zero_px()
+    for column in &ak.vector_span(&this.m_columns):
+        column.left_offset = left_column_offset
+        left_column_offset = left_column_offset.add(column.used_width)
+
+    for cell in &ak.vector_span(&this.m_cells):
+        let cell_state = layout_state_get_mutable(state, cell.box.layout_node_with_style())
+        let row_state = layout_state_get(state, ak.vector_at(&this.m_rows, cell.row_index).box.layout_node_with_style())
+        let row_content_height = layout_table_formatting_context_compute_row_content_height(this, cell)
+        let vertical_align = css_computed_values_vertical_align(layout_box_computed(cell.box))
+        # The following image shows various alignment lines of a row:
+        # https://www.w3.org/TR/css-tables-3/images/cell-align-explainer.png
+        # https://drafts.csswg.org/css2/#height-layout
+        # In the context of tables, values for vertical-align have the following meanings:
+        if layout_table_formatting_context_cell_is_anonymous_wrapper_for_flex_or_grid(cell):
+            cell_state.padding_bottom = cell_state.padding_bottom.add(row_content_height.sub(layout_state_used_values_border_box_height(cell_state)))
+        elif let keyword = layout_formatting_context_vertical_align_keyword(vertical_align):
+            match keyword:
+                # The center of the cell is aligned with the center of the rows it spans.
+                .middle:
+                    let height_diff = row_content_height.sub(layout_state_used_values_border_box_height(cell_state))
+                    cell_state.padding_top = cell_state.padding_top.add(layout_div_int(height_diff, 2))
+                    cell_state.padding_bottom = cell_state.padding_bottom.add(layout_div_int(height_diff, 2))
+                # The top of the cell box is aligned with the top of the first row it spans.
+                .top:
+                    cell_state.padding_bottom = cell_state.padding_bottom.add(row_content_height.sub(layout_state_used_values_border_box_height(cell_state)))
+                # The bottom of the cell box is aligned with the bottom of the last row it spans.
+                .bottom:
+                    cell_state.padding_top = cell_state.padding_top.add(row_content_height.sub(layout_state_used_values_border_box_height(cell_state)))
+                # These values do not apply to cells; the cell is aligned at the baseline instead.
+                # (sub, super, text-bottom, text-top)
+                # The baseline of the cell is put at the same height as the baseline of the first of the rows it spans.
+                .sub, .super, .text_bottom, .text_top, .baseline:
+                    cell_state.padding_top = cell_state.padding_top.add(ak.vector_at(&this.m_rows, cell.row_index).baseline.sub(cell.baseline))
+                    cell_state.padding_bottom = cell_state.padding_bottom.add(row_content_height.sub(layout_state_used_values_border_box_height(cell_state)))
+                _:
+                    trap("VERIFY_NOT_REACHED")
+
+        # Compute cell position as specified by https://www.w3.org/TR/css-tables-3/#bounding-box-assignment:
+        # left/top location is the sum of:
+        # - for top: the height reserved for top captions (including margins), if any
+        # - the padding-left/padding-top and border-left-width/border-top-width of the table
+        # FIXME: Account for visibility.
+        layout_state_used_values_set_content_offset(cell_state, gfx.css_pixel_point_translated_css_pixels_css_pixels(&row_state.offset,
+                                                                                                                     layout_state_used_values_border_box_left(cell_state).add(ak.vector_at(&this.m_columns, cell.column_index).left_offset).add(layout_table_formatting_context_mul_count(layout_table_formatting_context_border_spacing_horizontal(this), cell.column_index)),
+                                                                                                                     layout_state_used_values_border_box_top(cell_state)))
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:1266 Web::Layout::TableFormattingContext::use_fixed_mode_layout.
+func layout_table_formatting_context_use_fixed_mode_layout(this: LayoutTableFormattingContext*) -> bool:
+    # Implements https://www.w3.org/TR/css-tables-3/#in-fixed-mode.
+    # A table-root is said to be laid out in fixed mode whenever the computed value of the table-layout property is equal to fixed, and the
+    # specified width of the table root is either a <length-percentage>, min-content or fit-content. When the specified width is not one of
+    # those values, or if the computed value of the table-layout property is auto, then the table-root is said to be laid out in auto mode.
+    let computed_values = layout_box_computed(layout_table_formatting_context_table_box(this))
+    let width = css_computed_values_width(computed_values)
+    return css_computed_values_table_layout(computed_values) == css_data.TableLayout.fixed and (css_size_is_length(&width) or css_size_is_percentage(&width) or css_size_is_min_content(&width) or css_size_is_fit_content(&width))

@@ -1,0 +1,508 @@
+#==============================================================================================
+#
+#   table_formatting_context_1 - Layout::TableFormattingContext: construction, captions and the
+#                                cell, column and row measures
+#
+#   DESCRIPTION:
+#       Port of LibWeb/Layout/TableFormattingContext.cpp (lines 1-467) and the inline members of
+#       TableFormattingContext.h: the table box and its wrapper, the wrapper's containing block,
+#       the layout of the captions (https://www.w3.org/TR/CSS22/tables.html#model), the
+#       constrainedness of rows and columns, the cell measures
+#       (https://www.w3.org/TR/css-tables-3/#computing-cell-measures), the outer content sizes
+#       of columns and rows, and the column and row measures over cells of span up to N with
+#       their intrinsic percentages
+#       (https://www.w3.org/TR/css-tables-3/#computing-column-measures).
+#
+#       The C++ templates over RowOrColumn (TableGrid::Row or TableFormattingContext::Column)
+#       take a LayoutTableDimension here; their per-type specializations are the `_row` and
+#       `_column` functions of table_formatting_context_5, and the members both types share are
+#       reached through a LayoutTableFormattingContextRowOrColumn (DESIGN.md §2.4: a generic body
+#       cannot specialize on its type parameter).
+#
+#       Copyright (c) 2020, Andreas Kling <andreas@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: CSSPixels arithmetic with counts ========================================================
+
+## `CSSPixels * size_t` and `size_t * CSSPixels`: the count becomes CSSPixels through CSSPixels(Unsigned), which
+## saturates, before the fixed-point multiplication.
+func layout_table_formatting_context_mul_count(value: gfx.CssPixels, count: usize) -> gfx.CssPixels:
+    return value.mul(gfx.css_pixels_from_unsigned((u64)count))
+
+## `CSSPixels / size_t` read as CSSPixels: a CSSPixelFraction over CSSPixels(Unsigned), converted by its operator
+## CSSPixels.
+func layout_table_formatting_context_div_count(value: gfx.CssPixels, count: usize) -> gfx.CssPixels:
+    let fraction = value.div(gfx.css_pixels_from_unsigned((u64)count))
+    return gfx.css_pixel_fraction_to_css_pixels(&fraction)
+
+## `size.percentage().value()`.
+func layout_table_formatting_context_percentage_value(size: const CssSize*) -> f64:
+    let percentage = css_size_percentage(size)
+    return css_percentage_value(&percentage)
+
+## `length_percentage.to_px_or_zero(box, reference_value)` of a padding side.
+func layout_table_formatting_context_to_px_or_zero(length_percentage: CssLengthPercentageOrAuto, box: LayoutBox*, reference_value: gfx.CssPixels) -> gfx.CssPixels:
+    return css_length_percentage_or_auto_to_px_or_zero(&length_percentage, box.layout_node(), reference_value)
+
+## `static_cast<HTML::HTMLElement const&>(*column_box.dom_node()).get_attribute_value(HTML::AttributeNames::span)
+## .to_number<unsigned>().value_or(1)`: the span a column's element asks for, as read at each column walk.
+func layout_table_formatting_context_column_span_attribute(column_box: LayoutNode*) -> u32:
+    let dom_node = layout_node_dom_node(column_box) else trap("a table column without a DOM node")
+    let span = dom_element_get_attribute_value((DomElement*)dom_node, html_attribute_names_span)
+    return ak.string_to_number_u32(&span) else 1
+
+## `m_available_space->` (and `*m_available_space`): VERIFYs that run_until_width_calculation() has set it.
+func layout_table_formatting_context_available_space(this: LayoutTableFormattingContext*) -> LayoutAvailableSpace:
+    return this.m_available_space else trap("VERIFY: m_available_space has a value")
+
+# mark: TableFormattingContext.h's inline members ===============================================
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.h:33 Web::Layout::TableFormattingContext::table_box.
+pub func layout_table_formatting_context_table_box(this: LayoutTableFormattingContext*) -> LayoutBox*:
+    return layout_formatting_context_context_box(this.layout_formatting_context())
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.h:34 Web::Layout::TableFormattingContext::table_wrapper.
+pub func layout_table_formatting_context_table_wrapper(this: LayoutTableFormattingContext*) -> LayoutTableWrapper*:
+    let containing_block = layout_node_containing_block(layout_table_formatting_context_table_box(this).layout_node()) else trap("a table box without a containing block")
+    return as_layout_table_wrapper(containing_block)
+
+# mark: Construction ============================================================================
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:17 Web::Layout::TableFormattingContext::TableFormattingContext.
+pub func layout_table_formatting_context_construct(this: LayoutTableFormattingContext*, state: LayoutState*, layout_mode: LayoutMode, root: LayoutBox*, parent: LayoutFormattingContext*?):
+    layout_formatting_context_construct(this.layout_formatting_context(), LayoutFormattingContextType.table, layout_mode, state, root, parent)
+    layout_formatting_context_set_class(this.layout_formatting_context(), &layout_table_formatting_context_class)
+    # The members' default initializers.
+    this.m_table_height = layout_zero_px()
+    this.m_automatic_content_height = layout_zero_px()
+    this.m_available_space = none
+    this.m_cells = ak.Vector[LayoutTableGridCell]()
+    this.m_cells_by_coordinate = ak.Vector[ak.Vector[const LayoutTableGridCell*?]]()
+    this.m_columns = ak.Vector[LayoutTableFormattingContextColumn]()
+    this.m_rows = ak.Vector[LayoutTableGridRow]()
+
+# TableFormattingContext::~TableFormattingContext() is the default destructor: layout_formatting_context_destruct has
+# nothing to run for this context.
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:24 Web::Layout::TableFormattingContext::table_wrapper_containing_block_width.
+func layout_table_formatting_context_table_wrapper_containing_block_width(this: LayoutTableFormattingContext*) -> gfx.CssPixels:
+    let containing_block = layout_node_containing_block(layout_table_formatting_context_table_wrapper(this).layout_node()) else trap("a table wrapper without a containing block")
+    let containing_block_used_values = layout_state_try_get_layout_node_with_style(this.formatting_context.m_state, containing_block.layout_node_with_style()) else return layout_zero_px()
+    return layout_state_used_values_content_width(containing_block_used_values)
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:32 Web::Layout::TableFormattingContext::table_wrapper_containing_block_height.
+func layout_table_formatting_context_table_wrapper_containing_block_height(this: LayoutTableFormattingContext*) -> gfx.CssPixels:
+    let containing_block = layout_node_containing_block(layout_table_formatting_context_table_wrapper(this).layout_node()) else trap("a table wrapper without a containing block")
+    let containing_block_used_values = layout_state_try_get_layout_node_with_style(this.formatting_context.m_state, containing_block.layout_node_with_style()) else return layout_zero_px()
+    return layout_state_used_values_content_height(containing_block_used_values)
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:40 Web::Layout::is_table_column_group.
+## It takes the Node, as the matcher of layout_table_grid_child_boxes_matching (it is only ever called with a Box).
+func layout_is_table_column_group(box: LayoutNode*) -> bool:
+    let display = layout_node_display(box)
+    return css_display_is_table_column_group(&display)
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:45 Web::Layout::is_table_column.
+## It takes the Node, as the matcher of layout_table_grid_child_boxes_matching (it is only ever called with a Box).
+func layout_is_table_column_layout_box(box: LayoutNode*) -> bool:
+    let display = layout_node_display(box)
+    return css_display_is_table_column(&display)
+
+# mark: Captions ================================================================================
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:50 Web::Layout::TableFormattingContext::run_caption_layout.
+func layout_table_formatting_context_run_caption_layout(this: LayoutTableFormattingContext*, phase: css_data.CaptionSide, caption_available_space: LayoutAvailableSpace) -> gfx.CssPixels:
+    let base = this.layout_formatting_context()
+    let state = base.m_state
+    let table_box = layout_table_formatting_context_table_box(this)
+    var caption_height = layout_zero_px()
+    for child in layout_node_children(table_box.layout_node()):
+        let child_display = layout_node_display(child)
+        if not css_display_is_table_caption(&child_display) or css_computed_values_caption_side(&layout_node_computed_values(child).computed_values) != phase:
+            continue
+        let child_box = as_layout_box(child)
+        # The caption boxes are principal block-level boxes that retain their own content, padding, margin, and border areas,
+        # and are rendered as normal block boxes inside the table wrapper box, as described in https://www.w3.org/TR/CSS22/tables.html#model
+        if let caption_context = layout_formatting_context_create_independent_formatting_context_if_needed(base, state, base.m_layout_mode, child_box):
+            # The OwnPtr is destroyed at the end of this block.
+            defer layout_formatting_context_destruct(caption_context)
+            var inner_available_space = caption_available_space
+            let block_context = as_if_layout_block_formatting_context(caption_context)
+            if let block_formatting_context = block_context:
+                let available_width = layout_available_size_to_px_or_zero(&caption_available_space.width)
+                layout_block_formatting_context_resolve_vertical_box_model_metrics(block_formatting_context, child_box, available_width)
+                layout_block_formatting_context_compute_width(block_formatting_context, child_box, caption_available_space)
+                inner_available_space = layout_state_used_values_available_inner_space_or_constraints_from(layout_state_get(state, child_box.layout_node_with_style()), caption_available_space)
+
+            layout_formatting_context_run(caption_context, inner_available_space)
+
+            if block_context != none:
+                let caption_state = layout_state_get_mutable(state, child_box.layout_node_with_style())
+
+                # Adjust x offset so border-box aligns with the table wrapper.
+                layout_state_used_values_set_content_x(caption_state, caption_state.offset.m_x.add(caption_state.border_left).add(caption_state.padding_left))
+
+                if layout_formatting_context_should_treat_height_as_auto(base, child_box, caption_available_space):
+                    let height = layout_zero_px() if layout_node_has_size_containment(child_box.layout_node()) else layout_formatting_context_automatic_content_height(caption_context)
+                    layout_state_used_values_set_content_height(caption_state, height)
+
+        let caption_state = layout_state_get(state, child_box.layout_node_with_style())
+        if phase == css_data.CaptionSide.top:
+            layout_state_used_values_set_content_y(layout_state_get_mutable(state, table_box.layout_node_with_style()), layout_state_used_values_content_height(caption_state).add(layout_state_used_values_margin_box_bottom(caption_state)))
+        else:
+            layout_state_used_values_set_content_y(layout_state_get_mutable(state, child_box.layout_node_with_style()),
+                                                   layout_state_used_values_margin_box_height(layout_state_get(state, table_box.layout_node_with_style())).add(layout_state_used_values_margin_box_top(caption_state)))
+        caption_height = caption_height.add(layout_state_used_values_margin_box_height(caption_state))
+    return caption_height
+
+# mark: Constrainedness and cell measures =======================================================
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:97 Web::Layout::TableFormattingContext::compute_constrainedness.
+func layout_table_formatting_context_compute_constrainedness(this: LayoutTableFormattingContext*):
+    # Definition of constrainedness: https://www.w3.org/TR/css-tables-3/#constrainedness
+    # NB: The definition uses https://www.w3.org/TR/CSS21/visudet.html#propdef-width for width, which doesn't include
+    #     keyword values. The remaining checks can be simplified to checking whether the size is a length.
+    var column_index: usize = 0
+    for column_group_box in layout_table_grid_child_boxes_matching(layout_table_formatting_context_table_box(this), layout_is_table_column_group):
+        for column_box in layout_table_grid_child_boxes_matching(column_group_box, layout_is_table_column_layout_box):
+            let width = css_computed_values_width(layout_box_computed(column_box))
+            if css_size_is_length(&width):
+                ak.vector_at(&this.m_columns, column_index).is_constrained = true
+            let span = layout_table_formatting_context_column_span_attribute(column_box.layout_node())
+            column_index += span
+
+    for row in &ak.vector_span(&this.m_rows):
+        let height = css_computed_values_height(layout_box_computed(row.box))
+        if css_size_is_length(&height):
+            row.is_constrained = true
+
+    for cell in &ak.vector_span(&this.m_cells):
+        let computed_values = layout_box_computed(cell.box)
+        let width = css_computed_values_width(computed_values)
+        if css_size_is_length(&width):
+            ak.vector_at(&this.m_columns, cell.column_index).is_constrained = true
+
+        let height = css_computed_values_height(computed_values)
+        if css_size_is_length(&height):
+            ak.vector_at(&this.m_rows, cell.row_index).is_constrained = true
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:134 Web::Layout::TableFormattingContext::compute_cell_measures.
+func layout_table_formatting_context_compute_cell_measures(this: LayoutTableFormattingContext*):
+    let base = this.layout_formatting_context()
+    # Implements https://www.w3.org/TR/css-tables-3/#computing-cell-measures.
+    let containing_block_width = layout_table_formatting_context_table_wrapper_containing_block_width(this)
+    let containing_block_height = layout_table_formatting_context_table_wrapper_containing_block_height(this)
+
+    layout_table_formatting_context_compute_constrainedness(this)
+
+    for cell in &ak.vector_span(&this.m_cells):
+        let computed_values = layout_box_computed(cell.box)
+        let padding = css_computed_values_padding(computed_values)
+        let padding_top = layout_table_formatting_context_to_px_or_zero(css_length_box_top_const(&padding), cell.box, containing_block_height)
+        let padding_bottom = layout_table_formatting_context_to_px_or_zero(css_length_box_bottom_const(&padding), cell.box, containing_block_height)
+        let padding_left = layout_table_formatting_context_to_px_or_zero(css_length_box_left_const(&padding), cell.box, containing_block_width)
+        let padding_right = layout_table_formatting_context_to_px_or_zero(css_length_box_right_const(&padding), cell.box, containing_block_width)
+
+        let cell_state = layout_state_get(base.m_state, cell.box.layout_node_with_style())
+        let use_collapsing_borders_model = layout_state_used_values_override_borders_data(cell_state) != none
+        # Implement the collapsing border model https://www.w3.org/TR/CSS22/tables.html#collapsing-borders.
+        let border_top = gfx.round(layout_div_int(cell_state.border_top, 2)) if use_collapsing_borders_model else css_computed_values_border_top(computed_values).width
+        let border_bottom = gfx.round(layout_div_int(cell_state.border_bottom, 2)) if use_collapsing_borders_model else css_computed_values_border_bottom(computed_values).width
+        let border_left = gfx.round(layout_div_int(cell_state.border_left, 2)) if use_collapsing_borders_model else css_computed_values_border_left(computed_values).width
+        let border_right = gfx.round(layout_div_int(cell_state.border_right, 2)) if use_collapsing_borders_model else css_computed_values_border_right(computed_values).width
+
+        let min_content_width = layout_formatting_context_calculate_min_content_width(base, cell.box)
+        let max_content_width = layout_formatting_context_calculate_max_content_width(base, cell.box)
+        let min_content_height = layout_formatting_context_calculate_min_content_height(base, cell.box, max_content_width)
+        let max_content_height = layout_formatting_context_calculate_max_content_height(base, cell.box, min_content_width)
+
+        # The outer min-content height of a table-cell is max(min-height, min-content height) adjusted by the cell intrinsic offsets.
+        let computed_min_height = css_computed_values_min_height(computed_values)
+        let min_height = css_size_to_px(&computed_min_height, cell.box.layout_node(), containing_block_height)
+        let cell_intrinsic_height_offsets = padding_top.add(padding_bottom).add(border_top).add(border_bottom)
+        cell.outer_min_height = ak.max(min_height, min_content_height).add(cell_intrinsic_height_offsets)
+        # The outer min-content width of a table-cell is max(min-width, min-content width) adjusted by the cell intrinsic offsets.
+        let computed_min_width = css_computed_values_min_width(computed_values)
+        let min_width = css_size_to_px(&computed_min_width, cell.box.layout_node(), containing_block_width)
+        let cell_intrinsic_width_offsets = padding_left.add(padding_right).add(border_left).add(border_right)
+        # For fixed mode, according to https://www.w3.org/TR/css-tables-3/#computing-column-measures:
+        # The min-content and max-content width of cells is considered zero unless they are directly specified as a length-percentage,
+        # in which case they are resolved based on the table width (if it is definite, otherwise use 0).
+        let computed_width = css_computed_values_width(computed_values)
+        let width_is_specified_length_or_percentage = css_size_is_length(&computed_width) or css_size_is_percentage(&computed_width)
+        if not layout_table_formatting_context_use_fixed_mode_layout(this) or width_is_specified_length_or_percentage:
+            cell.outer_min_width = ak.max(min_width, min_content_width).add(cell_intrinsic_width_offsets)
+
+        # The tables specification isn't explicit on how to use the height and max-height CSS properties in the outer max-content formulas.
+        # However, during this early phase we don't have enough information to resolve percentage sizes yet and the formulas for outer sizes
+        # in the specification give enough clues to pick defaults in a way that makes sense.
+        let computed_height = css_computed_values_height(computed_values)
+        let height = css_size_to_px(&computed_height, cell.box.layout_node(), containing_block_height) if css_size_is_length(&computed_height) else layout_zero_px()
+        let computed_max_height = css_computed_values_max_height(computed_values)
+        let max_height = css_size_to_px(&computed_max_height, cell.box.layout_node(), containing_block_height) if css_size_is_length(&computed_max_height) else gfx.css_pixels_max()
+        if ak.vector_at(&this.m_rows, cell.row_index).is_constrained:
+            # The outer max-content height of a table-cell in a constrained row is
+            # max(min-height, height, min-content height, min(max-height, height)) adjusted by the cell intrinsic offsets.
+            # NB: min(max-height, height) doesn't have any effect here, we can simplify the expression to max(min-height, height, min-content height).
+            cell.outer_max_height = ak.max(min_height, ak.max(height, min_content_height)).add(cell_intrinsic_height_offsets)
+        else:
+            # The outer max-content height of a table-cell in a non-constrained row is
+            # max(min-height, height, min-content height, min(max-height, max-content height)) adjusted by the cell intrinsic offsets.
+            cell.outer_max_height = ak.max(min_height, ak.max(height, ak.max(min_content_height, ak.min(max_height, max_content_height)))).add(cell_intrinsic_height_offsets)
+
+        # See the explanation for height and max_height above.
+        let width = css_size_to_px(&computed_width, cell.box.layout_node(), containing_block_width) if css_size_is_length(&computed_width) else layout_zero_px()
+        let computed_max_width = css_computed_values_max_width(computed_values)
+        let max_width = css_size_to_px(&computed_max_width, cell.box.layout_node(), containing_block_width) if css_size_is_length(&computed_max_width) else gfx.css_pixels_max()
+        if layout_table_formatting_context_use_fixed_mode_layout(this) and not width_is_specified_length_or_percentage:
+            continue
+        if ak.vector_at(&this.m_columns, cell.column_index).is_constrained:
+            # The outer max-content width of a table-cell in a constrained column is
+            # max(min-width, width, min-content width, min(max-width, width)) adjusted by the cell intrinsic offsets.
+            # NB: min(max-width, width) doesn't have any effect here, we can simplify the expression to max(min-width, width, min-content width).
+            cell.outer_max_width = ak.max(min_width, ak.max(width, min_content_width)).add(cell_intrinsic_width_offsets)
+        else:
+            # The outer max-content width of a table-cell in a non-constrained column is
+            # max(min-width, width, min-content width, min(max-width, max-content width)) adjusted by the cell intrinsic offsets.
+            cell.outer_max_width = ak.max(min_width, ak.max(width, ak.max(min_content_width, ak.min(max_width, max_content_width)))).add(cell_intrinsic_width_offsets)
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:212 Web::Layout::TableFormattingContext::compute_outer_content_sizes.
+func layout_table_formatting_context_compute_outer_content_sizes(this: LayoutTableFormattingContext*):
+    let containing_block_width = layout_table_formatting_context_table_wrapper_containing_block_width(this)
+    let containing_block_height = layout_table_formatting_context_table_wrapper_containing_block_height(this)
+
+    var column_index: usize = 0
+    for column_group_box in layout_table_grid_child_boxes_matching(layout_table_formatting_context_table_box(this), layout_is_table_column_group):
+        for column_box in layout_table_grid_child_boxes_matching(column_group_box, layout_is_table_column_layout_box):
+            let computed_values = layout_box_computed(column_box)
+            let computed_min_width = css_computed_values_min_width(computed_values)
+            let min_width = css_size_to_px(&computed_min_width, column_box.layout_node(), containing_block_width)
+            let computed_max_width = css_computed_values_max_width(computed_values)
+            let max_width = css_size_to_px(&computed_max_width, column_box.layout_node(), containing_block_width) if css_size_is_length(&computed_max_width) else gfx.css_pixels_max()
+            let computed_width = css_computed_values_width(computed_values)
+            let width = css_size_to_px(&computed_width, column_box.layout_node(), containing_block_width)
+            # The outer min-content width of a table-column or table-column-group is max(min-width, width).
+            ak.vector_at(&this.m_columns, column_index).min_size = ak.max(min_width, width)
+            # The outer max-content width of a table-column or table-column-group is max(min-width, min(max-width, width)).
+            ak.vector_at(&this.m_columns, column_index).max_size = ak.max(min_width, ak.min(max_width, width))
+            let span = layout_table_formatting_context_column_span_attribute(column_box.layout_node())
+            column_index += span
+
+    for row in &ak.vector_span(&this.m_rows):
+        let computed_values = layout_box_computed(row.box)
+        let computed_min_height = css_computed_values_min_height(computed_values)
+        let min_height = css_size_to_px(&computed_min_height, row.box.layout_node(), containing_block_height)
+        let computed_max_height = css_computed_values_max_height(computed_values)
+        let max_height = css_size_to_px(&computed_max_height, row.box.layout_node(), containing_block_height) if css_size_is_length(&computed_max_height) else gfx.css_pixels_max()
+        let computed_height = css_computed_values_height(computed_values)
+        let height = css_size_to_px(&computed_height, row.box.layout_node(), containing_block_height)
+        # The outer min-content height of a table-row or table-row-group is max(min-height, height).
+        row.min_size = ak.max(min_height, height)
+        # The outer max-content height of a table-row or table-row-group is max(min-height, min(max-height, height)).
+        row.max_size = ak.max(min_height, ak.min(max_height, height))
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:247 Web::Layout::TableFormattingContext::initialize_table_measures<Row>.
+func layout_table_formatting_context_initialize_table_measures_row(this: LayoutTableFormattingContext*):
+    let containing_block_height = layout_table_formatting_context_table_wrapper_containing_block_height(this)
+
+    for cell in &ak.vector_span(&this.m_cells):
+        let computed_values = layout_box_computed(cell.box)
+        if cell.row_span == 1:
+            let computed_height = css_computed_values_height(computed_values)
+            let specified_height = css_size_to_px(&computed_height, cell.box.layout_node(), containing_block_height)
+            # https://www.w3.org/TR/css-tables-3/#row-layout makes specified cell height part of the initialization formula for row table measures:
+            # This is done by running the same algorithm as the column measurement, with the span=1 value being initialized (for min-content) with
+            # the largest of the resulting height of the previous row layout, the height specified on the corresponding table-row (if any), and
+            # the largest height specified on cells that span this row only (the algorithm starts by considering cells of span 2 on top of that assignment).
+            ak.vector_at(&this.m_rows, cell.row_index).min_size = ak.max(ak.vector_at(&this.m_rows, cell.row_index).min_size, ak.max(cell.outer_min_height, specified_height))
+            ak.vector_at(&this.m_rows, cell.row_index).max_size = ak.max(ak.vector_at(&this.m_rows, cell.row_index).max_size, cell.outer_max_height)
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:266 Web::Layout::TableFormattingContext::initialize_table_measures<Column>.
+func layout_table_formatting_context_initialize_table_measures_column(this: LayoutTableFormattingContext*):
+    # Implement the following parts of the specification, accounting for fixed layout mode:
+    # https://www.w3.org/TR/css-tables-3/#min-content-width-of-a-column-based-on-cells-of-span-up-to-1
+    # https://www.w3.org/TR/css-tables-3/#max-content-width-of-a-column-based-on-cells-of-span-up-to-1
+    for cell in &ak.vector_span(&this.m_cells):
+        if cell.column_span == 1 and (cell.row_index == 0 or not layout_table_formatting_context_use_fixed_mode_layout(this)):
+            ak.vector_at(&this.m_columns, cell.column_index).min_size = ak.max(ak.vector_at(&this.m_columns, cell.column_index).min_size, cell.outer_min_width)
+            ak.vector_at(&this.m_columns, cell.column_index).max_size = ak.max(ak.vector_at(&this.m_columns, cell.column_index).max_size, cell.outer_max_width)
+
+## `initialize_table_measures<RowOrColumn>()`.
+func layout_table_formatting_context_initialize_table_measures(this: LayoutTableFormattingContext*, dimension: LayoutTableDimension):
+    if dimension == LayoutTableDimension.row:
+        layout_table_formatting_context_initialize_table_measures_row(this)
+    else:
+        layout_table_formatting_context_initialize_table_measures_column(this)
+
+# mark: Measures over spanning cells ============================================================
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:280 Web::Layout::TableFormattingContext::compute_intrinsic_percentage.
+func layout_table_formatting_context_compute_intrinsic_percentage(this: LayoutTableFormattingContext*, dimension: LayoutTableDimension, max_cell_span: usize):
+    let rows_or_columns_size = layout_table_formatting_context_table_rows_or_columns_size(this, dimension)
+
+    # https://www.w3.org/TR/css-tables-3/#intrinsic-percentage-width-of-a-column-based-on-cells-of-span-up-to-1
+    layout_table_formatting_context_initialize_intrinsic_percentages_from_rows_or_columns(this, dimension)
+    layout_table_formatting_context_initialize_intrinsic_percentages_from_cells(this, dimension)
+
+    # Stores intermediate values for intrinsic percentage based on cells of span up to N for the iterative algorithm, to store them back at the end of the step.
+    var intrinsic_percentage_contribution_by_index = ak.Vector[f64]()
+    ak.vector_resize(&intrinsic_percentage_contribution_by_index, rows_or_columns_size)
+    for rc_index in 0..<rows_or_columns_size:
+        *ak.vector_at(&intrinsic_percentage_contribution_by_index, rc_index) = *layout_table_formatting_context_table_row_or_column(this, dimension, rc_index).intrinsic_percentage
+
+    let cells = ak.vector_span(&this.m_cells)
+    for current_span in 2..=max_cell_span:
+        # https://www.w3.org/TR/css-tables-3/#intrinsic-percentage-width-of-a-column-based-on-cells-of-span-up-to-n-n--1
+        for cell in &cells:
+            let cell_span_value = layout_table_formatting_context_cell_span(dimension, cell)
+            if cell_span_value != current_span:
+                continue
+            let cell_start_rc_index = layout_table_formatting_context_cell_index(dimension, cell)
+            let cell_end_rc_index = cell_start_rc_index + cell_span_value
+            # 1. Start with the percentage contribution of the cell.
+            var cell_contribution = gfx.css_pixels_nearest_value_for_f64(layout_table_formatting_context_cell_percentage_contribution(dimension, cell))
+            # 2. Subtract the intrinsic percentage width of the column based on cells of span up to N-1 of all columns
+            #    that the cell spans. If this gives a negative result, change it to 0%.
+            for rc_index in cell_start_rc_index..<cell_end_rc_index:
+                let row_or_column = layout_table_formatting_context_table_row_or_column(this, dimension, rc_index)
+                cell_contribution = cell_contribution.sub(gfx.css_pixels_nearest_value_for_f64(*row_or_column.intrinsic_percentage))
+                cell_contribution = ak.max(cell_contribution, layout_zero_px())
+            # Compute the sum of the non-spanning max-content sizes of all rows / columns spanned by the cell that have an intrinsic percentage
+            # size of the row / column based on cells of span up to N-1 equal to 0%, to be used in step 3 of the cell contribution algorithm.
+            var width_sum_of_columns_with_zero_intrinsic_percentage = layout_zero_px()
+            var number_of_columns_with_zero_intrinsic_percentage: usize = 0
+            for rc_index in cell_start_rc_index..<cell_end_rc_index:
+                let row_or_column = layout_table_formatting_context_table_row_or_column(this, dimension, rc_index)
+                if *row_or_column.intrinsic_percentage == 0.0:
+                    width_sum_of_columns_with_zero_intrinsic_percentage = width_sum_of_columns_with_zero_intrinsic_percentage.add(*row_or_column.max_size)
+                    number_of_columns_with_zero_intrinsic_percentage += 1
+            for rc_index in cell_start_rc_index..<cell_end_rc_index:
+                let row_or_column = layout_table_formatting_context_table_row_or_column(this, dimension, rc_index)
+                # If the intrinsic percentage width of a column based on cells of span up to N-1 is greater than 0%, then the intrinsic percentage width of
+                # the column based on cells of span up to N is the same as the intrinsic percentage width of the column based on cells of span up to N-1.
+                if *row_or_column.intrinsic_percentage > 0.0:
+                    continue
+                # Otherwise, it is the largest of the contributions of the cells in the column whose colSpan is N,
+                # where the contribution of a cell is the result of taking the following steps:
+                # 1. Start with the percentage contribution of the cell.
+                # 2. Subtract the intrinsic percentage width of the column based on cells of span up to N-1 of all columns
+                #    that the cell spans. If this gives a negative result, change it to 0%.
+                # 3. Multiply by the ratio of the column’s non-spanning max-content width to the sum of the non-spanning max-content widths of all
+                #    columns spanned by the cell that have an intrinsic percentage width of the column based on cells of span up to N-1 equal to 0%.
+                var adjusted_cell_contribution = layout_zero_px()
+                if width_sum_of_columns_with_zero_intrinsic_percentage != layout_zero_px():
+                    adjusted_cell_contribution = gfx.css_pixels_scaled_f64(&cell_contribution, gfx.div_css_pixels_f64(*row_or_column.max_size, width_sum_of_columns_with_zero_intrinsic_percentage.to_double()))
+                else:
+                    # However, if this ratio is undefined because the denominator is zero, instead use the 1 divided by the number of columns
+                    # spanned by the cell that have an intrinsic percentage width of the column based on cells of span up to N-1 equal to zero.
+                    adjusted_cell_contribution = layout_table_formatting_context_div_count(gfx.mul_css_pixels_int(cell_contribution, 1), number_of_columns_with_zero_intrinsic_percentage)
+                let contribution = ak.vector_at(&intrinsic_percentage_contribution_by_index, rc_index)
+                *contribution = ak.max_f64(adjusted_cell_contribution.to_double(), *contribution)
+        for rc_index in 0..<rows_or_columns_size:
+            *layout_table_formatting_context_table_row_or_column(this, dimension, rc_index).intrinsic_percentage = *ak.vector_at(&intrinsic_percentage_contribution_by_index, rc_index)
+
+    # Clamp total intrinsic percentage to 100%: https://www.w3.org/TR/css-tables-3/#intrinsic-percentage-width-of-a-column
+    var total_intrinsic_percentage: f64 = 0.0
+    for rc_index in 0..<rows_or_columns_size:
+        let row_or_column = layout_table_formatting_context_table_row_or_column(this, dimension, rc_index)
+        *row_or_column.intrinsic_percentage = ak.max_f64(ak.min_f64(100.0 - total_intrinsic_percentage, *row_or_column.intrinsic_percentage), 0.0)
+        total_intrinsic_percentage += *row_or_column.intrinsic_percentage
+
+## Ported from Libraries/LibWeb/Layout/TableFormattingContext.cpp:360 Web::Layout::TableFormattingContext::compute_table_measures.
+func layout_table_formatting_context_compute_table_measures(this: LayoutTableFormattingContext*, dimension: LayoutTableDimension):
+    layout_table_formatting_context_initialize_table_measures(this, dimension)
+
+    let rows_or_columns_size = layout_table_formatting_context_table_rows_or_columns_size(this, dimension)
+    let cells = ak.vector_span(&this.m_cells)
+
+    var max_cell_span: usize = 1
+    for cell in &cells:
+        max_cell_span = ak.max(max_cell_span, layout_table_formatting_context_cell_span(dimension, cell))
+
+    # Since the intrinsic percentage specification uses non-spanning max-content size for the iterative algorithm,
+    # run it before we compute the spanning max-content size with its own iterative algorithm for span up to N.
+    layout_table_formatting_context_compute_intrinsic_percentage(this, dimension, max_cell_span)
+
+    for current_span in 2..=max_cell_span:
+        # https://www.w3.org/TR/css-tables-3/#min-content-width-of-a-column-based-on-cells-of-span-up-to-n-n--1
+        var cell_min_contributions_by_rc_index = ak.Vector[ak.Vector[gfx.CssPixels]]()
+        ak.vector_resize(&cell_min_contributions_by_rc_index, rows_or_columns_size)
+        # https://www.w3.org/TR/css-tables-3/#max-content-width-of-a-column-based-on-cells-of-span-up-to-n-n--1
+        var cell_max_contributions_by_rc_index = ak.Vector[ak.Vector[gfx.CssPixels]]()
+        ak.vector_resize(&cell_max_contributions_by_rc_index, rows_or_columns_size)
+        for cell in &cells:
+            let cell_span_value = layout_table_formatting_context_cell_span(dimension, cell)
+            if cell_span_value == current_span:
+                # Define the baseline max-content size as the sum of the max-content sizes based on cells of span up to N-1 of all columns that the cell spans.
+                let cell_start_rc_index = layout_table_formatting_context_cell_index(dimension, cell)
+                let cell_end_rc_index = cell_start_rc_index + cell_span_value
+                var baseline_max_content_size = layout_zero_px()
+                for rc_index in cell_start_rc_index..<cell_end_rc_index:
+                    baseline_max_content_size = baseline_max_content_size.add(*layout_table_formatting_context_table_row_or_column(this, dimension, rc_index).max_size)
+                var baseline_min_content_size = layout_zero_px()
+                for rc_index in cell_start_rc_index..<cell_end_rc_index:
+                    baseline_min_content_size = baseline_min_content_size.add(*layout_table_formatting_context_table_row_or_column(this, dimension, rc_index).min_size)
+
+                # Define the baseline border spacing as the sum of the horizontal border-spacing for any columns spanned by the cell, other than the one in which the cell originates.
+                let baseline_border_spacing = layout_table_formatting_context_mul_count(layout_table_formatting_context_border_spacing(this, dimension), cell_span_value - 1)
+
+                # Add contribution from all rows / columns, since we've weighted the gap to the desired spanned size by the the
+                # ratio of the max-content size based on cells of span up to N-1 of the row / column to the baseline max-content width.
+                for rc_index in cell_start_rc_index..<cell_end_rc_index:
+                    let row_or_column = layout_table_formatting_context_table_row_or_column(this, dimension, rc_index)
+                    # The contribution of the cell is the sum of:
+                    # the min-content size of the column based on cells of span up to N-1
+                    var cell_min_contribution = *row_or_column.min_size
+                    # the product of:
+                    # - the ratio of:
+                    #   - the max-content size of the row / column based on cells of span up to N-1 of the row / column minus the
+                    #     min-content size of the row / column based on cells of span up to N-1 of the row / column, to
+                    #   - the baseline max-content size minus the baseline min-content size
+                    #   or zero if this ratio is undefined, and
+                    # - the outer min-content size of the cell minus the baseline min-content size and the baseline border spacing, clamped
+                    #   to be at least 0 and at most the difference between the baseline max-content size and the baseline min-content size
+                    let normalized_max_min_diff = gfx.div_css_pixels_f64((*row_or_column.max_size).sub(*row_or_column.min_size), baseline_max_content_size.sub(baseline_min_content_size).to_double()) if baseline_max_content_size != baseline_min_content_size else 0.0
+                    let clamped_diff_to_baseline_min = ak.min(
+                        ak.max(layout_table_formatting_context_cell_min_size(dimension, cell).sub(baseline_min_content_size).sub(baseline_border_spacing), layout_zero_px()),
+                        baseline_max_content_size.sub(baseline_min_content_size))
+                    cell_min_contribution = cell_min_contribution.add(gfx.css_pixels_nearest_value_for_f64(gfx.mul_css_pixels_f64(clamped_diff_to_baseline_min, normalized_max_min_diff)))
+                    # the product of:
+                    # - the ratio of the max-content size based on cells of span up to N-1 of the column to the baseline max-content size
+                    # - the outer min-content size of the cell minus the baseline max-content size and baseline border spacing, or 0 if this is negative
+                    if baseline_max_content_size != layout_zero_px():
+                        cell_min_contribution = cell_min_contribution.add(gfx.css_pixels_nearest_value_for_f64(gfx.div_css_pixels_f64(*row_or_column.max_size, baseline_max_content_size.to_double())).mul(ak.max(layout_zero_px(), layout_table_formatting_context_cell_min_size(dimension, cell).sub(baseline_max_content_size).sub(baseline_border_spacing))))
+                    else:
+                        # AD-HOC: The spec does not define behavior when baseline is zero. We distribute equally.
+                        #         This matches how undefined ratios are handled elsewhere.
+                        cell_min_contribution = cell_min_contribution.add(layout_table_formatting_context_div_count(ak.max(layout_zero_px(), layout_table_formatting_context_cell_min_size(dimension, cell).sub(baseline_border_spacing)), cell_span_value))
+
+                    # The contribution of the cell is the sum of:
+                    # the max-content size of the column based on cells of span up to N-1
+                    var cell_max_contribution = *row_or_column.max_size
+                    # and the product of:
+                    # - the ratio of the max-content size based on cells of span up to N-1 of the column to the baseline max-content size
+                    # - the outer max-content size of the cell minus the baseline max-content size and the baseline border spacing, or 0 if this is negative
+                    if baseline_max_content_size != layout_zero_px():
+                        cell_max_contribution = cell_max_contribution.add(gfx.css_pixels_nearest_value_for_f64(gfx.div_css_pixels_f64(*row_or_column.max_size, baseline_max_content_size.to_double())).mul(ak.max(layout_zero_px(), layout_table_formatting_context_cell_max_size(dimension, cell).sub(baseline_max_content_size).sub(baseline_border_spacing))))
+                    else:
+                        # AD-HOC: The spec does not define behavior when baseline is zero. We distribute equally,
+                        #         This matches how undefined ratios are handled elsewhere.
+                        cell_max_contribution = cell_max_contribution.add(layout_table_formatting_context_div_count(ak.max(layout_zero_px(), layout_table_formatting_context_cell_max_size(dimension, cell).sub(baseline_border_spacing)), cell_span_value))
+                    ak.vector_append_t(ak.vector_at(&cell_min_contributions_by_rc_index, rc_index), cell_min_contribution)
+                    ak.vector_append_t(ak.vector_at(&cell_max_contributions_by_rc_index, rc_index), cell_max_contribution)
+
+        for rc_index in 0..<rows_or_columns_size:
+            let row_or_column = layout_table_formatting_context_table_row_or_column(this, dimension, rc_index)
+            # min-content size of a row / column based on cells of span up to N (N > 1) is
+            # the largest of the min-content size of the row / column based on cells of span up to N-1 and
+            # the contributions of the cells in the row / column whose rowSpan / colSpan is N
+            for min_contribution in ak.vector_span(ak.vector_at(&cell_min_contributions_by_rc_index, rc_index)):
+                *row_or_column.min_size = ak.max(*row_or_column.min_size, min_contribution)
+
+            # max-content size of a row / column based on cells of span up to N (N > 1) is
+            # the largest of the max-content size based on cells of span up to N-1 and the contributions of
+            # the cells in the row / column whose rowSpan / colSpan is N
+            for max_contribution in ak.vector_span(ak.vector_at(&cell_max_contributions_by_rc_index, rc_index)):
+                *row_or_column.max_size = ak.max(*row_or_column.max_size, max_contribution)
