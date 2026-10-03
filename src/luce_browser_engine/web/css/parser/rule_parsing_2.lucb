@@ -1,0 +1,292 @@
+#==============================================================================================
+#
+#   rule_parsing_2 - converting parsed rules to CSSOM rules: @layer, @keyframes, @namespace
+#                    and @supports
+#
+#   DESCRIPTION:
+#       Port of LibWeb/CSS/Parser/RuleParsing.cpp (lines 358-708): convert_to_layer_rule (block
+#       and statement forms), convert_to_keyframes_rule (its for_each lambdas are the
+#       functions before it), convert_to_namespace_rule and convert_to_supports_rule.
+#
+#       Copyright (c) 2018-2022, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2020-2021, the SerenityOS developers.
+#       Copyright (c) 2021-2026, Sam Atkins <sam@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: @layer ==================================================================================
+
+## Ported from Libraries/LibWeb/CSS/Parser/RuleParsing.cpp:358 Web::CSS::Parser::Parser::convert_to_layer_rule.
+pub func css_parser_convert_to_layer_rule[TNestedDeclarationsRule](this: CssParser*, rule: css_syntax.AtRule, nested: CssParserNested) -> CssRule*?:
+    # https://drafts.csswg.org/css-cascade-5/#at-layer
+    if rule.is_block_rule:
+        # CSSLayerBlockRule
+        # @layer <layer-name>? {
+        #   <rule-list>
+        # }
+
+        # First, the name
+        var layer_name = ak.fly_string_new()
+        var prelude_tokens = css_syntax.token_stream_create(rule.prelude)
+        if let name = css_parser_parse_layer_name(this, &prelude_tokens, CssParserAllowBlankLayerName.yes):
+            layer_name = name
+        else:
+            css_report_invalid_rule(ak.fly_string_from_str("@layer"), css_syntax.token_stream_dump_string(&prelude_tokens), ak.string_from_str("Not a valid layer name."))
+            return none
+
+        css_syntax.token_stream_discard_whitespace(&prelude_tokens)
+        if css_syntax.token_stream_has_next_token(&prelude_tokens):
+            css_report_invalid_rule(ak.fly_string_from_str("@layer"), css_syntax.token_stream_dump_string(&prelude_tokens),
+                                    ak.string_from_str("Trailing tokens after name in prelude."))
+            return none
+
+        # Then the rules
+        var child_rules = ak.Vector[CssRule*]()
+        for child in ak.vector_span_const(&rule.child_rules_and_lists_of_declarations):
+            match child:
+                .rule(child_rule):
+                    if let converted_rule = css_parser_convert_to_rule[TNestedDeclarationsRule](this, child_rule, nested):
+                        ak.vector_append_t(&child_rules, converted_rule)
+                .vector_declaration(declarations):
+                    ak.vector_append_t(&child_rules, css_parser_create_nested_declarations_rule[TNestedDeclarationsRule](this, declarations))
+        let rule_list = css_rule_list_create(css_parser_realm(this), ak.vector_span_const(&child_rules))
+        return css_layer_block_rule_create(css_parser_realm(this), layer_name, rule_list).css_rule()
+
+    # CSSLayerStatementRule
+    # @layer <layer-name>#;
+    var prelude_tokens = css_syntax.token_stream_create(rule.prelude)
+    css_syntax.token_stream_discard_whitespace(&prelude_tokens)
+    var layer_names = ak.Vector[ak.FlyString]()
+    while css_syntax.token_stream_has_next_token(&prelude_tokens):
+        # Comma
+        if not ak.vector_is_empty(&layer_names):
+            let comma = css_syntax.token_stream_consume_a_token(&prelude_tokens)
+            if not css_syntax.component_value_is(&comma, .comma):
+                css_report_invalid_rule(ak.fly_string_from_str("@layer"), css_syntax.token_stream_dump_string(&prelude_tokens),
+                                        ak.string_from_str("Missing comma between layer names."))
+                return none
+            css_syntax.token_stream_discard_whitespace(&prelude_tokens)
+
+        if let name = css_parser_parse_layer_name(this, &prelude_tokens, CssParserAllowBlankLayerName.no):
+            ak.vector_append_t(&layer_names, name)
+        else:
+            css_report_invalid_rule(ak.fly_string_from_str("@layer"), css_syntax.token_stream_dump_string(&prelude_tokens), ak.string_from_str("Contains invalid layer name."))
+            return none
+        css_syntax.token_stream_discard_whitespace(&prelude_tokens)
+
+    if ak.vector_is_empty(&layer_names):
+        css_report_invalid_rule(ak.fly_string_from_str("@layer"), css_syntax.token_stream_dump_string(&prelude_tokens), ak.string_from_str("No layer names provided."))
+        return none
+
+    return css_layer_statement_rule_create(css_parser_realm(this), layer_names).css_rule()
+
+# mark: @keyframes ==============================================================================
+
+## The captures of convert_to_keyframes_rule's `for_each_as_qualified_rule_list` lambda (`[&]`).
+struct CssParserConvertToKeyframesRuleCaptures:
+    var this: CssParser*
+    var keyframes: ak.Vector[CssRule*]*
+
+## The name a misplaced child of a keyframe reports (the visit of `child_rule` in the lambda below).
+func css_keyframe_child_rule_name(child_rule: const css_syntax.RuleOrListOfDeclarations*) -> ak.String:
+    match *child_rule:
+        .rule(rule):
+            match rule:
+                .at_rule(at_rule): return css_at_rule_display_name(&at_rule.name)
+                .qualified_rule(_): return ak.string_from_str("qualified-rule")
+        .vector_declaration(_):
+            return ak.string_from_str("list-of-declarations")
+
+## `Percentage(value)`.
+func css_percentage_create(value: f64) -> CssPercentage:
+    var percentage: CssPercentage = ---
+    css_percentage_construct(&percentage, value)
+    return percentage
+
+## The `[&](auto& qualified_rule) { ... }` lambda of convert_to_keyframes_rule: one <keyframe-block>.
+func css_parser_convert_to_keyframes_rule_keyframe(context: void*?, qualified_rule: const css_syntax.QualifiedRule*):
+    let captures = (CssParserConvertToKeyframesRuleCaptures*)(context else trap("no captures"))
+    let this = captures.this
+    if not ak.vector_is_empty(&qualified_rule.child_rules):
+        for child_rule in ak.vector_span_const(&qualified_rule.child_rules):
+            css_error_reporter_report(css_error_reporter_the(), CssParsingError.css_invalid_rule_location_error(CssInvalidRuleLocationError(
+                outer_rule_name = ak.fly_string_from_str("@keyframes"),
+                inner_rule_name = ak.fly_string_from_string(css_keyframe_child_rule_name(&child_rule)),
+            )))
+
+    var selectors = ak.Vector[CssPercentage]()
+    var child_tokens = css_syntax.token_stream_create(qualified_rule.prelude)
+    while css_syntax.token_stream_has_next_token(&child_tokens):
+        css_syntax.token_stream_discard_whitespace(&child_tokens)
+        if not css_syntax.token_stream_has_next_token(&child_tokens):
+            break
+        let next_token = css_syntax.token_stream_next_token(&child_tokens)
+        if not css_syntax.component_value_is_token(&next_token):
+            css_report_invalid_rule(ak.fly_string_from_str("keyframe"), css_syntax.token_stream_dump_string(&child_tokens), ak.string_from_str("Invalid selector."))
+            break
+        var read_a_selector = false
+        if css_syntax.component_value_is_ident(&next_token, ak.sv("from")):
+            css_syntax.token_stream_discard_a_token(&child_tokens)  # from
+            ak.vector_append_t(&selectors, css_percentage_create(0.0))
+            read_a_selector = true
+        elif css_syntax.component_value_is_ident(&next_token, ak.sv("to")):
+            css_syntax.token_stream_discard_a_token(&child_tokens)  # to
+            ak.vector_append_t(&selectors, css_percentage_create(100.0))
+            read_a_selector = true
+        elif css_syntax.component_value_is(&next_token, .percentage):
+            css_syntax.token_stream_discard_a_token(&child_tokens)  # <percentage>
+            let percentage_token = css_syntax.component_value_token(&next_token)
+            ak.vector_append_t(&selectors, css_percentage_create(css_syntax.token_percentage(&percentage_token)))
+            read_a_selector = true
+
+        if read_a_selector:
+            css_syntax.token_stream_discard_whitespace(&child_tokens)
+            let comma = css_syntax.token_stream_next_token(&child_tokens)
+            if css_syntax.component_value_is(&comma, .comma):
+                css_syntax.token_stream_discard_a_token(&child_tokens)  # ,
+                continue
+
+        break
+
+    var properties = CssParserPropertiesAndCustomProperties()
+    var property_captures = CssParserExtractPropertyCaptures(this = this, properties = &properties)
+    css_syntax.qualified_rule_for_each_as_declaration_list(qualified_rule, ak.fly_string_from_str("keyframe"),
+                                                           ak.Function1[const css_syntax.Declaration*, unit](call = css_parser_extract_property_into, context = &property_captures))
+    let style = css_style_properties_create(css_parser_realm(this), properties.properties, properties.custom_properties)
+    for selector in ak.vector_span_const(&selectors):
+        let keyframe_rule = css_keyframe_rule_create(css_parser_realm(this), selector, style)
+        # CSSKeyframeRule is a CSSRule; its port (opaque in this phase) embeds CssRule first.
+        ak.vector_append_t(captures.keyframes, (CssRule*)keyframe_rule)
+
+## Ported from Libraries/LibWeb/CSS/Parser/RuleParsing.cpp:451 Web::CSS::Parser::Parser::convert_to_keyframes_rule.
+pub func css_parser_convert_to_keyframes_rule(this: CssParser*, rule: css_syntax.AtRule) -> CssKeyframesRule*?:
+    # https://drafts.csswg.org/css-animations/#keyframes
+    # @keyframes = @keyframes <keyframes-name> { <qualified-rule-list> }
+    # <keyframes-name> = <custom-ident> | <string>
+    # <keyframe-block> = <keyframe-selector># { <declaration-list> }
+    # <keyframe-selector> = from | to | <percentage [0,100]>
+    var prelude_stream = css_syntax.token_stream_create(rule.prelude)
+    if not rule.is_block_rule:
+        css_report_invalid_rule(ak.fly_string_from_str("@keyframes"), css_syntax.token_stream_dump_string(&prelude_stream), ak.string_from_str("Must be a block, not a statement."))
+        return none
+
+    if ak.vector_is_empty(&rule.prelude):
+        css_report_invalid_rule(ak.fly_string_from_str("@keyframes"), css_syntax.token_stream_dump_string(&prelude_stream), ak.string_from_str("Empty prelude."))
+        return none
+
+    css_syntax.token_stream_discard_whitespace(&prelude_stream)
+    let token = css_syntax.token_stream_consume_a_token(&prelude_stream)
+    if not css_syntax.component_value_is_token(&token):
+        css_report_invalid_rule(ak.fly_string_from_str("@keyframes"), css_syntax.token_stream_dump_string(&prelude_stream), ak.string_from_str("Name must be a <string> or <ident>."))
+        return none
+
+    let name_token = css_syntax.component_value_token(&token)
+    css_syntax.token_stream_discard_whitespace(&prelude_stream)
+
+    if css_syntax.token_stream_has_next_token(&prelude_stream):
+        css_report_invalid_rule(ak.fly_string_from_str("@keyframes"), css_syntax.token_stream_dump_string(&prelude_stream),
+                                ak.string_from_str("Trailing tokens after name in prelude."))
+        return none
+
+    let blacklist: ak.StringView[1] = [ak.sv("none")]
+    if css_syntax.token_is(&name_token, .ident) and not is_valid_custom_ident(css_syntax.token_ident(&name_token), blacklist):
+        css_report_invalid_rule(ak.fly_string_from_str("@keyframes"), css_syntax.token_stream_dump_string(&prelude_stream), ak.string_from_str("Invalid name."))
+        return none
+
+    if not css_syntax.token_is(&name_token, .string) and not css_syntax.token_is(&name_token, .ident):
+        css_report_invalid_rule(ak.fly_string_from_str("@keyframes"), css_syntax.token_stream_dump_string(&prelude_stream), ak.string_from_str("Name must be a <string> or <ident>."))
+        return none
+
+    # Store the logical keyframes name instead of the serialized token text so @keyframes "foo" and
+    # animation-name: "foo" compare on the same value.
+    let name = css_syntax.token_string(&name_token) if css_syntax.token_is(&name_token, .string) else css_syntax.token_ident(&name_token)
+
+    var keyframes = ak.Vector[CssRule*]()
+    var captures = CssParserConvertToKeyframesRuleCaptures(this = this, keyframes = &keyframes)
+    css_syntax.at_rule_for_each_as_qualified_rule_list(&rule, ak.Function1[const css_syntax.QualifiedRule*, unit](call = css_parser_convert_to_keyframes_rule_keyframe, context = &captures))
+
+    return css_keyframes_rule_create(css_parser_realm(this), name, css_rule_list_create(css_parser_realm(this), ak.vector_span_const(&keyframes)))
+
+# mark: @namespace ==============================================================================
+
+## Ported from Libraries/LibWeb/CSS/Parser/RuleParsing.cpp:596 Web::CSS::Parser::Parser::convert_to_namespace_rule.
+pub func css_parser_convert_to_namespace_rule(this: CssParser*, rule: css_syntax.AtRule) -> CssNamespaceRule*?:
+    # https://drafts.csswg.org/css-namespaces/#syntax
+    # @namespace <namespace-prefix>? [ <string> | <url> ] ;
+    # <namespace-prefix> = <ident>
+    var tokens = css_syntax.token_stream_create(rule.prelude)
+    if rule.is_block_rule:
+        css_report_invalid_rule(ak.fly_string_from_str("@namespace"), css_syntax.token_stream_dump_string(&tokens), ak.string_from_str("Must be a statement, not a block."))
+        return none
+
+    if ak.vector_is_empty(&rule.prelude):
+        css_report_invalid_rule(ak.fly_string_from_str("@namespace"), css_syntax.token_stream_dump_string(&tokens), ak.string_from_str("Empty prelude."))
+        return none
+
+    css_syntax.token_stream_discard_whitespace(&tokens)
+
+    var prefix: ak.FlyString? = none
+    let prefix_token = css_syntax.token_stream_next_token(&tokens)
+    if css_syntax.component_value_is(&prefix_token, .ident):
+        let ident = css_syntax.token_stream_consume_a_token(&tokens)
+        prefix = css_component_value_ident(&ident)
+        css_syntax.token_stream_discard_whitespace(&tokens)
+
+    var namespace_uri = ak.fly_string_new()
+    if let url = css_parser_parse_url_function(this, &tokens):
+        # "A URI string parsed from the URI syntax must be treated as a literal string: as with the STRING syntax, no
+        # URI-specific normalization is applied."
+        # https://drafts.csswg.org/css-namespaces/#syntax
+        namespace_uri = ak.fly_string_from_string(css_url_url(&url))
+    else:
+        let url_token = css_syntax.token_stream_consume_a_token(&tokens)
+        if css_syntax.component_value_is(&url_token, .string):
+            let string_token = css_syntax.component_value_token(&url_token)
+            namespace_uri = css_syntax.token_string(&string_token)
+        else:
+            css_report_invalid_rule(ak.fly_string_from_str("@namespace"), css_syntax.token_stream_dump_string(&tokens), ak.string_from_str("Unable to parse <url>."))
+            return none
+
+    css_syntax.token_stream_discard_whitespace(&tokens)
+    if css_syntax.token_stream_has_next_token(&tokens):
+        css_report_invalid_rule(ak.fly_string_from_str("@namespace"), css_syntax.token_stream_dump_string(&tokens),
+                                ak.string_from_str("Trailing tokens after <url> in prelude."))
+        return none
+
+    return css_namespace_rule_create(css_parser_realm(this), prefix, namespace_uri)
+
+# mark: @supports ===============================================================================
+
+## Ported from Libraries/LibWeb/CSS/Parser/RuleParsing.cpp:659 Web::CSS::Parser::Parser::convert_to_supports_rule.
+pub func css_parser_convert_to_supports_rule[TNestedDeclarationsRule](this: CssParser*, rule: css_syntax.AtRule, nested: CssParserNested) -> CssSupportsRule*?:
+    # https://drafts.csswg.org/css-conditional-3/#at-supports
+    # @supports <supports-condition> {
+    #   <rule-list>
+    # }
+    var supports_tokens = css_syntax.token_stream_create(rule.prelude)
+    if not rule.is_block_rule:
+        css_report_invalid_rule(ak.fly_string_from_str("@supports"), css_syntax.token_stream_dump_string(&supports_tokens), ak.string_from_str("Must be a block, not a statement."))
+        return none
+
+    if ak.vector_is_empty(&rule.prelude):
+        css_report_invalid_rule(ak.fly_string_from_str("@supports"), css_syntax.token_stream_dump_string(&supports_tokens), ak.string_from_str("Empty prelude."))
+        return none
+
+    let maybe_supports = css_parser_parse_a_supports(this, &supports_tokens)
+    if maybe_supports == none:
+        css_report_invalid_rule(ak.fly_string_from_str("@supports"), css_syntax.token_stream_dump_string(&supports_tokens), ak.string_from_str("Supports clause invalid."))
+        return none
+    let supports = maybe_supports else trap("VERIFY: a supports clause")
+
+    var child_rules = ak.Vector[CssRule*]()
+    for child in ak.vector_span_const(&rule.child_rules_and_lists_of_declarations):
+        match child:
+            .rule(child_rule):
+                if let converted_rule = css_parser_convert_to_rule[TNestedDeclarationsRule](this, child_rule, nested):
+                    ak.vector_append_t(&child_rules, converted_rule)
+            .vector_declaration(declarations):
+                ak.vector_append_t(&child_rules, css_parser_create_nested_declarations_rule[TNestedDeclarationsRule](this, declarations))
+
+    let rule_list = css_rule_list_create(css_parser_realm(this), ak.vector_span_const(&child_rules))
+    return css_supports_rule_create(css_parser_realm(this), supports, rule_list)

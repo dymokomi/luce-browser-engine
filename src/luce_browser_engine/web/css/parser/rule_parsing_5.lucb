@@ -1,0 +1,144 @@
+#==============================================================================================
+#
+#   rule_parsing_5 - converting parsed rules to CSSOM rules: @function, @page and its margin
+#                    rules, and descriptor blocks
+#
+#   DESCRIPTION:
+#       Port of LibWeb/CSS/Parser/RuleParsing.cpp (lines 1386-1528): convert_to_function_rule,
+#       convert_to_page_rule, convert_to_margin_rule and convert_to_descriptors (a template
+#       the donor instantiates for CSSFunctionDescriptors only).
+#
+#       Copyright (c) 2018-2022, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2020-2021, the SerenityOS developers.
+#       Copyright (c) 2021-2026, Sam Atkins <sam@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: @function ===============================================================================
+
+## Ported from Libraries/LibWeb/CSS/Parser/RuleParsing.cpp:1386 Web::CSS::Parser::Parser::convert_to_function_rule.
+pub func css_parser_convert_to_function_rule(this: CssParser*, function_rule: css_syntax.AtRule) -> CssFunctionRule*?:
+    # https://drafts.csswg.org/css-mixins-1/#function-rule
+    var prelude_stream = css_syntax.token_stream_create(function_rule.prelude)
+
+    if not function_rule.is_block_rule:
+        css_report_invalid_function_rule(css_syntax.token_stream_dump_string(&prelude_stream), "Must be a block, not a statement.")
+        return none
+
+    let prelude = css_parser_parse_function_prelude(this, &prelude_stream) else return none
+
+    var child_rules = ak.Vector[CssRule*]()
+
+    # https://drafts.csswg.org/css-mixins-1/#function-body
+    for child in ak.vector_span_const(&function_rule.child_rules_and_lists_of_declarations):
+        match child:
+            .rule(rule):
+                if let child_rule = css_parser_convert_to_rule[CssFunctionDeclarations](this, rule, CssParserNested.yes):
+                    ak.vector_append_t(&child_rules, child_rule)
+            .vector_declaration(declarations):
+                ak.vector_append_t(&child_rules, css_function_declarations_create(css_parser_realm(this), this, declarations).css_rule())
+
+    return css_function_rule_create(css_parser_realm(this), css_rule_list_create(css_parser_realm(this), ak.vector_span_const(&child_rules)), prelude.name, prelude.parameters,
+                                    prelude.return_type)
+
+# mark: @page ===================================================================================
+
+## The captures of convert_to_page_rule's `for_each_as_declaration_rule_list` lambdas (`[&]`).
+struct CssParserConvertToPageRuleCaptures:
+    var this: CssParser*
+    var child_rules: ak.Vector[CssRule*]*
+    var descriptors: CssDescriptorList*
+
+## The `[&](auto& at_rule) { ... }` lambda of convert_to_page_rule: a margin rule inside @page.
+func css_parser_convert_to_page_rule_at_rule(context: void*?, at_rule: const css_syntax.AtRule*):
+    let captures = (CssParserConvertToPageRuleCaptures*)(context else trap("no captures"))
+    if let converted_rule = css_parser_convert_to_rule[CssNestedDeclarations](captures.this, css_syntax.Rule.at_rule(*at_rule), CssParserNested.no):
+        if is_css_margin_rule(converted_rule):
+            ak.vector_append_t(captures.child_rules, converted_rule)
+        else:
+            css_error_reporter_report(css_error_reporter_the(), CssParsingError.css_invalid_rule_location_error(CssInvalidRuleLocationError(
+                outer_rule_name = ak.fly_string_from_str("@page"),
+                inner_rule_name = ak.fly_string_from_utf8(gc.cell_class_name(converted_rule.cell())) else trap("MUST: FlyString::from_utf8"),
+            )))
+
+## The `[&](auto& declaration) { ... }` lambda of convert_to_page_rule: a descriptor of @page.
+func css_parser_convert_to_page_rule_declaration(context: void*?, declaration: const css_syntax.Declaration*):
+    let captures = (CssParserConvertToPageRuleCaptures*)(context else trap("no captures"))
+    if let descriptor = css_parser_convert_to_descriptor(captures.this, css_data.AtRuleId.page, *declaration):
+        css_descriptor_list_append(captures.descriptors, descriptor)
+
+## Ported from Libraries/LibWeb/CSS/Parser/RuleParsing.cpp:1422 Web::CSS::Parser::Parser::convert_to_page_rule.
+pub func css_parser_convert_to_page_rule(this: CssParser*, page_rule: css_syntax.AtRule) -> CssPageRule*?:
+    # https://drafts.csswg.org/css-page-3/#syntax-page-selector
+    # @page = @page <page-selector-list>? { <declaration-rule-list> }
+    var tokens = css_syntax.token_stream_create(page_rule.prelude)
+    if not page_rule.is_block_rule:
+        css_report_invalid_rule(ak.fly_string_from_str("@page"), css_syntax.token_stream_dump_string(&tokens), ak.string_from_str("Must be a block, not a statement."))
+        return none
+
+    let page_selectors = css_parser_parse_a_page_selector_list(this, &tokens) catch: return none
+
+    var child_rules = ak.Vector[CssRule*]()
+    var descriptors: CssDescriptorList = ---
+    css_descriptor_list_construct(&descriptors, css_data.AtRuleId.page)
+    var captures = CssParserConvertToPageRuleCaptures(this = this, child_rules = &child_rules, descriptors = &descriptors)
+    css_syntax.at_rule_for_each_as_declaration_rule_list(&page_rule,
+                                                         ak.Function1[const css_syntax.AtRule*, unit](call = css_parser_convert_to_page_rule_at_rule, context = &captures),
+                                                         ak.Function1[const css_syntax.Declaration*, unit](call = css_parser_convert_to_page_rule_declaration, context = &captures))
+
+    let rule_list = css_rule_list_create(css_parser_realm(this), ak.vector_span_const(&child_rules))
+    return css_page_rule_create(css_parser_realm(this), page_selectors, css_page_descriptors_create(css_parser_realm(this), css_descriptor_list_release_descriptors(&descriptors)), rule_list)
+
+## The captures of convert_to_keyframes_rule's and convert_to_margin_rule's
+## `[&](auto const& declaration) { extract_property(declaration, properties); }` lambdas.
+struct CssParserExtractPropertyCaptures:
+    var this: CssParser*
+    var properties: CssParserPropertiesAndCustomProperties*
+
+## The lambda: extract the declaration's property into the properties.
+func css_parser_extract_property_into(context: void*?, declaration: const css_syntax.Declaration*):
+    let captures = (CssParserExtractPropertyCaptures*)(context else trap("no captures"))
+    css_parser_extract_property(captures.this, declaration, captures.properties)
+
+## Ported from Libraries/LibWeb/CSS/Parser/RuleParsing.cpp:1465 Web::CSS::Parser::Parser::convert_to_margin_rule.
+pub func css_parser_convert_to_margin_rule(this: CssParser*, rule: css_syntax.AtRule) -> CssMarginRule*?:
+    var prelude_stream = css_syntax.token_stream_create(rule.prelude)
+    if not rule.is_block_rule:
+        css_report_invalid_rule(ak.fly_string_from_string(css_at_rule_display_name(&rule.name)), css_syntax.token_stream_dump_string(&prelude_stream),
+                                ak.string_from_str("Must be a block, not a statement."))
+        return none
+
+    css_syntax.token_stream_discard_whitespace(&prelude_stream)
+    if css_syntax.token_stream_has_next_token(&prelude_stream):
+        css_report_invalid_rule(ak.fly_string_from_string(css_at_rule_display_name(&rule.name)), css_syntax.token_stream_dump_string(&prelude_stream),
+                                ak.string_from_str("Prelude is not allowed."))
+        return none
+
+    # https://drafts.csswg.org/css-page-3/#syntax-page-selector
+    # There are lots of these, but they're all in the format:
+    # @foo = @foo { <declaration-list> };
+
+    # FIXME: The declaration list should be a CSSMarginDescriptors, but that has no spec definition:
+    #        https://github.com/w3c/csswg-drafts/issues/10106
+    #        So, we just parse a CSSStyleProperties instead for now.
+    var properties = CssParserPropertiesAndCustomProperties()
+    var captures = CssParserExtractPropertyCaptures(this = this, properties = &properties)
+    css_syntax.at_rule_for_each_as_declaration_list(&rule, ak.Function1[const css_syntax.Declaration*, unit](call = css_parser_extract_property_into, context = &captures))
+    let style = css_style_properties_create(css_parser_realm(this), properties.properties, properties.custom_properties)
+    return css_margin_rule_create(css_parser_realm(this), rule.name, style)
+
+# mark: Descriptor blocks =======================================================================
+
+## Ported from Libraries/LibWeb/CSS/Parser/RuleParsing.cpp:1503 Web::CSS::Parser::Parser::convert_to_descriptors.
+## The donor instantiates it for CSSFunctionDescriptors only (`Descriptors::create(...)`).
+pub func css_parser_convert_to_descriptors[TDescriptors](this: CssParser*, at_rule_id: css_data.AtRuleId, declarations: ak.Vector[css_syntax.Declaration]) -> TDescriptors*:
+    var descriptor_list: CssDescriptorList = ---
+    css_descriptor_list_construct(&descriptor_list, at_rule_id)
+
+    for declaration in ak.vector_span_const(&declarations):
+        if let descriptor = css_parser_convert_to_descriptor(this, at_rule_id, declaration):
+            css_descriptor_list_append(&descriptor_list, descriptor)
+
+    assert(sizeof(TDescriptors) == sizeof(CssFunctionDescriptors))
+    return (TDescriptors*)css_function_descriptors_create(css_parser_realm(this), css_descriptor_list_release_descriptors(&descriptor_list))

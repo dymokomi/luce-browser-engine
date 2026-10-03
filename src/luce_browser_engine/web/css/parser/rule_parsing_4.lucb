@@ -1,0 +1,296 @@
+#==============================================================================================
+#
+#   rule_parsing_4 - converting parsed rules to CSSOM rules: @font-feature-values and the
+#                    @function prelude
+#
+#   DESCRIPTION:
+#       Port of LibWeb/CSS/Parser/RuleParsing.cpp (lines 1063-1384):
+#       parse_comma_separated_family_name_list, convert_to_font_feature_values_rule (its
+#       for_each_as_declaration_rule_list lambdas are the functions before it), <css-type>
+#       and parse_function_prelude.
+#
+#       Copyright (c) 2018-2022, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2020-2021, the SerenityOS developers.
+#       Copyright (c) 2021-2026, Sam Atkins <sam@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: @font-feature-values ====================================================================
+
+## Ported from Libraries/LibWeb/CSS/Parser/RuleParsing.cpp:1063 Web::CSS::Parser::Parser::parse_comma_separated_family_name_list.
+pub func css_parser_parse_comma_separated_family_name_list(this: CssParser*, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> ak.Vector[ak.FlyString]?:
+    var family_names = ak.Vector[ak.FlyString]()
+    let comma_separated_families = css_parser_parse_a_comma_separated_list_of_component_values(this, tokens)
+
+    if ak.vector_is_empty(&comma_separated_families):
+        css_report_invalid_rule(ak.fly_string_from_str("@font-feature-values"), css_syntax.token_stream_dump_string(tokens), ak.string_from_str("Empty family name list."))
+        return none
+
+    for family_component_values in ak.vector_span_const(&comma_separated_families):
+        var family_stream = css_syntax.token_stream_create(family_component_values)
+        let family_name = css_parser_parse_family_name_value(this, &family_stream)
+
+        if family_name == none or css_syntax.token_stream_has_next_token(&family_stream):
+            css_report_invalid_rule(ak.fly_string_from_str("@font-feature-values"), css_syntax.token_stream_dump_string(&family_stream), ak.string_from_str("Invalid family name."))
+            return none
+
+        ak.vector_append_t(&family_names, css_string_from_style_value(family_name else trap("VERIFY: a family name")))
+
+    return family_names
+
+## The captures of the `[&](Declaration const& declaration) { ... }` lambda of a feature-value at-rule.
+struct CssParserFontFeatureValueCaptures:
+    var at_rule: const css_syntax.AtRule*
+    var feature_values_map: CssFontFeatureValuesMap*
+    var max_value_count: usize
+
+## The lambda: one `<feature-value-name>: <integer>+` declaration of a feature-value at-rule.
+func css_parser_convert_to_font_feature_value(context: void*?, declaration: const css_syntax.Declaration*):
+    let captures = (CssParserFontFeatureValueCaptures*)(context else trap("no captures"))
+    let at_rule = captures.at_rule
+    var value_stream = css_syntax.token_stream_create(declaration.value)
+
+    if declaration.important == css_syntax.Important.yes:
+        css_report_invalid_rule(ak.fly_string_from_string(css_at_rule_display_name(&at_rule.name)), css_syntax.token_stream_dump_string(&value_stream),
+                                ak.string_from_str("Declarations in @font-feature-values rules cannot be marked !important."))
+        return
+
+    css_syntax.token_stream_discard_whitespace(&value_stream)
+
+    if not css_syntax.token_stream_has_next_token(&value_stream):
+        css_report_invalid_rule(ak.fly_string_from_string(css_at_rule_display_name(&at_rule.name)), css_syntax.token_stream_dump_string(&value_stream),
+                                ak.string_from_str("Empty feature value."))
+        return
+
+    var values = ak.Vector[u32]()
+
+    while css_syntax.token_stream_has_next_token(&value_stream):
+        let token = css_syntax.token_stream_consume_a_token(&value_stream)
+
+        # FIXME: Support calc()
+        if not css_syntax.component_value_is(&token, .number) or not css_component_value_is_integer(&token) or css_anb_to_integer(&token) < 0:
+            css_report_invalid_rule(ak.fly_string_from_string(css_at_rule_display_name(&at_rule.name)), css_syntax.token_stream_dump_string(&value_stream),
+                                    ak.string_from_str("Feature value entry must be a non-negative integer."))
+
+            return
+
+        ak.vector_append_t(&values, (u32)css_anb_to_integer(&token))
+
+        css_syntax.token_stream_discard_whitespace(&value_stream)
+
+    if ak.vector_size(&values) > captures.max_value_count:
+        css_report_invalid_rule(ak.fly_string_from_string(css_at_rule_display_name(&at_rule.name)), css_syntax.token_stream_dump_string(&value_stream),
+                                css_string_formatted("Too many feature values provided (maximum {}).", [ak.arg_u64((u64)captures.max_value_count)]))
+
+        return
+
+    css_font_feature_values_map_set(captures.feature_values_map, ak.fly_string_to_string_const_2(&declaration.name), ak.U32OrVectorU32.vector_u32(values)) else trap("MUST: FontFeatureValuesMap::set")
+
+## The `[&](AtRule const& at_rule) { ... }` lambda of convert_to_font_feature_values_rule: one feature-value at-rule.
+func css_parser_convert_to_font_feature_values_at_rule(context: void*?, at_rule: const css_syntax.AtRule*):
+    let font_feature_values_rule = (CssFontFeatureValuesRule*)(context else trap("no rule"))
+    # <font-feature-value-type> = <@stylistic> | <@historical-forms> | <@styleset> | <@character-variant> | <@swash> | <@ornaments> | <@annotation>
+    # @stylistic = @stylistic { <declaration-list> }
+    # @historical-forms = @historical-forms { <declaration-list> }
+    # @styleset = @styleset { <declaration-list> }
+    # @character-variant = @character-variant { <declaration-list> }
+    # @swash = @swash { <declaration-list> }
+    # @ornaments = @ornaments { <declaration-list> }
+    # @annotation = @annotation { <declaration-list> }
+
+    var feature_values_map: CssFontFeatureValuesMap*? = none
+    var max_value_count: usize = 1
+
+    if ak.fly_string_equals_ignoring_ascii_case_string_view(&at_rule.name, ak.sv("stylistic")):
+        feature_values_map = css_font_feature_values_rule_stylistic(font_feature_values_rule)
+    elif ak.fly_string_equals_ignoring_ascii_case_string_view(&at_rule.name, ak.sv("historical-forms")):
+        feature_values_map = css_font_feature_values_rule_historical_forms(font_feature_values_rule)
+    elif ak.fly_string_equals_ignoring_ascii_case_string_view(&at_rule.name, ak.sv("styleset")):
+        feature_values_map = css_font_feature_values_rule_styleset(font_feature_values_rule)
+        max_value_count = ak.usize_max
+    elif ak.fly_string_equals_ignoring_ascii_case_string_view(&at_rule.name, ak.sv("character-variant")):
+        feature_values_map = css_font_feature_values_rule_character_variant(font_feature_values_rule)
+        max_value_count = 2
+    elif ak.fly_string_equals_ignoring_ascii_case_string_view(&at_rule.name, ak.sv("swash")):
+        feature_values_map = css_font_feature_values_rule_swash(font_feature_values_rule)
+    elif ak.fly_string_equals_ignoring_ascii_case_string_view(&at_rule.name, ak.sv("ornaments")):
+        feature_values_map = css_font_feature_values_rule_ornaments(font_feature_values_rule)
+    elif ak.fly_string_equals_ignoring_ascii_case_string_view(&at_rule.name, ak.sv("annotation")):
+        feature_values_map = css_font_feature_values_rule_annotation(font_feature_values_rule)
+    else:
+        # NB: Other at-rules are disallowed in this context and should have already been dropped
+        trap("VERIFY_NOT_REACHED")
+
+    var captures = CssParserFontFeatureValueCaptures(at_rule = at_rule, feature_values_map = feature_values_map else trap("VERIFY: a feature values map"),
+                                                     max_value_count = max_value_count)
+    css_syntax.at_rule_for_each_as_declaration_list(at_rule, ak.Function1[const css_syntax.Declaration*, unit](call = css_parser_convert_to_font_feature_value, context = &captures))
+
+## The `[&](Declaration const&) { ... }` lambda of convert_to_font_feature_values_rule.
+func css_parser_convert_to_font_feature_values_declaration(context: void*?, declaration: const css_syntax.Declaration*):
+    discard(context)
+    discard(declaration)
+    # FIXME: Handle the `font-display` descriptor here, see
+    #        https://drafts.csswg.org/css-fonts-4/#font-display-font-feature-values
+
+## Ported from Libraries/LibWeb/CSS/Parser/RuleParsing.cpp:1096 Web::CSS::Parser::Parser::convert_to_font_feature_values_rule.
+pub func css_parser_convert_to_font_feature_values_rule(this: CssParser*, rule: css_syntax.AtRule) -> CssFontFeatureValuesRule*?:
+    # https://drafts.csswg.org/css-fonts-4/#font-feature-values-syntax
+    # @font-feature-values = @font-feature-values <family-name># { <declaration-rule-list> }
+    var prelude_stream = css_syntax.token_stream_create(rule.prelude)
+    if not rule.is_block_rule:
+        css_report_invalid_rule(ak.fly_string_from_str("@font-feature-values"), css_syntax.token_stream_dump_string(&prelude_stream), ak.string_from_str("Must be a block, not a statement."))
+        return none
+
+    let family_names = css_parser_parse_comma_separated_family_name_list(this, &prelude_stream) else return none
+
+    let font_feature_values_rule = css_font_feature_values_rule_create(css_parser_realm(this), family_names)
+
+    css_syntax.at_rule_for_each_as_declaration_rule_list(&rule,
+                                                         ak.Function1[const css_syntax.AtRule*, unit](call = css_parser_convert_to_font_feature_values_at_rule, context = font_feature_values_rule),
+                                                         ak.Function1[const css_syntax.Declaration*, unit](call = css_parser_convert_to_font_feature_values_declaration, context = none))
+
+    return font_feature_values_rule
+
+# mark: @function ===============================================================================
+
+## Ported from Libraries/LibWeb/CSS/Parser/RuleParsing.cpp:1217 Web::CSS::Parser::parse_css_type.
+func css_parse_css_type(tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssSyntaxNode*?:
+    # https://drafts.csswg.org/css-mixins-1/#function-rule
+    # <css-type> = <syntax-component> | <type()>
+    # <type()> = type( <syntax> )
+
+    var transaction = css_syntax.token_stream_begin_transaction(tokens)
+    defer css_syntax.state_transaction_destroy(&transaction)
+    css_syntax.token_stream_discard_whitespace(tokens)
+
+    # <syntax-component>
+    if let syntax_component = css_parse_syntax_component_token_stream(tokens):
+        css_syntax.state_transaction_commit(&transaction)
+        return syntax_component
+
+    # <type()>
+    let maybe_type_function_token = css_syntax.token_stream_consume_a_token(tokens)
+
+    if not css_syntax.component_value_is_function_string_view(&maybe_type_function_token, ak.sv("type")):
+        return none
+
+    let type_function = css_syntax.component_value_function(&maybe_type_function_token)
+    if let type_function_syntax = css_parse_as_syntax(type_function.value):
+        css_syntax.state_transaction_commit(&transaction)
+        return type_function_syntax
+
+    return none
+
+## `ErrorReporter::the().report(InvalidRuleError { .rule_name = "@function"_fly_string, ... })`.
+func css_report_invalid_function_rule(prelude: ak.String, description: str):
+    css_report_invalid_rule(ak.fly_string_from_str("@function"), prelude, ak.string_from_str(description))
+
+## `is_a_custom_property_name_string(name)` for a FlyString.
+func css_is_a_custom_property_name_fly_string(name: ak.FlyString) -> bool:
+    return css_data.is_a_custom_property_name_string(ak.fly_string_bytes_as_string_view(&name))
+
+## Ported from Libraries/LibWeb/CSS/Parser/RuleParsing.cpp:1246 Web::CSS::Parser::Parser::parse_function_prelude.
+pub func css_parser_parse_function_prelude(this: CssParser*, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssParserFunctionPrelude?:
+    # https://drafts.csswg.org/css-mixins-1/#function-rule
+    # <function-token> <function-parameter>#? ) [ returns <css-type> ]?
+    # <function-parameter> = <custom-property-name> <css-type>? [ : <default-value> ]?
+    # <default-value> = <declaration-value>
+    var transaction = css_syntax.token_stream_begin_transaction(tokens)
+    defer css_syntax.state_transaction_destroy(&transaction)
+
+    css_syntax.token_stream_discard_whitespace(tokens)
+
+    let function_token = css_syntax.token_stream_consume_a_token(tokens)
+
+    if not css_syntax.component_value_is_function(&function_token):
+        css_report_invalid_function_rule(css_syntax.token_stream_dump_string(tokens), "Prelude must start with a function token.")
+        return none
+
+    let function = css_syntax.component_value_function(&function_token)
+    let function_name = function.name
+
+    # The <function-token> production must start with two dashes (U+002D HYPHEN-MINUS), similar to <dashed-ident>, or
+    # else the definition is invalid.
+    if not ak.fly_string_starts_with_bytes(&function_name, ak.sv("--")):
+        css_report_invalid_function_rule(css_syntax.token_stream_dump_string(tokens), "Function name must start with two dashes.")
+        return none
+
+    var parsed_parameters = ak.Vector[CssFunctionParameterInternal]()
+
+    var parameters_tokens = css_syntax.token_stream_create(function.value)
+    css_syntax.token_stream_discard_whitespace(&parameters_tokens)
+    let parameters_component_values = css_parser_parse_a_comma_separated_list_of_component_values(this, &parameters_tokens)
+
+    # <function-parameter>#?
+    for parameter_component_values in ak.vector_span_const(&parameters_component_values):
+        var parameter_tokens = css_syntax.token_stream_create(parameter_component_values)
+        css_syntax.token_stream_discard_whitespace(&parameter_tokens)
+
+        # <custom-property-name>
+        let maybe_name = css_parser_parse_dashed_ident(this, &parameter_tokens)
+        if maybe_name == none or not css_is_a_custom_property_name_fly_string(maybe_name else trap("unreachable")):
+            css_report_invalid_function_rule(css_syntax.token_stream_dump_string(&parameter_tokens), "Parameter must have a name.")
+            return none
+
+        # <css-type>?
+        var type_ = css_universal_syntax_node_create().css_syntax_node()
+        if let maybe_type = css_parse_css_type(&parameter_tokens):
+            type_ = maybe_type
+
+        css_syntax.token_stream_discard_whitespace(&parameter_tokens)
+
+        # [ : <default-value> ]?
+        var default_value: ak.Vector[css_syntax.ComponentValue]? = none
+        let colon = css_syntax.token_stream_next_token(&parameter_tokens)
+        if css_syntax.component_value_is(&colon, .colon):
+            css_syntax.token_stream_discard_a_token(&parameter_tokens)  # :
+            css_syntax.token_stream_discard_whitespace(&parameter_tokens)
+
+            let maybe_default_value = css_parser_parse_declaration_value(&parameter_tokens)
+
+            if maybe_default_value == none:
+                css_report_invalid_function_rule(css_syntax.token_stream_dump_string(&parameter_tokens), "Expected default value after ':' in parameter")
+                return none
+
+            # If a default value and a parameter type are both provided, then the default value must parse successfully
+            # according to that parameter type’s syntax. Otherwise, the @function rule is invalid.
+            # FIXME: Chrome allows ASFs regardless of the parameter's type
+            var default_value_token_stream = css_syntax.token_stream_create(maybe_default_value else trap("VERIFY: a default value"))
+            if css_parser_parse_according_to_syntax_node(this, &default_value_token_stream, type_) == none or not css_syntax.token_stream_is_empty(&default_value_token_stream):
+                return none
+
+            default_value = maybe_default_value
+
+        css_syntax.token_stream_discard_whitespace(&parameter_tokens)
+
+        if not css_syntax.token_stream_is_empty(&parameter_tokens):
+            css_report_invalid_function_rule(css_syntax.token_stream_dump_string(&parameter_tokens), "Trailing tokens after parameter")
+            return none
+
+        ak.vector_append_t(&parsed_parameters, CssFunctionParameterInternal(name = maybe_name else trap("VERIFY: a name"), type_ = type_, default_value = default_value))
+
+    css_syntax.token_stream_discard_whitespace(tokens)
+
+    var return_type = css_universal_syntax_node_create().css_syntax_node()
+    let returns = css_syntax.token_stream_next_token(tokens)
+    if css_syntax.component_value_is_ident(&returns, ak.sv("returns")):
+        css_syntax.token_stream_discard_a_token(tokens)
+        css_syntax.token_stream_discard_whitespace(tokens)
+
+        let maybe_return_type = css_parse_css_type(tokens)
+
+        if maybe_return_type == none:
+            css_report_invalid_function_rule(css_syntax.token_stream_dump_string(tokens), "Expected return type after 'returns' in prelude.")
+            return none
+
+        return_type = maybe_return_type else trap("VERIFY: a return type")
+
+    css_syntax.token_stream_discard_whitespace(tokens)
+
+    if css_syntax.token_stream_has_next_token(tokens):
+        css_report_invalid_function_rule(css_syntax.token_stream_dump_string(tokens), "Trailing tokens in prelude.")
+        return none
+
+    css_syntax.state_transaction_commit(&transaction)
+    return CssParserFunctionPrelude(name = function_name, parameters = parsed_parameters, return_type = return_type)

@@ -1,0 +1,346 @@
+#==============================================================================================
+#
+#   rule_parsing_1 - converting parsed rules to CSSOM rules: DescriptorList, convert_to_rule,
+#                    style rules, @import and <layer-name>
+#
+#   DESCRIPTION:
+#       Port of LibWeb/CSS/Parser/RuleParsing.cpp (lines 1-356): the DescriptorList helper
+#       class, convert_to_rule (dispatching on the at-rule's name), convert_to_style_rule,
+#       convert_to_import_rule and parse_layer_name.
+#
+#       convert_to_rule and the rule converters it reaches are templates over the rule type
+#       that holds nested declarations (CSSNestedDeclarations, or CSSFunctionDeclarations
+#       inside @function), which they create with `NestedDeclarationsRule::create(...)`. A
+#       luce-base generic cannot call a static function of its type parameter, so
+#       css_parser_create_nested_declarations_rule tells the two types apart by size (they
+#       differ, which a module assert checks), the way parser_2's per-T steps do for tokens.
+#
+#       Copyright (c) 2018-2022, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2020-2021, the SerenityOS developers.
+#       Copyright (c) 2021-2026, Sam Atkins <sam@ladybird.org>
+#       Copyright (c) 2021, Tobias Christiansen <tobyase@serenityos.org>
+#       Copyright (c) 2022, MacDue <macdue@dueutil.tech>
+#       Copyright (c) 2024, Shannon Booth <shannon@serenityos.org>
+#       Copyright (c) 2024, Tommy van der Vorst <tommy@pixelspark.nl>
+#       Copyright (c) 2024, Matthew Olsson <mattco@serenityos.org>
+#       Copyright (c) 2024, Glenn Skrzypczak <glenn.skrzypczak@gmail.com>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: DescriptorList ==========================================================================
+# A helper that ensures only the last instance of each descriptor is included, while also handling shorthands.
+
+## Ported from Libraries/LibWeb/CSS/Parser/RuleParsing.cpp:58 Web::CSS::Parser::DescriptorList::DescriptorList.
+pub func css_descriptor_list_construct(this: CssDescriptorList*, at_rule: css_data.AtRuleId):
+    *this = CssDescriptorList(m_at_rule = at_rule)
+
+## The `[this](auto longhand_id, auto longhand_value) { append_internal(...); }` lambda of DescriptorList::append.
+func css_descriptor_list_append_longhand(context: void*?, longhand_id: const CssDescriptorNameAndId*, longhand_value: CssStyleValue*?):
+    let this = (CssDescriptorList*)(context else trap("no descriptor list"))
+    css_descriptor_list_append_internal(this, CssDescriptor(descriptor_name_and_id = *longhand_id, value = longhand_value else trap("VERIFY: a longhand value")))
+
+## Ported from Libraries/LibWeb/CSS/Parser/RuleParsing.cpp:63 Web::CSS::Parser::DescriptorList::append.
+pub func css_descriptor_list_append(this: CssDescriptorList*, descriptor: CssDescriptor):
+    if css_is_shorthand(this.m_at_rule, descriptor.descriptor_name_and_id):
+        css_for_each_expanded_longhand(this.m_at_rule, descriptor.descriptor_name_and_id, descriptor.value,
+                                       ak.Function2[const CssDescriptorNameAndId*, CssStyleValue*?, unit](call = css_descriptor_list_append_longhand, context = this))
+        return
+
+    css_descriptor_list_append_internal(this, descriptor)
+
+## Ported from Libraries/LibWeb/CSS/Parser/RuleParsing.cpp:75 Web::CSS::Parser::DescriptorList::release_descriptors.
+pub func css_descriptor_list_release_descriptors(this: CssDescriptorList*) -> ak.Vector[CssDescriptor]:
+    let descriptors = this.m_descriptors
+    this.m_descriptors = ak.Vector[CssDescriptor]()
+    return descriptors
+
+## The `[&descriptor](Descriptor const& existing) { ... }` lambda of DescriptorList::append_internal.
+func css_descriptor_list_has_same_id(context: void*?, existing: const CssDescriptor*) -> bool:
+    let descriptor = (const CssDescriptor*)(context else trap("no descriptor"))
+    return css_descriptor_name_and_id_eq(&existing.descriptor_name_and_id, descriptor.descriptor_name_and_id)
+
+## Ported from Libraries/LibWeb/CSS/Parser/RuleParsing.cpp:81 Web::CSS::Parser::DescriptorList::append_internal.
+pub func css_descriptor_list_append_internal(this: CssDescriptorList*, descriptor: CssDescriptor):
+    if ak.hash_table_contains_t(&this.m_seen_descriptor_ids, descriptor.descriptor_name_and_id):
+        var matched = descriptor
+        discard(ak.vector_remove_first_matching(&this.m_descriptors, ak.Function1[const CssDescriptor*, bool](call = css_descriptor_list_has_same_id, context = &matched)))
+    else:
+        discard(ak.hash_table_set(&this.m_seen_descriptor_ids, descriptor.descriptor_name_and_id))
+    ak.vector_append_t(&this.m_descriptors, descriptor)
+
+# mark: Shared helpers ==========================================================================
+
+## `ErrorReporter::the().report(CSS::Parser::InvalidRuleError { .rule_name, .prelude, .description })`.
+func css_report_invalid_rule(rule_name: ak.FlyString, prelude: ak.String, description: ak.String):
+    css_error_reporter_report(css_error_reporter_the(), CssParsingError.css_invalid_rule_error(CssInvalidRuleError(
+        rule_name = rule_name,
+        prelude = prelude,
+        description = description,
+    )))
+
+## `MUST(String::formatted("@{}", name))`: an at-rule's name with its `@`.
+func css_at_rule_display_name(name: const ak.FlyString*) -> ak.String:
+    return css_string_formatted("@{}", [css_arg_fly_string(name)])
+
+# NestedDeclarationsRule is CSSNestedDeclarations or CSSFunctionDeclarations, told apart by size.
+assert(sizeof(CssNestedDeclarations) != sizeof(CssFunctionDeclarations), "the rule converters tell their nested-declarations rule types apart by size")
+
+## `NestedDeclarationsRule::create(realm(), *this, declarations)` for the converters' template parameter.
+func css_parser_create_nested_declarations_rule[TNestedDeclarationsRule](this: CssParser*, declarations: ak.Vector[css_syntax.Declaration]) -> CssRule*:
+    if sizeof(TNestedDeclarationsRule) == sizeof(CssFunctionDeclarations):
+        return css_function_declarations_create(css_parser_realm(this), this, declarations).css_rule()
+    assert(sizeof(TNestedDeclarationsRule) == sizeof(CssNestedDeclarations))
+    return css_nested_declarations_create_css_parser(css_parser_realm(this), this, declarations).css_rule()
+
+# mark: convert_to_rule =========================================================================
+
+## Ported from Libraries/LibWeb/CSS/Parser/RuleParsing.cpp:99 Web::CSS::Parser::Parser::convert_to_rule.
+pub func css_parser_convert_to_rule[TNestedDeclarationsRule](this: CssParser*, rule: css_syntax.Rule, nested: CssParserNested) -> CssRule*?:
+    match rule:
+        .at_rule(at_rule):
+            let name = ak.fly_string_bytes_as_string_view(&at_rule.name)
+            # https://compat.spec.whatwg.org/#css-at-rules
+            # @-webkit-keyframes must be supported as an alias of @keyframes.
+            if (ak.fly_string_equals_ignoring_ascii_case_string_view(&at_rule.name, ak.sv("keyframes")) or ak.fly_string_equals_ignoring_ascii_case_string_view(&at_rule.name, ak.sv("-webkit-keyframes"))):
+                if let keyframes_rule = css_parser_convert_to_keyframes_rule(this, at_rule):
+                    # CSSKeyframesRule is a CSSRule; its port (opaque in this phase) embeds CssRule first.
+                    return (CssRule*)keyframes_rule
+                return none
+
+            if css_parser_has_ignored_vendor_prefix(name):
+                return none
+
+            if ak.fly_string_equals_ignoring_ascii_case_string_view(&at_rule.name, ak.sv("container")):
+                return css_rule_or_none(css_parser_convert_to_container_rule[TNestedDeclarationsRule](this, at_rule, nested))
+
+            if ak.fly_string_equals_ignoring_ascii_case_string_view(&at_rule.name, ak.sv("counter-style")):
+                return css_rule_or_none(css_parser_convert_to_counter_style_rule(this, at_rule))
+
+            if ak.fly_string_equals_ignoring_ascii_case_string_view(&at_rule.name, ak.sv("font-face")):
+                return css_rule_or_none(css_parser_convert_to_font_face_rule(this, at_rule))
+
+            if ak.fly_string_equals_ignoring_ascii_case_string_view(&at_rule.name, ak.sv("font-feature-values")):
+                return css_rule_or_none(css_parser_convert_to_font_feature_values_rule(this, at_rule))
+
+            if ak.fly_string_equals_ignoring_ascii_case_string_view(&at_rule.name, ak.sv("function")):
+                return css_rule_or_none(css_parser_convert_to_function_rule(this, at_rule))
+
+            if ak.fly_string_equals_ignoring_ascii_case_string_view(&at_rule.name, ak.sv("import")):
+                return css_rule_or_none(css_parser_convert_to_import_rule(this, at_rule))
+
+            if ak.fly_string_equals_ignoring_ascii_case_string_view(&at_rule.name, ak.sv("layer")):
+                return css_parser_convert_to_layer_rule[TNestedDeclarationsRule](this, at_rule, nested)
+
+            if css_is_margin_rule_name(name):
+                return css_rule_or_none(css_parser_convert_to_margin_rule(this, at_rule))
+
+            if ak.fly_string_equals_ignoring_ascii_case_string_view(&at_rule.name, ak.sv("media")):
+                return css_rule_or_none(css_parser_convert_to_media_rule[TNestedDeclarationsRule](this, at_rule, nested))
+
+            if ak.fly_string_equals_ignoring_ascii_case_string_view(&at_rule.name, ak.sv("namespace")):
+                return css_rule_or_none(css_parser_convert_to_namespace_rule(this, at_rule))
+
+            if ak.fly_string_equals_ignoring_ascii_case_string_view(&at_rule.name, ak.sv("page")):
+                return css_rule_or_none(css_parser_convert_to_page_rule(this, at_rule))
+
+            if ak.fly_string_equals_ignoring_ascii_case_string_view(&at_rule.name, ak.sv("property")):
+                return css_rule_or_none(css_parser_convert_to_property_rule(this, at_rule))
+
+            if ak.fly_string_equals_ignoring_ascii_case_string_view(&at_rule.name, ak.sv("supports")):
+                return css_rule_or_none(css_parser_convert_to_supports_rule[TNestedDeclarationsRule](this, at_rule, nested))
+
+            # FIXME: More at rules!
+            css_error_reporter_report(css_error_reporter_the(), CssParsingError.css_unknown_rule_error(CssUnknownRuleError(
+                rule_name = ak.fly_string_from_string(css_at_rule_display_name(&at_rule.name)),
+            )))
+            return none
+        .qualified_rule(qualified_rule):
+            return css_rule_or_none(css_parser_convert_to_style_rule(this, qualified_rule, nested))
+
+## A converted rule as its CSSRule base (C++ converts GC::Ptr<Derived> to GC::Ptr<CSSRule> implicitly).
+func css_rule_or_none[R: IsCssRule](rule: R*?) -> CssRule*?:
+    if let converted = rule:
+        return converted.css_rule()
+    return none
+
+# mark: Style rules =============================================================================
+
+## Ported from Libraries/LibWeb/CSS/Parser/RuleParsing.cpp:159 Web::CSS::Parser::Parser::convert_to_style_rule.
+pub func css_parser_convert_to_style_rule(this: CssParser*, qualified_rule: css_syntax.QualifiedRule, nested: CssParserNested) -> CssStyleRule*?:
+    var prelude_stream = css_syntax.token_stream_create(qualified_rule.prelude)
+
+    var mode = CssParserSelectorType.standalone
+    if nested == CssParserNested.yes:
+        mode = CssParserSelectorType.relative
+    let maybe_selectors: ak.Vector[CssSelector*]? = css_parser_parse_a_selector_list(this, &prelude_stream, mode) catch failure:
+        if failure.code == css_parser_parse_error_syntax_error:
+            css_report_invalid_rule(ak.fly_string_from_str("style"), css_syntax.token_stream_dump_string(&prelude_stream), ak.string_from_str("Selectors invalid."))
+        return none
+
+    var selectors = maybe_selectors else trap("VERIFY: selectors")
+    if ak.vector_is_empty(&selectors):
+        css_report_invalid_rule(ak.fly_string_from_str("style"), css_syntax.token_stream_dump_string(&prelude_stream), ak.string_from_str("Empty selector."))
+        return none
+
+    if nested == CssParserNested.yes:
+        selectors = css_adapt_nested_relative_selector_list(selectors)
+
+    let declaration = css_parser_convert_to_style_declaration(this, &qualified_rule.declarations)
+
+    var child_rules = ak.Vector[CssRule*]()
+    for child in ak.vector_span_const(&qualified_rule.child_rules):
+        match child:
+            .rule(rule):
+                # "In addition to nested style rules, this specification allows nested group rules inside of style rules:
+                # any at-rule whose body contains style rules can be nested inside of a style rule as well."
+                # https://drafts.csswg.org/css-nesting-1/#nested-group-rules
+                if let converted_rule = css_parser_convert_to_rule[CssNestedDeclarations](this, rule, CssParserNested.yes):
+                    if is_css_grouping_rule(converted_rule):
+                        ak.vector_append_t(&child_rules, converted_rule)
+                    else:
+                        css_error_reporter_report(css_error_reporter_the(), CssParsingError.css_invalid_rule_location_error(CssInvalidRuleLocationError(
+                            outer_rule_name = ak.fly_string_from_str("style"),
+                            inner_rule_name = ak.fly_string_from_utf8(gc.cell_class_name(converted_rule.cell())) else trap("MUST: FlyString::from_utf8"),
+                        )))
+            .vector_declaration(declarations):
+                ak.vector_append_t(&child_rules, css_nested_declarations_create_css_parser(css_parser_realm(this), this, declarations).css_rule())
+    let nested_rules = css_rule_list_create(css_parser_realm(this), ak.vector_span_const(&child_rules))
+    return css_style_rule_create(css_parser_realm(this), selectors, declaration, nested_rules)
+
+# mark: @import =================================================================================
+
+## Ported from Libraries/LibWeb/CSS/Parser/RuleParsing.cpp:218 Web::CSS::Parser::Parser::convert_to_import_rule.
+pub func css_parser_convert_to_import_rule(this: CssParser*, rule: css_syntax.AtRule) -> CssImportRule*?:
+    # https://drafts.csswg.org/css-cascade-5/#at-import
+    # @import [ <url> | <string> ]
+    #         [ layer | layer(<layer-name>) ]?
+    #         <import-conditions> ;
+    #
+    # <import-conditions> = [ supports( [ <supports-condition> | <declaration> ] ) ]?
+    #                      <media-query-list>?
+    var tokens = css_syntax.token_stream_create(rule.prelude)
+
+    if rule.is_block_rule:
+        css_report_invalid_rule(ak.fly_string_from_str("@import"), css_syntax.token_stream_dump_string(&tokens), ak.string_from_str("Must be a statement, not a block."))
+        return none
+
+    if ak.vector_is_empty(&rule.prelude):
+        css_report_invalid_rule(ak.fly_string_from_str("@import"), css_syntax.token_stream_dump_string(&tokens), ak.string_from_str("Empty prelude."))
+        return none
+
+    css_syntax.token_stream_discard_whitespace(&tokens)
+
+    var url = css_parser_parse_url_function(this, &tokens)
+    let url_token = css_syntax.token_stream_next_token(&tokens)
+    if url == none and css_syntax.component_value_is(&url_token, .string):
+        let string_value = css_syntax.token_stream_consume_a_token(&tokens)
+        let string_token = css_syntax.component_value_token(&string_value)
+        let string = css_syntax.token_string(&string_token)
+        var url_value: CssUrl = ---
+        css_url_construct(&url_value, ak.fly_string_to_string_const_2(&string), CssUrlType.url, ak.Vector[CssRequestUrlModifier]())
+        url = url_value
+
+    if url == none:
+        let next = css_syntax.token_stream_next_token(&tokens)
+        let next_string = css_syntax.component_value_to_debug_string(&next)
+        css_report_invalid_rule(ak.fly_string_from_str("@import"), css_syntax.token_stream_dump_string(&tokens),
+                                css_string_formatted("Unable to parse `{}` as URL.", [css_arg_string(&next_string)]))
+        return none
+
+    css_syntax.token_stream_discard_whitespace(&tokens)
+    var layer: ak.FlyString? = none
+    # [ layer | layer(<layer-name>) ]?
+    let layer_token = css_syntax.token_stream_next_token(&tokens)
+    if css_syntax.component_value_is_ident(&layer_token, ak.sv("layer")):
+        css_syntax.token_stream_discard_a_token(&tokens)  # layer
+        layer = ak.fly_string_new()
+    elif css_syntax.component_value_is_function_string_view(&layer_token, ak.sv("layer")):
+        var layer_transaction = css_syntax.token_stream_begin_transaction(&tokens)
+        defer css_syntax.state_transaction_destroy(&layer_transaction)
+        let layer_function_value = css_syntax.token_stream_consume_a_token(&tokens)
+        let layer_function = css_syntax.component_value_function(&layer_function_value)
+        var layer_tokens = css_syntax.token_stream_create(layer_function.value)
+        let name = css_parser_parse_layer_name(this, &layer_tokens, CssParserAllowBlankLayerName.no)
+        css_syntax.token_stream_discard_whitespace(&layer_tokens)
+        if name == none or css_syntax.token_stream_has_next_token(&layer_tokens):
+            let original = css_syntax.function_original_source_text(&layer_function)
+            css_report_invalid_rule(ak.fly_string_from_str("@import"), css_syntax.token_stream_dump_string(&tokens),
+                                    css_string_formatted("Unable to parse `{}` as a valid layer.", [css_arg_string(&original)]))
+        else:
+            css_syntax.state_transaction_commit(&layer_transaction)
+            layer = name
+
+    # <import-conditions> = [ supports( [ <supports-condition> | <declaration> ] ) ]?
+    #                      <media-query-list>?
+    css_syntax.token_stream_discard_whitespace(&tokens)
+    var supports: CssSupports*? = none
+    let supports_token = css_syntax.token_stream_next_token(&tokens)
+    if css_syntax.component_value_is_function_string_view(&supports_token, ak.sv("supports")):
+        let component_value = css_syntax.token_stream_consume_a_token(&tokens)
+        let supports_function = css_syntax.component_value_function(&component_value)
+        var supports_tokens = css_syntax.token_stream_create(supports_function.value)
+        supports = css_parser_parse_a_supports(this, &supports_tokens)
+        if supports == none:
+            ak.vector_append_t(&this.m_rule_context, CssRuleContext.supports_condition)
+            let supports_declaration = css_parser_parse_supports_declaration(this, &supports_tokens)
+            discard(ak.vector_take_last(&this.m_rule_context))
+            if let declaration = supports_declaration:
+                supports = css_supports_create((CssBooleanExpression*)declaration)
+
+    let media_query_list = css_parser_parse_a_media_query_list(this, &tokens)
+
+    if css_syntax.token_stream_has_next_token(&tokens):
+        css_report_invalid_rule(ak.fly_string_from_str("@import"), css_syntax.token_stream_dump_string(&tokens), ak.string_from_str("Trailing tokens in prelude."))
+        return none
+
+    return css_import_rule_create(css_parser_realm(this), url else trap("VERIFY: a URL"), this.m_document, layer, supports,
+                                  css_media_list_create(css_parser_realm(this), media_query_list))
+
+# mark: <layer-name> ============================================================================
+
+## The `is_valid_layer_name_part` lambda of parse_layer_name.
+func css_is_valid_layer_name_part(token: const css_syntax.ComponentValue*) -> bool:
+    if not css_syntax.component_value_is(token, .ident):
+        return false
+    let ident = css_component_value_ident(token)
+    return not css_data.is_css_wide_keyword(ak.fly_string_bytes_as_string_view(&ident))
+
+## Ported from Libraries/LibWeb/CSS/Parser/RuleParsing.cpp:317 Web::CSS::Parser::Parser::parse_layer_name.
+pub func css_parser_parse_layer_name(this: CssParser*, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*, allow_blank_layer_name: CssParserAllowBlankLayerName) -> ak.FlyString?:
+    discard(this)
+    # https://drafts.csswg.org/css-cascade-5/#typedef-layer-name
+    # <layer-name> = <ident> [ '.' <ident> ]*
+
+    # "The CSS-wide keywords are reserved for future use, and cause the rule to be invalid at parse time if used as an <ident> in the <layer-name>."
+
+    var transaction = css_syntax.token_stream_begin_transaction(tokens)
+    defer css_syntax.state_transaction_destroy(&transaction)
+    css_syntax.token_stream_discard_whitespace(tokens)
+    if not css_syntax.token_stream_has_next_token(tokens) and allow_blank_layer_name == CssParserAllowBlankLayerName.yes:
+        # No name present, just return a blank one
+        return ak.fly_string_new()
+
+    let first_name_token = css_syntax.token_stream_consume_a_token(tokens)
+    if not css_is_valid_layer_name_part(&first_name_token):
+        return none
+
+    var builder = ak.string_builder_new()
+    let first_name = css_component_value_ident(&first_name_token)
+    ak.string_builder_append_string_view(&builder, ak.fly_string_bytes_as_string_view(&first_name))
+
+    while css_syntax.token_stream_has_next_token(tokens):
+        # Repeatedly parse `'.' <ident>`
+        let next = css_syntax.token_stream_next_token(tokens)
+        if not css_syntax.component_value_is_delim(&next, (u32)'.'):
+            break
+        css_syntax.token_stream_discard_a_token(tokens)  # '.'
+
+        let name_token = css_syntax.token_stream_consume_a_token(tokens)
+        if not css_is_valid_layer_name_part(&name_token):
+            return none
+        let name = css_component_value_ident(&name_token)
+        dump_appendff(&builder, ".{}", [css_arg_fly_string(&name)])
+
+    css_syntax.state_transaction_commit(&transaction)
+    return ak.string_builder_to_fly_string_without_validation(&builder)
