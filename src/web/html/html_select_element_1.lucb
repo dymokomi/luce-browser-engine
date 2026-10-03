@@ -1,0 +1,464 @@
+#==============================================================================================
+#
+#   html_select_element_1 - HTML::HTMLSelectElement: construction, options and selection
+#
+#   DESCRIPTION:
+#       Port of LibWeb/HTML/HTMLSelectElement.cpp (lines 1-489): the constructor (which moves
+#       the mixin tables to HTMLSelectElement's, as C++'s vptrs move, and sets the legacy
+#       platform object flags), initialize, visit_edges, the adjusted computed style, the
+#       display size and size, the options collection with length, item, namedItem, add and
+#       remove, the selected options, the list of options (cached), the reset algorithm,
+#       selectedIndex, the children changed steps, type, the default role, and value.
+#       html_select_element_2 has the picker, the shadow tree and the selectedness setting
+#       algorithm; the inline functions of HTMLSelectElement.h are at its end.
+#
+#       Copyright (c) 2020, the SerenityOS developers.
+#       Copyright (c) 2021-2022, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2023, Bastiaan van der Plaat <bastiaan.v.d.plaat@gmail.com>
+#       Copyright (c) 2025, Shannon Booth <shannon@serenityos.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Construction ============================================================================
+
+## The select element of its FormAssociatedElement base (C++'s `this` adjustment).
+func html_select_element_from_form_associated_element(base: HtmlFormAssociatedElement*) -> HtmlSelectElement*:
+    return (HtmlSelectElement*)((u8*)base - offsetof(HtmlElement, form_associated_element))
+
+## The FormAssociatedElement base of a select element.
+func html_select_element_form_associated(this: HtmlSelectElement*) -> HtmlFormAssociatedElement*:
+    return &this.html_element_base.form_associated_element
+
+## Ported from HTMLSelectElement.cpp:42 Web::HTML::HTMLSelectElement::HTMLSelectElement.
+pub func html_select_element_construct(this: HtmlSelectElement*, document: DomDocument*, qualified_name: DomQualifiedName):
+    html_element_construct(this.html_element(), document, qualified_name)
+    # The AutocompleteElement base gets its table, then the vptrs of the mixin bases move to
+    # HTMLSelectElement's tables.
+    this.autocomplete_element.vtable = &html_select_element_autocomplete_element_vtable
+    this.autocomplete_element.class_id = this.cell().class_id
+    let element = this.html_element()
+    element.element.slottable_mixin.vtable = &html_select_element_slottable_mixin_vtable
+    element.element.aria_mixin.vtable = &html_select_element_aria_mixin_vtable
+    element.element.animatable.vtable = &html_select_element_animatable_vtable
+    element.global_event_handlers.vtable = &html_select_element_global_event_handlers_vtable
+    element.form_associated_element.vtable = &html_select_element_form_associated_element_vtable
+    this.m_cached_list_of_options = ak.Vector[HtmlOptionElement*]()
+    this.m_select_items = ak.Vector[HtmlSelectItem]()
+
+    this.bind_platform_object().m_legacy_platform_object_flags = BindPlatformObjectLegacyPlatformObjectFlags(supports_indexed_properties = 1, has_indexed_property_setter = 1, indexed_property_setter_has_identifier = 1)
+
+## Ported from HTMLSelectElement.cpp:54 Web::HTML::HTMLSelectElement::initialize (override).
+pub func html_select_element_initialize_impl(base: JsCell*, realm: Realm*):
+    web_set_prototype_for_interface(base, realm, BindInterfaceName.html_select_element)
+    html_element_initialize_impl(base, realm)
+
+## Ported from HTMLSelectElement.cpp:60 Web::HTML::HTMLSelectElement::visit_edges (override).
+pub func html_select_element_visit_edges_impl(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (HtmlSelectElement*)base
+    html_element_visit_edges_impl(base, visitor)
+    gc.cell_visitor_visit_t(visitor, this.m_options)
+    gc.cell_visitor_visit_t(visitor, this.m_selected_options)
+    gc.cell_visitor_visit_t(visitor, this.m_inner_text_element)
+    gc.cell_visitor_visit_t(visitor, this.m_chevron_icon_element)
+    gc.cell_visitor_visit_vector(visitor, &this.m_cached_list_of_options)
+
+    for item in &ak.vector_span(&this.m_select_items):
+        match *item:
+            .html_select_item_option(item_option):
+                gc.cell_visitor_visit_t(visitor, item_option.option_element)
+            .html_select_item_option_group(item_option_group):
+                var group_items = item_option_group.items
+                for group_item in &ak.vector_span(&group_items):
+                    gc.cell_visitor_visit_t(visitor, group_item.option_element)
+            .html_select_item_separator(separator):
+                discard(separator)
+
+## Ported from HTMLSelectElement.cpp:81 Web::HTML::HTMLSelectElement::adjust_computed_style (override).
+pub func html_select_element_adjust_computed_style_impl(base: DomElement*, style: CssComputedProperties*):
+    discard(base)
+    # https://drafts.csswg.org/css-display-3/#unbox
+    let display = css_computed_properties_display(style)
+    if css_display_is_contents(&display):
+        css_computed_properties_set_property(style, css_data.PropertyId.display, css_display_style_value_create(css_display_from_short(CssDisplayShort.none_)).css_style_value())
+
+    # AD-HOC: We rewrite `display: inline` to `display: inline-block`.
+    #         This is required for the internal shadow tree to work correctly in layout.
+    let display_now = css_computed_properties_display(style)
+    if css_display_is_inline_outside(&display_now) and css_display_is_flow_inside(&display_now):
+        css_computed_properties_set_property(style, css_data.PropertyId.display, css_display_style_value_create(css_display_from_short(CssDisplayShort.inline_block)).css_style_value())
+
+    # AD-HOC: Enforce normal line-height for select elements. This matches the behavior of other engines.
+    css_computed_properties_set_property(style, css_data.PropertyId.line_height, css_keyword_style_value_create(css_data.Keyword.normal).css_style_value())
+
+# mark: Size ====================================================================================
+
+## Ported from HTMLSelectElement.cpp:97 Web::HTML::HTMLSelectElement::display_size.
+# https://html.spec.whatwg.org/multipage/form-elements.html#concept-select-size
+func html_select_element_display_size(this: HtmlSelectElement*) -> u32:
+    # The size IDL attribute must reflect the respective content attributes of the same name. The size IDL attribute has a default value of 0.
+    if let size_string = dom_element_get_attribute(this.dom_element(), html_attribute_names_size):
+        # The display size of a select element is the result of applying the rules for parsing non-negative integers
+        # to the value of element's size attribute, if it has one and parsing it is successful.
+        if let size = html_parse_non_negative_integer(ak.string_bytes_as_string_view(&size_string)):
+            return size
+
+    # If applying those rules to the attribute's value is not successful or if the size attribute is absent,
+    # then the element's display size is 4 if the element's multiple content attribute is present, and 1 otherwise.
+    if dom_element_has_attribute(this.dom_element(), html_attribute_names_multiple):
+        return 4
+    return 1
+
+## Ported from HTMLSelectElement.cpp:115 Web::HTML::HTMLSelectElement::size.
+# https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-size
+pub func html_select_element_size(this: HtmlSelectElement*) -> u32:
+    # The multiple, required, and size IDL attributes must reflect the respective content attributes of the same name. The size IDL attribute has a default value of 0.
+    if let size_string = dom_element_get_attribute(this.dom_element(), html_attribute_names_size):
+        if let size = html_parse_non_negative_integer(ak.string_bytes_as_string_view(&size_string)):
+            if size <= 2147483647:
+                return size
+
+    return 0
+
+## Ported from HTMLSelectElement.cpp:126 Web::HTML::HTMLSelectElement::set_size.
+pub func html_select_element_set_size(this: HtmlSelectElement*, size: u32):
+    var new_size = size
+    if new_size > 2147483647:
+        new_size = 0
+    dom_element_set_attribute_value(this.dom_element(), html_attribute_names_size, ak.string_number_u64(new_size))
+
+# mark: The options collection ==================================================================
+
+## The filter of the options collection: `[this](Element const& element) { ... }`.
+func html_select_element_options_filter(context: void*?, element: DomElement*) -> bool:
+    let this = (HtmlSelectElement*)(context else trap("no select element"))
+    let maybe_option = as_if_html_option_element(element) else return false
+    return html_option_element_nearest_select_element_const(maybe_option) == this
+
+## Ported from HTMLSelectElement.cpp:134 Web::HTML::HTMLSelectElement::options.
+# https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-options
+pub func html_select_element_options(this: HtmlSelectElement*) -> HtmlOptionsCollection*?:
+    # The options IDL attribute must return an HTMLOptionsCollection rooted at the select node,
+    # whose filter matches the elements in the list of options.
+    if this.m_options == none:
+        this.m_options = html_options_collection_create(this.dom_parent_node(), ak.Function1[DomElement*, bool](call = html_select_element_options_filter, context = this))
+    return this.m_options
+
+## `const_cast<HTMLOptionsCollection&>(*options())`.
+func html_select_element_options_collection(this: HtmlSelectElement*) -> HtmlOptionsCollection*:
+    return html_select_element_options(this) else trap("VERIFY: GC::Ptr<HTMLOptionsCollection>::operator* on null")
+
+## Ported from HTMLSelectElement.cpp:148 Web::HTML::HTMLSelectElement::length.
+# https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-length
+pub func html_select_element_length(this: HtmlSelectElement*) -> u32:
+    # The length IDL attribute must return the number of nodes represented by the options collection. On setting, it must act like the attribute of the same name on the options collection.
+    return (u32)dom_html_collection_length(html_select_element_options_collection(this).dom_html_collection())
+
+## Ported from HTMLSelectElement.cpp:154 Web::HTML::HTMLSelectElement::set_length.
+pub func html_select_element_set_length(this: HtmlSelectElement*, length: u32) -> !:
+    # On setting, it must act like the attribute of the same name on the options collection.
+    try html_options_collection_set_length(html_select_element_options_collection(this), length)
+
+## Ported from HTMLSelectElement.cpp:161 Web::HTML::HTMLSelectElement::item.
+# https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-item
+pub func html_select_element_item(this: HtmlSelectElement*, index: u32) -> HtmlOptionElement*?:
+    # The item(index) method must return the value returned by the method of the same name on the options collection, when invoked with the same argument.
+    let item = dom_html_collection_item(html_select_element_options_collection(this).dom_html_collection(), (usize)index) else return none
+    return as_html_option_element(item)
+
+## Ported from HTMLSelectElement.cpp:168 Web::HTML::HTMLSelectElement::item_value (override).
+# https://html.spec.whatwg.org/multipage/form-elements.html#the-select-element:htmlselectelement
+pub func html_select_element_item_value_impl(base: BindPlatformObject*, index: usize) -> JsValue?:
+    let this = (HtmlSelectElement*)base
+    # The options collection is also mirrored on the HTMLSelectElement object. The supported property indices at any
+    # instant are the indices supported by the object returned by the options attribute at that instant.
+    return bind_platform_object_item_value(html_select_element_options_collection(this).bind_platform_object(), index)
+
+## Ported from HTMLSelectElement.cpp:176 Web::HTML::HTMLSelectElement::named_item.
+# https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-nameditem
+pub func html_select_element_named_item(this: HtmlSelectElement*, name: ak.FlyString) -> HtmlOptionElement*?:
+    # The namedItem(name) method must return the value returned by the method of the same name on the options collection, when invoked with the same argument.
+    let item = dom_html_collection_named_item(html_select_element_options_collection(this).dom_html_collection(), name) else return none
+    return as_html_option_element(item)
+
+## Ported from HTMLSelectElement.cpp:183 Web::HTML::HTMLSelectElement::add.
+# https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-add
+pub func html_select_element_add(this: HtmlSelectElement*, element: HtmlOptionOrOptGroupElement, before: HtmlNullableHtmlElementOrElementIndex = .empty) -> !:
+    # Similarly, the add(element, before) method must act like its namesake method on that same options collection.
+    try html_options_collection_add(html_select_element_options_collection(this), element, before)
+
+    html_select_element_update_selectedness(this)  # Not in spec
+
+## Ported from HTMLSelectElement.cpp:194 Web::HTML::HTMLSelectElement::set_value_of_indexed_property (override).
+# https://html.spec.whatwg.org/multipage/form-elements.html#the-select-element:set-the-value-of-a-new-indexed-property
+pub func html_select_element_set_value_of_indexed_property_impl(base: BindPlatformObject*, n: u32, new_value: JsValue) -> !:
+    let this = (HtmlSelectElement*)base
+    # When the user agent is to set the value of a new indexed property or set the value of an existing indexed property
+    # for a select element, it must instead run the corresponding algorithm on the select element's options collection.
+    try html_options_collection_set_value_of_indexed_property_impl(html_select_element_options_collection(this).bind_platform_object(), n, new_value)
+
+## Ported from HTMLSelectElement.cpp:204 Web::HTML::HTMLSelectElement::remove.
+# https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-remove
+pub func html_select_element_remove(this: HtmlSelectElement*):
+    # The remove() method must act like its namesake method on that same options collection when it has arguments,
+    # and like its namesake method on the ChildNode interface implemented by the HTMLSelectElement ancestor interface Element when it has no arguments.
+    dom_child_node_remove_binding(this.dom_node())
+
+## Ported from HTMLSelectElement.cpp:211 Web::HTML::HTMLSelectElement::remove(WebIDL::Long).
+pub func html_select_element_remove_i32(this: HtmlSelectElement*, index: i32):
+    html_options_collection_remove(html_select_element_options_collection(this), index)
+
+## The filter of the selected options collection: `[this](Element const& element) { ... }`.
+func html_select_element_selected_options_filter(context: void*?, element: DomElement*) -> bool:
+    let this = (HtmlSelectElement*)(context else trap("no select element"))
+    if let maybe_option = as_if_html_option_element(element):
+        if html_option_element_nearest_select_element_const(maybe_option) == this:
+            return html_option_element_selected(maybe_option)
+    return false
+
+## Ported from HTMLSelectElement.cpp:217 Web::HTML::HTMLSelectElement::selected_options.
+# https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-selectedoptions
+pub func html_select_element_selected_options(this: HtmlSelectElement*) -> DomHtmlCollection*:
+    # The selectedOptions IDL attribute must return an HTMLCollection rooted at the select node,
+    # whose filter matches the elements in the list of options that have their selectedness set to true.
+    if this.m_selected_options == none:
+        this.m_selected_options = dom_html_collection_create(this.dom_parent_node(), DomHtmlCollectionScope.descendants, ak.Function1[DomElement*, bool](call = html_select_element_selected_options_filter, context = this), ak.Function2[DomElement*, DomElement*, bool]())
+    return this.m_selected_options else trap("unreachable")
+
+# mark: The list of options =====================================================================
+
+## `is_nested_optgroup` of update_cached_list_of_options: whether node is an optgroup element
+## with an ancestor optgroup in between itself and this select.
+func html_select_element_is_nested_optgroup(this: HtmlSelectElement*, node: DomNode*) -> bool:
+    if not is_html_opt_group_element(node):
+        return false
+
+    var maybe_ancestor = node.tree_node.m_parent
+    while let ancestor = maybe_ancestor:
+        if ancestor == this.dom_node():
+            return false  # reached the select without another optgroup
+        if is_html_opt_group_element(ancestor):
+            return true  # found an optgroup above us
+        maybe_ancestor = ancestor.tree_node.m_parent
+    return false
+
+## Ported from HTMLSelectElement.cpp:234 Web::HTML::HTMLSelectElement::update_cached_list_of_options.
+# https://html.spec.whatwg.org/multipage/form-elements.html#concept-select-option-list
+func html_select_element_update_cached_list_of_options(this: HtmlSelectElement*):
+    # 1. Let options be « ».
+    ak.vector_clear(&this.m_cached_list_of_options)
+    this.m_cached_number_of_selected_options = 0
+
+    # 2. Let node be the first child of select in tree order.
+    # 3. While node is not null:
+    var iterator = dom_node_subtree(this.dom_node()).iterator()
+    while let node = iterator.next():
+        # 1. If node is an option element, then append node to options.
+        if let maybe_option = as_if_html_option_element(node):
+            if html_option_element_selected(maybe_option):
+                this.m_cached_number_of_selected_options += 1
+            ak.vector_append_t(&this.m_cached_list_of_options, maybe_option)
+
+        # 2. If any of the following conditions are true:
+        #    - node is a select element;
+        #    - node is an hr element;
+        #    - node is an option element;
+        #    - node is a datalist element;
+        #    - node is an optgroup element and node has an ancestor optgroup in between itself and select,
+        if is_html_select_element(node) or is_html_htmlhr_element(node) or is_html_option_element(node) or is_html_data_list_element(node) or html_select_element_is_nested_optgroup(this, node):
+            # then set node to the next descendant of select in tree order, excluding node's descendants, if any such
+            # node exists; otherwise null.
+            iterator.skip_children()
+        # Otherwise, set node to the next descendant of select in tree order, if any such node exists; otherwise null.
+
+    # 4. Return options.
+    # (Implicit by updating m_cached_list_of_options)
+
+## Ported from HTMLSelectElement.cpp:288 Web::HTML::HTMLSelectElement::list_of_options.
+# https://html.spec.whatwg.org/multipage/form-elements.html#concept-select-option-list
+pub func html_select_element_list_of_options(this: HtmlSelectElement*) -> ak.Vector[HtmlOptionElement*?]:
+    html_select_element_update_cached_list_of_options(this)
+    var list = ak.Vector[HtmlOptionElement*?]()
+    ak.vector_ensure_capacity(&list, ak.vector_size(&this.m_cached_list_of_options))
+    for item in ak.vector_span(&this.m_cached_list_of_options):
+        ak.vector_append_t(&list, item)
+
+    return list
+
+## Ported from HTMLSelectElement.cpp:300 Web::HTML::HTMLSelectElement::reset_algorithm (override).
+# https://html.spec.whatwg.org/multipage/form-elements.html#the-select-element:concept-form-reset-control
+pub func html_select_element_reset_algorithm_impl(base: HtmlFormAssociatedElement*):
+    let this = html_select_element_from_form_associated_element(base)
+    html_select_element_update_cached_list_of_options(this)
+    # The reset algorithm for a select element selectElement is:
+
+    # 1. Set selectElement's user validity to false.
+    this.m_user_validity = false
+
+    # 2. For each optionElement of selectElement's list of options:
+    for option_element in ak.vector_span(&this.m_cached_list_of_options):
+        # 1. If optionElement has a selected attribute, then set optionElement's selectedness to true; otherwise set it to false.
+        html_option_element_set_selected_internal(option_element, dom_element_has_attribute(option_element.dom_element(), html_attribute_names_selected))
+        # 2. Set optionElement's dirtiness to false.
+        option_element.m_dirty = false
+
+    # 3. Run the selectedness setting algorithm given selectElement.
+    html_select_element_update_selectedness(this)
+
+## Ported from HTMLSelectElement.cpp:321 Web::HTML::HTMLSelectElement::selected_index.
+# https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-selectedindex
+pub func html_select_element_selected_index(this: HtmlSelectElement*) -> i32:
+    # The selectedIndex getter steps are to return the index of the first option element in this's list of options
+    # in tree order that has its selectedness set to true, if any. If there isn't one, then return −1.
+    html_select_element_update_cached_list_of_options(this)
+
+    var index: i32 = 0
+    for option_element in ak.vector_span(&this.m_cached_list_of_options):
+        if html_option_element_selected(option_element):
+            return index
+        index += 1
+    return -1
+
+## Ported from HTMLSelectElement.cpp:337 Web::HTML::HTMLSelectElement::set_selected_index.
+# https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-selectedindex
+pub func html_select_element_set_selected_index(this: HtmlSelectElement*, index: i32) -> !:
+    # The selectedIndex setter steps are:
+    defer html_select_element_clone_selected_option_into_select_button(this)
+
+    # 1. Let firstMatchingOption be null.
+    var first_matching_option: HtmlOptionElement*? = none
+
+    # 2. For each option of this's list of options:
+    html_select_element_update_cached_list_of_options(this)
+    var current_index: i32 = 0
+    for option in ak.vector_span(&this.m_cached_list_of_options):
+        # 1. Set option's selectedness to false.
+        html_option_element_set_selected_internal(option, false)
+
+        # 2. If firstMatchingOption is null and option's index is equal to the given value, then
+        #    set firstMatchingOption to option.
+        if first_matching_option == none and current_index == index:
+            first_matching_option = option
+
+        current_index += 1
+
+    # 3. If firstMatchingOption is not null, then set firstMatchingOption's selectedness to true
+    #    and set firstMatchingOption's dirtiness to true.
+    if let option = first_matching_option:
+        html_option_element_set_selected_internal(option, true)
+        option.m_dirty = true
+
+    # 4. Run update a select's selectedcontent given this.
+    try html_select_element_update_selectedcontent(this)
+
+## Ported from HTMLSelectElement.cpp:374 Web::HTML::HTMLSelectElement::default_tab_index_value (override).
+# https://html.spec.whatwg.org/multipage/interaction.html#dom-tabindex
+pub func html_select_element_default_tab_index_value_impl(base: DomElement*) -> i32:
+    discard(base)
+    # See the base function for the spec comments.
+    return 0
+
+## Ported from HTMLSelectElement.cpp:380 Web::HTML::HTMLSelectElement::can_skip_selectedness_update_for_inserted_option.
+pub func html_select_element_can_skip_selectedness_update_for_inserted_option(this: HtmlSelectElement*, option: HtmlOptionElement*) -> bool:
+    if html_option_element_selected(option):
+        return false
+
+    if this.m_cached_number_of_selected_options >= 2:
+        return false
+
+    if html_select_element_display_size(this) == 1 and this.m_cached_number_of_selected_options == 0:
+        return false
+
+    return true
+
+## Ported from HTMLSelectElement.cpp:394 Web::HTML::HTMLSelectElement::can_skip_children_changed_selectedness_update.
+func html_select_element_can_skip_children_changed_selectedness_update(this: HtmlSelectElement*, metadata: DomNodeChildrenChangedMetadata) -> bool:
+    # If the following criteria are met, there is no need to re-run the selectedness algorithm.
+    # FIXME: We can tighten up these conditions and skip even more work!
+    if metadata.type_ != DomNodeChildrenChangedMetadataType.inserted:
+        return false
+
+    if let option = as_if_html_option_element(metadata.node):
+        return html_select_element_can_skip_selectedness_update_for_inserted_option(this, option)
+
+    return false
+
+## Ported from HTMLSelectElement.cpp:407 Web::HTML::HTMLSelectElement::children_changed (override).
+pub func html_select_element_children_changed_impl(base: DomNode*, metadata: DomNodeChildrenChangedMetadata):
+    let this = (HtmlSelectElement*)base
+    dom_element_children_changed_impl(base, metadata)
+
+    if html_select_element_can_skip_children_changed_selectedness_update(this, metadata):
+        return
+
+    html_select_element_update_cached_list_of_options(this)
+    html_select_element_update_selectedness(this)
+
+## Ported from HTMLSelectElement.cpp:419 Web::HTML::HTMLSelectElement::type.
+## (C++ returns references to two function-local static Strings; a module global is not
+## scanned by the collector, so the port makes the same value each time.)
+# https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-type
+pub func html_select_element_type(this: HtmlSelectElement*) -> ak.String:
+    # The type IDL attribute, on getting, must return the string "select-one" if the multiple attribute is absent, and the string "select-multiple" if the multiple attribute is present.
+    if not dom_element_has_attribute(this.dom_element(), html_attribute_names_multiple):
+        return ak.string_from_str("select-one")
+
+    return ak.string_from_str("select-multiple")
+
+## Ported from HTMLSelectElement.cpp:431 Web::HTML::HTMLSelectElement::default_role (override).
+pub func html_select_element_default_role_impl(base: AriaMixin*) -> AriaRole?:
+    let this = (HtmlSelectElement*)dom_element_from_aria_mixin(base)
+    # https://www.w3.org/TR/html-aria/#el-select-multiple-or-size-greater-1
+    if dom_element_has_attribute(this.dom_element(), html_attribute_names_multiple):
+        return AriaRole.listbox
+    if let size_string = dom_element_get_attribute(this.dom_element(), html_attribute_names_size):
+        if let size = ak.string_to_number_i32(&size_string):
+            if size > 1:
+                return AriaRole.listbox
+    # https://www.w3.org/TR/html-aria/#el-select
+    return AriaRole.combobox
+
+# mark: The value ===============================================================================
+
+## Ported from HTMLSelectElement.cpp:445 Web::HTML::HTMLSelectElement::value.
+# https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-value
+pub func html_select_element_value(this: HtmlSelectElement*) -> ak.Utf16String:
+    # The value getter steps are to return the value of the first option element in this's
+    # list of options in tree order that has its selectedness set to true, if any. If there
+    # isn't one, then return the empty string.
+    html_select_element_update_cached_list_of_options(this)
+    for option_element in ak.vector_span(&this.m_cached_list_of_options):
+        if html_option_element_selected(option_element):
+            return html_option_element_value(option_element)
+    return ak.utf16_string_new()
+
+## Ported from HTMLSelectElement.cpp:458 Web::HTML::HTMLSelectElement::set_value.
+# https://html.spec.whatwg.org/multipage/form-elements.html#dom-select-value
+pub func html_select_element_set_value(this: HtmlSelectElement*, value: ak.Utf16String) -> !:
+    # The value setter steps are:
+    defer html_select_element_clone_selected_option_into_select_button(this)
+    html_select_element_update_cached_list_of_options(this)
+
+    # 1. Let firstMatchingOption be null.
+    var first_matching_option: HtmlOptionElement*? = none
+
+    # 2. For each option of this's list of options:
+    for option_element in ak.vector_span(&this.m_cached_list_of_options):
+        # 1. Set option's selectedness to false.
+        html_option_element_set_selected_internal(option_element, false)
+
+        # 2. If firstMatchingOption is null and option's value is equal to the given value, then set
+        #    firstMatchingOption to option.
+        if first_matching_option == none:
+            let option_value = html_option_element_value(option_element)
+            if html_utf16_equals(&option_value, &value):
+                first_matching_option = option_element
+
+    # 3. If firstMatchingOption is not null, then set firstMatchingOption's selectedness to true and set
+    #    firstMatchingOption's dirtiness to true.
+    if let option = first_matching_option:
+        html_option_element_set_selected_internal(option, true)
+        option.m_dirty = true
+
+    # 4. Run update a select's selectedcontent given this.
+    try html_select_element_update_selectedcontent(this)
