@@ -1,0 +1,515 @@
+#==============================================================================================
+#
+#   style_computer_6 - CSS::StyleComputer: computing an element's style
+#
+#   DESCRIPTION:
+#       Port of LibWeb/CSS/StyleComputer.cpp (lines 1777-2239): the document's style,
+#       compute_style and its seeded and pseudo-element variants, compute_style_impl (the
+#       cascade, custom properties and the bail-outs for pseudo-elements), the monospace
+#       font-size time travel (recascade_font_size_if_needed), compute_properties (inheritance,
+#       initial values, logical properties, animations and the post-cascade adjustments) and
+#       the :is()/:where() bucketing simplification.
+#
+#       Copyright (c) 2018-2025, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2021, the SerenityOS developers.
+#       Copyright (c) 2021-2025, Sam Atkins <sam@ladybird.org>
+#       Copyright (c) 2024, Matthew Olsson <mattco@serenityos.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: compute_style ===========================================================================
+
+## heap.allocate<CSS::ComputedProperties>(): a ComputedProperties cell constructed under DeferGC.
+pub func heap_allocate_css_computed_properties(heap: gc.Heap*) -> CssComputedProperties*:
+    let this = (CssComputedProperties*)web_heap_allocate_cell(heap, &css_computed_properties_class)
+    gc.heap_defer_gc(heap)
+    css_computed_properties_construct(this)
+    gc.heap_undefer_gc(heap)
+    return this
+
+## Ported from Libraries/LibWeb/CSS/StyleComputer.cpp:1777 Web::CSS::StyleComputer::create_document_style.
+pub func css_style_computer_create_document_style(this: CssStyleComputer*) -> CssComputedProperties*:
+    let style = heap_allocate_css_computed_properties(gc.cell_heap(css_style_computer_document(this).cell()))
+    for i in (u16)css_data.first_longhand_property_id..=(u16)css_data.last_longhand_property_id:
+        let property_id = (css_data.PropertyId)i
+        css_computed_properties_set_property(style, property_id, css_property_initial_value(property_id))
+
+    css_style_computer_compute_property_values(this, style, none)
+    let viewport_rect = css_style_computer_viewport_rect(this)
+    css_computed_properties_set_property(style, css_data.PropertyId.width, css_length_style_value_create(css_length_make_px_css_pixels(gfx.css_pixel_rect_width(&viewport_rect))).css_style_value())
+    css_computed_properties_set_property(style, css_data.PropertyId.height, css_length_style_value_create(css_length_make_px_css_pixels(gfx.css_pixel_rect_height(&viewport_rect))).css_style_value())
+    css_computed_properties_set_property(style, css_data.PropertyId.display, css_display_style_value_create(css_display_from_short(CssDisplayShort.block)).css_style_value())
+    return style
+
+## Ported from Libraries/LibWeb/CSS/StyleComputer.cpp:1792 Web::CSS::StyleComputer::compute_style.
+pub func css_style_computer_compute_style(this: CssStyleComputer*, abstract_element: DomAbstractElement, did_change_custom_properties: bool*? = none) -> CssComputedProperties*:
+    let style_scope = dom_abstract_element_style_scope(&abstract_element)
+    return css_style_computer_compute_style_impl(this, abstract_element, CssStyleComputerComputeStyleMode.normal, did_change_custom_properties, style_scope) else trap("VERIFY: compute_style_impl produced a style")
+
+## Ported from Libraries/LibWeb/CSS/StyleComputer.cpp:1798 Web::CSS::StyleComputer::compute_style_with_seeded_ancestors.
+pub func css_style_computer_compute_style_with_seeded_ancestors(this: CssStyleComputer*, abstract_element: DomAbstractElement) -> CssComputedProperties*:
+    var parent = dom_abstract_element_parent_element(&abstract_element)
+    while let current = parent:
+        css_style_computer_push_ancestor(this, current)
+        parent = dom_node_parent_element(current.dom_node())
+
+    defer:
+        var popped = dom_abstract_element_parent_element(&abstract_element)
+        while let current = popped:
+            css_style_computer_pop_ancestor(this, current)
+            popped = dom_node_parent_element(current.dom_node())
+
+    return css_style_computer_compute_style(this, abstract_element)
+
+## Ported from Libraries/LibWeb/CSS/StyleComputer.cpp:1812 Web::CSS::StyleComputer::compute_pseudo_element_style_if_needed.
+pub func css_style_computer_compute_pseudo_element_style_if_needed(this: CssStyleComputer*, abstract_element: DomAbstractElement, did_change_custom_properties: bool*?) -> CssComputedProperties*?:
+    let style_scope = dom_abstract_element_style_scope(&abstract_element)
+    return css_style_computer_compute_style_impl(this, abstract_element, CssStyleComputerComputeStyleMode.create_pseudo_element_style_if_needed, did_change_custom_properties, style_scope)
+
+## Whether two maps of custom properties are equal (HashMap::operator==: the same size, and every key of one in the
+## other with an equal value).
+func css_custom_property_maps_equal(a: const ak.OrderedHashMap[ak.FlyString, CssStyleProperty, ak.FlyStringTraits]*, b: const ak.OrderedHashMap[ak.FlyString, CssStyleProperty, ak.FlyStringTraits]*) -> bool:
+    if ak.ordered_hash_map_size(a) != ak.ordered_hash_map_size(b):
+        return false
+    for it in ak.ordered_hash_map_begin_const(a):
+        let other_value = ak.ordered_hash_map_get_k_const(b, it.key) else return false
+        if not css_style_property_eq(&it.value, *other_value):
+            return false
+    return true
+
+## Ported from Libraries/LibWeb/CSS/StyleComputer.cpp:1818 Web::CSS::StyleComputer::compute_style_impl.
+pub func css_style_computer_compute_style_impl(this: CssStyleComputer*, abstract_element_: DomAbstractElement, mode: CssStyleComputerComputeStyleMode, did_change_custom_properties: bool*?, style_scope: const CssStyleScope*) -> CssComputedProperties*?:
+    var abstract_element = abstract_element_
+    css_style_scope_build_rule_cache_if_needed(style_scope)
+
+    # Special path for elements that represent a pseudo-element in some element's internal shadow tree.
+    let element = dom_abstract_element_element(&abstract_element)
+    if let use_pseudo_element = dom_element_use_pseudo_element(element):
+        let host_element = dom_node_parent_or_shadow_host_element(tree_node_root(element.dom_node())) else trap("VERIFY: the internal shadow tree has a host")
+
+        # We have to decide where to inherit from. If the pseudo-element has a parent element,
+        # we inherit from that. Otherwise, we inherit from the host element in the light DOM.
+        var abstract_element_for_pseudo_element = DomAbstractElement(m_element = host_element, m_pseudo_element = use_pseudo_element, m_inheritance_override = none)
+        if let parent_element = dom_node_parent_element(element.dom_node()):
+            dom_abstract_element_set_inheritance_override(&abstract_element_for_pseudo_element, parent_element)
+        else:
+            dom_abstract_element_set_inheritance_override(&abstract_element_for_pseudo_element, host_element)
+
+        let style = css_style_computer_compute_style(this, abstract_element_for_pseudo_element)
+
+        # Copy cascaded properties to the element itself so that elements
+        # slotted into this slot can find them via element_to_inherit_style_from().
+        dom_abstract_element_set_cascaded_properties(&abstract_element, dom_abstract_element_cascaded_properties(&abstract_element_for_pseudo_element))
+
+        # Merge back inline styles
+        if let inline_style = dom_element_inline_style(element):
+            let properties = css_style_properties_properties(inline_style)
+            for property in ak.vector_span_const(&properties):
+                css_computed_properties_set_property(style, property.property_id, property.value)
+        dom_element_adjust_computed_style(element, style)
+        return style
+
+    defer dom_node_set_needs_style_update(element.dom_node(), false)
+
+    # 1. Perform the cascade. This produces the "specified style"
+    var did_match_any_pseudo_element_rules = false
+    var attempted_pseudo_class_matches: CssPseudoClassBitmap
+    let matching_rule_set = css_style_computer_build_matching_rule_set(this, abstract_element, &attempted_pseudo_class_matches, &did_match_any_pseudo_element_rules, mode, style_scope)
+
+    if mode == CssStyleComputerComputeStyleMode.create_pseudo_element_style_if_needed:
+        # NOTE: If we're computing style for a pseudo-element, we look for a number of reasons to bail early.
+
+        # Some pseudo-elements are generated regardless of CSS rules, so we need to compute their styles even when no
+        # rules matched.
+        let pseudo_element = dom_abstract_element_pseudo_element(&abstract_element) else trap("VERIFY: a pseudo-element")
+        let has_implicit_style = pseudo_element == css_data.PseudoElement.details_content or pseudo_element == css_data.PseudoElement.file_selector_button or pseudo_element == css_data.PseudoElement.marker or pseudo_element == css_data.PseudoElement.placeholder
+
+        # Bail if no pseudo-element rules matched. Clear any stale cascaded/custom property data so
+        # getComputedStyle() doesn't return values from a previous match.
+        if not did_match_any_pseudo_element_rules and not has_implicit_style:
+            dom_abstract_element_set_cascaded_properties(&abstract_element, none)
+            dom_abstract_element_set_custom_property_data(&abstract_element, none)
+            return none
+
+    let old_custom_property_data = dom_abstract_element_custom_property_data(&abstract_element)
+
+    # Resolve all the CSS custom properties ("variables") for this element:
+    var supports_custom_properties = true
+    if let pseudo_element = dom_abstract_element_pseudo_element(&abstract_element):
+        supports_custom_properties = css_data.pseudo_element_supports_property(pseudo_element, css_data.PropertyId.custom)
+    if supports_custom_properties:
+        var cascaded_all: ak.OrderedHashMap[ak.FlyString, CssStyleProperty, ak.FlyStringTraits]
+        for layer in ak.vector_span_const(&matching_rule_set.author_rules):
+            css_cascade_custom_properties(abstract_element, &layer.rules, &cascaded_all)
+
+        var parent_data: const CssCustomPropertyData*? = none
+        if let inherit_from = dom_abstract_element_element_to_inherit_style_from(&abstract_element):
+            parent_data = css_inheritable_custom_property_data(inherit_from)
+
+        # Build own_values with only properties that differ from the parent.
+        # We build a fresh map instead of removing from cascaded_all,
+        # because removing entries doesn't shrink the bucket array.
+        var cascaded_own: ak.OrderedHashMap[ak.FlyString, CssStyleProperty, ak.FlyStringTraits]
+        for entry in ak.ordered_hash_map_begin_const(&cascaded_all):
+            if let parent = parent_data:
+                if let parent_property = css_custom_property_data_get(parent, entry.key):
+                    if parent_property.value == entry.value.value:
+                        continue
+            discard(ak.ordered_hash_map_set(&cascaded_own, entry.key, entry.value))
+
+        if ak.ordered_hash_map_is_empty(&cascaded_own) and parent_data != none:
+            dom_abstract_element_set_custom_property_data(&abstract_element, parent_data)
+        elif ak.ordered_hash_map_is_empty(&cascaded_own) and parent_data == none:
+            dom_abstract_element_set_custom_property_data(&abstract_element, none)
+        else:
+            dom_abstract_element_set_custom_property_data(&abstract_element, css_custom_property_data_create(cascaded_own, parent_data))
+
+    let cascaded_properties = css_style_computer_compute_cascaded_values(this, abstract_element, did_match_any_pseudo_element_rules, mode, &matching_rule_set)
+    dom_abstract_element_set_cascaded_properties(&abstract_element, cascaded_properties)
+
+    if mode == CssStyleComputerComputeStyleMode.create_pseudo_element_style_if_needed:
+        # Bail if no pseudo-element would be generated due to...
+        # - content: none
+        # - content: normal (for ::before and ::after)
+        var content_is_normal = false
+        if let content_value = css_cascaded_properties_property(cascaded_properties, css_data.PropertyId.content):
+            if css_style_value_is_keyword(content_value):
+                let content = css_keyword_style_value_keyword(css_style_value_as_keyword(content_value))
+                if content == css_data.Keyword.none_:
+                    return none
+                content_is_normal = content == css_data.Keyword.normal
+            else:
+                content_is_normal = false
+        else:
+            # NOTE: `normal` is the initial value, so the absence of a value is treated as `normal`.
+            content_is_normal = true
+        let pseudo_element = dom_abstract_element_pseudo_element(&abstract_element) else trap("VERIFY: a pseudo-element")
+        if content_is_normal and (pseudo_element == css_data.PseudoElement.before or pseudo_element == css_data.PseudoElement.after):
+            return none
+
+    let computed_properties = css_style_computer_compute_properties(this, abstract_element, cascaded_properties)
+    css_computed_properties_set_attempted_pseudo_class_matches(computed_properties, attempted_pseudo_class_matches)
+
+    if let changed = did_change_custom_properties:
+        let new_custom_property_data = dom_abstract_element_custom_property_data(&abstract_element)
+        if old_custom_property_data != new_custom_property_data:
+            # static OrderedHashMap<FlyString, StyleProperty> const empty_own_values;
+            var empty_own_values: ak.OrderedHashMap[ak.FlyString, CssStyleProperty, ak.FlyStringTraits]
+            var old_own = empty_own_values
+            if let old_data = old_custom_property_data:
+                old_own = css_custom_property_data_own_values(old_data)
+            var new_own = empty_own_values
+            if let new_data = new_custom_property_data:
+                new_own = css_custom_property_data_own_values(new_data)
+            if not css_custom_property_maps_equal(&old_own, &new_own):
+                *changed = true
+
+    return computed_properties
+
+# mark: The monospace font size =================================================================
+
+## Ported from Libraries/LibWeb/CSS/StyleComputer.cpp:1957 Web::CSS::is_monospace.
+func css_is_monospace(value: CssStyleValue*) -> bool:
+    if not css_style_value_is_value_list(value):
+        return false
+
+    let values = css_style_value_list_values(css_style_value_as_value_list(value))
+
+    return ak.vector_size(&values) == 1 and css_style_value_to_keyword(*ak.vector_at_const(&values, 0)) == css_data.Keyword.monospace
+
+## recascade_font_size_if_needed's `constexpr CSSPixels default_monospace_font_size_in_px = 13;`.
+let css_default_monospace_font_size_in_px: i64 = 13
+
+## recascade_font_size_if_needed's `static auto monospace_font` (null until first needed).
+var css_recascade_monospace_font: web_fonts.Font*?
+
+## Ported from Libraries/LibWeb/CSS/StyleComputer.cpp:1974 Web::CSS::StyleComputer::recascade_font_size_if_needed.
+# HACK: This function implements time-travelling inheritance for the font-size property
+#       in situations where the cascade ended up with `font-family: monospace`.
+#       In such cases, other browsers will magically change the meaning of keyword font sizes
+#       *even in earlier stages of the cascade!!* to be relative to the default monospace font size (13px)
+#       instead of the default font size (16px).
+#       See this blog post for a lot more details about this weirdness:
+#       https://manishearth.github.io/blog/2017/08/10/font-size-an-unexpectedly-complex-css-property/
+pub func css_style_computer_recascade_font_size_if_needed(this: CssStyleComputer*, abstract_element: DomAbstractElement, cascaded_properties: CssCascadedProperties*) -> CssStyleValue*?:
+    # Check for `font-family: monospace`. Note that `font-family: monospace, AnythingElse` does not trigger this path.
+    # Some CSS frameworks use `font-family: monospace, monospace` to work around this behavior.
+    let font_family_value = css_cascaded_properties_property(cascaded_properties, css_data.PropertyId.font_family) else return none
+    if not css_is_monospace(font_family_value):
+        return none
+
+    # FIXME: This should be configurable.
+    let default_monospace_font_size_in_px = gfx.css_pixels_from_int(css_default_monospace_font_size_in_px)
+    if css_recascade_monospace_font == none:
+        # static auto monospace_font_family_name = ...; static auto monospace_font = ...;
+        let monospace_font_family_name = platform_font_plugin_generic_font_name(platform_font_plugin_the(), PlatformGenericFont.monospace, 400, 0)
+        css_recascade_monospace_font = web_fonts.font_database_get(web_fonts.font_database_the(), monospace_font_family_name, gfx.mul_css_pixels_f32(default_monospace_font_size_in_px, 0.75), 400, (u32)web_fonts.FontWidth.normal, 0)
+    let monospace_font = css_recascade_monospace_font else trap("VERIFY: the monospace font")
+
+    # Reconstruct the line of ancestor elements we need to inherit style from, and then do the cascade again
+    # but only for the font-size property.
+    var ancestors: ak.Vector[DomAbstractElement]
+    var ancestor = dom_abstract_element_element_to_inherit_style_from(&abstract_element)
+    while let current = ancestor:
+        ak.vector_append_t(&ancestors, current)
+        ancestor = dom_abstract_element_element_to_inherit_style_from(&current)
+
+    # NonnullRefPtr<StyleValue const> new_font_size = ...; (C++ never reads it)
+    discard(css_length_style_value_create(css_length_make_px_css_pixels(default_monospace_font_size_in_px)))
+    var current_size_in_px = default_monospace_font_size_in_px
+
+    var index = ak.vector_size(&ancestors)
+    while index > 0:
+        index -= 1
+        let ancestor_element = *ak.vector_at_const(&ancestors, index)
+        let ancestor_cascaded_properties = dom_abstract_element_cascaded_properties(&ancestor_element) else trap("VERIFY: the ancestor has cascaded properties")
+        let font_size_value = css_cascaded_properties_property(ancestor_cascaded_properties, css_data.PropertyId.font_size) else continue
+
+        if css_style_value_is_initial(font_size_value) or css_style_value_is_unset(font_size_value):
+            current_size_in_px = default_monospace_font_size_in_px
+            continue
+        if css_style_value_is_inherit(font_size_value):
+            # Do nothing.
+            continue
+
+        if let absolute_size = css_data.keyword_to_absolute_size(css_style_value_to_keyword(font_size_value)):
+            current_size_in_px = css_style_computer_absolute_size_mapping(absolute_size, default_monospace_font_size_in_px)
+            continue
+
+        if let relative_size = css_data.keyword_to_relative_size(css_style_value_to_keyword(font_size_value)):
+            current_size_in_px = css_style_computer_relative_size_mapping(relative_size, current_size_in_px)
+            continue
+
+        # FIXME: Resolve `font-size: math`
+        if css_style_value_to_keyword(font_size_value) == css_data.Keyword.math:
+            continue
+
+        if css_style_value_is_percentage(font_size_value):
+            let percentage = css_percentage_style_value_percentage(css_style_value_as_percentage(font_size_value))
+            current_size_in_px = gfx.css_pixels_nearest_value_for_f64(gfx.mul_f64(css_percentage_as_fraction(&percentage), current_size_in_px))
+            continue
+
+        if css_style_value_is_calculated(font_size_value):
+            ak.dbgln("FIXME: Support calc() when time-traveling for monospace font-size")
+            continue
+
+        assert(css_style_value_is_length(font_size_value))
+
+        var inherited_line_height = css_initial_values_line_height()
+        if let parent_element = dom_abstract_element_element_to_inherit_style_from(&ancestor_element):
+            inherited_line_height = css_computed_properties_line_height(dom_abstract_element_computed_properties(&parent_element) else trap("VERIFY: the parent has computed properties"))
+
+        let length = css_length_style_value_length(css_style_value_as_length(font_size_value))
+        let sized_font = web_fonts.font_with_size(monospace_font, gfx.mul_css_pixels_f32(current_size_in_px, 0.75))
+        current_size_in_px = css_length_to_px_css_pixel_rect(&length, css_style_computer_viewport_rect(this), css_length_font_metrics_new(current_size_in_px, web_fonts.font_pixel_metrics(sized_font), inherited_line_height), this.m_root_element_font_metrics)
+
+    return css_length_style_value_create(css_length_make_px_css_pixels(current_size_in_px)).css_style_value()
+
+# mark: compute_properties ======================================================================
+
+## The captures of compute_properties' `get_property_specified_value` and `compute_property` lambdas.
+struct CssStyleComputerComputeProperties:
+    var this: CssStyleComputer*
+    var computed_style: CssComputedProperties*
+    var abstract_element: DomAbstractElement
+    var device_pixels_per_css_pixel: f64
+    var logical_alias_mapping_context: css_data.LogicalAliasMappingContext?
+
+## compute_properties' `get_property_specified_value` lambda.
+func css_style_computer_compute_properties_specified_value(context: void*?, property_id: css_data.PropertyId) -> CssStyleValue*:
+    let captures = (CssStyleComputerComputeProperties*)(context else trap("no captures"))
+    return css_computed_properties_property(captures.computed_style, property_id)
+
+## compute_properties' `compute_property` lambda.
+func css_style_computer_compute_property(captures: CssStyleComputerComputeProperties*, property_id: css_data.PropertyId, style_value: CssStyleValue*) -> CssStyleValue*:
+    let computation_context = css_style_computer_get_computation_context_for_property(captures.this, property_id, captures.computed_style, captures.abstract_element)
+    let get_property_specified_value = ak.Function1[css_data.PropertyId, CssStyleValue*](call = css_style_computer_compute_properties_specified_value, context = captures)
+    return css_style_computer_compute_value_of_property(property_id, style_value, get_property_specified_value, computation_context, captures.device_pixels_per_css_pixel)
+
+## compute_properties' `get_logical_alias_mapping_context` lambda.
+func css_style_computer_get_logical_alias_mapping_context(captures: CssStyleComputerComputeProperties*) -> css_data.LogicalAliasMappingContext:
+    if captures.logical_alias_mapping_context == none:
+        captures.logical_alias_mapping_context = css_data.LogicalAliasMappingContext(writing_mode = css_computed_properties_writing_mode(captures.computed_style), direction = css_computed_properties_direction(captures.computed_style))
+
+    return captures.logical_alias_mapping_context else trap("unreachable: set above")
+
+## Ported from Libraries/LibWeb/CSS/StyleComputer.cpp:2046 Web::CSS::StyleComputer::compute_properties.
+pub func css_style_computer_compute_properties(this: CssStyleComputer*, abstract_element_: DomAbstractElement, cascaded_properties: CssCascadedProperties*) -> CssComputedProperties*:
+    var abstract_element = abstract_element_
+    assert(css_style_computer_computation_context_cache_is_empty(this))
+
+    let computed_style = heap_allocate_css_computed_properties(gc.cell_heap(css_style_computer_document(this).cell()))
+
+    let new_font_size = css_style_computer_recascade_font_size_if_needed(this, abstract_element, cascaded_properties)
+    if let font_size = new_font_size:
+        css_computed_properties_set_property(computed_style, css_data.PropertyId.font_size, font_size, CssComputedPropertiesInherited.no, css_syntax.Important.no)
+
+    var computed_properties_to_inherit_from: CssComputedProperties*? = none
+    if let element_to_inherit_from = dom_abstract_element_element_to_inherit_style_from(&abstract_element):
+        computed_properties_to_inherit_from = dom_abstract_element_computed_properties(&element_to_inherit_from)
+
+    var captures = CssStyleComputerComputeProperties(
+        this = this,
+        computed_style = computed_style,
+        abstract_element = abstract_element,
+        device_pixels_per_css_pixel = css_style_computer_device_pixels_per_css_pixel(this),
+        logical_alias_mapping_context = none,
+    )
+
+    let computation_order = css_data.property_computation_order()
+    for property_id in ak.vector_span_const(&computation_order):
+        var value: CssStyleValue*? = none
+        var requires_computation = false
+
+        var cascaded_property_id = property_id
+        var inherited_property_id = property_id
+
+        if css_data.logical_property_group_for_property(property_id) != none:
+            var counterpart_property_id = property_id
+
+            if css_data.property_is_logical_alias(property_id):
+                counterpart_property_id = css_data.map_logical_alias_to_physical_property(property_id, css_style_computer_get_logical_alias_mapping_context(&captures))
+
+                # AD-HOC: While the spec says that inheritance of logical aliases should be direct, other browsers
+                #         instead inherit from the physical counterpart - the CSSWG has resolved to update the spec to
+                #         reflect this - see https://github.com/w3c/csswg-drafts/issues/3029
+                inherited_property_id = counterpart_property_id
+            else:
+                counterpart_property_id = css_data.map_physical_property_to_logical_alias(property_id, css_style_computer_get_logical_alias_mapping_context(&captures))
+
+            # https://drafts.csswg.org/css-logical/#box
+            # Within each logical property group, corresponding flow-relative and physical properties are paired using
+            # the element’s own computed writing mode. Although the specified value of each property remains distinct,
+            # paired properties share a computed value. This shared value is determined by cascading the declarations
+            # of both properties together as one; in other words, the computed value of both properties in the pair is
+            # derived from the specified value of the property declared with higher priority in the CSS cascade.
+            cascaded_property_id = css_cascaded_properties_property_with_higher_priority(cascaded_properties, property_id, counterpart_property_id)
+
+        if let cascaded_style_property = css_cascaded_properties_style_property(cascaded_properties, cascaded_property_id):
+            if cascaded_style_property.important == css_syntax.Important.yes:
+                css_computed_properties_set_property_important(computed_style, property_id, css_syntax.Important.yes)
+            value = cascaded_style_property.value
+            requires_computation = css_data.property_requires_computation_with_cascaded_value(property_id)
+
+        # NOTE: We've already handled font-size above.
+        if property_id == css_data.PropertyId.font_size and value == none and new_font_size != none:
+            continue
+
+        var should_inherit = value == none and css_data.is_inherited_property(property_id)
+
+        if let cascaded_value = value:
+            # https://www.w3.org/TR/css-cascade-4/#inherit
+            # If the cascaded value of a property is the inherit keyword, the property’s specified and computed values are the inherited value.
+            should_inherit = should_inherit or css_style_value_is_inherit(cascaded_value)
+
+            # https://www.w3.org/TR/css-cascade-4/#inherit-initial
+            # If the cascaded value of a property is the unset keyword, then if it is an inherited property, this is treated as inherit, and if it is not, this is treated as initial.
+            should_inherit = should_inherit or (css_style_value_is_unset(cascaded_value) and css_data.is_inherited_property(property_id))
+
+            # https://www.w3.org/TR/css-color-4/#resolving-other-colors
+            # In the color property, the used value of currentcolor is the resolved inherited value.
+            should_inherit = should_inherit or (property_id == css_data.PropertyId.color and css_style_value_to_keyword(cascaded_value) == css_data.Keyword.currentcolor)
+
+        if should_inherit:
+            if let inherit_from = computed_properties_to_inherit_from:
+                css_computed_properties_set_property_inherited(computed_style, property_id, CssComputedPropertiesInherited.yes)
+                value = css_computed_properties_property(inherit_from, inherited_property_id, CssComputedPropertiesWithAnimationsApplied.no)
+                requires_computation = css_data.property_requires_computation_with_inherited_value(property_id)
+
+                # FIXME: Do we need to recompute animated inherited values?
+                let animated_property_values = css_computed_properties_animated_property_values(inherit_from)
+                if let animated_value = ak.hash_map_get_k_const(&animated_property_values, inherited_property_id):
+                    var is_result_of_transition = CssAnimatedPropertyResultOfTransition.no
+                    if css_computed_properties_is_animated_property_result_of_transition(inherit_from, inherited_property_id):
+                        is_result_of_transition = CssAnimatedPropertyResultOfTransition.yes
+                    css_computed_properties_set_animated_property(computed_style, property_id, *animated_value, is_result_of_transition, CssComputedPropertiesInherited.yes)
+
+        var use_initial_value = value == none or (should_inherit and computed_properties_to_inherit_from == none)
+        if let current_value = value:
+            use_initial_value = use_initial_value or css_style_value_is_initial(current_value) or css_style_value_is_unset(current_value)
+        if use_initial_value:
+            value = css_property_initial_value(property_id)
+            requires_computation = css_data.property_requires_computation_with_initial_value(property_id)
+
+        # NB: We compute using the inherited (physical) property to avoid having to add cases for all the logical
+        #     alias properties in `compute_value_of_property`
+        let final_value = value else trap("VERIFY: the property has a value")
+        if requires_computation:
+            css_computed_properties_set_property_without_modifying_flags(computed_style, property_id, css_style_computer_compute_property(&captures, inherited_property_id, final_value))
+        else:
+            css_computed_properties_set_property_without_modifying_flags(computed_style, property_id, final_value)
+
+    if is_html_html_element(dom_abstract_element_element(&abstract_element)):
+        this.m_root_element_font_metrics = css_style_computer_calculate_root_element_font_metrics(this, computed_style)
+
+    # Compute the value of custom properties
+    css_style_computer_compute_custom_properties(this, computed_style, abstract_element)
+
+    css_style_computer_clear_computation_context_caches(this)
+
+    # Add or modify CSS-defined animations
+    css_style_computer_process_animation_definitions(this, computed_style, cascaded_properties, &abstract_element)
+
+    let element = dom_abstract_element_element(&abstract_element)
+    let maybe_animations: ak.Vector[AnimationsAnimation*]? = animations_animatable_get_animations_internal(&element.animatable, AnimationsAnimatableGetAnimationsSorted.yes, AnimationsGetAnimationsOptions(subtree = false)) catch: recover none
+    if let animations = maybe_animations:
+        for animation in ak.vector_span_const(&animations):
+            if let effect = animations_animation_effect(animation):
+                if animations_animation_effect_is_keyframe_effect(effect):
+                    let keyframe_effect = (AnimationsKeyframeEffect*)effect
+                    if animations_keyframe_effect_pseudo_element_type(keyframe_effect) == dom_abstract_element_pseudo_element(&abstract_element):
+                        css_style_computer_collect_animation_into(this, abstract_element, keyframe_effect, computed_style)
+    else:
+        let description = dom_abstract_element_debug_description(&abstract_element)
+        let view = ak.string_bytes_as_string_view(&description)
+        ak.dbgln(f"Error getting animations for element {(str)ak.string_view_bytes(&view)}")
+
+    # Run automatic box type transformations
+    css_style_computer_transform_box_type_if_needed(this, computed_style, abstract_element)
+
+    # Apply any property-specific computed value logic
+    css_style_computer_resolve_effective_overflow_values(this, computed_style)
+    css_compute_text_align(computed_style, abstract_element)
+
+    # Let the element adjust computed style
+    if dom_abstract_element_pseudo_element(&abstract_element) == none:
+        dom_element_adjust_computed_style(element, computed_style)
+
+    # Transition declarations [css-transitions-1]
+    # Theoretically this should be part of the cascade, but it works with computed values, which we don't have until now.
+    css_compute_transitioned_properties(computed_style, abstract_element)
+    if let previous_style = dom_abstract_element_computed_properties(&abstract_element):
+        css_style_computer_start_needed_transitions(this, previous_style, computed_style, abstract_element)
+
+    return computed_style
+
+# mark: Bucketing ===============================================================================
+
+## Ported from Libraries/LibWeb/CSS/StyleComputer.cpp:2210 Web::CSS::is_roundabout_selector_bucketable_as_something_simpler.
+func css_is_roundabout_selector_bucketable_as_something_simpler(simple_selector: const CssSelectorSimpleSelector*) -> CssSimplifiedSelectorForBucketing?:
+    if simple_selector.type_ != CssSelectorSimpleSelectorType.pseudo_class:
+        return none
+
+    let pseudo_class = css_selector_simple_selector_pseudo_class(simple_selector)
+    if pseudo_class.type_ != css_data.PseudoClass.is and pseudo_class.type_ != css_data.PseudoClass.where:
+        return none
+
+    if ak.vector_size(&pseudo_class.argument_selector_list) != 1:
+        return none
+
+    let argument_selector = *ak.vector_first_const(&pseudo_class.argument_selector_list)
+
+    let compound_selectors = css_selector_compound_selectors(argument_selector)
+    let compound_selector = ak.vector_last_const(&compound_selectors)
+    if ak.vector_size(&compound_selector.simple_selectors) != 1:
+        return none
+
+    let inner_simple_selector = ak.vector_first_const(&compound_selector.simple_selectors)
+    if inner_simple_selector.type_ == CssSelectorSimpleSelectorType.class_ or inner_simple_selector.type_ == CssSelectorSimpleSelectorType.id:
+        return CssSimplifiedSelectorForBucketing(type_ = inner_simple_selector.type_, name = css_selector_simple_selector_name(inner_simple_selector))
+
+    if inner_simple_selector.type_ == CssSelectorSimpleSelectorType.tag_name:
+        return CssSimplifiedSelectorForBucketing(type_ = inner_simple_selector.type_, name = css_selector_simple_selector_qualified_name(inner_simple_selector).name.lowercase_name)
+
+    return none

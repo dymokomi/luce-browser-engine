@@ -1,0 +1,227 @@
+#==============================================================================================
+#
+#   style_computer_2 - CSS::StyleComputer: expanding shorthands and cascading declarations
+#
+#   DESCRIPTION:
+#       Port of LibWeb/CSS/StyleComputer.cpp (lines 439-637): for_each_property_expanding_
+#       shorthands, apply_property_list_to_cascade (with var()/attr() resolution and the
+#       guaranteed-invalid value), cascade_declarations, the cascade of custom properties,
+#       inheritable_custom_property_data and resolve_keyframe_easing.
+#
+#       Copyright (c) 2018-2025, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2021, the SerenityOS developers.
+#       Copyright (c) 2021-2025, Sam Atkins <sam@ladybird.org>
+#       Copyright (c) 2024, Matthew Olsson <mattco@serenityos.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Expanding shorthands ====================================================================
+
+## Ported from Libraries/LibWeb/CSS/StyleComputer.cpp:439 Web::CSS::StyleComputer::for_each_property_expanding_shorthands.
+pub func css_style_computer_for_each_property_expanding_shorthands(property_id: css_data.PropertyId, value: CssStyleValue*, set_longhand_property: ak.Function2[css_data.PropertyId, CssStyleValue*, unit]):
+    if css_data.property_is_shorthand(property_id) and (css_style_value_is_unresolved(value) or css_style_value_is_pending_substitution(value)):
+        # If a shorthand property contains an arbitrary substitution function in its value, the longhand properties
+        # it’s associated with must instead be filled in with a special, unobservable-to-authors pending-substitution
+        # value that indicates the shorthand contains an arbitrary substitution function, and thus the longhand’s
+        # value can’t be determined until after substituted.
+        # https://drafts.csswg.org/css-values-5/#pending-substitution-value
+        # Ensure we keep the longhand around until it can be resolved.
+        ak.function2_call(&set_longhand_property, property_id, value)
+        let pending_substitution_value = css_pending_substitution_style_value_create(value).css_style_value()
+        let longhands = css_data.longhands_for_shorthand(property_id)
+        for longhand_id in ak.vector_span_const(&longhands):
+            css_style_computer_for_each_property_expanding_shorthands(longhand_id, pending_substitution_value, set_longhand_property)
+        return
+
+    if css_style_value_is_shorthand(value):
+        let shorthand_value = css_style_value_as_shorthand(value)
+        let properties = css_shorthand_style_value_sub_properties(shorthand_value)
+        let values = css_shorthand_style_value_values(shorthand_value)
+        for i in 0..<ak.vector_size(&properties):
+            css_style_computer_for_each_property_expanding_shorthands(*ak.vector_at_const(&properties, i), *ak.vector_at_const(&values, i), set_longhand_property)
+        return
+
+    if css_data.property_is_shorthand(property_id):
+        # ShorthandStyleValue was handled already, as were unresolved shorthands.
+        # That means the only values we should see are the CSS-wide keywords, or the guaranteed-invalid value.
+        # Both should be applied to our longhand properties.
+        # We don't directly call `set_longhand_property()` because the longhands might have longhands of their own.
+        # (eg `grid` -> `grid-template` -> `grid-template-areas` & `grid-template-rows` & `grid-template-columns`)
+        assert(css_style_value_is_css_wide_keyword(value) or css_style_value_is_guaranteed_invalid(value))
+        let longhands = css_data.longhands_for_shorthand(property_id)
+        for longhand in ak.vector_span_const(&longhands):
+            css_style_computer_for_each_property_expanding_shorthands(longhand, value, set_longhand_property)
+        return
+
+    ak.function2_call(&set_longhand_property, property_id, value)
+
+# mark: Cascading declarations ==================================================================
+
+## The bit count of apply_property_list_to_cascade's `seen_properties`: to_underlying(last_property_id) + 1.
+let css_style_computer_seen_properties_size: usize = (usize)(u16)css_data.last_property_id + 1
+
+assert(css_style_computer_seen_properties_size == 386, "apply_property_list_to_cascade's seen_properties has one bit per property")
+
+## The captures of apply_property_list_to_cascade's for_each_property_expanding_shorthands callback.
+struct CssStyleComputerApplyPropertyListToCascade:
+    var cascaded_properties: CssCascadedProperties*
+    var abstract_element: DomAbstractElement
+    var cascade_origin: CssCascadeOrigin
+    var important: css_syntax.Important
+    var layer_name: ak.FlyString?
+    var source: CssStyleDeclaration*?
+    var source_shadow_root: DomShadowRoot*?
+    # AK::FixedBitmap<to_underlying(last_property_id) + 1> seen_properties(false);
+    # LUCE-BUG: array_length_constant_expression (the length is the literal; a module assert ties it to the constant)
+    var seen_properties: bool[386]
+    # The value of the declaration being expanded.
+    var property_value: CssStyleValue*?
+
+## apply_property_list_to_cascade's for_each_property_expanding_shorthands callback.
+func css_style_computer_apply_property_list_to_cascade_longhand(context: void*?, longhand_id: css_data.PropertyId, longhand_value: CssStyleValue*):
+    let captures = (CssStyleComputerApplyPropertyListToCascade*)(context else trap("no captures"))
+    if let pseudo_element = dom_abstract_element_pseudo_element(&captures.abstract_element):
+        if not css_data.pseudo_element_supports_property(pseudo_element, longhand_id):
+            return
+
+    # If we're a PSV that's already been seen, that should mean that our shorthand already got
+    # resolved and gave us a value, so we don't want to overwrite it with a PSV.
+    let property_value = captures.property_value else trap("no declaration value")
+    if captures.seen_properties[(usize)(u16)longhand_id] and css_style_value_is_pending_substitution(property_value):
+        return
+    captures.seen_properties[(usize)(u16)longhand_id] = true
+
+    if css_style_value_is_revert(longhand_value):
+        css_cascaded_properties_revert_property(captures.cascaded_properties, longhand_id, captures.important, captures.cascade_origin)
+    elif css_style_value_is_revert_layer(longhand_value):
+        css_cascaded_properties_revert_layer_property(captures.cascaded_properties, longhand_id, captures.important, captures.layer_name)
+    else:
+        # Track the exact shadow-root scope that supplied this winning declaration. A constructable
+        # stylesheet can be adopted into multiple scopes at once, so the declaration object alone is
+        # not specific enough.
+        css_cascaded_properties_set_property(captures.cascaded_properties, longhand_id, longhand_value, captures.important, captures.cascade_origin, captures.layer_name, captures.source, captures.source_shadow_root)
+
+## Ported from Libraries/LibWeb/CSS/StyleComputer.cpp:480 Web::CSS::StyleComputer::apply_property_list_to_cascade.
+pub func css_style_computer_apply_property_list_to_cascade(this: CssStyleComputer*, cascaded_properties: CssCascadedProperties*, abstract_element: DomAbstractElement, properties: const CssStyleProperty[], cascade_origin: CssCascadeOrigin, important: css_syntax.Important, layer_name: ak.FlyString?, source: CssStyleDeclaration*?, source_shadow_root: DomShadowRoot*?):
+    var captures = CssStyleComputerApplyPropertyListToCascade(
+        cascaded_properties = cascaded_properties,
+        abstract_element = abstract_element,
+        cascade_origin = cascade_origin,
+        important = important,
+        layer_name = layer_name,
+        source = source,
+        source_shadow_root = source_shadow_root,
+    )
+    let element_pseudo_element = dom_abstract_element_pseudo_element(&captures.abstract_element)
+    for property in properties:
+        if important != property.important:
+            continue
+
+        if let pseudo_element = element_pseudo_element:
+            if not css_data.pseudo_element_supports_property(pseudo_element, property.property_id) and not css_style_value_is_unresolved(property.value):
+                continue
+
+        var property_value = property.value
+
+        if css_style_value_is_pending_substitution(property_value):
+            continue
+
+        if css_style_value_is_unresolved(property_value):
+            var params: CssParsingParams = ---
+            css_parsing_params_construct_dom_document(&params, dom_abstract_element_document(&captures.abstract_element))
+            property_value = css_parser_resolve_unresolved_style_value_css_parsing_params(params, abstract_element, css_property_name_and_id_from_id(property.property_id), css_style_value_as_unresolved(property_value))
+
+        if css_style_value_is_guaranteed_invalid(property_value):
+            # https://drafts.csswg.org/css-values-5/#invalid-at-computed-value-time
+            # When substitution results in a property’s value containing the guaranteed-invalid value, this makes the
+            # declaration invalid at computed-value time. When this happens, the computed value is one of the
+            # following depending on the property’s type:
+
+            # -> The property is a non-registered custom property
+            # -> The property is a registered custom property with universal syntax
+            # FIXME: Process custom properties here?
+            #     (C++: `if (false) { /* The computed value is the guaranteed-invalid value. */ }`)
+            # -> Otherwise
+            # Either the property’s inherited value or its initial value depending on whether the property is
+            # inherited or not, respectively, as if the property’s value had been specified as the unset keyword.
+            property_value = css_keyword_style_value_create(css_data.Keyword.unset).css_style_value()
+
+        captures.property_value = property_value
+        css_style_computer_for_each_property_expanding_shorthands(property.property_id, property_value, ak.Function2[css_data.PropertyId, CssStyleValue*, unit](call = css_style_computer_apply_property_list_to_cascade_longhand, context = &captures))
+
+## Ported from Libraries/LibWeb/CSS/StyleComputer.cpp:552 Web::CSS::StyleComputer::cascade_declarations.
+pub func css_style_computer_cascade_declarations(this: CssStyleComputer*, cascaded_properties: CssCascadedProperties*, abstract_element: DomAbstractElement, matching_rules: const ak.Vector[CssStyleComputerScopedMatchingRule]*, cascade_origin: CssCascadeOrigin, important: css_syntax.Important, layer_name: ak.FlyString?):
+    for match_ in ak.vector_span_const(matching_rules):
+        let declaration = css_matching_rule_declaration(match_.rule)
+        let properties = css_style_properties_properties(declaration)
+        css_style_computer_apply_property_list_to_cascade(this, cascaded_properties, abstract_element, ak.vector_span_const(&properties), cascade_origin, important, layer_name, declaration.css_style_declaration(), match_.shadow_root)
+
+    var subject = abstract_element
+    if cascade_origin == CssCascadeOrigin.author and dom_abstract_element_pseudo_element(&subject) == none:
+        if let inline_style = dom_element_inline_style(dom_abstract_element_element(&subject)):
+            let properties = css_style_properties_properties(inline_style)
+            css_style_computer_apply_property_list_to_cascade(this, cascaded_properties, abstract_element, ak.vector_span_const(&properties), cascade_origin, important, layer_name, inline_style.css_style_declaration(), none)
+
+## Ported from Libraries/LibWeb/CSS/StyleComputer.cpp:571 Web::CSS::cascade_custom_properties.
+func css_cascade_custom_properties(abstract_element: DomAbstractElement, matching_rules: const ak.Vector[CssStyleComputerScopedMatchingRule]*, custom_properties: ak.OrderedHashMap[ak.FlyString, CssStyleProperty, ak.FlyStringTraits]*):
+    var subject = abstract_element
+    var needed_capacity: usize = 0
+    for matching_rule in ak.vector_span_const(matching_rules):
+        let declaration_custom_properties = css_style_properties_custom_properties(css_matching_rule_declaration(matching_rule.rule))
+        needed_capacity += ak.ordered_hash_map_size(&declaration_custom_properties)
+
+    if dom_abstract_element_pseudo_element(&subject) == none:
+        if let inline_style = dom_element_inline_style(dom_abstract_element_element(&subject)):
+            let inline_custom_properties = css_style_properties_custom_properties(inline_style)
+            needed_capacity += ak.ordered_hash_map_size(&inline_custom_properties)
+
+    ak.ordered_hash_map_ensure_capacity(custom_properties, ak.ordered_hash_map_size(custom_properties) + needed_capacity)
+
+    var important_custom_properties: ak.OrderedHashMap[ak.FlyString, CssStyleProperty, ak.FlyStringTraits]
+    for matching_rule in ak.vector_span_const(matching_rules):
+        let declaration_custom_properties = css_style_properties_custom_properties(css_matching_rule_declaration(matching_rule.rule))
+        for it in ak.ordered_hash_map_begin_const(&declaration_custom_properties):
+            let style_value = it.value.value
+            if css_style_value_is_revert_layer(style_value):
+                continue
+
+            if it.value.important == css_syntax.Important.yes:
+                discard(ak.ordered_hash_map_set(&important_custom_properties, it.key, it.value))
+            discard(ak.ordered_hash_map_set(custom_properties, it.key, it.value))
+
+    if dom_abstract_element_pseudo_element(&subject) == none:
+        if let inline_style = dom_element_inline_style(dom_abstract_element_element(&subject)):
+            let inline_custom_properties = css_style_properties_custom_properties(inline_style)
+            for it in ak.ordered_hash_map_begin_const(&inline_custom_properties):
+                if it.value.important == css_syntax.Important.yes:
+                    discard(ak.ordered_hash_map_set(&important_custom_properties, it.key, it.value))
+                discard(ak.ordered_hash_map_set(custom_properties, it.key, it.value))
+
+    # custom_properties.update(important_custom_properties): HashMap::update sets each of the other map's entries.
+    for it in ak.ordered_hash_map_begin_const(&important_custom_properties):
+        discard(ak.ordered_hash_map_set(custom_properties, it.key, it.value))
+
+## Ported from Libraries/LibWeb/CSS/StyleComputer.cpp:612 Web::CSS::inheritable_custom_property_data.
+func css_inheritable_custom_property_data(abstract_element: DomAbstractElement) -> const CssCustomPropertyData*?:
+    let data = dom_abstract_element_custom_property_data(&abstract_element) else return none
+    return css_custom_property_data_inheritable(data, dom_abstract_element_document(&abstract_element))
+
+## Ported from Libraries/LibWeb/CSS/StyleComputer.cpp:620 Web::CSS::resolve_keyframe_easing.
+func css_resolve_keyframe_easing(style_value: CssStyleValue*, abstract_element: DomAbstractElement) -> CssEasingFunction?:
+    var resolved = style_value
+    if css_style_value_is_unresolved(resolved):
+        var params: CssParsingParams = ---
+        css_parsing_params_construct_dom_document(&params, dom_abstract_element_document(&abstract_element))
+        resolved = css_parser_resolve_unresolved_style_value_css_parsing_params(params, abstract_element, css_property_name_and_id_from_id(css_data.PropertyId.animation_timing_function), css_style_value_as_unresolved(resolved))
+    if css_style_value_is_guaranteed_invalid(resolved):
+        return none
+    if css_style_value_is_value_list(resolved):
+        let list = css_style_value_as_value_list(resolved)
+        if css_style_value_list_size(list) > 0:
+            resolved = css_style_value_list_value_at(list, 0, false)
+        else:
+            return none
+    if css_style_value_is_easing(resolved) or css_style_value_is_keyword(resolved):
+        return css_easing_function_from_style_value(resolved)
+    return none

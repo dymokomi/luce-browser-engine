@@ -1,0 +1,436 @@
+#==============================================================================================
+#
+#   style_computer_3 - CSS::StyleComputer: CSS animations
+#
+#   DESCRIPTION:
+#       Port of LibWeb/CSS/StyleComputer.cpp (lines 639-996): collect_animation_into (the
+#       interpolated keyframe values at an animation's progress) and
+#       process_animation_definitions (CSSAnimations from animation-name and @keyframes).
+#
+#       The animations are phase 4: the Animations and CSSAnimation/CSSTransition members these
+#       functions call are stubs of stubs/stub_closure ("unported (P4)"), and their types are
+#       opaque, so an AnimationEffect is reached from its KeyframeEffect (and an Animation from
+#       its CSSAnimation or CSSTransition) by a pointer cast, the embedded-base upcast of
+#       DESIGN.md §2.3.
+#
+#       Copyright (c) 2018-2025, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2021, the SerenityOS developers.
+#       Copyright (c) 2021-2025, Sam Atkins <sam@ladybird.org>
+#       Copyright (c) 2024, Matthew Olsson <mattco@serenityos.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+## AK/Debug.h's LIBWEB_CSS_ANIMATION_DEBUG (0 in the reference build).
+let css_libweb_css_animation_debug: bool = false
+
+# mark: collect_animation_into ==================================================================
+
+## A String's text, for the debug messages.
+func css_style_computer_debug_text(string: const ak.String*) -> str:
+    let view = ak.string_bytes_as_string_view(string)
+    return (str)ak.string_view_bytes(&view)
+
+## A keyframe set's map from property to value.
+type CssKeyframePropertyValues = ak.HashMap[css_data.PropertyId, AnimationsKeyframeEffectKeyFrameSetUseInitialOrCssStyleValue, css_data.PropertyIdTraits]
+
+## A map from property to computed (or absent) value, as compute_keyframe_values builds it.
+type CssComputedKeyframeValues = ak.HashMap[css_data.PropertyId, CssStyleValue*?, css_data.PropertyIdTraits]
+
+## compute_keyframe_values' `property_is_logical_alias_including_shorthands` lambda.
+func css_property_is_logical_alias_including_shorthands(property_id: css_data.PropertyId) -> bool:
+    if css_data.property_is_shorthand(property_id):
+        # NOTE: All expanded longhands for a logical alias shorthand are logical aliases so we only need to check the first one.
+        let longhands = css_data.expanded_longhands_for_shorthand(property_id)
+        return css_data.property_is_logical_alias(*ak.vector_at_const(&longhands, 0))
+
+    return css_data.property_is_logical_alias(property_id)
+
+## compute_keyframe_values' `is_property_preferred` lambda.
+# https://drafts.csswg.org/web-animations-1/#ref-for-computed-keyframes
+func css_is_property_preferred(a: css_data.PropertyId, b: css_data.PropertyId) -> bool:
+    # If conflicts arise when expanding shorthand properties or replacing logical properties with physical properties, apply the following rules in order until the conflict is resolved:
+    # 1. Longhand properties override shorthand properties (e.g. border-top-color overrides border-top).
+    if css_data.property_is_shorthand(a) != css_data.property_is_shorthand(b):
+        return not css_data.property_is_shorthand(a)
+
+    # 2. Shorthand properties with fewer longhand components override those with more longhand components (e.g. border-top overrides border-color).
+    if css_data.property_is_shorthand(a):
+        let longhands_a = css_data.expanded_longhands_for_shorthand(a)
+        let longhands_b = css_data.expanded_longhands_for_shorthand(b)
+        let number_of_expanded_shorthands_a = ak.vector_size(&longhands_a)
+        let number_of_expanded_shorthands_b = ak.vector_size(&longhands_b)
+
+        if number_of_expanded_shorthands_a != number_of_expanded_shorthands_b:
+            return number_of_expanded_shorthands_a < number_of_expanded_shorthands_b
+
+    let property_a_is_logical_alias = css_property_is_logical_alias_including_shorthands(a)
+    let property_b_is_logical_alias = css_property_is_logical_alias_including_shorthands(b)
+
+    # 3. Physical properties override logical properties.
+    if property_a_is_logical_alias != property_b_is_logical_alias:
+        return not property_a_is_logical_alias
+
+    # 4. For shorthand properties with an equal number of longhand components, properties whose IDL name (see
+    #    the CSS property to IDL attribute algorithm [CSSOM]) appears earlier when sorted in ascending order
+    #    by the Unicode codepoints that make up each IDL name, override those who appear later.
+    let camel_case_a = css_data.camel_case_string_from_property_id(a)
+    let camel_case_b = css_data.camel_case_string_from_property_id(b)
+    return ak.fly_string_cmp(&camel_case_a, &camel_case_b) < 0
+
+## The captures of compute_keyframe_values' for_each_property_expanding_shorthands callback.
+struct CssComputeKeyframeValuesLonghand:
+    var computed_properties: CssComputedProperties*
+    var abstract_element: DomAbstractElement
+    var property_id: css_data.PropertyId
+    var is_use_initial: bool
+    var specified_values: CssComputedKeyframeValues*
+    var longhands_set_by_property_id: ak.HashMap[css_data.PropertyId, css_data.PropertyId, css_data.PropertyIdTraits]*
+    # AK::FixedBitmap<number_of_longhand_properties> property_is_set_by_use_initial(false);
+    var property_is_set_by_use_initial: bool*
+
+## Whether `specified_values` holds a value (other than null) for `property_id`.
+func css_specified_value_is_set(specified_values: const CssComputedKeyframeValues*, property_id: css_data.PropertyId) -> bool:
+    let value = ak.hash_map_get_k_const(specified_values, property_id) else return false
+    return *value != none
+
+## compute_keyframe_values' for_each_property_expanding_shorthands callback.
+func css_compute_keyframe_values_longhand(context: void*?, longhand_id: css_data.PropertyId, longhand_value: CssStyleValue*):
+    let captures = (CssComputeKeyframeValuesLonghand*)(context else trap("no captures"))
+    let computed_properties = captures.computed_properties
+    let physical_longhand_id = css_data.map_logical_alias_to_physical_property(longhand_id, css_data.LogicalAliasMappingContext(writing_mode = css_computed_properties_writing_mode(computed_properties), direction = css_computed_properties_direction(computed_properties)))
+    let physical_longhand_id_bitmap_index = (usize)(u16)physical_longhand_id - (usize)(u16)css_data.first_longhand_property_id
+
+    # Don't overwrite values if this is the result of a UseInitial
+    if css_specified_value_is_set(captures.specified_values, physical_longhand_id) and captures.is_use_initial:
+        return
+
+    # Don't overwrite unless the value was originally set by a UseInitial or this property is preferred over the one that set it originally
+    if css_specified_value_is_set(captures.specified_values, physical_longhand_id) and not captures.property_is_set_by_use_initial[physical_longhand_id_bitmap_index]:
+        let setter = ak.hash_map_get_k_const(captures.longhands_set_by_property_id, physical_longhand_id) else trap("VERIFY: the longhand was set by a property")
+        if not css_is_property_preferred(captures.property_id, *setter):
+            return
+
+    var specified_value_with_css_wide_keywords_applied = longhand_value
+    if css_style_value_is_inherit(longhand_value) or (css_style_value_is_unset(longhand_value) and css_data.is_inherited_property(longhand_id)):
+        if let inherited_animated_value = css_style_computer_get_animated_inherit_value(longhand_id, captures.abstract_element):
+            specified_value_with_css_wide_keywords_applied = inherited_animated_value.value
+        else:
+            specified_value_with_css_wide_keywords_applied = css_style_computer_get_non_animated_inherit_value(longhand_id, captures.abstract_element)
+    elif css_style_value_is_initial(longhand_value) or css_style_value_is_unset(longhand_value):
+        specified_value_with_css_wide_keywords_applied = css_property_initial_value(longhand_id)
+    elif css_style_value_is_revert(longhand_value) or css_style_value_is_revert_layer(longhand_value):
+        specified_value_with_css_wide_keywords_applied = css_computed_properties_property(computed_properties, longhand_id)
+
+    discard(ak.hash_map_set(captures.longhands_set_by_property_id, physical_longhand_id, captures.property_id))
+    captures.property_is_set_by_use_initial[physical_longhand_id_bitmap_index] = captures.is_use_initial
+    discard(ak.hash_map_set(captures.specified_values, physical_longhand_id, specified_value_with_css_wide_keywords_applied))
+
+## The captures of compute_keyframe_values' `get_property_specified_value`.
+struct CssComputeKeyframeValuesSpecifiedValue:
+    var specified_values: const CssComputedKeyframeValues*
+    var computed_properties: CssComputedProperties*
+
+## compute_keyframe_values' `get_property_specified_value`.
+# NOTE: This doesn't necessarily return the specified value if we reach into computed_properties but that
+#       doesn't matter as a computed value is always valid as a specified value.
+func css_compute_keyframe_values_specified_value(context: void*?, property_id: css_data.PropertyId) -> CssStyleValue*:
+    let captures = (CssComputeKeyframeValuesSpecifiedValue*)(context else trap("no captures"))
+    if let keyframe_value = ak.hash_map_get_k_const(captures.specified_values, property_id):
+        if let value = *keyframe_value:
+            return value
+
+    return css_computed_properties_property(captures.computed_properties, property_id)
+
+## collect_animation_into's `compute_keyframe_values` lambda.
+# FIXME: Follow https://drafts.csswg.org/web-animations-1/#ref-for-computed-keyframes in whatever the right place is.
+func css_style_computer_compute_keyframe_values(this: CssStyleComputer*, computed_properties: CssComputedProperties*, abstract_element: DomAbstractElement, keyframe_values: const AnimationsKeyframeEffectKeyFrameSetResolvedKeyFrame*) -> CssComputedKeyframeValues:
+    var result: CssComputedKeyframeValues
+    var longhands_set_by_property_id: ak.HashMap[css_data.PropertyId, css_data.PropertyId, css_data.PropertyIdTraits]
+    # LUCE-BUG: array_length_constant_expression (the length is number_of_longhand_properties, 314; asserted below)
+    var property_is_set_by_use_initial: bool[314]
+
+    var specified_values: CssComputedKeyframeValues
+
+    for entry in ak.hash_map_begin_const(&keyframe_values.properties):
+        let property_id = entry.key
+        var is_use_initial = false
+
+        var style_value: CssStyleValue*? = none
+        match entry.value:
+            .use_initial(_):
+                if not css_data.property_is_shorthand(property_id):
+                    is_use_initial = true
+                    style_value = css_computed_properties_property(computed_properties, property_id, CssComputedPropertiesWithAnimationsApplied.no)
+            .css_style_value(value):
+                style_value = value
+
+        if style_value == none:
+            discard(ak.hash_map_set(&specified_values, property_id, none))
+            continue
+        var value = style_value else trap("unreachable: checked above")
+
+        # If the style value is a PendingSubstitutionStyleValue we should skip it to avoid overwriting any value
+        # already set by resolving the relevant shorthand's value.
+        if css_style_value_is_pending_substitution(value):
+            continue
+
+        if css_style_value_is_unresolved(value):
+            var params: CssParsingParams = ---
+            css_parsing_params_construct_dom_document(&params, dom_abstract_element_document(&abstract_element))
+            value = css_parser_resolve_unresolved_style_value_css_parsing_params(params, abstract_element, css_property_name_and_id_from_id(property_id), css_style_value_as_unresolved(value))
+
+        # https://drafts.csswg.org/css-values-5/#invalid-at-computed-value-time
+        # When substitution results in a guaranteed-invalid value, treat it as unset
+        # (i.e. inherit for inherited properties, initial for non-inherited properties).
+        if css_style_value_is_guaranteed_invalid(value):
+            discard(ak.hash_map_set(&specified_values, property_id, none))
+            continue
+
+        var captures = CssComputeKeyframeValuesLonghand(
+            computed_properties = computed_properties,
+            abstract_element = abstract_element,
+            property_id = property_id,
+            is_use_initial = is_use_initial,
+            specified_values = &specified_values,
+            longhands_set_by_property_id = &longhands_set_by_property_id,
+            property_is_set_by_use_initial = &property_is_set_by_use_initial[0],
+        )
+        css_style_computer_for_each_property_expanding_shorthands(property_id, value, ak.Function2[css_data.PropertyId, CssStyleValue*, unit](call = css_compute_keyframe_values_longhand, context = &captures))
+
+    var specified_value_captures = CssComputeKeyframeValuesSpecifiedValue(specified_values = &specified_values, computed_properties = computed_properties)
+    let get_property_specified_value = ak.Function1[css_data.PropertyId, CssStyleValue*](call = css_compute_keyframe_values_specified_value, context = &specified_value_captures)
+
+    for entry in ak.hash_map_begin_const(&specified_values):
+        let style_value = entry.value else continue
+
+        let computation_context = css_style_computer_get_computation_context_for_property(this, entry.key, computed_properties, abstract_element)
+
+        discard(ak.hash_map_set(&result, entry.key, css_style_computer_compute_value_of_property(entry.key, style_value, get_property_specified_value, computation_context, css_style_computer_device_pixels_per_css_pixel(this))))
+
+    return result
+
+assert(css_data.number_of_longhand_properties == 314, "compute_keyframe_values' property_is_set_by_use_initial has one bit per longhand")
+
+## collect_animation_into's `to_composite_operation` lambda.
+func css_to_composite_operation(effect: AnimationsKeyframeEffect*, composite_operation_or_auto: BindCompositeOperationOrAuto) -> BindCompositeOperation:
+    match composite_operation_or_auto:
+        .accumulate:
+            return BindCompositeOperation.accumulate
+        .add:
+            return BindCompositeOperation.add
+        .replace:
+            return BindCompositeOperation.replace
+        .auto:
+            return animations_keyframe_effect_composite(effect)
+        _:
+            trap("VERIFY_NOT_REACHED")
+
+## Ported from Libraries/LibWeb/CSS/StyleComputer.cpp:639 Web::CSS::StyleComputer::collect_animation_into.
+pub func css_style_computer_collect_animation_into(this: CssStyleComputer*, abstract_element: DomAbstractElement, effect: AnimationsKeyframeEffect*, computed_properties: CssComputedProperties*):
+    let animation_effect = (AnimationsAnimationEffect*)effect
+    let animation = animations_animation_effect_associated_animation(animation_effect) else return
+
+    let output_progress = animations_animation_effect_transformed_progress(animation_effect) else return
+
+    let key_frame_set = animations_keyframe_effect_key_frame_set(effect) else return
+
+    let keyframes = &key_frame_set.keyframes_by_key
+    if ak.base_red_black_tree_size(&keyframes.base) < 2:
+        if css_libweb_css_animation_debug:
+            ak.dbgln(f"    Did not find enough keyframes ({ak.base_red_black_tree_size(&keyframes.base)} keyframes)")
+            var it = ak.red_black_tree_begin_const(keyframes)
+            while not ak.red_black_tree_iterator_is_end(&it):
+                ak.dbgln(f"        - {ak.red_black_tree_iterator_key(&it)}")
+                discard(ak.red_black_tree_iterator_inc(&it))
+        return
+
+    let progress = math.round(output_progress * 100.0 * animations_keyframe_effect_animation_key_frame_key_scale_factor)
+    # FIXME: Support progress values outside the range of i64.
+    var key: i64 = 0
+    if progress > (f64)ak.i64_max:
+        key = ak.i64_max
+    elif progress < (f64)ak.i64_min:
+        key = ak.i64_min
+    else:
+        key = (i64)progress
+    var keyframe_start_it = ak.red_black_tree_begin_const(keyframes)
+    if output_progress > 0.0:
+        var potential_match = ak.red_black_tree_find_largest_not_above_iterator_const(keyframes, (u64)key)
+        var next = potential_match
+        discard(ak.red_black_tree_iterator_inc(&next))
+        if ak.red_black_tree_iterator_is_end(&next):
+            discard(ak.red_black_tree_iterator_dec(&potential_match))
+        keyframe_start_it = potential_match
+    let keyframe_start = (i64)ak.red_black_tree_iterator_key(&keyframe_start_it)
+    let keyframe_values = *ak.red_black_tree_iterator_deref(&keyframe_start_it)
+
+    var keyframe_end_it = *ak.red_black_tree_iterator_inc(&keyframe_start_it)
+    assert(not ak.red_black_tree_iterator_is_end(&keyframe_end_it))
+    let keyframe_end = (i64)ak.red_black_tree_iterator_key(&keyframe_end_it)
+    let keyframe_end_values = *ak.red_black_tree_iterator_deref(&keyframe_end_it)
+
+    var progress_in_keyframe = (progress - f64(keyframe_start)) / f64(keyframe_end - keyframe_start)
+
+    # https://drafts.csswg.org/css-animations-1/#animation-timing-function
+    # Apply the per-keyframe easing to the interval progress. The easing on a keyframe applies to the
+    # interval from that keyframe to the next. If the keyframe doesn't specify an easing, use the
+    # animation's default easing (from the animation-timing-function property).
+    var resolved_easing: CssEasingFunction? = none
+    match keyframe_values.easing:
+        .empty:
+            resolved_easing = none
+        .css_easing_function(easing):
+            resolved_easing = easing
+        .css_style_value(value):
+            resolved_easing = css_resolve_keyframe_easing(value, abstract_element)
+    if let easing = resolved_easing:
+        progress_in_keyframe = css_easing_function_evaluate_at(&easing, progress_in_keyframe, false)
+    elif animations_animation_is_css_animation(animation):
+        let default_easing = css_animation_default_easing((CssAnimation*)animation)
+        progress_in_keyframe = css_easing_function_evaluate_at(&default_easing, progress_in_keyframe, false)
+
+    if css_libweb_css_animation_debug:
+        let valid_properties = ak.hash_map_size(&keyframe_values.properties)
+        let id = animations_animation_id(animation)
+        ak.dbgln(f"Animation {(str)ak.fly_string_bytes(&id)} contains {valid_properties} properties to interpolate, progress = {progress_in_keyframe * 100.0}%")
+
+    assert(css_style_computer_computation_context_cache_is_empty(this))
+    let computed_start_values = css_style_computer_compute_keyframe_values(this, computed_properties, abstract_element, &keyframe_values)
+    let computed_end_values = css_style_computer_compute_keyframe_values(this, computed_properties, abstract_element, &keyframe_end_values)
+    css_style_computer_clear_computation_context_caches(this)
+
+    var is_result_of_transition = CssAnimatedPropertyResultOfTransition.no
+    if animations_animation_is_css_transition(animation):
+        is_result_of_transition = CssAnimatedPropertyResultOfTransition.yes
+
+    let start_composite_operation = css_to_composite_operation(effect, keyframe_values.composite)
+    let end_composite_operation = css_to_composite_operation(effect, keyframe_end_values.composite)
+
+    for it in ak.hash_map_begin_const(&computed_start_values):
+        var resolved_start_property = it.value
+        var resolved_end_property: CssStyleValue*? = none
+        if let end_value = ak.hash_map_get_k_const(&computed_end_values, it.key):
+            resolved_end_property = *end_value
+
+        if resolved_end_property == none:
+            if let start_value = resolved_start_property:
+                css_computed_properties_set_animated_property(computed_properties, it.key, start_value, is_result_of_transition)
+                if css_libweb_css_animation_debug:
+                    let name = css_data.string_from_property_id(it.key)
+                    let serialized = css_style_value_to_string(start_value, css_syntax.SerializationMode.normal)
+                    ak.dbgln(f"No end property for property {(str)ak.fly_string_bytes(&name)}, using {css_style_computer_debug_text(&serialized)}")
+            continue
+
+        if resolved_end_property != none and resolved_start_property == none:
+            resolved_start_property = css_property_initial_value(it.key)
+
+        var start = resolved_start_property else continue
+        var end = resolved_end_property else continue
+
+        # OPTIMIZATION: Values resulting from animations other than CSS transitions are overridden by important
+        #               properties so there's no need to calculate them
+        if not animations_animation_is_css_transition(animation) and css_computed_properties_is_property_important(computed_properties, it.key):
+            continue
+
+        let underlying_value = css_computed_properties_property(computed_properties, it.key)
+        if let composited_start_value = css_composite_value(it.key, underlying_value, start, start_composite_operation):
+            start = composited_start_value
+
+        if let composited_end_value = css_composite_value(it.key, underlying_value, end, end_composite_operation):
+            end = composited_end_value
+
+        let target = animations_animation_effect_target(animation_effect) else trap("VERIFY: the effect has a target")
+        if let next_value = css_interpolate_property(target, it.key, start, end, (f32)progress_in_keyframe, CssAllowDiscrete.yes):
+            if css_libweb_css_animation_debug:
+                let name = css_data.string_from_property_id(it.key)
+                let start_string = css_style_value_to_string(start, css_syntax.SerializationMode.normal)
+                let end_string = css_style_value_to_string(end, css_syntax.SerializationMode.normal)
+                let next_string = css_style_value_to_string(next_value, css_syntax.SerializationMode.normal)
+                ak.dbgln(f"Interpolated value for property {(str)ak.fly_string_bytes(&name)} at {progress_in_keyframe}: {css_style_computer_debug_text(&start_string)} -> {css_style_computer_debug_text(&end_string)} = {css_style_computer_debug_text(&next_string)}")
+            css_computed_properties_set_animated_property(computed_properties, it.key, next_value, is_result_of_transition)
+        else:
+            # If interpolate_property() fails, the element should not be rendered
+            if css_libweb_css_animation_debug:
+                let name = css_data.string_from_property_id(it.key)
+                let start_string = css_style_value_to_string(start, css_syntax.SerializationMode.normal)
+                let end_string = css_style_value_to_string(end, css_syntax.SerializationMode.normal)
+                ak.dbgln(f"Interpolated value for property {(str)ak.fly_string_bytes(&name)} at {progress_in_keyframe}: {css_style_computer_debug_text(&start_string)} -> {css_style_computer_debug_text(&end_string)} is invalid")
+            css_computed_properties_set_animated_property(computed_properties, css_data.PropertyId.visibility, css_keyword_style_value_create(css_data.Keyword.hidden).css_style_value(), is_result_of_transition)
+
+# mark: process_animation_definitions ===========================================================
+
+## process_animation_definitions' `find_keyframes` lambda.
+func css_style_computer_find_keyframes(this: CssStyleComputer*, animation_properties: const CssComputedPropertiesAnimationProperties*, shadow_root: DomShadowRoot*?) -> const AnimationsKeyframeEffectKeyFrameSet*?:
+    if let rule_cache = css_style_computer_rule_cache_for_cascade_origin(this, CssCascadeOrigin.author, none, shadow_root):
+        if let keyframe_set = ak.hash_map_get_k_const(&rule_cache.rules_by_animation_keyframes, animation_properties.name):
+            return *keyframe_set
+    return none
+
+## process_animation_definitions' `resolve_keyframes` lambda.
+func css_style_computer_resolve_keyframes(this: CssStyleComputer*, animation_properties: const CssComputedPropertiesAnimationProperties*, cascaded_properties: CssCascadedProperties*, abstract_element: DomAbstractElement*) -> const AnimationsKeyframeEffectKeyFrameSet*?:
+    if let animation_name_source_shadow_root = css_cascaded_properties_property_source_shadow_root(cascaded_properties, css_data.PropertyId.animation_name):
+        # The winning animation-name declaration can come from a shadow-root rule even when the animated
+        # element itself is outside that subtree, most notably for :host(...) and ::slotted(...). Resolve
+        # @keyframes in the declaration's scope first so same-named document rules do not win.
+        if let keyframe_set = css_style_computer_find_keyframes(this, animation_properties, animation_name_source_shadow_root):
+            return keyframe_set
+
+    if let shadow_root = as_if_dom_shadow_root(tree_node_root(dom_abstract_element_element(abstract_element).dom_node())):
+        if let keyframe_set = css_style_computer_find_keyframes(this, animation_properties, shadow_root):
+            return keyframe_set
+
+    return css_style_computer_find_keyframes(this, animation_properties, none)
+
+## Ported from Libraries/LibWeb/CSS/StyleComputer.cpp:919 Web::CSS::StyleComputer::process_animation_definitions.
+pub func css_style_computer_process_animation_definitions(this: CssStyleComputer*, computed_properties: CssComputedProperties*, cascaded_properties: CssCascadedProperties*, abstract_element: DomAbstractElement*):
+    let animation_definitions = css_computed_properties_animations(computed_properties, *abstract_element)
+
+    let document = dom_abstract_element_document(abstract_element)
+
+    let element_animations = dom_abstract_element_css_defined_animations(abstract_element)
+
+    # If we have a nullptr for element_animations it means that the pseudo element was invalid and thus we shouldn't apply animations
+    let animations = element_animations else return
+
+    var defined_animation_names: ak.HashTable[ak.FlyString, ak.FlyStringTraits]
+
+    let definitions = ak.vector_span_const(&animation_definitions)
+    for animation_properties in &definitions:
+        discard(ak.hash_table_set(&defined_animation_names, animation_properties.name))
+
+        # Changes to the values of animation properties while the animation is running apply as if the animation had
+        # those values from when it began
+        if let existing_animation = ak.hash_map_get_k(animations, animation_properties.name):
+            let existing_effect = animations_animation_effect((AnimationsAnimation*)*existing_animation) else trap("VERIFY: the animation has an effect")
+            animations_keyframe_effect_set_key_frame_set((AnimationsKeyframeEffect*)existing_effect, css_style_computer_resolve_keyframes(this, animation_properties, cascaded_properties, abstract_element))
+            css_animation_apply_css_properties(*existing_animation, animation_properties)
+            return
+
+        # An animation applies to an element if its name appears as one of the identifiers in the computed value of the
+        # animation-name property and the animation uses a valid @keyframes rule
+        let realm = dom_document_realm(document)
+        let animation = css_animation_create(realm)
+        css_animation_set_animation_name(animation, animation_properties.name)
+        animations_animation_set_owning_element((AnimationsAnimation*)animation, *abstract_element)
+
+        let effect = animations_keyframe_effect_create(realm)
+        animations_animation_set_effect((AnimationsAnimation*)animation, (AnimationsAnimationEffect*)effect)
+
+        css_animation_apply_css_properties(animation, animation_properties)
+
+        animations_keyframe_effect_set_key_frame_set(effect, css_style_computer_resolve_keyframes(this, animation_properties, cascaded_properties, abstract_element))
+
+        animations_keyframe_effect_set_target_dom_abstract_element(effect, *abstract_element)
+        dom_abstract_element_set_has_css_defined_animations(abstract_element)
+        discard(ak.hash_map_set(animations, animation_properties.name, animation))
+
+    # Once an animation has started it continues until it ends or the animation-name is removed
+    let existing_animation_names = ak.hash_map_keys(animations)
+    for existing_animation_name in ak.vector_span_const(&existing_animation_names):
+        if ak.hash_table_contains_t(&defined_animation_names, existing_animation_name):
+            continue
+
+        let existing_animation = ak.hash_map_get_k(animations, existing_animation_name) else trap("VERIFY: the animation is in the map")
+        animations_animation_cancel((AnimationsAnimation*)*existing_animation, AnimationsAnimationShouldInvalidate.no)
+        discard(ak.hash_map_remove_k(animations, existing_animation_name))

@@ -1,0 +1,513 @@
+#==============================================================================================
+#
+#   style_computer_5 - CSS::StyleComputer: the cascade, inheritance and box type transformations
+#
+#   DESCRIPTION:
+#       Port of LibWeb/CSS/StyleComputer.cpp (lines 1268-1776): build_matching_rule_set and
+#       compute_cascaded_values (the origins, presentational hints and @layer order of
+#       css-cascade-5), the inherited values, the root element's font metrics, the font-size
+#       keyword tables, compute_property_values with its computation contexts, the effective
+#       overflow values, text-align's match-parent, and the automatic box type
+#       transformations of css-display.
+#
+#       Copyright (c) 2018-2025, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2021, the SerenityOS developers.
+#       Copyright (c) 2021-2025, Sam Atkins <sam@ladybird.org>
+#       Copyright (c) 2024, Matthew Olsson <mattco@serenityos.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: The cascade =============================================================================
+
+## Ported from Libraries/LibWeb/CSS/StyleComputer.cpp:1268 Web::CSS::StyleComputer::build_matching_rule_set.
+pub func css_style_computer_build_matching_rule_set(this: CssStyleComputer*, abstract_element: DomAbstractElement, attempted_pseudo_class_matches: CssPseudoClassBitmap*, did_match_any_pseudo_element_rules: bool*, mode: CssStyleComputerComputeStyleMode, style_scope: const CssStyleScope*) -> CssStyleComputerMatchingRuleSet:
+    # First, we collect all the CSS rules whose selectors match `element`:
+    var matching_rule_set: CssStyleComputerMatchingRuleSet
+    matching_rule_set.user_agent_rules = css_style_computer_collect_matching_rules(this, abstract_element, CssCascadeOrigin.user_agent, attempted_pseudo_class_matches)
+    css_sort_matching_rules(&matching_rule_set.user_agent_rules)
+    matching_rule_set.user_rules = css_style_computer_collect_matching_rules(this, abstract_element, CssCascadeOrigin.user, attempted_pseudo_class_matches)
+    css_sort_matching_rules(&matching_rule_set.user_rules)
+
+    # @layer-ed author rules
+    let rule_cache = style_scope.m_rule_cache else trap("VERIFY: the style scope has a rule cache")
+    for layer_name in ak.vector_span_const(&rule_cache.qualified_layer_names_in_order):
+        var layer_rules = css_style_computer_collect_matching_rules(this, abstract_element, CssCascadeOrigin.author, attempted_pseudo_class_matches, layer_name)
+        css_sort_matching_rules(&layer_rules)
+        ak.vector_append_t(&matching_rule_set.author_rules, CssStyleComputerLayerMatchingRules(qualified_layer_name = layer_name, rules = layer_rules))
+    # Un-@layer-ed author rules
+    var unlayered_author_rules = css_style_computer_collect_matching_rules(this, abstract_element, CssCascadeOrigin.author, attempted_pseudo_class_matches)
+    css_sort_matching_rules(&unlayered_author_rules)
+    ak.vector_append_t(&matching_rule_set.author_rules, CssStyleComputerLayerMatchingRules(qualified_layer_name = ak.FlyString(), rules = unlayered_author_rules))
+
+    if mode == CssStyleComputerComputeStyleMode.create_pseudo_element_style_if_needed:
+        assert(dom_abstract_element_pseudo_element(&abstract_element) != none)
+        var author_rules_has_any_rules = false
+        for layer in ak.vector_span_const(&matching_rule_set.author_rules):
+            if not ak.vector_is_empty(&layer.rules):
+                author_rules_has_any_rules = true
+                break
+        *did_match_any_pseudo_element_rules = author_rules_has_any_rules or not ak.vector_is_empty(&matching_rule_set.user_rules) or not ak.vector_is_empty(&matching_rule_set.user_agent_rules)
+    return matching_rule_set
+
+## heap.allocate<CSS::CascadedProperties>(): a CascadedProperties cell constructed under DeferGC.
+pub func heap_allocate_css_cascaded_properties(heap: gc.Heap*) -> CssCascadedProperties*:
+    let this = (CssCascadedProperties*)web_heap_allocate_cell(heap, &css_cascaded_properties_class)
+    gc.heap_defer_gc(heap)
+    css_cascaded_properties_construct(this)
+    gc.heap_undefer_gc(heap)
+    return this
+
+## Ported from Libraries/LibWeb/CSS/StyleComputer.cpp:1302 Web::CSS::StyleComputer::compute_cascaded_values.
+# https://www.w3.org/TR/css-cascade/#cascading
+# https://drafts.csswg.org/css-cascade-5/#layering
+pub func css_style_computer_compute_cascaded_values(this: CssStyleComputer*, abstract_element: DomAbstractElement, did_match_any_pseudo_element_rules: bool, mode: CssStyleComputerComputeStyleMode, matching_rule_set: const CssStyleComputerMatchingRuleSet*) -> CssCascadedProperties*:
+    let cascaded_properties = heap_allocate_css_cascaded_properties(gc.cell_heap(this.m_document.cell()))
+    if mode == CssStyleComputerComputeStyleMode.create_pseudo_element_style_if_needed:
+        if not did_match_any_pseudo_element_rules:
+            return cascaded_properties
+
+    # Normal user agent declarations
+    css_style_computer_cascade_declarations(this, cascaded_properties, abstract_element, &matching_rule_set.user_agent_rules, CssCascadeOrigin.user_agent, css_syntax.Important.no, none)
+
+    # Normal user declarations
+    css_style_computer_cascade_declarations(this, cascaded_properties, abstract_element, &matching_rule_set.user_rules, CssCascadeOrigin.user, css_syntax.Important.no, none)
+
+    # Author presentational hints
+    # The spec calls this a special "Author presentational hint origin":
+    # "For the purpose of cascading this author presentational hint origin is treated as an independent origin;
+    # however for the purpose of the revert keyword (but not for the revert-layer keyword) it is considered
+    # part of the author origin."
+    # https://drafts.csswg.org/css-cascade-5/#author-presentational-hint-origin
+    var subject = abstract_element
+    if dom_abstract_element_pseudo_element(&subject) == none:
+        let element = dom_abstract_element_element(&subject)
+        var presentational_hint_properties: ak.Vector[CssStyleProperty]
+        dom_element_apply_presentational_hints(element, &presentational_hint_properties)
+        if dom_element_supports_dimension_attributes(element):
+            var dimension_source = element
+            if is_html_image_element(element):
+                dimension_source = html_image_element_dimension_attribute_source(as_html_image_element(element))
+            css_collect_dimension_attribute(&presentational_hint_properties, dimension_source, html_attribute_names_width, css_data.PropertyId.width)
+            css_collect_dimension_attribute(&presentational_hint_properties, dimension_source, html_attribute_names_height, css_data.PropertyId.height)
+        if not ak.vector_is_empty(&presentational_hint_properties):
+            css_style_computer_apply_property_list_to_cascade(this, cascaded_properties, abstract_element, ak.vector_span_const(&presentational_hint_properties), CssCascadeOrigin.author_presentational_hint, css_syntax.Important.no, none, none, none)
+
+    # Normal author declarations, ordered by @layer, with un-@layer-ed rules last
+    for layer in ak.vector_span_const(&matching_rule_set.author_rules):
+        css_style_computer_cascade_declarations(this, cascaded_properties, abstract_element, &layer.rules, CssCascadeOrigin.author, css_syntax.Important.no, layer.qualified_layer_name)
+
+    # Important author declarations, with un-@layer-ed rules first, followed by each @layer in reverse order.
+    var index = ak.vector_size(&matching_rule_set.author_rules)
+    while index > 0:
+        index -= 1
+        let layer = ak.vector_at_const(&matching_rule_set.author_rules, index)
+        css_style_computer_cascade_declarations(this, cascaded_properties, abstract_element, &layer.rules, CssCascadeOrigin.author, css_syntax.Important.yes, none)
+
+    # Important user declarations
+    css_style_computer_cascade_declarations(this, cascaded_properties, abstract_element, &matching_rule_set.user_rules, CssCascadeOrigin.user, css_syntax.Important.yes, none)
+
+    # Important user agent declarations
+    css_style_computer_cascade_declarations(this, cascaded_properties, abstract_element, &matching_rule_set.user_agent_rules, CssCascadeOrigin.user_agent, css_syntax.Important.yes, none)
+
+    # Transition declarations [css-transitions-1]
+    # Note that we have to do these after finishing computing the style,
+    # so they're not done here, but as the final step in compute_properties()
+
+    return cascaded_properties
+
+# mark: Inherited values ========================================================================
+
+## Ported from Libraries/LibWeb/CSS/StyleComputer.cpp:1362 Web::CSS::StyleComputer::get_non_animated_inherit_value.
+pub func css_style_computer_get_non_animated_inherit_value(property_id: css_data.PropertyId, abstract_element: DomAbstractElement) -> CssStyleValue*:
+    let parent_element = dom_abstract_element_element_to_inherit_style_from(&abstract_element) else return css_property_initial_value(property_id)
+    let parent_computed_properties = dom_abstract_element_computed_properties(&parent_element) else return css_property_initial_value(property_id)
+
+    return css_computed_properties_property(parent_computed_properties, property_id, CssComputedPropertiesWithAnimationsApplied.no)
+
+## Ported from Libraries/LibWeb/CSS/StyleComputer.cpp:1372 Web::CSS::StyleComputer::get_animated_inherit_value.
+pub func css_style_computer_get_animated_inherit_value(property_id: css_data.PropertyId, abstract_element: DomAbstractElement) -> CssStyleComputerAnimatedInheritValue?:
+    let parent_element = dom_abstract_element_element_to_inherit_style_from(&abstract_element) else return none
+    let parent_computed_properties = dom_abstract_element_computed_properties(&parent_element) else return none
+
+    let animated_property_values = css_computed_properties_animated_property_values(parent_computed_properties)
+    if let animated_value = ak.hash_map_get_k_const(&animated_property_values, property_id):
+        var is_result_of_transition = CssAnimatedPropertyResultOfTransition.no
+        if css_computed_properties_is_animated_property_result_of_transition(parent_computed_properties, property_id):
+            is_result_of_transition = CssAnimatedPropertyResultOfTransition.yes
+        return CssStyleComputerAnimatedInheritValue(value = *animated_value, is_result_of_transition = is_result_of_transition)
+
+    return none
+
+# mark: Font sizes ==============================================================================
+
+## Ported from Libraries/LibWeb/CSS/StyleComputer.cpp:1390 Web::CSS::StyleComputer::calculate_root_element_font_metrics.
+pub func css_style_computer_calculate_root_element_font_metrics(this: CssStyleComputer*, style: CssComputedProperties*) -> CssLengthFontMetrics:
+    let root_value = css_computed_properties_property(style, css_data.PropertyId.font_size)
+
+    let font_pixel_metrics = web_fonts.font_pixel_metrics(css_computed_properties_first_available_computed_font(style, dom_document_font_computer(css_style_computer_document(this))))
+    var font_metrics = css_length_font_metrics_new(this.m_default_font_metrics.font_size, font_pixel_metrics, css_initial_values_line_height())
+    let root_length = css_length_style_value_length(css_style_value_as_length(root_value))
+    font_metrics.font_size = css_length_to_px_css_pixel_rect(&root_length, css_style_computer_viewport_rect(this), font_metrics, font_metrics)
+    font_metrics.line_height = css_computed_properties_line_height(style)
+
+    return font_metrics
+
+## Ported from Libraries/LibWeb/CSS/StyleComputer.cpp:1402 Web::CSS::StyleComputer::default_user_font_size.
+pub func css_style_computer_default_user_font_size() -> gfx.CssPixels:
+    # FIXME: This value should be configurable by the user.
+    return gfx.css_pixels_from_int(16)
+
+## `font_size * CSSPixels(numerator) / denominator`: CSSPixels' product, divided into a CSSPixelFraction and
+## converted back to CSSPixels.
+func css_style_computer_scale_font_size(font_size: gfx.CssPixels, numerator: i64, denominator: i64) -> gfx.CssPixels:
+    let product = gfx.css_pixels_mul_css_pixels(&font_size, gfx.css_pixels_from_int(numerator))
+    let fraction = gfx.div_css_pixels_int(product, denominator)
+    return gfx.css_pixel_fraction_to_css_pixels(&fraction)
+
+## Ported from Libraries/LibWeb/CSS/StyleComputer.cpp:1409 Web::CSS::StyleComputer::absolute_size_mapping.
+# https://w3c.github.io/csswg-drafts/css-fonts/#absolute-size-mapping
+pub func css_style_computer_absolute_size_mapping(absolute_size: css_data.AbsoluteSize, default_font_size: gfx.CssPixels) -> gfx.CssPixels:
+    # An <absolute-size> keyword refers to an entry in a table of font sizes computed and kept by the user agent. See
+    # § 2.5.1 Absolute Size Keyword Mapping Table.
+    match absolute_size:
+        .xx_small:
+            return css_style_computer_scale_font_size(default_font_size, 3, 5)
+        .x_small:
+            return css_style_computer_scale_font_size(default_font_size, 3, 4)
+        .small:
+            return css_style_computer_scale_font_size(default_font_size, 8, 9)
+        .medium:
+            return default_font_size
+        .large:
+            return css_style_computer_scale_font_size(default_font_size, 6, 5)
+        .x_large:
+            return css_style_computer_scale_font_size(default_font_size, 3, 2)
+        .xx_large:
+            return gfx.mul_css_pixels_int(default_font_size, 2)
+        .xxx_large:
+            return gfx.mul_css_pixels_int(default_font_size, 3)
+        _:
+            trap("VERIFY_NOT_REACHED")
+
+## Ported from Libraries/LibWeb/CSS/StyleComputer.cpp:1436 Web::CSS::StyleComputer::relative_size_mapping.
+# https://drafts.csswg.org/css-fonts/#font-size-prop
+pub func css_style_computer_relative_size_mapping(relative_size: css_data.RelativeSize, inherited_font_size: gfx.CssPixels) -> gfx.CssPixels:
+    # A <relative-size> keyword is interpreted relative to the computed font-size of the parent element and possibly
+    # the table of font sizes.
+
+    # If the parent element has a keyword font size in the absolute size keyword mapping table, larger may compute the
+    # font size to the next entry in the table, and smaller may compute the font size to the previous entry in the
+    # table. For example, if the parent element has a font size of font-size:medium, specifying a value of larger may
+    # make the font size of the child element font-size:large.
+
+    # Instead of using next and previous items in the previous keyword table, User agents may instead use a simple
+    # ratio to increase or decrease the font size relative to the parent element. The specific ratio is unspecified,
+    # but should be around 1.2–1.5. This ratio may vary across different elements.
+    match relative_size:
+        .smaller:
+            return css_style_computer_scale_font_size(inherited_font_size, 4, 5)
+        .larger:
+            return css_style_computer_scale_font_size(inherited_font_size, 5, 4)
+        _:
+            trap("VERIFY_NOT_REACHED")
+
+# mark: Computing property values ===============================================================
+
+## compute_property_values' `get_property_specified_value` lambda: the style's current value.
+func css_style_computer_style_property_value(context: void*?, property_id: css_data.PropertyId) -> CssStyleValue*:
+    let style = (CssComputedProperties*)(context else trap("no captures"))
+    return css_computed_properties_property(style, property_id)
+
+## `m_document->page().client().device_pixels_per_css_pixel()`.
+func css_style_computer_device_pixels_per_css_pixel(this: CssStyleComputer*) -> f64:
+    return page_client_device_pixels_per_css_pixel(page_client(dom_document_page(this.m_document)))
+
+## Ported from Libraries/LibWeb/CSS/StyleComputer.cpp:1458 Web::CSS::StyleComputer::compute_property_values.
+pub func css_style_computer_compute_property_values(this: CssStyleComputer*, style: CssComputedProperties*, abstract_element: DomAbstractElement?):
+    assert(css_style_computer_computation_context_cache_is_empty(this))
+    # NOTE: This doesn't necessarily return the specified value if we have already computed this property but that
+    #       doesn't matter as a computed value is always valid as a specified value.
+    let get_property_specified_value = ak.Function1[css_data.PropertyId, CssStyleValue*](call = css_style_computer_style_property_value, context = style)
+
+    let device_pixels_per_css_pixel = css_style_computer_device_pixels_per_css_pixel(this)
+    let computation_order = css_data.property_computation_order()
+    for property_id in ak.vector_span_const(&computation_order):
+        let computation_context = css_style_computer_get_computation_context_for_property(this, property_id, style, abstract_element)
+
+        let specified_value = css_computed_properties_property(style, property_id, CssComputedPropertiesWithAnimationsApplied.no)
+
+        let computed_value = css_style_computer_compute_value_of_property(property_id, specified_value, get_property_specified_value, computation_context, device_pixels_per_css_pixel)
+
+        css_computed_properties_set_property_without_modifying_flags(style, property_id, computed_value)
+
+    css_style_computer_clear_computation_context_caches(this)
+
+    if let element = abstract_element:
+        if is_html_html_element(dom_abstract_element_element_const(&element)):
+            this.m_root_element_font_metrics = css_style_computer_calculate_root_element_font_metrics(this, style)
+
+## `abstract_element.map([](auto& element) { return element.element_to_inherit_style_from(); }).value_or(OptionalNone {})`.
+func css_style_computer_inheritance_parent_of(abstract_element: DomAbstractElement?) -> DomAbstractElement?:
+    let element = abstract_element else return none
+    return dom_abstract_element_element_to_inherit_style_from(&element)
+
+## Ported from Libraries/LibWeb/CSS/StyleComputer.cpp:1484 Web::CSS::StyleComputer::get_computation_context_for_property.
+pub func css_style_computer_get_computation_context_for_property(this: CssStyleComputer*, property_id: css_data.PropertyId, style: CssComputedProperties*, abstract_element: DomAbstractElement?) -> CssComputationContext:
+    match property_id:
+        # FIXME: While `color-scheme` doesn't actually require a computation context (since it only takes keyword values)
+        #        we still try to generate one in `compute_property_values()` and since we need `color-scheme` to be
+        #        computed before creating a generic computation context we use the font one instead.
+        .color_scheme, .font_family, .font_feature_settings, .font_kerning, .font_optical_sizing, .font_size, .font_style, .font_variant_alternates, .font_variant_caps, .font_variant_east_asian, .font_variant_emoji, .font_variant_ligatures, .font_variant_numeric, .font_variant_position, .font_variation_settings, .font_weight, .font_width, .math_depth, .text_rendering:
+            if this.m_cached_font_computation_context == none:
+                let inheritance_parent = css_style_computer_inheritance_parent_of(abstract_element)
+
+                var length_resolution_context: CssLengthResolutionContext = ---
+                if let parent = inheritance_parent:
+                    length_resolution_context = css_length_resolution_context_for_element(parent)
+                else:
+                    length_resolution_context = css_length_resolution_context_for_document(this.m_document)
+                this.m_cached_font_computation_context = CssComputationContext(
+                    length_resolution_context = length_resolution_context,
+                    abstract_element = abstract_element,
+                )
+
+            return this.m_cached_font_computation_context else trap("unreachable: set above")
+        .line_height:
+            if this.m_cached_line_height_computation_context == none:
+                let inheritance_parent = css_style_computer_inheritance_parent_of(abstract_element)
+
+                var inherited_line_height = css_initial_values_line_height()
+                if let parent = inheritance_parent:
+                    inherited_line_height = css_computed_properties_line_height(dom_abstract_element_computed_properties(&parent) else trap("VERIFY: the parent has computed properties"))
+                let line_height_font_metrics = css_length_font_metrics_new(
+                    css_computed_properties_font_size(style),
+                    web_fonts.font_pixel_metrics(css_computed_properties_first_available_computed_font(style, dom_document_font_computer(css_style_computer_document(this)))),
+                    inherited_line_height,
+                )
+
+                var root_font_metrics = this.m_root_element_font_metrics
+                if let element = abstract_element:
+                    if dom_node_is_html_html_element(dom_abstract_element_element_const(&element).dom_node()):
+                        root_font_metrics = line_height_font_metrics
+
+                this.m_cached_line_height_computation_context = CssComputationContext(
+                    length_resolution_context = CssLengthResolutionContext(
+                        viewport_rect = css_style_computer_viewport_rect(this),
+                        font_metrics = line_height_font_metrics,
+                        root_font_metrics = root_font_metrics,
+                    ),
+                    abstract_element = abstract_element,
+                )
+
+            return this.m_cached_line_height_computation_context else trap("unreachable: set above")
+        _:
+            if this.m_cached_generic_computation_context == none:
+                let document = css_style_computer_document(this)
+                let supported_color_schemes = dom_document_supported_color_schemes(document)
+                var supported: const ak.Vector[ak.String]*? = none
+                if let schemes = supported_color_schemes:
+                    supported = &schemes
+                this.m_cached_generic_computation_context = CssComputationContext(
+                    length_resolution_context = CssLengthResolutionContext(
+                        viewport_rect = css_style_computer_viewport_rect(this),
+                        font_metrics = css_length_font_metrics_new(
+                            css_computed_properties_font_size(style),
+                            web_fonts.font_pixel_metrics(css_computed_properties_first_available_computed_font(style, dom_document_font_computer(document))),
+                            css_computed_properties_line_height(style),
+                        ),
+                        root_font_metrics = this.m_root_element_font_metrics,
+                    ),
+                    abstract_element = abstract_element,
+                    color_scheme = css_computed_properties_color_scheme(style, page_preferred_color_scheme(dom_document_page(document)), supported),
+                )
+            return this.m_cached_generic_computation_context else trap("unreachable: set above")
+
+# mark: Overflow, text-align and box type transformations =======================================
+
+## Ported from Libraries/LibWeb/CSS/StyleComputer.cpp:1568 Web::CSS::StyleComputer::resolve_effective_overflow_values.
+pub func css_style_computer_resolve_effective_overflow_values(this: CssStyleComputer*, style: CssComputedProperties*):
+    # https://www.w3.org/TR/css-overflow-3/#overflow-control
+    # The visible/clip values of overflow compute to auto/hidden (respectively) if one of overflow-x or
+    # overflow-y is neither visible nor clip.
+    let overflow_x = css_data.keyword_to_overflow(css_style_value_to_keyword(css_computed_properties_property(style, css_data.PropertyId.overflow_x)))
+    let overflow_y = css_data.keyword_to_overflow(css_style_value_to_keyword(css_computed_properties_property(style, css_data.PropertyId.overflow_y)))
+    let overflow_x_is_visible_or_clip = overflow_x == css_data.Overflow.visible or overflow_x == css_data.Overflow.clip
+    let overflow_y_is_visible_or_clip = overflow_y == css_data.Overflow.visible or overflow_y == css_data.Overflow.clip
+    if not overflow_x_is_visible_or_clip or not overflow_y_is_visible_or_clip:
+        if overflow_x == css_data.Overflow.visible:
+            css_computed_properties_set_property(style, css_data.PropertyId.overflow_x, css_keyword_style_value_create(css_data.Keyword.auto).css_style_value())
+        if overflow_x == css_data.Overflow.clip:
+            css_computed_properties_set_property(style, css_data.PropertyId.overflow_x, css_keyword_style_value_create(css_data.Keyword.hidden).css_style_value())
+        if overflow_y == css_data.Overflow.visible:
+            css_computed_properties_set_property(style, css_data.PropertyId.overflow_y, css_keyword_style_value_create(css_data.Keyword.auto).css_style_value())
+        if overflow_y == css_data.Overflow.clip:
+            css_computed_properties_set_property(style, css_data.PropertyId.overflow_y, css_keyword_style_value_create(css_data.Keyword.hidden).css_style_value())
+
+## Ported from Libraries/LibWeb/CSS/StyleComputer.cpp:1589 Web::CSS::compute_text_align.
+func css_compute_text_align(style: CssComputedProperties*, abstract_element: DomAbstractElement):
+    let text_align_keyword = css_style_value_to_keyword(css_computed_properties_property(style, css_data.PropertyId.text_align))
+
+    # https://drafts.csswg.org/css-text-4/#valdef-text-align-match-parent
+    # This value behaves the same as inherit (computes to its parent’s computed value) except that an inherited
+    # value of start or end is interpreted against the parent’s direction value and results in a computed value of
+    # either left or right. Computes to start when specified on the root element.
+    if text_align_keyword == css_data.Keyword.match_parent:
+        if let parent = dom_abstract_element_element_to_inherit_style_from(&abstract_element):
+            let parent_computed_properties = dom_abstract_element_computed_properties(&parent) else trap("VERIFY: the parent has computed properties")
+            let parent_text_align = css_computed_properties_property(parent_computed_properties, css_data.PropertyId.text_align)
+            let parent_direction = css_computed_properties_direction(parent_computed_properties)
+            match css_style_value_to_keyword(parent_text_align):
+                .start:
+                    if parent_direction == css_data.Direction.ltr:
+                        css_computed_properties_set_property(style, css_data.PropertyId.text_align, css_keyword_style_value_create(css_data.Keyword.left).css_style_value())
+                    else:
+                        css_computed_properties_set_property(style, css_data.PropertyId.text_align, css_keyword_style_value_create(css_data.Keyword.right).css_style_value())
+                .end:
+                    if parent_direction == css_data.Direction.ltr:
+                        css_computed_properties_set_property(style, css_data.PropertyId.text_align, css_keyword_style_value_create(css_data.Keyword.right).css_style_value())
+                    else:
+                        css_computed_properties_set_property(style, css_data.PropertyId.text_align, css_keyword_style_value_create(css_data.Keyword.left).css_style_value())
+                _:
+                    css_computed_properties_set_property(style, css_data.PropertyId.text_align, parent_text_align)
+        else:
+            css_computed_properties_set_property(style, css_data.PropertyId.text_align, css_keyword_style_value_create(css_data.Keyword.start).css_style_value())
+
+    # AD-HOC: The -libweb-inherit-or-center style defaults to centering, unless a style value usually would have been
+    #         inherited. This is used to support the ad-hoc default <th> text-align behavior.
+    let local_name = dom_element_local_name(dom_abstract_element_element_const(&abstract_element))
+    if text_align_keyword == css_data.Keyword.libweb_inherit_or_center and ak.fly_string_eq_fly_string(&local_name, &html_tag_names_th):
+        var parent_element = dom_abstract_element_element_to_inherit_style_from(&abstract_element)
+        while let current = parent_element:
+            let parent_computed = dom_abstract_element_computed_properties(&current) else break
+            let parent_cascaded = dom_abstract_element_cascaded_properties(&current) else break
+            if css_cascaded_properties_property(parent_cascaded, css_data.PropertyId.text_align) != none:
+                let style_value = css_computed_properties_property(parent_computed, css_data.PropertyId.text_align)
+                css_computed_properties_set_property(style, css_data.PropertyId.text_align, style_value, CssComputedPropertiesInherited.yes)
+                break
+            parent_element = dom_abstract_element_element_to_inherit_style_from(&current)
+
+## Ported from Libraries/LibWeb/CSS/StyleComputer.cpp:1649 Web::CSS::required_box_type_transformation.
+func css_required_box_type_transformation(style: CssComputedProperties*, abstract_element: DomAbstractElement) -> CssBoxTypeTransformation:
+    # NOTE: We never blockify <br> elements. They are always inline.
+    #       There is currently no way to express in CSS how a <br> element really behaves.
+    #       Spec issue: https://github.com/whatwg/html/issues/2291
+    if dom_abstract_element_pseudo_element(&abstract_element) == none and is_html_htmlbr_element(dom_abstract_element_element_const(&abstract_element)):
+        return CssBoxTypeTransformation.none_
+
+    # Absolute positioning or floating an element blockifies the box’s display type. [CSS2]
+    let position = css_computed_properties_position(style)
+    if position == css_data.Positioning.absolute or position == css_data.Positioning.fixed or css_computed_properties_float(style) != css_data.Float.none_:
+        return CssBoxTypeTransformation.blockify
+
+    # FIXME: Containment in a ruby container inlinifies the box’s display type, as described in [CSS-RUBY-1].
+
+    # NOTE: If we're computing style for a pseudo-element, the effective parent will be the originating element itself, not its parent.
+    var parent = dom_abstract_element_element_to_inherit_style_from(&abstract_element)
+
+    # Climb out of `display: contents` context.
+    while let current = parent:
+        let current_computed_properties = dom_abstract_element_computed_properties(&current) else break
+        let current_display = css_computed_properties_display(current_computed_properties)
+        if not css_display_is_contents(&current_display):
+            break
+        parent = dom_abstract_element_element_to_inherit_style_from(&current)
+
+    # A parent with a grid or flex display value blockifies the box’s display type. [CSS-GRID-1] [CSS-FLEXBOX-1]
+    if let current = parent:
+        if let parent_computed_properties = dom_abstract_element_computed_properties(&current):
+            let parent_display = css_computed_properties_display(parent_computed_properties)
+            if css_display_is_grid_inside(&parent_display) or css_display_is_flex_inside(&parent_display):
+                return CssBoxTypeTransformation.blockify
+
+    return CssBoxTypeTransformation.none_
+
+## Ported from Libraries/LibWeb/CSS/StyleComputer.cpp:1681 Web::CSS::StyleComputer::transform_box_type_if_needed.
+# https://drafts.csswg.org/css-display/#transformations
+pub func css_style_computer_transform_box_type_if_needed(this: CssStyleComputer*, style: CssComputedProperties*, abstract_element: DomAbstractElement):
+    # 2.7. Automatic Box Type Transformations
+
+    # Some layout effects require blockification or inlinification of the box type,
+    # which sets the box’s computed outer display type to block or inline (respectively).
+    # (This has no effect on display types that generate no box at all, such as none or contents.)
+
+    let display = css_computed_properties_display(style)
+
+    css_computed_properties_set_display_before_box_type_transformation(style, display)
+
+    let element = dom_abstract_element_element_const(&abstract_element)
+    if css_display_is_none(&display) or (css_display_is_contents(&display) and not dom_element_is_document_element(element)):
+        return
+
+    # https://drafts.csswg.org/css-display/#root
+    # The root element’s display type is always blockified, and its principal box always establishes an independent formatting context.
+    if dom_element_is_document_element(element) and not css_display_is_block_outside(&display):
+        css_computed_properties_set_property(style, css_data.PropertyId.display, css_display_style_value_create(css_display_from_short(CssDisplayShort.block)).css_style_value())
+        return
+
+    var new_display = display
+
+    if css_display_is_math_inside(&display):
+        # https://w3c.github.io/mathml-core/#new-display-math-value
+        # For elements that are not MathML elements, if the specified value of display is inline math or block math
+        # then the computed value is block flow and inline flow respectively.
+        let tag_name = dom_element_tag_name(element)
+        if not css_optional_fly_strings_equal(dom_element_namespace_uri(element), namespace_math_ml):
+            new_display = css_display_new(css_display_outside(&display), css_data.DisplayInside.flow)
+        # For the mtable element the computed value is block table and inline table respectively.
+        elif ak.fly_string_equals_ignoring_ascii_case_string_view(&tag_name, ak.sv("mtable")):
+            new_display = css_display_new(css_display_outside(&display), css_data.DisplayInside.table)
+        # For the mtr element, the computed value is table-row.
+        elif ak.fly_string_equals_ignoring_ascii_case_string_view(&tag_name, ak.sv("mtr")):
+            new_display = css_display_new_display_internal(css_data.DisplayInternal.table_row)
+        # For the mtd element, the computed value is table-cell.
+        elif ak.fly_string_equals_ignoring_ascii_case_string_view(&tag_name, ak.sv("mtd")):
+            new_display = css_display_new_display_internal(css_data.DisplayInternal.table_cell)
+
+    # https://www.w3.org/TR/CSS2/visuren.html#dis-pos-flo
+    # If 'position' has the value 'absolute' or 'fixed', [...] 'float' is set to 'none'
+    let position = css_computed_properties_position(style)
+    if position == css_data.Positioning.absolute or position == css_data.Positioning.fixed:
+        css_computed_properties_set_property(style, css_data.PropertyId.float, css_keyword_style_value_create(css_data.Keyword.none_).css_style_value())
+
+    match css_required_box_type_transformation(style, abstract_element):
+        .none_:
+            discard(0)
+        .blockify:
+            if css_display_is_block_outside(&display):
+                return
+            # If a layout-internal box is blockified, its inner display type converts to flow so that it becomes a block container.
+            if css_display_is_internal(&display):
+                new_display = css_display_from_short(CssDisplayShort.block)
+            else:
+                assert(css_display_is_outside_and_inside(&display))
+
+                # For legacy reasons, if an inline block box (inline flow-root) is blockified, it becomes a block box (losing its flow-root nature).
+                # For consistency, a run-in flow-root box also blockifies to a block box.
+                if css_display_is_inline_block(&display):
+                    new_display = css_display_new_list_item(css_data.DisplayOutside.block, css_data.DisplayInside.flow, css_display_list_item(&display))
+                else:
+                    new_display = css_display_new_list_item(css_data.DisplayOutside.block, css_display_inside(&display), css_display_list_item(&display))
+        .inlinify:
+            if css_display_is_inline_outside(&display):
+                # FIXME: If an inline box (inline flow) is inlinified, it recursively inlinifies all of its in-flow children,
+                #        so that no block-level descendants break up the inline formatting context in which it participates.
+                if css_display_is_flow_inside(&display):
+                    ak.dbgln("FIXME: Inlinify inline box children recursively")
+            elif css_display_is_internal(&display):
+                # Inlinification has no effect on layout-internal boxes. (However, placement in such an inline context will typically cause them
+                # to be wrapped in an appropriately-typed anonymous inline-level box.)
+                discard(0)
+            else:
+                assert(css_display_is_outside_and_inside(&display))
+
+                # If a block box (block flow) is inlinified, its inner display type is set to flow-root so that it remains a block container.
+                if css_display_is_block_outside(&display) and css_display_is_flow_inside(&display):
+                    new_display = css_display_new_list_item(css_data.DisplayOutside.inline, css_data.DisplayInside.flow_root, css_display_list_item(&display))
+
+                new_display = css_display_new_list_item(css_data.DisplayOutside.inline, css_display_inside(&display), css_display_list_item(&display))
+        _:
+            trap("VERIFY_NOT_REACHED")
+
+    if not css_display_eq(&new_display, display):
+        css_computed_properties_set_property(style, css_data.PropertyId.display, css_display_style_value_create(new_display).css_style_value())

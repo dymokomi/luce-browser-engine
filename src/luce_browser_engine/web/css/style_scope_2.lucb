@@ -1,0 +1,548 @@
+#==============================================================================================
+#
+#   style_scope_2 - CSS::StyleScope: cascade layers, counter styles, :has() invalidation and
+#                   tree-scoped references
+#
+#   DESCRIPTION:
+#       Port of LibWeb/CSS/StyleScope.cpp (lines 422-1024): the qualified layer names in
+#       order, the registered counter styles (with the complex predefined ones), the :has()
+#       selector insights, the pending :has() invalidations of mutated nodes, and the
+#       dereferencing of global tree-scoped names through shadow roots.
+#
+#       Copyright (c) 2018-2025, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2022-2025, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Cascade layers ==========================================================================
+
+## Ported from Libraries/LibWeb/CSS/StyleScope.cpp:426 Web::CSS::flatten_layer_names_tree.
+func css_flatten_layer_names_tree(layer_names: ak.Vector[ak.FlyString]*, parent_qualified_name: ak.StringView, name: ak.FlyString, node: const CssLayerNode*):
+    var qualified_name = name
+    if not ak.string_view_is_empty(&parent_qualified_name):
+        # MUST(String::formatted("{}.{}", parent_qualified_name, name))
+        var builder = ak.string_builder_new()
+        ak.string_builder_append_string_view(&builder, parent_qualified_name)
+        ak.string_builder_append_u8(&builder, '.')
+        ak.string_builder_append_string_view(&builder, ak.fly_string_bytes_as_string_view(&name))
+        qualified_name = ak.fly_string_from_string(ak.string_builder_to_string_without_validation(&builder))
+
+    for item in ak.ordered_hash_map_begin_const(&node.children):
+        css_flatten_layer_names_tree(layer_names, ak.fly_string_bytes_as_string_view(&qualified_name), item.key, &item.value)
+
+    ak.vector_append_t(layer_names, qualified_name)
+
+## build_qualified_layer_names_cache's `insert_layer_name` lambda.
+func css_style_scope_insert_layer_name(root: CssLayerNode*, internal_qualified_name: ak.FlyString):
+    var node = root
+    let name_view = ak.fly_string_bytes_as_string_view(&internal_qualified_name)
+    let parts = ak.string_view_split_view_u8(&name_view, '.', ak.SplitBehavior.nothing)
+    for part in ak.vector_span_const(&parts):
+        let local_name = ak.fly_string_from_utf8(part) else trap("MUST: FlyString::from_utf8")
+        node = ak.ordered_hash_map_ensure(&node.children, local_name)
+
+## The captures of build_qualified_layer_names_cache's lambdas: the root of the layer tree.
+struct CssStyleScopeBuildQualifiedLayerNamesCache:
+    var root: CssLayerNode*
+
+## build_qualified_layer_names_cache's lambda over the effective rules of a sheet (postorder).
+func css_style_scope_build_qualified_layer_names_cache_rule(context: void*?, rule: CssRule*):
+    let captures = (CssStyleScopeBuildQualifiedLayerNamesCache*)(context else trap("no captures"))
+    match css_rule_type(rule):
+        .import_:
+            let import_rule = as_css_import_rule(rule)
+            # https://drafts.csswg.org/css-cascade-5/#at-import
+            # The layer is added to the layer order even if the import fails to load the stylesheet, but is
+            # subject to any import conditions (just as if declared by an @layer rule wrapped in the appropriate
+            # conditional group rules).
+            if let layer_name = css_import_rule_internal_qualified_layer_name(import_rule):
+                if css_import_rule_matches(import_rule):
+                    css_style_scope_insert_layer_name(captures.root, layer_name)
+        .layer_block:
+            let layer_block = as_css_layer_block_rule(rule)
+            css_style_scope_insert_layer_name(captures.root, css_layer_block_rule_internal_qualified_name(layer_block))
+        .layer_statement:
+            let layer_statement = as_css_layer_statement_rule(rule)
+            let qualified_names = css_layer_statement_rule_internal_qualified_name_list(layer_statement)
+            for name in ak.vector_span_const(&qualified_names):
+                css_style_scope_insert_layer_name(captures.root, name)
+        # Ignore everything else
+        _:
+            return
+
+## build_qualified_layer_names_cache's lambda over the author style sheets.
+func css_style_scope_build_qualified_layer_names_cache_sheet(context: void*?, sheet: CssCssStyleSheet*):
+    # NOTE: Postorder so that a @layer block is iterated after its children,
+    # because we want those children to occur before it in the list.
+    css_css_style_sheet_for_each_effective_rule(sheet, TraversalOrder.postorder, ak.Function1[CssRule*, unit](call = css_style_scope_build_qualified_layer_names_cache_rule, context = context))
+
+## Ported from Libraries/LibWeb/CSS/StyleScope.cpp:436 Web::CSS::StyleScope::build_qualified_layer_names_cache.
+pub func css_style_scope_build_qualified_layer_names_cache(this: CssStyleScope*, style_cache: CssStyleCache*):
+    var root: CssLayerNode
+
+    # Walk all style sheets, identifying when we first see a @layer name, and add its qualified name to the list.
+    # TODO: Separate the light and shadow-dom layers.
+    var captures = CssStyleScopeBuildQualifiedLayerNamesCache(root = &root)
+    css_style_scope_for_each_stylesheet(this, CssCascadeOrigin.author, ak.Function1[CssCssStyleSheet*, unit](call = css_style_scope_build_qualified_layer_names_cache_sheet, context = &captures))
+
+    # Now, produce a flat list of qualified names to use later
+    ak.vector_clear(&style_cache.qualified_layer_names_in_order)
+    css_flatten_layer_names_tree(&style_cache.qualified_layer_names_in_order, ak.sv(""), ak.FlyString(), &root)
+
+# mark: Counter styles ==========================================================================
+
+## The captures of invalidate_counter_style_cache's for_each_shadow_root lambda (none).
+func css_style_scope_invalidate_counter_style_cache_shadow_root(context: void*?, shadow_root: DomShadowRoot*):
+    dom_shadow_root_style_scope(shadow_root).m_needs_counter_style_cache_update = true
+
+## Ported from Libraries/LibWeb/CSS/StyleScope.cpp:506 Web::CSS::StyleScope::invalidate_counter_style_cache.
+pub func css_style_scope_invalidate_counter_style_cache(this: CssStyleScope*):
+    this.m_needs_counter_style_cache_update = true
+
+    # FIXME: We only need to invalidate this style scope and those belonging to descendant shadow roots (since they may
+    #        include counter styles which extend the ones defined in this scope), not all style scopes in the document.
+    let document = dom_node_document(this.m_node)
+    dom_document_style_scope(document).m_needs_counter_style_cache_update = true
+    dom_document_for_each_shadow_root(document, ak.Function1[DomShadowRoot*, unit](call = css_style_scope_invalidate_counter_style_cache_shadow_root, context = none))
+
+## A complex predefined counter style defined as build_counter_style_cache's lambda does:
+## `counter_style_definitions.set(name, CounterStyleDefinition::create(name, ...))`.
+func css_style_scope_define_counter_style(counter_style_definitions: ak.HashMap[ak.FlyString, CssCounterStyleDefinition, ak.FlyStringTraits]*, name: str, algorithm: CssCounterStyleAlgorithm, negative_sign: CssCounterStyleNegativeSign?, suffix: str, range: ak.Vector[CssCounterStyleRangeEntry], fallback: ak.FlyString?):
+    let fly_name = ak.fly_string_from_str(name)
+    discard(ak.hash_map_set(counter_style_definitions, fly_name, css_counter_style_definition_create(
+        fly_name,
+        CssCounterStyleAlgorithmOrExtends.css_counter_style_algorithm(algorithm),
+        negative_sign,
+        none,
+        ak.fly_string_from_str(suffix),
+        EmptyOrCssAutoRangeOrVectorCssCounterStyleRangeEntry.vector_css_counter_style_range_entry(range),
+        fallback,
+        none,
+    )))
+
+## An ExtendedCJKCounterStyleAlgorithm of `type_`.
+func css_style_scope_extended_cjk(type_: CssExtendedCjkCounterStyleAlgorithmType) -> CssCounterStyleAlgorithm:
+    return CssCounterStyleAlgorithm.css_extended_cjk_counter_style_algorithm(CssExtendedCjkCounterStyleAlgorithm(type_ = type_))
+
+## A CounterStyleNegativeSign of `prefix` and an empty suffix.
+func css_style_scope_negative_sign(prefix: str) -> CssCounterStyleNegativeSign?:
+    return CssCounterStyleNegativeSign(prefix = ak.fly_string_from_str(prefix), suffix = ak.fly_string_from_str(""))
+
+## build_counter_style_cache's `define_complex_predefined_counter_styles` lambda.
+func css_style_scope_define_complex_predefined_counter_styles(counter_style_definitions: ak.HashMap[ak.FlyString, CssCounterStyleDefinition, ak.FlyStringTraits]*):
+    # https://drafts.csswg.org/css-counter-styles-3/#complex-predefined-counters
+    # While authors may define their own counter styles using the @counter-style rule or rely on the set of
+    # predefined counter styles, a few counter styles are described by rules that are too complex to be captured by
+    # the predefined algorithms.
+
+    # FIXME: All of the counter styles defined in this section have a spoken form of numbers
+
+    # https://drafts.csswg.org/css-counter-styles-3/#ethiopic-numeric-counter-style
+    # For this system, the name is "ethiopic-numeric", the range is 1 infinite, the suffix is "/ " (U+002F SOLIDUS
+    # followed by a U+0020 SPACE), and the rest of the descriptors have their initial value.
+    var ethiopic_range: ak.Vector[CssCounterStyleRangeEntry]
+    ak.vector_append_t(&ethiopic_range, CssCounterStyleRangeEntry(start = 1, end = ak.i32_max))
+    let ethiopic_name = ak.fly_string_from_str("ethiopic-numeric")
+    discard(ak.hash_map_set(counter_style_definitions, ethiopic_name, css_counter_style_definition_create(
+        ethiopic_name,
+        CssCounterStyleAlgorithmOrExtends.css_counter_style_algorithm(CssCounterStyleAlgorithm.css_ethiopic_numeric_counter_style_algorithm(CssEthiopicNumericCounterStyleAlgorithm(empty_ = 0))),
+        none,
+        none,
+        ak.fly_string_from_str("/ "),
+        EmptyOrCssAutoRangeOrVectorCssCounterStyleRangeEntry.vector_css_counter_style_range_entry(ethiopic_range),
+        none,
+        none,
+    )))
+
+    # https://drafts.csswg.org/css-counter-styles-3/#extended-range-optional
+    # For all of these counter styles, the descriptors are the same as for the limited range variants, except for
+    # the range, which is calc(-1 * pow(10, 16) + 1) calc(pow(10, 16) - 1).
+    # AD-HOC: Ranges (as with all other CSS <integer>s are limited to i32 range)
+    var extended_cjk_range: ak.Vector[CssCounterStyleRangeEntry]
+    ak.vector_append_t(&extended_cjk_range, CssCounterStyleRangeEntry(start = ak.clamp_to_i32_i64(-9999999999999999), end = ak.clamp_to_i32_i64(9999999999999999)))
+    let cjk_decimal: ak.FlyString? = ak.fly_string_from_str("cjk-decimal")
+
+    # https://drafts.csswg.org/css-counter-styles-3/#limited-chinese
+    # For all of these counter styles, the suffix is "、" U+3001, the fallback is cjk-decimal, the range is -9999
+    # 9999, and the negative value is given in the table of symbols for each style.
+
+    #                  simp-chinese-informal simp-chinese-formal trad-chinese-informal trad-chinese-formal
+    # Negative Sign    负 U+8D1F             负 U+8D1F           負 U+8CA0              負 U+8CA0
+
+    # https://drafts.csswg.org/css-counter-styles-3/#simp-chinese-informal
+    # simp-chinese-informal
+    css_style_scope_define_counter_style(counter_style_definitions, "simp-chinese-informal", css_style_scope_extended_cjk(CssExtendedCjkCounterStyleAlgorithmType.simp_chinese_informal), css_style_scope_negative_sign("\u{8D1F}"), "\u{3001}", ak.vector_clone(&extended_cjk_range), cjk_decimal)
+
+    # https://drafts.csswg.org/css-counter-styles-3/#simp-chinese-formal
+    # simp-chinese-formal
+    css_style_scope_define_counter_style(counter_style_definitions, "simp-chinese-formal", css_style_scope_extended_cjk(CssExtendedCjkCounterStyleAlgorithmType.simp_chinese_formal), css_style_scope_negative_sign("\u{8D1F}"), "\u{3001}", ak.vector_clone(&extended_cjk_range), cjk_decimal)
+
+    # https://drafts.csswg.org/css-counter-styles-3/#trad-chinese-informal
+    # trad-chinese-informal
+    css_style_scope_define_counter_style(counter_style_definitions, "trad-chinese-informal", css_style_scope_extended_cjk(CssExtendedCjkCounterStyleAlgorithmType.trad_chinese_informal), css_style_scope_negative_sign("\u{8CA0}"), "\u{3001}", ak.vector_clone(&extended_cjk_range), cjk_decimal)
+
+    # https://drafts.csswg.org/css-counter-styles-3/#trad-chinese-formal
+    # trad-chinese-formal
+    css_style_scope_define_counter_style(counter_style_definitions, "trad-chinese-formal", css_style_scope_extended_cjk(CssExtendedCjkCounterStyleAlgorithmType.trad_chinese_formal), css_style_scope_negative_sign("\u{8CA0}"), "\u{3001}", ak.vector_clone(&extended_cjk_range), cjk_decimal)
+
+    # https://drafts.csswg.org/css-counter-styles-3/#cjk-ideographic
+    # cjk-ideographic
+    # This counter style is identical to trad-chinese-informal. (It exists for legacy reasons.)
+    css_style_scope_define_counter_style(counter_style_definitions, "cjk-ideographic", css_style_scope_extended_cjk(CssExtendedCjkCounterStyleAlgorithmType.trad_chinese_informal), css_style_scope_negative_sign("\u{8CA0}"), "\u{3001}", ak.vector_clone(&extended_cjk_range), cjk_decimal)
+
+    # https://drafts.csswg.org/css-counter-styles-3/#japanese-informal
+    # japanese-informal
+    css_style_scope_define_counter_style(counter_style_definitions, "japanese-informal", css_style_scope_extended_cjk(CssExtendedCjkCounterStyleAlgorithmType.japanese_informal), css_style_scope_negative_sign("\u{30DE}\u{30A4}\u{30CA}\u{30B9}"), "\u{3001}", ak.vector_clone(&extended_cjk_range), cjk_decimal)
+
+    # https://drafts.csswg.org/css-counter-styles-3/#japanese-formal
+    # japanese-formal
+    css_style_scope_define_counter_style(counter_style_definitions, "japanese-formal", css_style_scope_extended_cjk(CssExtendedCjkCounterStyleAlgorithmType.japanese_formal), css_style_scope_negative_sign("\u{30DE}\u{30A4}\u{30CA}\u{30B9}"), "\u{3001}", ak.vector_clone(&extended_cjk_range), cjk_decimal)
+
+    # https://drafts.csswg.org/css-counter-styles-3/#korean-hangul-formal
+    # korean-hangul-formal
+    css_style_scope_define_counter_style(counter_style_definitions, "korean-hangul-formal", css_style_scope_extended_cjk(CssExtendedCjkCounterStyleAlgorithmType.korean_hangul_formal), css_style_scope_negative_sign("\u{B9C8}\u{C774}\u{B108}\u{C2A4} "), ", ", ak.vector_clone(&extended_cjk_range), cjk_decimal)
+
+    # https://drafts.csswg.org/css-counter-styles-3/#korean-hanja-informal
+    # korean-hanja-informal
+    css_style_scope_define_counter_style(counter_style_definitions, "korean-hanja-informal", css_style_scope_extended_cjk(CssExtendedCjkCounterStyleAlgorithmType.korean_hanja_informal), css_style_scope_negative_sign("\u{B9C8}\u{C774}\u{B108}\u{C2A4} "), ", ", ak.vector_clone(&extended_cjk_range), cjk_decimal)
+
+    # https://drafts.csswg.org/css-counter-styles-3/#korean-hanja-formal
+    # korean-hanja-formal
+    css_style_scope_define_counter_style(counter_style_definitions, "korean-hanja-formal", css_style_scope_extended_cjk(CssExtendedCjkCounterStyleAlgorithmType.korean_hanja_formal), css_style_scope_negative_sign("\u{B9C8}\u{C774}\u{B108}\u{C2A4} "), ", ", ak.vector_clone(&extended_cjk_range), cjk_decimal)
+
+## The captures of build_counter_style_cache's `collect_counter_style_definitions` function and its lambda.
+struct CssStyleScopeCollectCounterStyleDefinitions:
+    var counter_style_definitions: ak.HashMap[ak.FlyString, CssCounterStyleDefinition, ak.FlyStringTraits]*
+    var computation_context: CssComputationContext
+
+## The lambda over a style sheet's effective @counter-style rules.
+func css_style_scope_collect_counter_style_definition(context: void*?, counter_style_rule: CssCounterStyleRule*):
+    let captures = (CssStyleScopeCollectCounterStyleDefinitions*)(context else trap("no captures"))
+    if let definition = css_counter_style_definition_from_counter_style_rule(counter_style_rule, captures.computation_context):
+        discard(ak.hash_map_set(captures.counter_style_definitions, css_counter_style_definition_name(&definition), definition))
+
+## build_counter_style_cache's `collect_counter_style_definitions` function.
+func css_style_scope_collect_counter_style_definitions(context: void*?, style_sheet: CssCssStyleSheet*):
+    css_css_style_sheet_for_each_effective_counter_style_at_rule(style_sheet, ak.Function1[CssCounterStyleRule*, unit](call = css_style_scope_collect_counter_style_definition, context = context))
+
+## The name a counter style extends, when its algorithm is `extends` (C++ `algorithm().get<Extends>().name`).
+func css_style_scope_extended_name(definition: const CssCounterStyleDefinition*) -> ak.FlyString:
+    match css_counter_style_definition_algorithm(definition):
+        .css_counter_style_system_style_value_extends(extends):
+            return extends.name
+        _:
+            trap("VERIFY: the counter style extends another")
+
+## Whether a counter style definition has its own algorithm (`algorithm().has<CounterStyleAlgorithm>()`).
+func css_style_scope_has_algorithm(definition: const CssCounterStyleDefinition*) -> bool:
+    match css_counter_style_definition_algorithm(definition):
+        .css_counter_style_algorithm(_):
+            return true
+        _:
+            return false
+
+## build_counter_style_cache's `is_part_of_extends_cycle` lambda.
+func css_style_scope_is_part_of_extends_cycle(counter_style_definitions: const ak.HashMap[ak.FlyString, CssCounterStyleDefinition, ak.FlyStringTraits]*, counter_style_name: ak.FlyString) -> bool:
+    var visited: ak.HashTable[ak.FlyString, ak.FlyStringTraits]
+    var current_counter_style_name = counter_style_name
+
+    while true:
+        if ak.hash_table_contains_t(&visited, current_counter_style_name):
+            return true
+
+        discard(ak.hash_table_set(&visited, current_counter_style_name))
+
+        # NB: If we don't have a definition for this counter style it means it's either undefined in this scope
+        #     (and will the counter style extending it will instead default to extending "decimal" instead) or it's
+        #     defined in an outer style scope (and thus can't extend a counter style in the current scope), neither
+        #     of which can lead to a cycle.
+        let current_definition = ak.hash_map_get_k_const(counter_style_definitions, current_counter_style_name) else return false
+
+        if css_style_scope_has_algorithm(current_definition):
+            return false
+
+        current_counter_style_name = css_style_scope_extended_name(current_definition)
+    # (C++'s VERIFY_NOT_REACHED() after the loop is unreachable.)
+
+## Ported from Libraries/LibWeb/CSS/StyleScope.cpp:518 Web::CSS::StyleScope::build_counter_style_cache.
+pub func css_style_scope_build_counter_style_cache(this: CssStyleScope*):
+    this.m_is_doing_counter_style_cache_update = true
+
+    ak.hash_map_clear_with_capacity(&this.m_registered_counter_styles)
+
+    var counter_style_definitions: ak.HashMap[ak.FlyString, CssCounterStyleDefinition, ak.FlyStringTraits]
+
+    var captures = CssStyleScopeCollectCounterStyleDefinitions(
+        counter_style_definitions = &counter_style_definitions,
+        computation_context = CssComputationContext(length_resolution_context = css_length_resolution_context_for_document(css_style_scope_document(this))),
+    )
+    let collect_counter_style_definitions = ak.Function1[CssCssStyleSheet*, unit](call = css_style_scope_collect_counter_style_definitions, context = &captures)
+
+    # NB: We should only register predefined counter styles in the document's style scope, this ensures overrides are
+    #     correctly inherited by shadow roots.
+    if dom_node_is_document(this.m_node):
+        css_style_scope_for_each_stylesheet(this, CssCascadeOrigin.user_agent, collect_counter_style_definitions)
+        css_style_scope_define_complex_predefined_counter_styles(&counter_style_definitions)
+        css_style_scope_for_each_stylesheet(this, CssCascadeOrigin.user, collect_counter_style_definitions)
+
+    css_style_scope_for_each_stylesheet(this, CssCascadeOrigin.author, collect_counter_style_definitions)
+
+    assert(not dom_node_is_document(this.m_node) or ak.hash_map_contains_k(&counter_style_definitions, ak.fly_string_from_str("decimal")))
+
+    # NB: We register non-extending counter styles immediately and then extending counter styles after we have
+    #     registered their corresponding extended counter style.
+    var extending_counter_styles: ak.Vector[CssCounterStyleDefinition]
+
+    for entry in ak.hash_map_begin(&counter_style_definitions):
+        let definition = &entry.value
+        # NB: We don't need to wait for this counter style's extended counter style to be registered since it doesn't
+        #     have one - register it immediately.
+        if css_style_scope_has_algorithm(definition):
+            discard(ak.hash_map_set(&this.m_registered_counter_styles, entry.key, css_counter_style_from_counter_style_definition(definition, this)))
+            continue
+
+        if css_style_scope_is_part_of_extends_cycle(&counter_style_definitions, entry.key):
+            var copied = *definition
+            css_counter_style_definition_set_algorithm(&copied, CssCounterStyleAlgorithmOrExtends.css_counter_style_system_style_value_extends(CssCounterStyleSystemStyleValueExtends(name = ak.fly_string_from_str("decimal"))))
+            ak.vector_append_t(&extending_counter_styles, copied)
+        else:
+            ak.vector_append_t(&extending_counter_styles, *definition)
+
+    # FIXME: This is O(n^2) in the worst case but we usually don't see many counter styles so it should be fine in practice.
+    while not ak.vector_is_empty(&extending_counter_styles):
+        var i: usize = 0
+        while i < ak.vector_size(&extending_counter_styles):
+            let definition = ak.vector_at(&extending_counter_styles, i)
+            let extends_name = css_style_scope_extended_name(definition)
+
+            if not ak.hash_map_contains_k(&this.m_registered_counter_styles, extends_name) and ak.hash_map_contains_k(&counter_style_definitions, extends_name):
+                i += 1
+                continue
+
+            discard(ak.hash_map_set(&this.m_registered_counter_styles, css_counter_style_definition_name(definition), css_counter_style_from_counter_style_definition(definition, this)))
+            # extending_counter_styles.remove(i); --i; (then the loop's ++i)
+            ak.vector_remove(&extending_counter_styles, i)
+
+    this.m_is_doing_counter_style_cache_update = false
+    this.m_needs_counter_style_cache_update = false
+
+# mark: :has() selectors ========================================================================
+
+## Ported from Libraries/LibWeb/CSS/StyleScope.cpp:797 Web::CSS::StyleScope::may_have_has_selectors.
+pub func css_style_scope_may_have_has_selectors(this: const CssStyleScope*) -> bool:
+    if not css_style_scope_has_valid_rule_cache(this):
+        return true
+
+    css_style_scope_build_rule_cache_if_needed(this)
+    let rule_cache = this.m_rule_cache else trap("VERIFY: the rule cache was built")
+    return rule_cache.selector_insights.has_has_selectors
+
+## Ported from Libraries/LibWeb/CSS/StyleScope.cpp:806 Web::CSS::StyleScope::have_has_selectors.
+pub func css_style_scope_have_has_selectors(this: const CssStyleScope*) -> bool:
+    css_style_scope_build_rule_cache_if_needed(this)
+    let rule_cache = this.m_rule_cache else trap("VERIFY: the rule cache was built")
+    return rule_cache.selector_insights.has_has_selectors
+
+## Ported from Libraries/LibWeb/CSS/StyleScope.cpp:812 Web::CSS::StyleScope::may_have_has_selectors_with_relative_selector_that_has_sibling_combinator.
+pub func css_style_scope_may_have_has_selectors_with_relative_selector_that_has_sibling_combinator(this: const CssStyleScope*) -> bool:
+    if not css_style_scope_has_valid_rule_cache(this):
+        return true
+
+    css_style_scope_build_rule_cache_if_needed(this)
+    let rule_cache = this.m_rule_cache else trap("VERIFY: the rule cache was built")
+    return rule_cache.selector_insights.has_has_selectors_with_relative_selector_that_has_sibling_combinator
+
+## Ported from Libraries/LibWeb/CSS/StyleScope.cpp:821 Web::CSS::StyleScope::have_has_selectors_with_relative_selector_that_has_sibling_combinator.
+pub func css_style_scope_have_has_selectors_with_relative_selector_that_has_sibling_combinator(this: const CssStyleScope*) -> bool:
+    css_style_scope_build_rule_cache_if_needed(this)
+    let rule_cache = this.m_rule_cache else trap("VERIFY: the rule cache was built")
+    return rule_cache.selector_insights.has_has_selectors_with_relative_selector_that_has_sibling_combinator
+
+## Ported from Libraries/LibWeb/CSS/StyleScope.cpp:827 Web::CSS::StyleScope::document.
+pub func css_style_scope_document(this: const CssStyleScope*) -> DomDocument*:
+    return dom_node_document(this.m_node)
+
+## Ported from Libraries/LibWeb/CSS/StyleScope.cpp:832 Web::CSS::StyleScope::get_pseudo_class_rule_cache.
+pub func css_style_scope_get_pseudo_class_rule_cache(this: const CssStyleScope*, pseudo_class: css_data.PseudoClass) -> const CssRuleCache*:
+    css_style_scope_build_rule_cache_if_needed(this)
+    let rule_cache = this.m_rule_cache else trap("VERIFY: the rule cache was built")
+    return rule_cache.pseudo_class_rule_cache[(usize)pseudo_class] else trap("VERIFY: a rule cache for the pseudo-class")
+
+## Ported from Libraries/LibWeb/CSS/StyleScope.cpp:838 Web::CSS::StyleScope::for_each_active_css_style_sheet.
+pub func css_style_scope_for_each_active_css_style_sheet(this: const CssStyleScope*, callback: ak.Function1[CssCssStyleSheet*, unit]):
+    if let shadow_root = as_if_dom_shadow_root(this.m_node):
+        dom_shadow_root_for_each_active_css_style_sheet(shadow_root, callback)
+    else:
+        dom_document_for_each_active_css_style_sheet(dom_node_document(this.m_node), callback)
+
+# mark: Pending :has() invalidations ============================================================
+
+## Ported from Libraries/LibWeb/CSS/StyleScope.cpp:847 Web::CSS::StyleScope::schedule_ancestors_style_invalidation_due_to_presence_of_has.
+pub func css_style_scope_schedule_ancestors_style_invalidation_due_to_presence_of_has(this: CssStyleScope*, node: DomNode*):
+    let previous_size = ak.ordered_hash_map_size(&this.m_pending_has_invalidations)
+    let mutation_features = ak.ordered_hash_map_ensure(&this.m_pending_has_invalidations, node)
+    if ak.ordered_hash_map_size(&this.m_pending_has_invalidations) == previous_size:
+        return
+    mutation_features.is_conservative = true
+    dom_document_set_needs_invalidation_of_elements_affected_by_has(css_style_scope_document(this))
+
+## Ported from Libraries/LibWeb/CSS/StyleScope.cpp:857 Web::CSS::merge_pending_has_invalidation_mutation_features.
+func css_merge_pending_has_invalidation_mutation_features(target: CssPendingHasInvalidationMutationFeatures*, source: const CssPendingHasInvalidationMutationFeatures*):
+    target.is_conservative = target.is_conservative or source.is_conservative
+    target.may_affect_sibling_relationships = target.may_affect_sibling_relationships or source.may_affect_sibling_relationships
+    target.may_affect_pseudo_classes = target.may_affect_pseudo_classes or source.may_affect_pseudo_classes
+    for tag_name in ak.hash_table_begin_const(&source.tag_names):
+        discard(ak.hash_table_set(&target.tag_names, *tag_name))
+    for id in ak.hash_table_begin_const(&source.ids):
+        discard(ak.hash_table_set(&target.ids, *id))
+    for class_name in ak.hash_table_begin_const(&source.class_names):
+        discard(ak.hash_table_set(&target.class_names, *class_name))
+    for attribute_name in ak.hash_table_begin_const(&source.attribute_names):
+        discard(ak.hash_table_set(&target.attribute_names, *attribute_name))
+    for pseudo_class in ak.hash_table_begin_const(&source.pseudo_classes):
+        discard(ak.hash_table_set(&target.pseudo_classes, *pseudo_class))
+
+## Ported from Libraries/LibWeb/CSS/StyleScope.cpp:874 Web::CSS::collect_pending_has_invalidation_features_from_element.
+func css_collect_pending_has_invalidation_features_from_element(features: CssPendingHasInvalidationMutationFeatures*, element: DomElement*):
+    discard(ak.hash_table_set(&features.tag_names, dom_element_local_name(element)))
+    let is_html = css_optional_fly_strings_equal(dom_element_namespace_uri(element), namespace_html)
+    if not is_html:
+        discard(ak.hash_table_set(&features.tag_names, dom_element_lowercased_local_name(element)))
+
+    if let id = dom_element_id(element):
+        discard(ak.hash_table_set(&features.ids, id))
+
+    let class_names = dom_element_class_names(element)
+    for class_name in ak.vector_span_const(&class_names):
+        discard(ak.hash_table_set(&features.class_names, class_name))
+
+    # element.for_each_attribute([&](FlyString const& name, String const&) { ... })
+    if let attributes = element.m_attributes:
+        for i in 0..<dom_named_node_map_length(attributes):
+            let attribute = dom_named_node_map_item(attributes, (u32)i) else trap("NamedNodeMap::item in range")
+            let name = dom_attr_name(attribute)
+            discard(ak.hash_table_set(&features.attribute_names, name))
+            if not is_html:
+                discard(ak.hash_table_set(&features.attribute_names, ak.fly_string_to_ascii_lowercase(&name)))
+
+## Ported from Libraries/LibWeb/CSS/StyleScope.cpp:893 Web::CSS::StyleScope::record_conservative_pending_has_invalidation.
+pub func css_style_scope_record_conservative_pending_has_invalidation(this: CssStyleScope*, scheduled_node: DomNode*, may_affect_sibling_relationships: bool):
+    let previous_size = ak.ordered_hash_map_size(&this.m_pending_has_invalidations)
+    let mutation_features = ak.ordered_hash_map_ensure(&this.m_pending_has_invalidations, scheduled_node)
+    mutation_features.is_conservative = true
+    mutation_features.may_affect_sibling_relationships = mutation_features.may_affect_sibling_relationships or may_affect_sibling_relationships
+    mutation_features.may_affect_pseudo_classes = true
+
+    if ak.ordered_hash_map_size(&this.m_pending_has_invalidations) != previous_size:
+        dom_document_set_needs_invalidation_of_elements_affected_by_has(css_style_scope_document(this))
+
+## collect_pending_has_invalidation_mutation_features' `collect_node` lambda.
+func css_collect_pending_has_invalidation_mutation_features_node(features: CssPendingHasInvalidationMutationFeatures*, node: DomNode*):
+    if dom_node_is_character_data(node):
+        return
+    if let element = as_if_dom_element(node):
+        css_collect_pending_has_invalidation_features_from_element(features, element)
+
+## Ported from Libraries/LibWeb/CSS/StyleScope.cpp:905 Web::CSS::collect_pending_has_invalidation_mutation_features.
+func css_collect_pending_has_invalidation_mutation_features_dom_node(mutation_root: DomNode*, includes_descendants: bool) -> CssPendingHasInvalidationMutationFeatures:
+    var features: CssPendingHasInvalidationMutationFeatures
+    features.may_affect_sibling_relationships = includes_descendants
+    features.may_affect_pseudo_classes = true
+
+    if not includes_descendants:
+        css_collect_pending_has_invalidation_mutation_features_node(&features, mutation_root)
+        return features
+
+    for node in dom_node_inclusive_subtree(mutation_root):
+        css_collect_pending_has_invalidation_mutation_features_node(&features, node)
+    return features
+
+## Ported from Libraries/LibWeb/CSS/StyleScope.cpp:929 Web::CSS::collect_pending_has_invalidation_mutation_features.
+func css_collect_pending_has_invalidation_mutation_features_vector(properties: const ak.Vector[CssInvalidationSetProperty]*) -> CssPendingHasInvalidationMutationFeatures:
+    var features: CssPendingHasInvalidationMutationFeatures
+    for property in ak.vector_span_const(properties):
+        match property.type_:
+            .class_:
+                discard(ak.hash_table_set(&features.class_names, css_invalidation_set_property_name(&property)))
+            .id:
+                discard(ak.hash_table_set(&features.ids, css_invalidation_set_property_name(&property)))
+            .tag_name:
+                discard(ak.hash_table_set(&features.tag_names, css_invalidation_set_property_name(&property)))
+            .attribute:
+                discard(ak.hash_table_set(&features.attribute_names, css_invalidation_set_property_name(&property)))
+            .invalidate_self, .invalidate_whole_subtree:
+                features.is_conservative = true
+            .pseudo_class:
+                match property.value:
+                    .pseudo_class(pseudo_class):
+                        discard(ak.hash_table_set(&features.pseudo_classes, pseudo_class))
+                    _:
+                        trap("VERIFY: Variant::get<PseudoClass>")
+            _:
+                trap("VERIFY_NOT_REACHED")
+    return features
+
+## Ported from Libraries/LibWeb/CSS/StyleScope.cpp:958 Web::CSS::StyleScope::record_pending_has_invalidation_mutation_features.
+pub func css_style_scope_record_pending_has_invalidation_mutation_features_dom_node(this: CssStyleScope*, scheduled_node: DomNode*, mutation_root: DomNode*, includes_descendants: bool):
+    let features = css_collect_pending_has_invalidation_mutation_features_dom_node(mutation_root, includes_descendants)
+    let previous_size = ak.ordered_hash_map_size(&this.m_pending_has_invalidations)
+    let existing_features = ak.ordered_hash_map_ensure(&this.m_pending_has_invalidations, scheduled_node)
+    if ak.ordered_hash_map_size(&this.m_pending_has_invalidations) == previous_size:
+        css_merge_pending_has_invalidation_mutation_features(existing_features, &features)
+        return
+    *existing_features = features
+    dom_document_set_needs_invalidation_of_elements_affected_by_has(css_style_scope_document(this))
+
+## Ported from Libraries/LibWeb/CSS/StyleScope.cpp:971 Web::CSS::StyleScope::record_pending_has_invalidation_mutation_features.
+pub func css_style_scope_record_pending_has_invalidation_mutation_features_vector(this: CssStyleScope*, scheduled_node: DomNode*, properties: const ak.Vector[CssInvalidationSetProperty]*):
+    let features = css_collect_pending_has_invalidation_mutation_features_vector(properties)
+    let previous_size = ak.ordered_hash_map_size(&this.m_pending_has_invalidations)
+    let existing_features = ak.ordered_hash_map_ensure(&this.m_pending_has_invalidations, scheduled_node)
+    if ak.ordered_hash_map_size(&this.m_pending_has_invalidations) == previous_size:
+        css_merge_pending_has_invalidation_mutation_features(existing_features, &features)
+        return
+    *existing_features = features
+    dom_document_set_needs_invalidation_of_elements_affected_by_has(css_style_scope_document(this))
+
+# mark: Tree-scoped references ==================================================================
+
+## get_registered_counter_style's lambda: `scope.m_registered_counter_styles.get(name)`.
+func css_style_scope_get_registered_counter_style_in(context: void*?, scope: const CssStyleScope*) -> CssCounterStyle*?:
+    let name = (ak.FlyString*)(context else trap("no captures"))
+    let counter_style = ak.hash_map_get_k_const(&scope.m_registered_counter_styles, *name) else return none
+    return *counter_style
+
+## Ported from Libraries/LibWeb/CSS/StyleScope.cpp:984 Web::CSS::StyleScope::get_registered_counter_style.
+pub func css_style_scope_get_registered_counter_style(this: const CssStyleScope*, name: ak.FlyString) -> CssCounterStyle*?:
+    if this.m_needs_counter_style_cache_update and not this.m_is_doing_counter_style_cache_update:
+        css_style_scope_build_counter_style_cache((CssStyleScope*)this)
+
+    var captured_name = name
+    return css_style_scope_dereference_global_tree_scoped_reference[CssCounterStyle*](this, ak.Function1[const CssStyleScope*, CssCounterStyle*?](call = css_style_scope_get_registered_counter_style_in, context = &captured_name))
+
+## Ported from Libraries/LibWeb/CSS/StyleScope.cpp:994 Web::CSS::StyleScope::dereference_global_tree_scoped_reference.
+pub func css_style_scope_dereference_global_tree_scoped_reference[T](this: const CssStyleScope*, callback: ak.Function1[const CssStyleScope*, T?]) -> T?:
+    # https://drafts.csswg.org/css-shadow-1/#tree-scoped-name-global
+    # If a tree-scoped name is global (such as @font-face names), then when a tree-scoped reference is dereferenced to
+    # find it, first search only the tree-scoped names associated with the same root as the tree-scoped reference. If
+    # no relevant tree-scoped name is found, and the root is a shadow root, then repeat this search in the root’s
+    # host’s node tree (recursively). (In other words, global tree-scoped names “inherit” into descendant shadow trees,
+    # so long as they don’t define the same name themselves.)
+    if let result = ak.function1_call(&callback, this):
+        return result
+
+    if let shadow_root = as_if_dom_shadow_root(this.m_node):
+        if let host = dom_document_fragment_host(shadow_root.dom_document_fragment()):
+            let root = tree_node_root(host.dom_node())
+
+            if dom_node_is_shadow_root(root):
+                let root_shadow_root = as_dom_shadow_root(root)
+                if dom_shadow_root_uses_document_style_sheets(root_shadow_root):
+                    return css_style_scope_dereference_global_tree_scoped_reference(dom_document_style_scope(dom_node_document(root)), callback)
+
+                return css_style_scope_dereference_global_tree_scoped_reference(dom_shadow_root_style_scope(root_shadow_root), callback)
+
+            return css_style_scope_dereference_global_tree_scoped_reference(dom_document_style_scope(as_dom_document(root)), callback)
+
+    return none
