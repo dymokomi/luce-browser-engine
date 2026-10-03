@@ -1,0 +1,552 @@
+#==============================================================================================
+#
+#   value_parsing_10 - parsing CSS values: grid track sizes, track lists and line placement
+#
+#   DESCRIPTION:
+#       Port of LibWeb/CSS/Parser/ValueParsing.cpp (lines 4419-4928): <track-breadth>,
+#       <inflexible-breadth>, <fixed-breadth>, <line-names>, the track-list walker, repeat() and
+#       minmax() with their parameter parsers (the C++ GridRepeatTypeParser, GridTrackParser and
+#       GridMinMaxParamParser lambdas are ak.Function1s over the functions here), <track-size>,
+#       <fixed-size>, <track-list>, <auto-track-list>, <explicit-track-list> and <grid-line>.
+#
+#       Copyright (c) 2018-2024, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2021-2025, Sam Atkins <sam@ladybird.org>
+#       (the full list of ValueParsing.cpp's copyright holders is in value_parsing_1)
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Breadths and line names =================================================================
+
+## Ported from Libraries/LibWeb/CSS/Parser/ValueParsing.cpp:4420 Web::CSS::Parser::Parser::parse_grid_track_breadth.
+# https://www.w3.org/TR/css-grid-2/#typedef-track-breadth
+pub func css_parser_parse_grid_track_breadth(this: CssParser*, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssGridSize?:
+    # <track-breadth> = <length-percentage [0,∞]> | <flex [0,∞]> | min-content | max-content | auto
+
+    if let inflexible_breadth = css_parser_parse_grid_inflexible_breadth(this, tokens):
+        return inflexible_breadth
+
+    if let flex_value = css_parser_parse_flex_value(this, tokens, css_non_negative_range):
+        return css_grid_size_new(flex_value)
+
+    return none
+
+## Ported from Libraries/LibWeb/CSS/Parser/ValueParsing.cpp:4434 Web::CSS::Parser::Parser::parse_grid_inflexible_breadth.
+# https://www.w3.org/TR/css-grid-2/#typedef-inflexible-breadth
+pub func css_parser_parse_grid_inflexible_breadth(this: CssParser*, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssGridSize?:
+    # <inflexible-breadth>  = <length-percentage [0,∞]> | min-content | max-content | auto
+
+    if let fixed_breadth = css_parser_parse_grid_fixed_breadth(this, tokens):
+        return css_grid_size_new(fixed_breadth)
+
+    var transaction = css_syntax.token_stream_begin_transaction(tokens)
+    defer css_syntax.state_transaction_destroy(&transaction)
+    css_syntax.token_stream_discard_whitespace(tokens)
+    if not css_syntax.token_stream_has_next_token(tokens):
+        return none
+
+    let token = css_syntax.token_stream_consume_a_token(tokens)
+    if css_syntax.component_value_is_ident(&token, ak.sv("max-content")):
+        css_syntax.state_transaction_commit(&transaction)
+        return css_grid_size_new(css_keyword_style_value_create(css_data.Keyword.max_content).css_style_value())
+    if css_syntax.component_value_is_ident(&token, ak.sv("min-content")):
+        css_syntax.state_transaction_commit(&transaction)
+        return css_grid_size_new(css_keyword_style_value_create(css_data.Keyword.min_content).css_style_value())
+    if css_syntax.component_value_is_ident(&token, ak.sv("auto")):
+        css_syntax.state_transaction_commit(&transaction)
+        return css_grid_size_make_auto()
+
+    return none
+
+## Ported from Libraries/LibWeb/CSS/Parser/ValueParsing.cpp:4464 Web::CSS::Parser::Parser::parse_grid_fixed_breadth.
+# https://www.w3.org/TR/css-grid-2/#typedef-fixed-breadth
+pub func css_parser_parse_grid_fixed_breadth(this: CssParser*, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssStyleValue*?:
+    # <fixed-breadth> = <length-percentage [0,∞]>
+
+    var transaction = css_syntax.token_stream_begin_transaction(tokens)
+    defer css_syntax.state_transaction_destroy(&transaction)
+    let length_percentage = css_parser_parse_length_percentage_value(this, tokens, css_non_negative_range, css_non_negative_range) else return none
+    css_syntax.state_transaction_commit(&transaction)
+    return length_percentage
+
+## Ported from Libraries/LibWeb/CSS/Parser/ValueParsing.cpp:4477 Web::CSS::Parser::Parser::parse_grid_line_names.
+# https://www.w3.org/TR/css-grid-2/#typedef-line-names
+pub func css_parser_parse_grid_line_names(this: CssParser*, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssGridLineNames?:
+    # <line-names> = '[' <custom-ident>* ']'
+
+    var transactions = css_syntax.token_stream_begin_transaction(tokens)
+    defer css_syntax.state_transaction_destroy(&transactions)
+    var line_names = CssGridLineNames()
+    css_syntax.token_stream_discard_whitespace(tokens)
+    let token = css_syntax.token_stream_consume_a_token(tokens)
+    if not css_syntax.component_value_is_block(&token):
+        return line_names
+    let block = css_syntax.component_value_block(&token)
+    if not css_syntax.simple_block_is_square(&block):
+        return line_names
+
+    var block_tokens = css_syntax.token_stream_create(block.value)
+    css_syntax.token_stream_discard_whitespace(&block_tokens)
+    while css_syntax.token_stream_has_next_token(&block_tokens):
+        let blacklist: ak.StringView[2] = [ak.sv("span"), ak.sv("auto")]
+        let maybe_ident = css_parser_parse_custom_ident(this, &block_tokens, blacklist) else return none
+        css_grid_line_names_append(&line_names, maybe_ident)
+        css_syntax.token_stream_discard_whitespace(&block_tokens)
+
+    css_syntax.state_transaction_commit(&transactions)
+    return line_names
+
+# mark: Track lists, repeat() and minmax() ======================================================
+
+## Ported from Libraries/LibWeb/CSS/Parser/ValueParsing.cpp:4502 Web::CSS::Parser::Parser::parse_track_list_impl.
+pub func css_parser_parse_track_list_impl(this: CssParser*, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*, output: CssGridTrackSizeList*, track_parsing_callback: ak.Function1[css_syntax.TokenStream[css_syntax.ComponentValue]*, CssExplicitGridTrack?], allow_trailing_line_names_for_each_track: CssParserAllowTrailingLineNamesForEachTrack = CssParserAllowTrailingLineNamesForEachTrack.no) -> usize:
+    var parsed_tracks_count: usize = 0
+    css_syntax.token_stream_discard_whitespace(tokens)
+    while css_syntax.token_stream_has_next_token(tokens):
+        var transaction = css_syntax.token_stream_begin_transaction(tokens)
+        defer css_syntax.state_transaction_destroy(&transaction)
+        let line_names = css_parser_parse_grid_line_names(this, tokens)
+
+        css_syntax.token_stream_discard_whitespace(tokens)
+        let explicit_grid_track = ak.function1_call(&track_parsing_callback, tokens)
+        css_syntax.token_stream_discard_whitespace(tokens)
+
+        let track = explicit_grid_track else break
+
+        if let names = line_names:
+            if not css_grid_line_names_is_empty(&names):
+                css_grid_track_size_list_append_css_grid_line_names(output, names)
+
+        css_grid_track_size_list_append_css_explicit_grid_track(output, track)
+        if allow_trailing_line_names_for_each_track == CssParserAllowTrailingLineNamesForEachTrack.yes:
+            if let trailing_line_names = css_parser_parse_grid_line_names(this, tokens):
+                if not css_grid_line_names_is_empty(&trailing_line_names):
+                    css_grid_track_size_list_append_css_grid_line_names(output, trailing_line_names)
+        css_syntax.state_transaction_commit(&transaction)
+        parsed_tracks_count += 1
+        css_syntax.token_stream_discard_whitespace(tokens)
+
+    if allow_trailing_line_names_for_each_track == CssParserAllowTrailingLineNamesForEachTrack.no:
+        if let trailing_line_names = css_parser_parse_grid_line_names(this, tokens):
+            if not css_grid_line_names_is_empty(&trailing_line_names):
+                css_grid_track_size_list_append_css_grid_line_names(output, trailing_line_names)
+
+    return parsed_tracks_count
+
+## `GridRepeat(GridTrackSizeList(move(track_list)), repeat_params)`.
+func css_grid_repeat_new(grid_track_size_list: CssGridTrackSizeList, params: CssGridRepeatParams) -> CssGridRepeat:
+    var repeat: CssGridRepeat = ---
+    css_grid_repeat_construct_css_grid_track_size_list(&repeat, grid_track_size_list, params)
+    return repeat
+
+## Ported from Libraries/LibWeb/CSS/Parser/ValueParsing.cpp:4541 Web::CSS::Parser::Parser::parse_grid_track_repeat_impl.
+pub func css_parser_parse_grid_track_repeat_impl(this: CssParser*, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*, repeat_type_parser: ak.Function1[css_syntax.TokenStream[css_syntax.ComponentValue]*, CssGridRepeatParams?], repeat_track_parser: ak.Function1[css_syntax.TokenStream[css_syntax.ComponentValue]*, CssExplicitGridTrack?]) -> CssGridRepeat?:
+    var transaction = css_syntax.token_stream_begin_transaction(tokens)
+    defer css_syntax.state_transaction_destroy(&transaction)
+    css_syntax.token_stream_discard_whitespace(tokens)
+
+    if not css_syntax.token_stream_has_next_token(tokens):
+        return none
+
+    let token = css_syntax.token_stream_consume_a_token(tokens)
+    if not css_syntax.component_value_is_function(&token):
+        return none
+
+    let function_token = css_syntax.component_value_function(&token)
+    if not ak.fly_string_equals_ignoring_ascii_case_string_view(&function_token.name, ak.sv("repeat")):
+        return none
+    css_parser_push_temporary_value_parsing_context(this, css_function_context_of(&function_token))
+    defer css_parser_pop_temporary_value_parsing_context(this)
+
+    var function_tokens = css_syntax.token_stream_create(function_token.value)
+    let comma_separated_list = css_parser_parse_a_comma_separated_list_of_component_values(this, &function_tokens)
+    if ak.vector_size(&comma_separated_list) != 2:
+        return none
+
+    var first_arg_tokens = css_syntax.token_stream_create(*ak.vector_at_const(&comma_separated_list, 0))
+    css_syntax.token_stream_discard_whitespace(&first_arg_tokens)
+    if not css_syntax.token_stream_has_next_token(&first_arg_tokens):
+        return none
+
+    let repeat_params = ak.function1_call(&repeat_type_parser, &first_arg_tokens) else return none
+    css_syntax.token_stream_discard_whitespace(&first_arg_tokens)
+    if css_syntax.token_stream_has_next_token(&first_arg_tokens):
+        return none
+
+    var second_arg_tokens = css_syntax.token_stream_create(*ak.vector_at_const(&comma_separated_list, 1))
+    css_syntax.token_stream_discard_whitespace(&second_arg_tokens)
+    var track_list = CssGridTrackSizeList()
+    let parsed_track_count = css_parser_parse_track_list_impl(this, &second_arg_tokens, &track_list, repeat_track_parser)
+    if parsed_track_count == 0:
+        return none
+    if css_syntax.token_stream_has_next_token(&second_arg_tokens):
+        return none
+    css_syntax.state_transaction_commit(&transaction)
+    return css_grid_repeat_new(track_list, repeat_params)
+
+## `GridMinMax(min, max)`.
+func css_grid_min_max_new(min_grid_size: CssGridSize, max_grid_size: CssGridSize) -> CssGridMinMax:
+    var minmax: CssGridMinMax = ---
+    css_grid_min_max_construct(&minmax, min_grid_size, max_grid_size)
+    return minmax
+
+## Ported from Libraries/LibWeb/CSS/Parser/ValueParsing.cpp:4586 Web::CSS::Parser::Parser::parse_grid_minmax.
+pub func css_parser_parse_grid_minmax(this: CssParser*, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*, min_parser: ak.Function1[css_syntax.TokenStream[css_syntax.ComponentValue]*, CssGridSize?], max_parser: ak.Function1[css_syntax.TokenStream[css_syntax.ComponentValue]*, CssGridSize?]) -> CssExplicitGridTrack?:
+    var transaction = css_syntax.token_stream_begin_transaction(tokens)
+    defer css_syntax.state_transaction_destroy(&transaction)
+    css_syntax.token_stream_discard_whitespace(tokens)
+
+    if not css_syntax.token_stream_has_next_token(tokens):
+        return none
+
+    let token = css_syntax.token_stream_consume_a_token(tokens)
+    if not css_syntax.component_value_is_function(&token):
+        return none
+
+    let function_token = css_syntax.component_value_function(&token)
+    if not ak.fly_string_equals_ignoring_ascii_case_string_view(&function_token.name, ak.sv("minmax")):
+        return none
+
+    css_parser_push_temporary_value_parsing_context(this, css_function_context_of(&function_token))
+    defer css_parser_pop_temporary_value_parsing_context(this)
+    var function_tokens = css_syntax.token_stream_create(function_token.value)
+    let comma_separated_list = css_parser_parse_a_comma_separated_list_of_component_values(this, &function_tokens)
+    if ak.vector_size(&comma_separated_list) != 2:
+        return none
+
+    var min_tokens = css_syntax.token_stream_create(*ak.vector_at_const(&comma_separated_list, 0))
+    css_syntax.token_stream_discard_whitespace(&min_tokens)
+    let min_value = ak.function1_call(&min_parser, &min_tokens) else return none
+    css_syntax.token_stream_discard_whitespace(&min_tokens)
+    if css_syntax.token_stream_has_next_token(&min_tokens):
+        return none
+
+    var max_tokens = css_syntax.token_stream_create(*ak.vector_at_const(&comma_separated_list, 1))
+    css_syntax.token_stream_discard_whitespace(&max_tokens)
+    let max_value = ak.function1_call(&max_parser, &max_tokens) else return none
+    css_syntax.token_stream_discard_whitespace(&max_tokens)
+    if css_syntax.token_stream_has_next_token(&max_tokens):
+        return none
+
+    css_syntax.state_transaction_commit(&transaction)
+    return css_explicit_grid_track_new(CssGridRepeatOrCssGridMinMaxOrCssGridSize.css_grid_min_max(css_grid_min_max_new(min_value, max_value)))
+
+# mark: The parser lambdas ======================================================================
+
+## The `parse_repeat_type` lambda of parse_grid_track_repeat and parse_grid_fixed_repeat: <integer [1,∞]>.
+func css_parser_parse_fixed_repeat_type(context: void*?, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssGridRepeatParams?:
+    let this = (CssParser*)(context else trap("no parser"))
+    let maybe_integer = css_parser_parse_integer_value(this, tokens, CssNumericRange(min = 1.0, max = f64(ak.i32_max))) else return none
+
+    return CssGridRepeatParams(type_ = CssGridRepeatType.fixed, count = maybe_integer)
+
+## The `parse_repeat_type` lambda of parse_grid_auto_repeat: auto-fill | auto-fit.
+func css_parser_parse_auto_repeat_type(context: void*?, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssGridRepeatParams?:
+    discard(context)
+    css_syntax.token_stream_discard_whitespace(tokens)
+    let first_token = css_syntax.token_stream_consume_a_token(tokens)
+    if not css_syntax.component_value_is_token(&first_token) or not css_syntax.component_value_is(&first_token, .ident):
+        return none
+
+    let ident_value = css_component_value_ident(&first_token)
+    if ak.fly_string_equals_ignoring_ascii_case_string_view(&ident_value, ak.sv("auto-fill")):
+        return CssGridRepeatParams(type_ = CssGridRepeatType.auto_fill)
+    if ak.fly_string_equals_ignoring_ascii_case_string_view(&ident_value, ak.sv("auto-fit")):
+        return CssGridRepeatParams(type_ = CssGridRepeatType.auto_fit)
+    return none
+
+## The `parse_track` lambda of parse_grid_track_repeat, and parse_explicit_track_list's lambda: <track-size>.
+func css_parser_parse_track_size_callback(context: void*?, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssExplicitGridTrack?:
+    return css_parser_parse_grid_track_size((CssParser*)(context else trap("no parser")), tokens)
+
+## The `parse_track` lambda of parse_grid_auto_repeat and parse_grid_fixed_repeat: <fixed-size>.
+func css_parser_parse_fixed_size_callback(context: void*?, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssExplicitGridTrack?:
+    return css_parser_parse_grid_fixed_size((CssParser*)(context else trap("no parser")), tokens)
+
+## The `[this](auto& tokens) { return parse_grid_inflexible_breadth(tokens); }` minmax() parameter parser.
+func css_parser_parse_inflexible_breadth_callback(context: void*?, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssGridSize?:
+    return css_parser_parse_grid_inflexible_breadth((CssParser*)(context else trap("no parser")), tokens)
+
+## The `[this](auto& tokens) { return parse_grid_track_breadth(tokens); }` minmax() parameter parser.
+func css_parser_parse_track_breadth_callback(context: void*?, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssGridSize?:
+    return css_parser_parse_grid_track_breadth((CssParser*)(context else trap("no parser")), tokens)
+
+## The `GridSize(parse_grid_fixed_breadth(tokens))` minmax() parameter parser of parse_grid_fixed_size.
+func css_parser_parse_fixed_breadth_callback(context: void*?, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssGridSize?:
+    if let result = css_parser_parse_grid_fixed_breadth((CssParser*)(context else trap("no parser")), tokens):
+        return css_grid_size_new(result)
+    return none
+
+## A GridTrackParser over one of the callbacks above.
+func css_grid_track_parser(this: CssParser*, call: func(void*?, css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssExplicitGridTrack?) -> ak.Function1[css_syntax.TokenStream[css_syntax.ComponentValue]*, CssExplicitGridTrack?]:
+    return ak.Function1[css_syntax.TokenStream[css_syntax.ComponentValue]*, CssExplicitGridTrack?](call = call, context = this)
+
+## A GridRepeatTypeParser over one of the callbacks above.
+func css_grid_repeat_type_parser(this: CssParser*, call: func(void*?, css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssGridRepeatParams?) -> ak.Function1[css_syntax.TokenStream[css_syntax.ComponentValue]*, CssGridRepeatParams?]:
+    return ak.Function1[css_syntax.TokenStream[css_syntax.ComponentValue]*, CssGridRepeatParams?](call = call, context = this)
+
+## A GridMinMaxParamParser over one of the callbacks above.
+func css_grid_min_max_param_parser(this: CssParser*, call: func(void*?, css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssGridSize?) -> ak.Function1[css_syntax.TokenStream[css_syntax.ComponentValue]*, CssGridSize?]:
+    return ak.Function1[css_syntax.TokenStream[css_syntax.ComponentValue]*, CssGridSize?](call = call, context = this)
+
+# mark: repeat() and track sizes ================================================================
+
+## Ported from Libraries/LibWeb/CSS/Parser/ValueParsing.cpp:4631 Web::CSS::Parser::Parser::parse_grid_track_repeat.
+# https://www.w3.org/TR/css-grid-2/#typedef-track-repeat
+pub func css_parser_parse_grid_track_repeat(this: CssParser*, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssGridRepeat?:
+    # <track-repeat> = repeat( [ <integer [1,∞]> ] , [ <line-names>? <track-size> ]+ <line-names>? )
+
+    let parse_repeat_type = css_grid_repeat_type_parser(this, css_parser_parse_fixed_repeat_type)
+    let parse_track = css_grid_track_parser(this, css_parser_parse_track_size_callback)
+    return css_parser_parse_grid_track_repeat_impl(this, tokens, parse_repeat_type, parse_track)
+
+## Ported from Libraries/LibWeb/CSS/Parser/ValueParsing.cpp:4649 Web::CSS::Parser::Parser::parse_grid_auto_repeat.
+# https://www.w3.org/TR/css-grid-2/#typedef-auto-repeat
+pub func css_parser_parse_grid_auto_repeat(this: CssParser*, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssGridRepeat?:
+    # <auto-repeat> = repeat( [ auto-fill | auto-fit ] , [ <line-names>? <fixed-size> ]+ <line-names>? )
+
+    let parse_repeat_type = css_grid_repeat_type_parser(this, css_parser_parse_auto_repeat_type)
+    let parse_track = css_grid_track_parser(this, css_parser_parse_fixed_size_callback)
+    return css_parser_parse_grid_track_repeat_impl(this, tokens, parse_repeat_type, parse_track)
+
+## Ported from Libraries/LibWeb/CSS/Parser/ValueParsing.cpp:4673 Web::CSS::Parser::Parser::parse_grid_fixed_repeat.
+# https://www.w3.org/TR/css-grid-2/#typedef-fixed-repeat
+pub func css_parser_parse_grid_fixed_repeat(this: CssParser*, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssGridRepeat?:
+    # <fixed-repeat> = repeat( [ <integer [1,∞]> ] , [ <line-names>? <fixed-size> ]+ <line-names>? )
+
+    let parse_repeat_type = css_grid_repeat_type_parser(this, css_parser_parse_fixed_repeat_type)
+    let parse_track = css_grid_track_parser(this, css_parser_parse_fixed_size_callback)
+    return css_parser_parse_grid_track_repeat_impl(this, tokens, parse_repeat_type, parse_track)
+
+## Ported from Libraries/LibWeb/CSS/Parser/ValueParsing.cpp:4691 Web::CSS::Parser::Parser::parse_grid_track_size.
+# https://www.w3.org/TR/css-grid-2/#typedef-track-size
+pub func css_parser_parse_grid_track_size(this: CssParser*, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssExplicitGridTrack?:
+    # <track-size> = <track-breadth> | minmax( <inflexible-breadth> , <track-breadth> ) | fit-content( <length-percentage [0,∞]> )
+    css_syntax.token_stream_discard_whitespace(tokens)
+    if not css_syntax.token_stream_has_next_token(tokens):
+        return none
+
+    let token = css_syntax.token_stream_next_token(tokens)
+    if css_syntax.component_value_is_function(&token):
+        let function_token = css_syntax.component_value_function(&token)
+
+        if ak.fly_string_equals_ignoring_ascii_case_string_view(&function_token.name, ak.sv("minmax")):
+            let parse_min = css_grid_min_max_param_parser(this, css_parser_parse_inflexible_breadth_callback)
+            let parse_max = css_grid_min_max_param_parser(this, css_parser_parse_track_breadth_callback)
+            return css_parser_parse_grid_minmax(this, tokens, parse_min, parse_max)
+
+        var transaction = css_syntax.token_stream_begin_transaction(tokens)
+        defer css_syntax.state_transaction_destroy(&transaction)
+        css_syntax.token_stream_discard_a_token(tokens)
+        css_parser_push_temporary_value_parsing_context(this, css_function_context_of(&function_token))
+        defer css_parser_pop_temporary_value_parsing_context(this)
+
+        if ak.fly_string_equals_ignoring_ascii_case_string_view(&function_token.name, ak.sv("fit-content")):
+            var function_tokens = css_syntax.token_stream_create(function_token.value)
+            css_syntax.token_stream_discard_whitespace(&function_tokens)
+            let maybe_length_percentage = css_parser_parse_grid_fixed_breadth(this, &function_tokens) else return none
+            if css_syntax.token_stream_has_next_token(&function_tokens):
+                return none
+            css_syntax.state_transaction_commit(&transaction)
+            return css_explicit_grid_track_new(CssGridRepeatOrCssGridMinMaxOrCssGridSize.css_grid_size(css_grid_size_new(css_function_style_value_create(ak.fly_string_from_str("fit-content"), maybe_length_percentage).css_style_value())))
+
+    if let track_breadth = css_parser_parse_grid_track_breadth(this, tokens):
+        return css_explicit_grid_track_new(CssGridRepeatOrCssGridMinMaxOrCssGridSize.css_grid_size(track_breadth))
+
+    return none
+
+## Ported from Libraries/LibWeb/CSS/Parser/ValueParsing.cpp:4733 Web::CSS::Parser::Parser::parse_grid_fixed_size.
+# https://www.w3.org/TR/css-grid-2/#typedef-fixed-size
+pub func css_parser_parse_grid_fixed_size(this: CssParser*, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssExplicitGridTrack?:
+    # <fixed-size> = <fixed-breadth> | minmax( <fixed-breadth> , <track-breadth> ) | minmax( <inflexible-breadth> , <fixed-breadth> )
+    css_syntax.token_stream_discard_whitespace(tokens)
+    if not css_syntax.token_stream_has_next_token(tokens):
+        return none
+
+    let token = css_syntax.token_stream_next_token(tokens)
+    if css_syntax.component_value_is_function(&token):
+        let function_token = css_syntax.component_value_function(&token)
+        if ak.fly_string_equals_ignoring_ascii_case_string_view(&function_token.name, ak.sv("minmax")):
+            let parse_fixed_min = css_grid_min_max_param_parser(this, css_parser_parse_fixed_breadth_callback)
+            let parse_track_max = css_grid_min_max_param_parser(this, css_parser_parse_track_breadth_callback)
+
+            if let result = css_parser_parse_grid_minmax(this, tokens, parse_fixed_min, parse_track_max):
+                return result
+
+            let parse_inflexible_min = css_grid_min_max_param_parser(this, css_parser_parse_inflexible_breadth_callback)
+            let parse_fixed_max = css_grid_min_max_param_parser(this, css_parser_parse_fixed_breadth_callback)
+
+            if let result = css_parser_parse_grid_minmax(this, tokens, parse_inflexible_min, parse_fixed_max):
+                return result
+
+            return none
+
+    if let fixed_breadth = css_parser_parse_grid_fixed_breadth(this, tokens):
+        return css_explicit_grid_track_new(CssGridRepeatOrCssGridMinMaxOrCssGridSize.css_grid_size(css_grid_size_new(fixed_breadth)))
+
+    return none
+
+# mark: Track lists =============================================================================
+
+## The track parsing lambda of parse_grid_track_list: <track-repeat> | <track-size>.
+func css_parser_parse_track_list_track(context: void*?, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssExplicitGridTrack?:
+    let this = (CssParser*)(context else trap("no parser"))
+    if let track_repeat = css_parser_parse_grid_track_repeat(this, tokens):
+        return css_explicit_grid_track_new(CssGridRepeatOrCssGridMinMaxOrCssGridSize.css_grid_repeat(track_repeat))
+    if let track_size = css_parser_parse_grid_track_size(this, tokens):
+        return track_size
+    return none
+
+## Ported from Libraries/LibWeb/CSS/Parser/ValueParsing.cpp:4781 Web::CSS::Parser::Parser::parse_grid_track_list.
+# https://www.w3.org/TR/css-grid-2/#typedef-track-list
+pub func css_parser_parse_grid_track_list(this: CssParser*, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssGridTrackSizeList:
+    # <track-list> = [ <line-names>? [ <track-size> | <track-repeat> ] ]+ <line-names>?
+
+    var transaction = css_syntax.token_stream_begin_transaction(tokens)
+    defer css_syntax.state_transaction_destroy(&transaction)
+    var track_list = CssGridTrackSizeList()
+    let parsed_track_count = css_parser_parse_track_list_impl(this, tokens, &track_list, css_grid_track_parser(this, css_parser_parse_track_list_track))
+    if parsed_track_count == 0:
+        return CssGridTrackSizeList()
+    css_syntax.state_transaction_commit(&transaction)
+    return track_list
+
+## The track parsing lambda of parse_grid_auto_track_list's parse_zero_or_more_fixed_tracks: <fixed-repeat> | <fixed-size>.
+func css_parser_parse_auto_track_list_fixed_track(context: void*?, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssExplicitGridTrack?:
+    let this = (CssParser*)(context else trap("no parser"))
+    if let fixed_repeat = css_parser_parse_grid_fixed_repeat(this, tokens):
+        return css_explicit_grid_track_new(CssGridRepeatOrCssGridMinMaxOrCssGridSize.css_grid_repeat(fixed_repeat))
+    if let fixed_size = css_parser_parse_grid_fixed_size(this, tokens):
+        return fixed_size
+    return none
+
+## The `parse_zero_or_more_fixed_tracks` lambda of parse_grid_auto_track_list: the number of tracks it parsed.
+func css_parser_parse_zero_or_more_fixed_tracks(this: CssParser*, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*, track_list: CssGridTrackSizeList*) -> usize:
+    return css_parser_parse_track_list_impl(this, tokens, track_list, css_grid_track_parser(this, css_parser_parse_auto_track_list_fixed_track))
+
+## Ported from Libraries/LibWeb/CSS/Parser/ValueParsing.cpp:4801 Web::CSS::Parser::Parser::parse_grid_auto_track_list.
+# https://www.w3.org/TR/css-grid-2/#typedef-auto-track-list
+pub func css_parser_parse_grid_auto_track_list(this: CssParser*, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssGridTrackSizeList:
+    # <auto-track-list> = [ <line-names>? [ <fixed-size> | <fixed-repeat> ] ]* <line-names>? <auto-repeat>
+    #                     [ <line-names>? [ <fixed-size> | <fixed-repeat> ] ]* <line-names>?
+
+    var transaction = css_syntax.token_stream_begin_transaction(tokens)
+    defer css_syntax.state_transaction_destroy(&transaction)
+    var track_list = CssGridTrackSizeList()
+    var parsed_track_count: usize = 0
+
+    parsed_track_count += css_parser_parse_zero_or_more_fixed_tracks(this, tokens, &track_list)
+    css_syntax.token_stream_discard_whitespace(tokens)
+    if not css_syntax.token_stream_has_next_token(tokens):
+        if parsed_track_count == 0:
+            return CssGridTrackSizeList()
+        css_syntax.state_transaction_commit(&transaction)
+        return track_list
+
+    if let auto_repeat = css_parser_parse_grid_auto_repeat(this, tokens):
+        css_grid_track_size_list_append_css_explicit_grid_track(&track_list, css_explicit_grid_track_new(CssGridRepeatOrCssGridMinMaxOrCssGridSize.css_grid_repeat(auto_repeat)))
+    else:
+        return CssGridTrackSizeList()
+
+    parsed_track_count += css_parser_parse_zero_or_more_fixed_tracks(this, tokens, &track_list)
+    css_syntax.state_transaction_commit(&transaction)
+    return track_list
+
+## Ported from Libraries/LibWeb/CSS/Parser/ValueParsing.cpp:4840 Web::CSS::Parser::Parser::parse_explicit_track_list.
+# https://www.w3.org/TR/css-grid-2/#typedef-explicit-track-list
+pub func css_parser_parse_explicit_track_list(this: CssParser*, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssGridTrackSizeList:
+    # <explicit-track-list> = [ <line-names>? <track-size> ]+ <line-names>?
+
+    var transaction = css_syntax.token_stream_begin_transaction(tokens)
+    defer css_syntax.state_transaction_destroy(&transaction)
+    var track_list = CssGridTrackSizeList()
+    let parsed_track_count = css_parser_parse_track_list_impl(this, tokens, &track_list, css_grid_track_parser(this, css_parser_parse_track_size_callback))
+    if parsed_track_count == 0:
+        return CssGridTrackSizeList()
+    css_syntax.state_transaction_commit(&transaction)
+    return track_list
+
+# mark: <grid-line> =============================================================================
+
+## Ported from Libraries/LibWeb/CSS/Parser/ValueParsing.cpp:4855 Web::CSS::Parser::Parser::parse_grid_track_placement.
+pub func css_parser_parse_grid_track_placement(this: CssParser*, tokens: css_syntax.TokenStream[css_syntax.ComponentValue]*) -> CssGridTrackPlacementStyleValue*?:
+    # https://www.w3.org/TR/css-grid-2/#line-placement
+    # Line-based Placement: the grid-row-start, grid-column-start, grid-row-end, and grid-column-end properties
+    # <grid-line> =
+    #     auto |
+    #     <custom-ident> |
+    #     [ [ <integer [-∞,-1]> | <integer [1,∞]> ] && <custom-ident>? ] |
+    #     [ span && [ <integer [1,∞]> || <custom-ident> ] ]
+    var is_span = false
+    var parsed_custom_ident: ak.String? = none
+    var parsed_integer: CssStyleValue*? = none
+
+    var transaction = css_syntax.token_stream_begin_transaction(tokens)
+    defer css_syntax.state_transaction_destroy(&transaction)
+    css_syntax.token_stream_discard_whitespace(tokens)
+
+    if css_parser_parse_all_as_single_keyword_value(this, tokens, css_data.Keyword.auto) != none:
+        css_syntax.state_transaction_commit(&transaction)
+        return css_grid_track_placement_style_value_create(css_grid_track_placement_make_auto())
+
+    while css_syntax.token_stream_has_next_token(tokens):
+        if css_next_token_is_ident(tokens, "span"):
+            if is_span:
+                return none
+
+            css_syntax.token_stream_discard_a_token(tokens)  # span
+
+            # NOTE: "span" must not appear in between <custom-ident> and <integer>
+            if css_syntax.token_stream_has_next_token(tokens) and (parsed_custom_ident != none or parsed_integer != none):
+                return none
+
+            is_span = true
+            css_syntax.token_stream_discard_whitespace(tokens)
+            continue
+
+        let blacklist: ak.StringView[1] = [ak.sv("auto")]
+        if let maybe_parsed_custom_ident = css_parser_parse_custom_ident(this, tokens, blacklist):
+            if parsed_custom_ident != none:
+                return none
+
+            parsed_custom_ident = ak.fly_string_to_string_const(&maybe_parsed_custom_ident)
+            css_syntax.token_stream_discard_whitespace(tokens)
+            continue
+
+        # FIXME: Use the correct value parsing context here to clamp calculated values (note the non-contiguous valid
+        #        range for integers for non-span)
+        if let maybe_parsed_integer = css_parser_parse_integer_value(this, tokens, css_infinite_integer_range):
+            if parsed_integer != none:
+                return none
+
+            parsed_integer = maybe_parsed_integer
+            css_syntax.token_stream_discard_whitespace(tokens)
+            continue
+
+        return none
+
+    css_syntax.state_transaction_commit(&transaction)
+
+    # <custom-ident>
+    # [ [ <integer [-∞,-1]> | <integer [1,∞]> ] && <custom-ident>? ]
+    if not is_span and (parsed_integer != none or parsed_custom_ident != none) and css_grid_placement_integer_is(parsed_integer, false):
+        return css_grid_track_placement_style_value_create(css_grid_track_placement_make_line(parsed_integer, parsed_custom_ident))
+
+    # [ span && [ <integer [1,∞]> || <custom-ident> ] ]
+    if is_span and (parsed_integer != none or parsed_custom_ident != none) and css_grid_placement_integer_is(parsed_integer, true):
+        # If the <integer> is omitted, it defaults to 1.
+        let span_value = parsed_integer else css_integer_style_value_create(1).css_style_value()
+        return css_grid_track_placement_style_value_create(css_grid_track_placement_make_span(span_value, parsed_custom_ident))
+
+    return none
+
+## `!parsed_integer || !parsed_integer->is_integer() || parsed_integer->as_integer().integer() != 0` (`> 0` when
+## `positive`) of parse_grid_track_placement.
+func css_grid_placement_integer_is(parsed_integer: CssStyleValue*?, positive: bool) -> bool:
+    let integer = parsed_integer else return true
+    if not css_style_value_is_integer(integer):
+        return true
+    let value = css_integer_style_value_integer(css_style_value_as_integer(integer))
+    if positive:
+        return value > 0
+    return value != 0
