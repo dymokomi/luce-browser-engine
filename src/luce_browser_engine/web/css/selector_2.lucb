@@ -1,0 +1,594 @@
+#==============================================================================================
+#
+#   selector_2 - CSS::Selector: serialization, nesting (relative_to, absolutized), the sibling
+#                invalidation distance and the An+B pattern
+#
+#   DESCRIPTION:
+#       Port of LibWeb/CSS/Selector.cpp (lines 334-979): PseudoElementSelector::serialize,
+#       SimpleSelector::serialize, Selector::serialize, is_legacy_single_colon_pseudo_element,
+#       serialize_a_group_of_selectors, relative_to, contains_unknown_webkit_pseudo_element,
+#       the absolutized() of Selector, CompoundSelector and SimpleSelector,
+#       contains_invalid_contents_for_has, sibling_invalidation_distance,
+#       adapt_nested_relative_selector_list and ANPlusBPattern's matches and serialize.
+#
+#       Copyright (c) 2018-2020, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2021-2025, Sam Atkins <sam@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Serialization ===========================================================================
+
+## Ported from Libraries/LibWeb/CSS/Selector.cpp:334 Web::CSS::Selector::PseudoElementSelector::serialize.
+pub func css_selector_pseudo_element_selector_serialize(this: const CssSelectorPseudoElementSelector*) -> ak.String:
+    var builder = ak.string_builder_new()
+    ak.string_builder_append(&builder, "::")
+
+    if not ak.string_is_empty(&this.m_name):
+        ak.string_builder_append_string_view(&builder, ak.string_bytes_as_string_view(&this.m_name))
+    else:
+        ak.string_builder_append_string_view(&builder, css_data.pseudo_element_name(this.m_type))
+
+    match this.m_value:
+        .css_selector(compound_selector):
+            ak.string_builder_append_u8(&builder, '(')
+            let serialized = css_selector_serialize(compound_selector)
+            ak.string_builder_append_string_view(&builder, ak.string_bytes_as_string_view(&serialized))
+            ak.string_builder_append_u8(&builder, ')')
+        .css_selector_pseudo_element_selector_pt_name_selector(pt_name_selector):
+            ak.string_builder_append_u8(&builder, '(')
+            if pt_name_selector.is_universal:
+                ak.string_builder_append_u8(&builder, '*')
+            else:
+                ak.string_builder_append_string_view(&builder, ak.fly_string_bytes_as_string_view(&pt_name_selector.value))
+            ak.string_builder_append_u8(&builder, ')')
+        .vector_fly_string(ident_list):
+            ak.string_builder_append_u8(&builder, '(')
+            var first = true
+            for ident in ak.vector_span_const(&ident_list):
+                if not first:
+                    ak.string_builder_append_u8(&builder, ' ')
+                first = false
+                let serialized = css_syntax.serialize_an_identifier_string_view(ak.fly_string_bytes_as_string_view(&ident))
+                ak.string_builder_append_string_view(&builder, ak.string_bytes_as_string_view(&serialized))
+            ak.string_builder_append_u8(&builder, ')')
+        .empty:
+            discard(this)
+
+    return ak.string_builder_to_string_without_validation(&builder)
+
+## SimpleSelector::serialize's `accepts_arguments` lambda.
+func css_selector_simple_selector_serialize_accepts_arguments(pseudo_class: const CssSelectorSimpleSelectorPseudoClassSelector*, metadata: css_data.PseudoClassMetadata) -> bool:
+    if not metadata.is_valid_as_function:
+        return false
+    if not metadata.is_valid_as_identifier:
+        return true
+    # For pseudo-classes with both a function and identifier form, see if they have arguments.
+    match pseudo_class.type_:
+        .heading: return not ak.vector_is_empty(&pseudo_class.levels)
+        .host: return not ak.vector_is_empty(&pseudo_class.argument_selector_list)
+        _: trap("VERIFY_NOT_REACHED")
+
+## Ported from Libraries/LibWeb/CSS/Selector.cpp:376 Web::CSS::Selector::SimpleSelector::serialize.
+# https://www.w3.org/TR/cssom/#serialize-a-simple-selector
+pub func css_selector_simple_selector_serialize(this: const CssSelectorSimpleSelector*) -> ak.String:
+    var s = ak.string_builder_new()
+    match this.type_:
+        .tag_name, .universal:
+            let qualified_name = css_selector_simple_selector_qualified_name(this)
+            # 1. If the namespace prefix maps to a namespace that is not the default namespace and is not the null
+            #    namespace (not in a namespace) append the serialization of the namespace prefix as an identifier,
+            #    followed by a "|" (U+007C) to s.
+            if qualified_name.namespace_type == CssSelectorSimpleSelectorQualifiedNameNamespaceType.named:
+                css_syntax.serialize_an_identifier_string_builder(&s, ak.fly_string_bytes_as_string_view(&qualified_name.namespace_))
+                ak.string_builder_append_u8(&s, '|')
+
+            # 2. If the namespace prefix maps to a namespace that is the null namespace (not in a namespace)
+            #    append "|" (U+007C) to s.
+            if qualified_name.namespace_type == CssSelectorSimpleSelectorQualifiedNameNamespaceType.none_:
+                ak.string_builder_append_u8(&s, '|')
+
+            # 3. If this is a type selector append the serialization of the element name as an identifier to s.
+            if this.type_ == CssSelectorSimpleSelectorType.tag_name:
+                css_syntax.serialize_an_identifier_string_builder(&s, ak.fly_string_bytes_as_string_view(&qualified_name.name.name))
+
+            # 4. If this is a universal selector append "*" (U+002A) to s.
+            if this.type_ == CssSelectorSimpleSelectorType.universal:
+                ak.string_builder_append_u8(&s, '*')
+        .attribute:
+            let attribute = css_selector_simple_selector_attribute(this)
+
+            # 1. Append "[" (U+005B) to s.
+            ak.string_builder_append_u8(&s, '[')
+
+            # 2. If the namespace prefix maps to a namespace that is not the null namespace (not in a namespace)
+            #    append the serialization of the namespace prefix as an identifier, followed by a "|" (U+007C) to s.
+            if attribute.qualified_name.namespace_type == CssSelectorSimpleSelectorQualifiedNameNamespaceType.named:
+                css_syntax.serialize_an_identifier_string_builder(&s, ak.fly_string_bytes_as_string_view(&attribute.qualified_name.namespace_))
+                ak.string_builder_append_u8(&s, '|')
+            elif attribute.qualified_name.namespace_type == CssSelectorSimpleSelectorQualifiedNameNamespaceType.any:
+                ak.string_builder_append(&s, "*|")
+
+            # 3. Append the serialization of the attribute name as an identifier to s.
+            css_syntax.serialize_an_identifier_string_builder(&s, ak.fly_string_bytes_as_string_view(&attribute.qualified_name.name.name))
+
+            # 4. If there is an attribute value specified, append "=", "~=", "|=", "^=", "$=", or "*=" as appropriate (depending on the type of attribute selector),
+            #    followed by the serialization of the attribute value as a string, to s.
+            if not ak.string_is_empty(&attribute.value):
+                match attribute.match_type:
+                    .exact_value_match: ak.string_builder_append(&s, "=")
+                    .contains_word: ak.string_builder_append(&s, "~=")
+                    .contains_string: ak.string_builder_append(&s, "*=")
+                    .starts_with_segment: ak.string_builder_append(&s, "|=")
+                    .starts_with_string: ak.string_builder_append(&s, "^=")
+                    .ends_with_string: ak.string_builder_append(&s, "$=")
+                    _: discard(attribute)
+
+                css_syntax.serialize_a_string_string_builder(&s, ak.string_bytes_as_string_view(&attribute.value))
+
+            # 5. If the attribute selector has the case-insensitivity flag present, append " i" (U+0020 U+0069) to s.
+            #    If the attribute selector has the case-insensitivity flag present, append " s" (U+0020 U+0073) to s.
+            #    (the line just above is an addition to CSS OM to match Selectors Level 4 last draft)
+            match attribute.case_type:
+                .case_insensitive_match: ak.string_builder_append(&s, " i")
+                .case_sensitive_match: ak.string_builder_append(&s, " s")
+                _: discard(attribute)
+
+            # 6. Append "]" (U+005D) to s.
+            ak.string_builder_append_u8(&s, ']')
+        .class_:
+            # Append a "." (U+002E), followed by the serialization of the class name as an identifier to s.
+            ak.string_builder_append_u8(&s, '.')
+            let name = css_selector_simple_selector_name(this)
+            css_syntax.serialize_an_identifier_string_builder(&s, ak.fly_string_bytes_as_string_view(&name))
+        .id:
+            # Append a "#" (U+0023), followed by the serialization of the ID as an identifier to s.
+            ak.string_builder_append_u8(&s, '#')
+            let name = css_selector_simple_selector_name(this)
+            css_syntax.serialize_an_identifier_string_builder(&s, ak.fly_string_bytes_as_string_view(&name))
+        .pseudo_class:
+            let pseudo_class = css_selector_simple_selector_pseudo_class(this)
+
+            let metadata = css_data.pseudo_class_metadata(pseudo_class.type_)
+            let accepts_arguments = css_selector_simple_selector_serialize_accepts_arguments(&pseudo_class, metadata)
+
+            # If the pseudo-class does not accept arguments append ":" (U+003A), followed by the name of the pseudo-class, to s.
+            if not accepts_arguments:
+                ak.string_builder_append_u8(&s, ':')
+                ak.string_builder_append_string_view(&s, css_data.pseudo_class_name(pseudo_class.type_))
+            # Otherwise, append ":" (U+003A), followed by the name of the pseudo-class, followed by "(" (U+0028),
+            # followed by the value of the pseudo-class argument(s) determined as per below, followed by ")" (U+0029), to s.
+            else:
+                ak.string_builder_append_u8(&s, ':')
+                ak.string_builder_append_string_view(&s, css_data.pseudo_class_name(pseudo_class.type_))
+                ak.string_builder_append_u8(&s, '(')
+                # NB: The spec list is incomplete. For ease of maintenance, we use the data from PseudoClasses.json for
+                #     this instead of a hard-coded list.
+                match metadata.parameter_type:
+                    .none_:
+                        discard(metadata)
+                    .an_plus_b, .an_plus_b_of:
+                        # The result of serializing the value using the rules to serialize an <an+b> value.
+                        let serialized = css_selector_simple_selector_an_plus_b_pattern_serialize(&pseudo_class.an_plus_b_pattern)
+                        ak.string_builder_append_string_view(&s, ak.string_bytes_as_string_view(&serialized))
+                    .compound_selector, .forgiving_selector_list, .forgiving_relative_selector_list, .relative_selector_list, .selector_list:
+                        # The result of serializing the value using the rules for serializing a group of selectors.
+                        let serialized = css_serialize_a_group_of_selectors(pseudo_class.argument_selector_list)
+                        ak.string_builder_append_string_view(&s, ak.string_bytes_as_string_view(&serialized))
+                    .ident:
+                        let ident = pseudo_class.ident else trap("VERIFY: :dir()/:state() without its ident")
+                        let serialized = css_syntax.serialize_an_identifier_string_view(ak.fly_string_bytes_as_string_view(&ident.string_value))
+                        ak.string_builder_append_string_view(&s, ak.string_bytes_as_string_view(&serialized))
+                    .language_ranges:
+                        # The serialization of a comma-separated list of each argument’s serialization as a string, preserving relative order.
+                        ak.string_builder_join_fly_string(&s, ak.sv(", "), ak.vector_span_const(&pseudo_class.languages))
+                    .level_list:
+                        # AD-HOC: not in the spec.
+                        var first = true
+                        for level in ak.vector_span_const(&pseudo_class.levels):
+                            if not first:
+                                ak.string_builder_append(&s, ", ")
+                            first = false
+                            let number = ak.string_number_i64(level)
+                            ak.string_builder_append_string_view(&s, ak.string_bytes_as_string_view(&number))
+                    _:
+                        trap("VERIFY_NOT_REACHED")
+                ak.string_builder_append_u8(&s, ')')
+        .pseudo_element:
+            # AD-HOC: Spec issue: https://github.com/w3c/csswg-drafts/issues/11997
+            let pseudo_element = css_selector_simple_selector_pseudo_element(this)
+            let serialized = css_selector_pseudo_element_selector_serialize(&pseudo_element)
+            ak.string_builder_append_string_view(&s, ak.string_bytes_as_string_view(&serialized))
+        .nesting:
+            # AD-HOC: Not in spec yet.
+            ak.string_builder_append_u8(&s, '&')
+        .invalid:
+            # AD-HOC: We're not told how to do these. Just serialize their component values.
+            match this.value:
+                .css_selector_simple_selector_invalid(invalid):
+                    let component_values = ak.vector_span_const(&invalid.component_values)
+                    for component_value in &component_values:
+                        let serialized = css_syntax.component_value_to_string(component_value)
+                        ak.string_builder_append_string_view(&s, ak.string_bytes_as_string_view(&serialized))
+                _:
+                    trap("VERIFY: SimpleSelector::Invalid without its value")
+        _:
+            trap("VERIFY_NOT_REACHED")
+    return ak.string_builder_to_string(&s) else trap("MUST: StringBuilder::to_string")
+
+## Ported from Libraries/LibWeb/CSS/Selector.cpp:568 Web::CSS::Selector::serialize.
+# https://www.w3.org/TR/cssom/#serialize-a-selector
+pub func css_selector_serialize(this: const CssSelector*) -> ak.String:
+    var s = ak.string_builder_new()
+
+    # AD-HOC: If this is a relative selector, we need to serialize the starting combinator.
+    if not ak.vector_is_empty(&this.m_compound_selectors):
+        match ak.vector_first_const(&this.m_compound_selectors).combinator:
+            .immediate_child: ak.string_builder_append(&s, "> ")
+            .next_sibling: ak.string_builder_append(&s, "+ ")
+            .subsequent_sibling: ak.string_builder_append(&s, "~ ")
+            .column: ak.string_builder_append(&s, "|| ")
+            _: discard(this)
+
+    # To serialize a selector let s be the empty string, run the steps below for each part of the chain of the selector, and finally return s:
+    let size = ak.vector_size(&this.m_compound_selectors)
+    for i in 0..<size:
+        let compound_selector = ak.vector_at_const(&this.m_compound_selectors, i)
+        # 1. If there is only one simple selector in the compound selectors which is a universal selector, append the result of serializing the universal selector to s.
+        if (ak.vector_size(&compound_selector.simple_selectors) == 1 and ak.vector_first_const(&compound_selector.simple_selectors).type_ == CssSelectorSimpleSelectorType.universal):
+            let serialized = css_selector_simple_selector_serialize(ak.vector_first_const(&compound_selector.simple_selectors))
+            ak.string_builder_append_string_view(&s, ak.string_bytes_as_string_view(&serialized))
+        # 2. Otherwise, for each simple selector in the compound selectors that is not a universal selector
+        #    of which the namespace prefix maps to a namespace that is not the default namespace
+        #    serialize the simple selector and append the result to s.
+        else:
+            let simple_selectors = ak.vector_span_const(&compound_selector.simple_selectors)
+            for simple_selector in &simple_selectors:
+                if simple_selector.type_ == CssSelectorSimpleSelectorType.universal:
+                    let qualified_name = css_selector_simple_selector_qualified_name(simple_selector)
+                    if (qualified_name.namespace_type == CssSelectorSimpleSelectorQualifiedNameNamespaceType.default_ or qualified_name.namespace_type == CssSelectorSimpleSelectorQualifiedNameNamespaceType.any):
+                        continue
+                    # FIXME: I *think* if we have a namespace prefix that happens to equal the same as the default namespace,
+                    #        we also should skip it. But we don't have access to that here. eg:
+                    # <style>
+                    #   @namespace "http://example";
+                    #   @namespace foo "http://example";
+                    #   foo|*.bar { } /* This would skip the `foo|*` when serializing. */
+                    # </style>
+                let serialized = css_selector_simple_selector_serialize(simple_selector)
+                ak.string_builder_append_string_view(&s, ak.string_bytes_as_string_view(&serialized))
+
+        # 3. If this is not the last part of the chain of the selector append a single SPACE (U+0020),
+        #    followed by the combinator ">", "+", "~", ">>", "||", as appropriate, followed by another
+        #    single SPACE (U+0020) if the combinator was not whitespace, to s.
+        if i != size - 1:
+            # NB: The combinator that appears between parts `i` and `i+1` appears with the `i+1` selector,
+            #     so we have to check that one.
+            match ak.vector_at_const(&this.m_compound_selectors, i + 1).combinator:
+                .descendant: ak.string_builder_append_u8(&s, ' ')
+                .immediate_child: ak.string_builder_append(&s, " > ")
+                .next_sibling: ak.string_builder_append(&s, " + ")
+                .subsequent_sibling: ak.string_builder_append(&s, " ~ ")
+                .column: ak.string_builder_append(&s, " || ")
+                _: discard(this)
+        else:
+            # 4. If this is the last part of the chain of the selector and there is a pseudo-element,
+            # append "::" followed by the name of the pseudo-element, to s.
+            # This algorithm has a problem, see https://github.com/w3c/csswg-drafts/issues/11997
+            #      serialization of pseudoElements was moved to SimpleSelector::serialize()
+            discard(this)
+
+    return ak.string_builder_to_string(&s) else trap("MUST: StringBuilder::to_string")
+
+## Ported from Libraries/LibWeb/CSS/Selector.cpp:659 Web::CSS::is_legacy_single_colon_pseudo_element.
+# https://drafts.csswg.org/selectors-4/#single-colon-pseudos
+pub func css_is_legacy_single_colon_pseudo_element(pseudo_element: css_data.PseudoElement) -> bool:
+    # The four Level 2 pseudo-elements (::before, ::after, ::first-line, and ::first-letter) may, for legacy reasons,
+    # be written with only a single ":" character at their front, making them resemble a <pseudo-class-selector>.
+    match pseudo_element:
+        .after, .before, .first_letter, .first_line: return true
+        _: return false
+
+## Ported from Libraries/LibWeb/CSS/Selector.cpp:675 Web::CSS::serialize_a_group_of_selectors.
+# https://www.w3.org/TR/cssom/#serialize-a-group-of-selectors
+pub func css_serialize_a_group_of_selectors(selectors: ak.Vector[CssSelector*]) -> ak.String:
+    # To serialize a group of selectors serialize each selector in the group of selectors and then serialize a comma-separated list of these serializations.
+    # String::join(", "sv, selectors), each selector through Formatter<Selector> (its serialization)
+    var builder = ak.string_builder_new()
+    var first = true
+    for selector in ak.vector_span_const(&selectors):
+        if not first:
+            ak.string_builder_append(&builder, ", ")
+        first = false
+        let serialized = css_selector_serialize(selector)
+        ak.string_builder_append_string_view(&builder, ak.string_bytes_as_string_view(&serialized))
+    return ak.string_builder_to_string(&builder) else trap("MUST: String::join")
+
+# mark: Nesting =================================================================================
+
+## Ported from Libraries/LibWeb/CSS/Selector.cpp:681 Web::CSS::Selector::relative_to.
+pub func css_selector_relative_to(this: const CssSelector*, parent: CssSelectorSimpleSelector) -> CssSelector*:
+    # To make us relative to the parent, prepend it to the list of compound selectors,
+    # and ensure the next compound selector starts with a combinator.
+    var copied_compound_selectors = ak.Vector[CssSelectorCompoundSelector]()
+    ak.vector_ensure_capacity(&copied_compound_selectors, ak.vector_size(&this.m_compound_selectors) + 1)
+    var parent_simple_selectors = ak.Vector[CssSelectorSimpleSelector]()
+    ak.vector_append_t(&parent_simple_selectors, parent)
+    ak.vector_append_t(&copied_compound_selectors, CssSelectorCompoundSelector(combinator = CssSelectorCombinator.none_, simple_selectors = parent_simple_selectors))
+
+    var first = true
+    for compound_selector_value in ak.vector_span_const(&this.m_compound_selectors):
+        var compound_selector = compound_selector_value
+        if first:
+            if compound_selector.combinator == CssSelectorCombinator.none_:
+                compound_selector.combinator = CssSelectorCombinator.descendant
+            first = false
+
+        ak.vector_append_t(&copied_compound_selectors, compound_selector)
+
+    return css_selector_create(copied_compound_selectors)
+
+## Ported from Libraries/LibWeb/CSS/Selector.cpp:703 Web::CSS::Selector::contains_unknown_webkit_pseudo_element.
+pub func css_selector_contains_unknown_webkit_pseudo_element(this: const CssSelector*) -> bool:
+    let compound_selectors = ak.vector_span_const(&this.m_compound_selectors)
+    for compound_selector in &compound_selectors:
+        let simple_selectors = ak.vector_span_const(&compound_selector.simple_selectors)
+        for simple_selector in &simple_selectors:
+            if simple_selector.type_ == CssSelectorSimpleSelectorType.pseudo_class:
+                let pseudo_class = css_selector_simple_selector_pseudo_class(simple_selector)
+                # selector_list.contains([](auto const& s) { return s->contains_unknown_webkit_pseudo_element(); })
+                for s in ak.vector_span_const(&pseudo_class.argument_selector_list):
+                    if css_selector_contains_unknown_webkit_pseudo_element(s):
+                        return true
+            if simple_selector.type_ == CssSelectorSimpleSelectorType.pseudo_element:
+                let pseudo_element = css_selector_simple_selector_pseudo_element(simple_selector)
+                if css_selector_pseudo_element_selector_type(&pseudo_element) == css_data.PseudoElement.unknown_web_kit:
+                    return true
+    return false
+
+## Ported from Libraries/LibWeb/CSS/Selector.cpp:719 Web::CSS::Selector::absolutized.
+pub func css_selector_absolutized(this: const CssSelector*, selector_for_nesting: CssSelectorSimpleSelector) -> CssSelector*?:
+    if not css_selector_contains_the_nesting_selector(this):
+        return (CssSelector*)this  # fixme_launder_const_through_pointer_cast(*this)
+
+    var absolutized_compound_selectors = ak.Vector[CssSelectorCompoundSelector]()
+    ak.vector_ensure_capacity(&absolutized_compound_selectors, ak.vector_size(&this.m_compound_selectors))
+    let compound_selectors = ak.vector_span_const(&this.m_compound_selectors)
+    for compound_selector in &compound_selectors:
+        if let absolutized = css_selector_compound_selector_absolutized(compound_selector, selector_for_nesting):
+            ak.vector_append_t(&absolutized_compound_selectors, absolutized)
+        else:
+            return none
+
+    return css_selector_create(absolutized_compound_selectors)
+
+## Ported from Libraries/LibWeb/CSS/Selector.cpp:737 Web::CSS::Selector::CompoundSelector::absolutized.
+pub func css_selector_compound_selector_absolutized(this: const CssSelectorCompoundSelector*, selector_for_nesting: CssSelectorSimpleSelector) -> CssSelectorCompoundSelector?:
+    # TODO: Cache if it contains the nesting selector?
+
+    var absolutized_simple_selectors = ak.Vector[CssSelectorSimpleSelector]()
+    ak.vector_ensure_capacity(&absolutized_simple_selectors, ak.vector_size(&this.simple_selectors))
+    let simple_selectors = ak.vector_span_const(&this.simple_selectors)
+    for simple_selector in &simple_selectors:
+        if let absolutized = css_selector_simple_selector_absolutized(simple_selector, selector_for_nesting):
+            ak.vector_append_t(&absolutized_simple_selectors, absolutized)
+        else:
+            return none
+
+    return CssSelectorCompoundSelector(
+        combinator = this.combinator,
+        simple_selectors = absolutized_simple_selectors,
+    )
+
+## Ported from Libraries/LibWeb/CSS/Selector.cpp:757 Web::CSS::contains_invalid_contents_for_has.
+func css_contains_invalid_contents_for_has(selector: const CssSelector*) -> bool:
+    # :has() has special validity rules:
+    # - It can't appear inside itself
+    # - It bans most pseudo-elements
+    # https://drafts.csswg.org/selectors/#relational
+
+    let compound_selectors = ak.vector_span_const(&selector.m_compound_selectors)
+    for compound_selector in &compound_selectors:
+        let simple_selectors = ak.vector_span_const(&compound_selector.simple_selectors)
+        for simple_selector in &simple_selectors:
+            if simple_selector.type_ == CssSelectorSimpleSelectorType.pseudo_element:
+                let pseudo_element = css_selector_simple_selector_pseudo_element(simple_selector)
+                if not css_data.is_has_allowed_pseudo_element(css_selector_pseudo_element_selector_type(&pseudo_element)):
+                    return true
+            if simple_selector.type_ == CssSelectorSimpleSelectorType.pseudo_class:
+                let pseudo_class = css_selector_simple_selector_pseudo_class(simple_selector)
+                if pseudo_class.type_ == css_data.PseudoClass.has:
+                    return true
+                for child_selector in ak.vector_span_const(&pseudo_class.argument_selector_list):
+                    if css_contains_invalid_contents_for_has(child_selector):
+                        return true
+
+    return false
+
+## Ported from Libraries/LibWeb/CSS/Selector.cpp:784 Web::CSS::Selector::SimpleSelector::absolutized.
+pub func css_selector_simple_selector_absolutized(this: const CssSelectorSimpleSelector*, selector_for_nesting: CssSelectorSimpleSelector) -> CssSelectorSimpleSelector?:
+    match this.type_:
+        .nesting:
+            # Nesting selectors get replaced directly.
+            return selector_for_nesting
+        .pseudo_class:
+            # Pseudo-classes may contain other selectors, so we need to absolutize them.
+            # Copy the PseudoClassSelector, and then replace its argument selector list.
+            var pseudo_class = css_selector_simple_selector_pseudo_class(this)
+            if not ak.vector_is_empty(&pseudo_class.argument_selector_list):
+                var new_selector_list = ak.Vector[CssSelector*]()
+                ak.vector_ensure_capacity(&new_selector_list, ak.vector_size(&pseudo_class.argument_selector_list))
+                for argument_selector in ak.vector_span_const(&pseudo_class.argument_selector_list):
+                    if let absolutized = css_selector_absolutized(argument_selector, selector_for_nesting):
+                        ak.vector_append_t(&new_selector_list, absolutized)
+                    elif not pseudo_class.is_forgiving:
+                        return none
+                pseudo_class.argument_selector_list = new_selector_list
+
+            # :has() has special validity rules
+            if pseudo_class.type_ == css_data.PseudoClass.has:
+                for selector in ak.vector_span_const(&pseudo_class.argument_selector_list):
+                    if css_contains_invalid_contents_for_has(selector):
+                        css_report_invalid_selector(css_selector_serialize(selector),
+                                                    ak.string_from_str("After absolutizing, :has() would contain invalid contents."))
+                        return none
+
+            return CssSelectorSimpleSelector(
+                type_ = CssSelectorSimpleSelectorType.pseudo_class,
+                value = CssSelectorSimpleSelectorValue.css_selector_simple_selector_pseudo_class_selector(pseudo_class),
+            )
+        .universal, .tag_name, .id, .class_, .attribute, .pseudo_element, .invalid:
+            # Everything else isn't affected
+            return *this
+        _:
+            trap("VERIFY_NOT_REACHED")
+
+# mark: Sibling invalidation distance ===========================================================
+
+## Ported from Libraries/LibWeb/CSS/Selector.cpp:841 Web::CSS::Selector::sibling_invalidation_distance.
+pub func css_selector_sibling_invalidation_distance(this: const CssSelector*) -> usize:
+    if let cached = this.m_sibling_invalidation_distance:
+        return (usize)cached
+
+    let mutable_this = (CssSelector*)this  # the cache is mutable in C++
+    var distance: usize = 0
+    var current_distance: usize = 0
+    let compound_selectors = ak.vector_span_const(&this.m_compound_selectors)
+    for compound_selector in &compound_selectors:
+        if compound_selector.combinator == CssSelectorCombinator.none_:
+            continue
+
+        if compound_selector.combinator == CssSelectorCombinator.subsequent_sibling:
+            # NumericLimits<size_t>::max()
+            mutable_this.m_sibling_invalidation_distance = (u64)~0usize
+            return ~0usize
+
+        if compound_selector.combinator == CssSelectorCombinator.next_sibling:
+            current_distance += 1
+        else:
+            if current_distance > distance:
+                distance = current_distance
+            current_distance = 0
+
+    if current_distance > 0:
+        if current_distance > distance:
+            distance = current_distance
+    mutable_this.m_sibling_invalidation_distance = (u64)distance
+    return distance
+
+# mark: Nested relative selectors ===============================================================
+
+## Ported from Libraries/LibWeb/CSS/Selector.cpp:871 Web::CSS::adapt_nested_relative_selector_list.
+pub func css_adapt_nested_relative_selector_list(selectors: ak.Vector[CssSelector*]) -> ak.Vector[CssSelector*]:
+    # "Nested style rules differ from non-nested rules in the following ways:
+    # - A nested style rule accepts a <relative-selector-list> as its prelude (rather than just a <selector-list>).
+    #   Any relative selectors are relative to the elements represented by the nesting selector.
+    # - If a selector in the <relative-selector-list> does not start with a combinator but does contain the nesting
+    #   selector, it is interpreted as a non-relative selector."
+    # https://drafts.csswg.org/css-nesting-1/#syntax
+    # NOTE: We already parsed the selectors as a <relative-selector-list>
+
+    # Nested relative selectors get a `&` inserted at the beginning.
+    # This is, handily, how the spec wants them serialized:
+    # "When serializing a relative selector in a nested style rule, the selector must be absolutized,
+    # with the implied nesting selector inserted."
+    # - https://drafts.csswg.org/css-nesting-1/#cssom
+
+    var new_list = ak.Vector[CssSelector*]()
+    ak.vector_ensure_capacity(&new_list, ak.vector_size(&selectors))
+    for selector in ak.vector_span_const(&selectors):
+        let first_combinator = ak.vector_first_const(&selector.m_compound_selectors).combinator
+        if (not (first_combinator == CssSelectorCombinator.none_ or first_combinator == CssSelectorCombinator.descendant) or not css_selector_contains_the_nesting_selector(selector)):
+            let nesting = CssSelectorSimpleSelector(type_ = CssSelectorSimpleSelectorType.nesting, value = CssSelectorSimpleSelectorValue.empty)
+            ak.vector_append_t(&new_list, css_selector_relative_to(selector, nesting))
+        elif first_combinator == CssSelectorCombinator.descendant:
+            # Replace leading descendant combinator (whitespace) with none, because we're not actually relative.
+            var copied_compound_selectors = ak.vector_clone(&selector.m_compound_selectors)  # a copy in C++
+            ak.vector_first(&copied_compound_selectors).combinator = CssSelectorCombinator.none_
+            ak.vector_append_t(&new_list, css_selector_create(copied_compound_selectors))
+        else:
+            ak.vector_append_t(&new_list, selector)
+    return new_list
+
+# mark: Selector::SimpleSelector::ANPlusBPattern ================================================
+
+## ANPlusBPattern::matches's `canonical_modulo` lambda: like "a % b", but handles negative
+## integers correctly.
+func css_selector_simple_selector_an_plus_b_pattern_canonical_modulo(a: i32, b: i32) -> i32:
+    var c = a % b
+    if (c < 0 and b > 0) or (c > 0 and b < 0):
+        c += b
+    return c
+
+## Ported from Libraries/LibWeb/CSS/Selector.cpp:907 Web::CSS::Selector::SimpleSelector::ANPlusBPattern::matches.
+# https://drafts.csswg.org/css-syntax-3/#anb-microsyntax
+pub func css_selector_simple_selector_an_plus_b_pattern_matches(this: const CssSelectorSimpleSelectorAnPlusBPattern*, index: i32) -> bool:
+    let step_size = this.step_size
+    let offset = this.offset
+
+    # "If both a and b are equal to zero, the pseudo-class represents no element in the document tree."
+    if step_size == 0 and offset == 0:
+        return false
+
+    # When "step_size == -1", selector represents first "offset" elements in document tree.
+    if step_size == -1:
+        return not (offset <= 0 or index > offset)
+
+    # When "step_size == 1", selector represents last "offset" elements in document tree.
+    if step_size == 1:
+        return not (offset < 0 or index < offset)
+
+    # When "step_size == 0", selector picks only the "offset" element.
+    if step_size == 0:
+        return index == offset
+
+    # If both are negative, nothing can match.
+    if step_size < 0 and offset < 0:
+        return false
+
+    # When "step_size < 0", we start at "offset" and count backwards.
+    if step_size < 0:
+        return index <= offset and css_selector_simple_selector_an_plus_b_pattern_canonical_modulo(index - offset, -step_size) == 0
+
+    # Otherwise, we start at "offset" and count forwards.
+    return index >= offset and css_selector_simple_selector_an_plus_b_pattern_canonical_modulo(index - offset, step_size) == 0
+
+## Ported from Libraries/LibWeb/CSS/Selector.cpp:947 Web::CSS::Selector::SimpleSelector::ANPlusBPattern::serialize.
+# https://drafts.csswg.org/css-syntax-3/#serializing-anb
+pub func css_selector_simple_selector_an_plus_b_pattern_serialize(this: const CssSelectorSimpleSelectorAnPlusBPattern*) -> ak.String:
+    # 1. If A is zero, return the serialization of B.
+    if this.step_size == 0:
+        return ak.string_number_i64((i64)this.offset)
+
+    # 2. Otherwise, let result initially be an empty string.
+    var result = ak.string_builder_new()
+
+    # 3.
+    # - A is 1: Append "n" to result.
+    if this.step_size == 1:
+        ak.string_builder_append_u8(&result, 'n')
+    # - A is -1: Append "-n" to result.
+    elif this.step_size == -1:
+        ak.string_builder_append(&result, "-n")
+    # - A is non-zero: Serialize A and append it to result, then append "n" to result.
+    elif this.step_size != 0:
+        # result.appendff("{}n", step_size)
+        let step = ak.string_number_i64((i64)this.step_size)
+        ak.string_builder_append_string_view(&result, ak.string_bytes_as_string_view(&step))
+        ak.string_builder_append_u8(&result, 'n')
+
+    # 4.
+    # - B is greater than zero: Append "+" to result, then append the serialization of B to result.
+    if this.offset > 0:
+        # result.appendff("+{}", offset)
+        ak.string_builder_append_u8(&result, '+')
+        let offset = ak.string_number_i64((i64)this.offset)
+        ak.string_builder_append_string_view(&result, ak.string_bytes_as_string_view(&offset))
+    # - B is less than zero: Append the serialization of B to result.
+    elif this.offset < 0:
+        # result.appendff("{}", offset)
+        let offset = ak.string_number_i64((i64)this.offset)
+        ak.string_builder_append_string_view(&result, ak.string_bytes_as_string_view(&offset))
+
+    # 5. Return result.
+    return ak.string_builder_to_string(&result) else trap("MUST: StringBuilder::to_string")

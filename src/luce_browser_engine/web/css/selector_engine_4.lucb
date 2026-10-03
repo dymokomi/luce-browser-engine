@@ -1,0 +1,310 @@
+#==============================================================================================
+#
+#   selector_engine_4 - SelectorEngine: compound selectors, combinators, matches() and the fast
+#                       path
+#
+#   DESCRIPTION:
+#       Port of LibWeb/CSS/SelectorEngine.cpp (lines 1478-1783): matches_compound_selector
+#       (with the combinators), matches, fast_matches_simple_selector,
+#       fast_matches_compound_selector and fast_matches.
+#
+#       Copyright (c) 2018-2024, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2021-2026, Sam Atkins <sam@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Compound selectors ======================================================================
+
+## matches_compound_selector's scan for :host in a compound, including inside :is(): whether
+## `pseudo_class` (an :is()) has an argument with a :host simple selector.
+func selector_engine_is_argument_contains_host(pseudo_class: const CssSelectorSimpleSelectorPseudoClassSelector*) -> bool:
+    for arg in ak.vector_span_const(&pseudo_class.argument_selector_list):
+        let arg_compounds = ak.vector_span_const(&arg.m_compound_selectors)
+        for arg_compound in &arg_compounds:
+            let arg_simples = ak.vector_span_const(&arg_compound.simple_selectors)
+            for arg_simple in &arg_simples:
+                if (arg_simple.type_ == CssSelectorSimpleSelectorType.pseudo_class and css_selector_simple_selector_pseudo_class(arg_simple).type_ == css_data.PseudoClass.host):
+                    return true
+    return false
+
+## matches_compound_selector's `is_has_pseudo_class` lambda.
+func selector_engine_is_has_pseudo_class(s: const CssSelectorSimpleSelector*) -> bool:
+    return (s.type_ == CssSelectorSimpleSelectorType.pseudo_class and css_selector_simple_selector_pseudo_class(s).type_ == css_data.PseudoClass.has)
+
+## Ported from Libraries/LibWeb/CSS/SelectorEngine.cpp:1478 Web::SelectorEngine::matches_compound_selector.
+# `shadow_host_argument` is C++'s `shadow_host` parameter, which the function reassigns.
+func selector_engine_matches_compound_selector(selector: const CssSelector*, component_list_index: i32, target: DomAbstractElement, shadow_host_argument: DomElement*?, context: SelectorEngineMatchContext*, scope: DomParentNode*?, selector_kind: SelectorEngineSelectorKind, anchor: DomElement*? = none) -> bool:
+    var shadow_host = shadow_host_argument
+    let compound_selector = ak.vector_at_const(&selector.m_compound_selectors, (usize)component_list_index)
+    let simple_selectors = ak.vector_span_const(&compound_selector.simple_selectors)
+
+    # NB: :host::part() must consult the rule shadow root's part map even when the direct-child scope check would skip
+    #     it. That path only applies when the rule comes from a shadow stylesheet (rule_shadow_root is set); otherwise
+    #     the same-shadow-root exception cannot trigger. Scan this compound for :host, including inside :is() (nesting
+    #     expands &::part() in a :host rule to :is(:host)::part()).
+    let saved_for_host_part_matching = context.for_host_part_matching
+    defer context.for_host_part_matching = saved_for_host_part_matching  # ScopeGuard restore_for_host_part
+    for simple in &simple_selectors:
+        if context.rule_shadow_root == none:
+            break
+        if simple.type_ != CssSelectorSimpleSelectorType.pseudo_class:
+            continue
+        let pseudo_class = css_selector_simple_selector_pseudo_class(simple)
+        if pseudo_class.type_ == css_data.PseudoClass.host:
+            context.for_host_part_matching = true
+            break
+        if pseudo_class.type_ == css_data.PseudoClass.is:
+            let found = selector_engine_is_argument_contains_host(&pseudo_class)
+            if found:
+                context.for_host_part_matching = true
+                break
+
+    # Defer :has() until every other simple selector in the compound has matched.
+    # :has() has side effects (setting per-element flags used by invalidation) and
+    # is expensive, so running it at compounds that ultimately fail is both
+    # wasteful and produces spuriously permissive flags.
+    var has_part_pseudo_element = false
+    for simple_selector in &simple_selectors:
+        if simple_selector.type_ == CssSelectorSimpleSelectorType.pseudo_element:
+            let pseudo_element = css_selector_simple_selector_pseudo_element(simple_selector)
+            if css_selector_pseudo_element_selector_type(&pseudo_element) == css_data.PseudoElement.part:
+                has_part_pseudo_element = true
+                break
+    let defer_has_pseudo_class = not has_part_pseudo_element
+
+    var element_for_compound_matching = target
+    # for (auto& simple_selector : compound_selector.simple_selectors.in_reverse())
+    var reverse_index = simple_selectors.length
+    while reverse_index > 0:
+        reverse_index -= 1
+        let simple_selector = &simple_selectors[reverse_index]
+        if defer_has_pseudo_class and selector_engine_is_has_pseudo_class(simple_selector):
+            continue
+        if not selector_engine_matches_simple_selector(simple_selector, element_for_compound_matching, shadow_host, context, scope, selector_kind, anchor):
+            return false
+        if let part_owning_parent = context.part_owning_parent:
+            # Match the rest of the compound selector against the shadow host that element is a part of.
+            element_for_compound_matching = dom_element_abstract_element(part_owning_parent)
+            context.part_owning_parent = none
+            # Also have to update the shadow host we're using.
+            # If the rule comes from the element's own shadow root, we're matching
+            # :host::part() from within the shadow DOM's own stylesheet.
+            # Keep shadow_host as-is so that :host can match.
+            let compound_element = dom_abstract_element_element_const(&element_for_compound_matching)
+            let is_internal_part = context.rule_shadow_root != none and context.rule_shadow_root == dom_element_shadow_root(compound_element)
+            if not is_internal_part:
+                if let shadow_root = dom_node_containing_shadow_root(compound_element.dom_node()):
+                    shadow_host = dom_document_fragment_host(shadow_root.dom_document_fragment())
+                else:
+                    shadow_host = none
+    if defer_has_pseudo_class:
+        reverse_index = simple_selectors.length
+        while reverse_index > 0:
+            reverse_index -= 1
+            let simple_selector = &simple_selectors[reverse_index]
+            if not selector_engine_is_has_pseudo_class(simple_selector):
+                continue
+            if not selector_engine_matches_simple_selector(simple_selector, element_for_compound_matching, shadow_host, context, scope, selector_kind, anchor):
+                return false
+    let element = element_for_compound_matching
+    let element_element = dom_abstract_element_element_const(&element)  # element.element()
+
+    if selector_kind == SelectorEngineSelectorKind.relative and component_list_index == 0:
+        let anchor_element = anchor else trap("VERIFY: a relative selector without its anchor")
+        return element_element != anchor_element
+
+    match compound_selector.combinator:
+        .none_:
+            assert(selector_kind != SelectorEngineSelectorKind.relative)
+            return true
+        .descendant:
+            assert(component_list_index != 0)
+            var ancestor = selector_engine_traverse_up_dom_abstract_element(element, shadow_host)
+            while let ancestor_node = ancestor:
+                ancestor = selector_engine_traverse_up_dom_node(ancestor_node, shadow_host)
+                let ancestor_element = as_if_dom_element(ancestor_node) else continue
+                if (DomElement*?)ancestor_element == anchor:
+                    return false
+                if context.inside_has_argument_match and context.collect_per_element_selector_involvement_metadata:
+                    dom_element_set_in_has_scope(ancestor_element, true)
+                if selector_engine_matches_compound_selector(selector, component_list_index - 1, dom_element_abstract_element(ancestor_element), shadow_host, context, scope, selector_kind, anchor):
+                    return true
+            return false
+        .immediate_child:
+            assert(component_list_index != 0)
+            let parent = selector_engine_traverse_up_dom_abstract_element(element, shadow_host) else return false
+            if not dom_node_is_element(parent):
+                return false
+            let parent_element = (DomElement*)parent
+            if context.inside_has_argument_match and context.collect_per_element_selector_involvement_metadata:
+                dom_element_set_in_has_scope(parent_element, true)
+            return selector_engine_matches_compound_selector(selector, component_list_index - 1, dom_element_abstract_element(parent_element), shadow_host, context, scope, selector_kind, anchor)
+        .next_sibling:
+            if context.collect_per_element_selector_involvement_metadata:
+                dom_element_set_affected_by_direct_sibling_combinator(element_element, true)
+                if (DomElement*?)element_element != context.subject:
+                    dom_element_set_affected_by_sibling_combinator_in_non_subject_position(element_element)
+                var new_sibling_invalidation_distance = css_selector_sibling_invalidation_distance(selector)
+                let element_distance = dom_element_sibling_invalidation_distance(element_element)
+                if element_distance > new_sibling_invalidation_distance:
+                    new_sibling_invalidation_distance = element_distance
+                dom_element_set_sibling_invalidation_distance(element_element, new_sibling_invalidation_distance)
+            assert(component_list_index != 0)
+            if let sibling = dom_non_document_type_child_node_previous_element_sibling(element_element.dom_node()):
+                if context.inside_has_argument_match and context.collect_per_element_selector_involvement_metadata:
+                    dom_element_set_in_has_scope(sibling, true)
+                return selector_engine_matches_compound_selector(selector, component_list_index - 1, dom_element_abstract_element(sibling), shadow_host, context, scope, selector_kind, anchor)
+            return false
+        .subsequent_sibling:
+            if context.collect_per_element_selector_involvement_metadata:
+                dom_element_set_affected_by_indirect_sibling_combinator(element_element, true)
+                if (DomElement*?)element_element != context.subject:
+                    dom_element_set_affected_by_sibling_combinator_in_non_subject_position(element_element)
+            assert(component_list_index != 0)
+            var next = dom_non_document_type_child_node_previous_element_sibling(element_element.dom_node())
+            while let sibling = next:
+                next = dom_non_document_type_child_node_previous_element_sibling(sibling.dom_node())
+                if context.inside_has_argument_match and context.collect_per_element_selector_involvement_metadata:
+                    dom_element_set_in_has_scope(sibling, true)
+                if selector_engine_matches_compound_selector(selector, component_list_index - 1, dom_element_abstract_element(sibling), shadow_host, context, scope, selector_kind, anchor):
+                    return true
+            return false
+        .column:
+            trap("TODO")
+        _:
+            trap("VERIFY_NOT_REACHED")
+
+# mark: matches() ===============================================================================
+
+## Ported from Libraries/LibWeb/CSS/SelectorEngine.cpp:1649 Web::SelectorEngine::matches.
+pub func selector_engine_matches(selector: const CssSelector*, target: DomAbstractElement, shadow_host: DomElement*?, context: SelectorEngineMatchContext*, scope: DomParentNode*? = none, selector_kind: SelectorEngineSelectorKind = SelectorEngineSelectorKind.normal, anchor: DomElement*? = none) -> bool:
+    if selector_kind == SelectorEngineSelectorKind.normal and css_selector_can_use_fast_matches(selector):
+        return selector_engine_fast_matches(selector, dom_abstract_element_element_const(&target), shadow_host, context)
+
+    assert(not ak.vector_is_empty(&selector.m_compound_selectors))
+    let target_pseudo_element = dom_abstract_element_pseudo_element(&target)
+    if css_selector_has_part_pseudo_element(selector):
+        # For ::part() selectors, find any additional pseudo-element beyond ::part() (e.g., the ::selection in
+        # ::part(foo)::selection) and verify it matches the target pseudo-element. A bare ::part(foo) selector has no
+        # additional pseudo-element and should only match base element styles.
+        var target_pseudo: css_data.PseudoElement? = none
+        let last_simple_selectors = ak.vector_span_const(&ak.vector_last_const(&selector.m_compound_selectors).simple_selectors)
+        for simple in &last_simple_selectors:
+            if simple.type_ == CssSelectorSimpleSelectorType.pseudo_element:
+                let pseudo_element = css_selector_simple_selector_pseudo_element(simple)
+                if css_selector_pseudo_element_selector_type(&pseudo_element) != css_data.PseudoElement.part:
+                    target_pseudo = css_selector_pseudo_element_selector_type(&pseudo_element)
+                    break
+        if target_pseudo != target_pseudo_element:
+            return false
+    else:
+        let selector_target_pseudo_element = css_selector_target_pseudo_element(selector)
+        if target_pseudo_element != none:
+            if let selector_pseudo_element = selector_target_pseudo_element:
+                let selector_pseudo_element_type: css_data.PseudoElement? = css_selector_pseudo_element_selector_type(&selector_pseudo_element)
+                if selector_pseudo_element_type != target_pseudo_element:
+                    return false
+        if target_pseudo_element == none and selector_target_pseudo_element != none:
+            return false
+
+    return selector_engine_matches_compound_selector(selector, (i32)ak.vector_size(&selector.m_compound_selectors) - 1, dom_element_abstract_element(dom_abstract_element_element_const(&target)), shadow_host, context, scope, selector_kind, anchor)
+
+# mark: The fast path ===========================================================================
+
+## Ported from Libraries/LibWeb/CSS/SelectorEngine.cpp:1681 Web::SelectorEngine::fast_matches_simple_selector.
+func selector_engine_fast_matches_simple_selector(simple_selector: const CssSelectorSimpleSelector*, element: DomElement*, shadow_host: DomElement*?, context: SelectorEngineMatchContext*) -> bool:
+    if selector_engine_should_block_shadow_host_matching(simple_selector, shadow_host, element):
+        return false
+
+    match simple_selector.type_:
+        .universal:
+            let qualified_name = css_selector_simple_selector_qualified_name(simple_selector)
+            return selector_engine_matches_namespace(&qualified_name, element, context.style_sheet_for_rule)
+        .tag_name:
+            # https://html.spec.whatwg.org/multipage/semantics-other.html#case-sensitivity-of-selectors
+            # When comparing a CSS element type selector to the names of HTML elements in HTML documents, the CSS element type selector must first be converted to ASCII lowercase. The
+            # same selector when compared to other elements must be compared according to its original case. In both cases, to match the values must be identical to each other (and therefore
+            # the comparison is case sensitive).
+            let qualified_name = css_selector_simple_selector_qualified_name(simple_selector)
+            let local_name = dom_element_local_name(element)
+            if (selector_engine_namespace_is(dom_element_namespace_uri(element), &namespace_html) and dom_document_document_type(dom_node_document(element.dom_node())) == DocumentDomDocumentType.html):
+                if not ak.fly_string_eq_fly_string(&qualified_name.name.lowercase_name, &local_name):
+                    return false
+            elif not ak.fly_string_eq_fly_string(&qualified_name.name.name, &local_name):
+                # NOTE: Any other elements are either SVG, XHTML or MathML, all of which are case-sensitive.
+                return false
+            return selector_engine_matches_namespace(&qualified_name, element, context.style_sheet_for_rule)
+        .class_:
+            # Class selectors are matched case insensitively in quirks mode.
+            # See: https://drafts.csswg.org/selectors-4/#class-html
+            let case_sensitivity = ak.CaseSensitivity.case_insensitive if dom_document_in_quirks_mode(dom_node_document(element.dom_node())) else ak.CaseSensitivity.case_sensitive
+            return dom_element_has_class(element, css_selector_simple_selector_name(simple_selector), case_sensitivity)
+        .id:
+            return selector_engine_optional_fly_strings_equal(css_selector_simple_selector_name(simple_selector), dom_element_id(element))
+        .attribute:
+            let attribute = css_selector_simple_selector_attribute(simple_selector)
+            return selector_engine_matches_attribute(&attribute, context.style_sheet_for_rule, element)
+        .pseudo_class:
+            let pseudo_class = css_selector_simple_selector_pseudo_class(simple_selector)
+            return selector_engine_matches_pseudo_class(&pseudo_class, dom_element_abstract_element(element), shadow_host, context, none, SelectorEngineSelectorKind.normal)
+        _:
+            trap("VERIFY_NOT_REACHED")
+
+## Ported from Libraries/LibWeb/CSS/SelectorEngine.cpp:1719 Web::SelectorEngine::fast_matches_compound_selector.
+func selector_engine_fast_matches_compound_selector(compound_selector: const CssSelectorCompoundSelector*, element: DomElement*, shadow_host: DomElement*?, context: SelectorEngineMatchContext*) -> bool:
+    let simple_selectors = ak.vector_span_const(&compound_selector.simple_selectors)
+    for simple_selector in &simple_selectors:
+        if not selector_engine_fast_matches_simple_selector(simple_selector, element, shadow_host, context):
+            return false
+    return true
+
+## Ported from Libraries/LibWeb/CSS/SelectorEngine.cpp:1728 Web::SelectorEngine::fast_matches.
+pub func selector_engine_fast_matches(selector: const CssSelector*, element_to_match: DomElement*, shadow_host: DomElement*?, context: SelectorEngineMatchContext*) -> bool:
+    var current: DomElement*? = element_to_match
+
+    var compound_selector_index = (isize)ak.vector_size(&selector.m_compound_selectors) - 1
+
+    if not selector_engine_fast_matches_compound_selector(ak.vector_last_const(&selector.m_compound_selectors), element_to_match, shadow_host, context):
+        return false
+
+    # NOTE: If we fail after following a child combinator, we may need to backtrack
+    #       to the last matched descendant. We store the state here.
+    var backtrack_state_element: DomElement*? = none
+    var backtrack_state_compound_selector_index: isize = 0
+
+    while true:
+        # NOTE: There should always be a leftmost compound selector without combinator that kicks us out of this loop.
+        assert(compound_selector_index >= 0)
+
+        var compound_selector = ak.vector_at_const(&selector.m_compound_selectors, (usize)compound_selector_index)
+        let current_element = current else trap("unreachable: fast_matches lost its element")
+
+        match compound_selector.combinator:
+            .none_:
+                return true
+            .descendant:
+                backtrack_state_element = dom_node_parent_element(current_element.dom_node())
+                backtrack_state_compound_selector_index = compound_selector_index
+                compound_selector_index -= 1
+                compound_selector = ak.vector_at_const(&selector.m_compound_selectors, (usize)compound_selector_index)
+                current = dom_node_parent_element(current_element.dom_node())
+                while let candidate = current:
+                    if selector_engine_fast_matches_compound_selector(compound_selector, candidate, shadow_host, context):
+                        break
+                    current = dom_node_parent_element(candidate.dom_node())
+                if current == none:
+                    return false
+            .immediate_child:
+                compound_selector_index -= 1
+                compound_selector = ak.vector_at_const(&selector.m_compound_selectors, (usize)compound_selector_index)
+                current = dom_node_parent_element(current_element.dom_node())
+                let parent = current else return false
+                if not selector_engine_fast_matches_compound_selector(compound_selector, parent, shadow_host, context):
+                    if let backtrack_element = backtrack_state_element:
+                        current = backtrack_element
+                        compound_selector_index = backtrack_state_compound_selector_index
+                        continue
+                    return false
+            _:
+                trap("VERIFY_NOT_REACHED")

@@ -1,0 +1,536 @@
+#==============================================================================================
+#
+#   selector_engine_1 - SelectorEngine: the :has() result cache, the :has() fast paths, upward
+#                       traversal, :lang(), relative selectors and attributes
+#
+#   DESCRIPTION:
+#       Port of LibWeb/CSS/SelectorEngine.h's inline members (HasResultCacheKey::visit_edges,
+#       operator==, HasResultCacheKeyTraits::hash) and LibWeb/CSS/SelectorEngine.cpp (lines
+#       1-555): simple_has_child_tag_selector, simple_has_descendant_tag_and_class_compound,
+#       the two :has() fast paths, traverse_up, language_range_matches_tag,
+#       matches_lang_pseudo_class, matches_relative_selector, matches_has_pseudo_class,
+#       :hover, :indeterminate and the attribute matching (for_each_matching_attribute,
+#       matches_single_attribute, matches_attribute).
+#
+#       `CSS::Selector const&` is `const CssSelector*`: the :has() result cache keys on the
+#       selector's address (DESIGN.md §2.2: const stays on value types passed by pointer; the
+#       other `const&` value types of these functions are passed the same way). An
+#       `AbstractElement const&` is passed by value (three words), as the generated signatures
+#       did; an `Element const&` that C++ converts to one implicitly is
+#       `dom_element_abstract_element(element)`.
+#
+#       Copyright (c) 2018-2024, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2021-2026, Sam Atkins <sam@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: HasResultCacheKey (SelectorEngine.h) ====================================================
+
+## Ported from Libraries/LibWeb/CSS/SelectorEngine.h:29 Web::SelectorEngine::HasResultCacheKey::visit_edges.
+pub func selector_engine_has_result_cache_key_visit_edges(this: SelectorEngineHasResultCacheKey*, visitor: gc.CellVisitor*):
+    gc.cell_visitor_visit_t(visitor, this.element)
+
+## Ported from Libraries/LibWeb/CSS/SelectorEngine.h:34 Web::SelectorEngine::HasResultCacheKey::operator== (defaulted).
+pub func selector_engine_has_result_cache_key_eq(this: const SelectorEngineHasResultCacheKey*, other: const SelectorEngineHasResultCacheKey*) -> bool:
+    return this.selector == other.selector and this.element == other.element
+
+## Ported from Libraries/LibWeb/CSS/SelectorEngine.h:38 Web::SelectorEngine::HasResultCacheKeyTraits::hash.
+pub func selector_engine_has_result_cache_key_traits_hash(key: SelectorEngineHasResultCacheKey) -> u32:
+    return ak.pair_int_hash(ak.ptr_hash_void(key.selector), ak.ptr_hash_void(key.element))
+
+# mark: The :has() fast paths ===================================================================
+
+## Ported from Libraries/LibWeb/CSS/SelectorEngine.cpp:44 Web::SelectorEngine::simple_has_child_tag_selector.
+func selector_engine_simple_has_child_tag_selector(selector: const CssSelector*) -> const CssSelectorSimpleSelector*?:
+    if ak.vector_size(&selector.m_compound_selectors) != 1:
+        return none
+
+    let first = ak.vector_first_const(&selector.m_compound_selectors)
+    if first.combinator != CssSelectorCombinator.immediate_child:
+        return none
+    if ak.vector_size(&first.simple_selectors) != 1:
+        return none
+
+    let simple_selector = ak.vector_first_const(&first.simple_selectors)
+    if simple_selector.type_ != CssSelectorSimpleSelectorType.tag_name:
+        return none
+
+    return simple_selector
+
+## Ported from Libraries/LibWeb/CSS/SelectorEngine.cpp:62 Web::SelectorEngine::simple_has_descendant_tag_and_class_compound.
+func selector_engine_simple_has_descendant_tag_and_class_compound(selector: const CssSelector*) -> const CssSelectorCompoundSelector*?:
+    if ak.vector_size(&selector.m_compound_selectors) != 1:
+        return none
+
+    let first = ak.vector_first_const(&selector.m_compound_selectors)
+    if first.combinator != CssSelectorCombinator.descendant:
+        return none
+    if ak.vector_is_empty(&first.simple_selectors):
+        return none
+
+    let simple_selectors = ak.vector_span_const(&first.simple_selectors)
+    for simple_selector in &simple_selectors:
+        match simple_selector.type_:
+            .tag_name, .class_: discard(simple_selector)
+            _: return none
+
+    return first
+
+## Ported from Libraries/LibWeb/CSS/SelectorEngine.cpp:86 Web::SelectorEngine::matches_has_child_tag_fast_path.
+func selector_engine_matches_has_child_tag_fast_path(simple_selector: const CssSelectorSimpleSelector*, anchor: DomElement*, shadow_host: DomElement*?, context: SelectorEngineMatchContext*) -> bool:
+    var has = false
+    for child in dom_node_children(anchor.dom_node()):
+        if not dom_node_is_element(child):
+            continue
+
+        let child_element = (DomElement*)child
+        if not selector_engine_fast_matches_simple_selector(simple_selector, child_element, shadow_host, context):
+            continue
+
+        has = true
+        break
+    return has
+
+## Ported from Libraries/LibWeb/CSS/SelectorEngine.cpp:103 Web::SelectorEngine::matches_has_descendant_tag_and_class_fast_path.
+func selector_engine_matches_has_descendant_tag_and_class_fast_path(selector: const CssSelector*, compound_selector: const CssSelectorCompoundSelector*, anchor: DomElement*, shadow_host: DomElement*?, context: SelectorEngineMatchContext*) -> bool:
+    var has = false
+    var matching_descendant: DomElement*? = none
+    for descendant in dom_node_subtree(anchor.dom_node()):
+        if not dom_node_is_element(descendant):
+            continue
+
+        let descendant_element = (DomElement*)descendant
+        if not selector_engine_fast_matches_compound_selector(compound_selector, descendant_element, shadow_host, context):
+            continue
+
+        has = true
+        matching_descendant = descendant_element
+        break
+
+    if let descendant = matching_descendant:  # has && matching_descendant && context.has_result_cache
+        if let cache = context.has_result_cache:
+            var ancestor = dom_node_parent_element(descendant.dom_node())
+            while let ancestor_element = ancestor:
+                if ancestor_element == anchor:
+                    break
+                discard(ak.hash_map_set(cache, SelectorEngineHasResultCacheKey(selector = selector, element = ancestor_element), SelectorEngineHasMatchResult.matched))
+                ancestor = dom_node_parent_element(ancestor_element.dom_node())
+
+    return has
+
+# mark: Upward traversal and :lang() ============================================================
+
+## Ported from Libraries/LibWeb/CSS/SelectorEngine.cpp:133 Web::SelectorEngine::traverse_up.
+# Upward traversal for descendant (' ') and immediate child combinator ('>')
+# If we're starting inside a shadow tree, traversal stops at the nearest shadow host.
+# This is an implementation detail of the :host selector. Otherwise we would just traverse up to the document root.
+func selector_engine_traverse_up_dom_node(node: DomNode*?, shadow_host: DomElement*?) -> DomNode*?:
+    let present = node else return none
+
+    if let host = shadow_host:
+        # NOTE: We only traverse up to the shadow host, not beyond.
+        if present == host.dom_node():
+            return none
+
+        return (DomNode*?)dom_node_parent_or_shadow_host_element(present)
+    return tree_node_parent(present)
+
+## Ported from Libraries/LibWeb/CSS/SelectorEngine.cpp:149 Web::SelectorEngine::traverse_up.
+# FIXME: This doesn't support pseudo-elements with pseudo-element parents, but neither does the rest of the codebase.
+func selector_engine_traverse_up_dom_abstract_element(node: DomAbstractElement, shadow_host: DomElement*?) -> DomNode*?:
+    if dom_abstract_element_pseudo_element(&node) != none:
+        return dom_abstract_element_element_const(&node).dom_node()
+    return selector_engine_traverse_up_dom_node(dom_abstract_element_element_const(&node).dom_node(), shadow_host)
+
+## language_range_matches_tag's `subtags_match` lambda: two subtags match if either they are the
+## same when compared case-insensitively or the language range's subtag is the wildcard '*'.
+func selector_engine_language_range_matches_tag_subtags_match(language_range_subtag: ak.StringView, language_subtag: ak.StringView) -> bool:
+    return ak.string_view_equals(&language_range_subtag, "*") or ak.string_view_equals_ignoring_ascii_case(&language_range_subtag, language_subtag)
+
+## Ported from Libraries/LibWeb/CSS/SelectorEngine.cpp:158 Web::SelectorEngine::language_range_matches_tag.
+# https://www.rfc-editor.org/rfc/rfc4647.html#section-3.3.2
+# NB: Language tags only use ASCII characters, so we can get away with using StringView.
+func selector_engine_language_range_matches_tag(language_range: ak.StringView, language_tag: ak.StringView) -> bool:
+    # 1. Split both the extended language range and the language tag being compared into a list of subtags by
+    #    dividing on the hyphen (%x2D) character.
+    let range_subtags = ak.string_view_split_view_u8(&language_range, '-', ak.SplitBehavior.keep_empty)
+    let tag_subtags = ak.string_view_split_view_u8(&language_tag, '-', ak.SplitBehavior.keep_empty)
+
+    #    Two subtags match if either they are the same when compared case-insensitively or the language range's subtag
+    #    is the wildcard '*'.
+
+    # 2. Begin with the first subtag in each list. If the first subtag in the range does not match the first
+    #    subtag in the tag, the overall match fails. Otherwise, move to the next subtag in both the range and the
+    #    tag.
+    var tag_subtag: usize = 0
+    var range_subtag: usize = 0
+    if not selector_engine_language_range_matches_tag_subtags_match(*ak.vector_at_const(&range_subtags, range_subtag), *ak.vector_at_const(&tag_subtags, tag_subtag)):
+        return false
+    tag_subtag += 1
+    range_subtag += 1
+
+    # 3. While there are more subtags left in the language range's list:
+    while range_subtag < ak.vector_size(&range_subtags):
+        let range_subtag_value = *ak.vector_at_const(&range_subtags, range_subtag)
+        # A. If the subtag currently being examined in the range is the wildcard ('*'), move to the next subtag in
+        #    the range and continue with the loop.
+        if ak.string_view_equals(&range_subtag_value, "*"):
+            range_subtag += 1
+            continue
+
+        # B. Else, if there are no more subtags in the language tag's list, the match fails.
+        if tag_subtag >= ak.vector_size(&tag_subtags):
+            return false
+
+        # C. Else, if the current subtag in the range's list matches the current subtag in the language tag's
+        #    list, move to the next subtag in both lists and continue with the loop.
+        let tag_subtag_value = *ak.vector_at_const(&tag_subtags, tag_subtag)
+        if selector_engine_language_range_matches_tag_subtags_match(range_subtag_value, tag_subtag_value):
+            range_subtag += 1
+            tag_subtag += 1
+            continue
+
+        # D. Else, if the language tag's subtag is a "singleton" (a single letter or digit, which includes the
+        #    private-use subtag 'x') the match fails.
+        if ak.string_view_length(&tag_subtag_value) == 1 and ak.is_ascii_alphanumeric((u32)ak.string_view_at(&tag_subtag_value, 0)):
+            return false
+
+        # E. Else, move to the next subtag in the language tag's list and continue with the loop.
+        tag_subtag += 1
+
+    # 4. When the language range's list has no more subtags, the match succeeds.
+    return true
+
+## Ported from Libraries/LibWeb/CSS/SelectorEngine.cpp:218 Web::SelectorEngine::matches_lang_pseudo_class.
+# https://drafts.csswg.org/selectors-4/#the-lang-pseudo
+func selector_engine_matches_lang_pseudo_class(element: DomElement*, languages: const ak.Vector[ak.FlyString]*) -> bool:
+    let maybe_element_language = dom_element_lang(element)
+    let element_language = maybe_element_language else return false
+
+    # The element’s content language matches a language range if its content language, as represented in BCP 47
+    # syntax, matches the given language range in an extended filtering operation per [RFC4647] Matching of Language
+    # Tags (section 3.3.2). Both the content language and the language range must be canonicalized and converted to
+    # extlang form as per section 4.5 of [RFC5646] prior to the extended filtering operation. The matching is
+    # performed case-insensitively within the ASCII range.
+
+    # FIXME: Canonicalize both as extlang.
+
+    for language_range in ak.vector_span_const(languages):
+        if selector_engine_language_range_matches_tag(ak.fly_string_bytes_as_string_view(&language_range), ak.string_bytes_as_string_view(&element_language)):
+            return true
+    return false
+
+# mark: Relative selectors and :has() ===========================================================
+
+## Ported from Libraries/LibWeb/CSS/SelectorEngine.cpp:242 Web::SelectorEngine::matches_relative_selector.
+# https://drafts.csswg.org/selectors-4/#relational
+func selector_engine_matches_relative_selector(selector: const CssSelector*, compound_index: usize, element: DomElement*, shadow_host: DomElement*?, context: SelectorEngineMatchContext*, anchor: DomElement*, scope: DomParentNode*?) -> bool:
+    if compound_index >= ak.vector_size(&selector.m_compound_selectors):
+        return selector_engine_matches(selector, dom_element_abstract_element(element), shadow_host, context, scope, SelectorEngineSelectorKind.relative, anchor)
+
+    match ak.vector_at_const(&selector.m_compound_selectors, compound_index).combinator:
+        # Shouldn't be possible because we've parsed relative selectors, which always have a combinator, implicitly or explicitly.
+        .none_:
+            trap("VERIFY_NOT_REACHED")
+        .descendant:
+            var has = false
+            var matching_descendant: DomElement*? = none
+            for descendant in dom_node_subtree(element.dom_node()):
+                if not dom_node_is_element(descendant):
+                    continue
+                let descendant_element = (DomElement*)descendant
+                if context.inside_has_argument_match and context.collect_per_element_selector_involvement_metadata:
+                    dom_element_set_in_has_scope(descendant_element, true)
+                if selector_engine_matches(selector, dom_element_abstract_element(descendant_element), shadow_host, context, scope, SelectorEngineSelectorKind.relative, anchor):
+                    has = true
+                    matching_descendant = descendant_element
+                    break
+            # Cache ancestors as also matching (they have the matching descendant too)
+            if let descendant = matching_descendant:  # has && matching_descendant && context.has_result_cache
+                if let cache = context.has_result_cache:
+                    var ancestor = dom_node_parent_element(descendant.dom_node())
+                    while let ancestor_element = ancestor:
+                        if ancestor_element == element:
+                            break
+                        discard(ak.hash_map_set(cache, SelectorEngineHasResultCacheKey(selector = selector, element = ancestor_element), SelectorEngineHasMatchResult.matched))
+                        ancestor = dom_node_parent_element(ancestor_element.dom_node())
+            return has
+        .immediate_child:
+            var has = false
+            for child in dom_node_children(element.dom_node()):
+                if not dom_node_is_element(child):
+                    continue
+                let child_element = (DomElement*)child
+                if context.inside_has_argument_match and context.collect_per_element_selector_involvement_metadata:
+                    dom_element_set_in_has_scope(child_element, true)
+                if not selector_engine_matches_compound_selector(selector, (i32)compound_index, dom_element_abstract_element(child_element), shadow_host, context, scope, SelectorEngineSelectorKind.relative, anchor):
+                    continue
+                if selector_engine_matches_relative_selector(selector, compound_index + 1, child_element, shadow_host, context, anchor, scope):
+                    has = true
+                    break
+            return has
+        .next_sibling:
+            if context.collect_per_element_selector_involvement_metadata:
+                dom_element_set_affected_by_has_pseudo_class_with_relative_selector_that_has_sibling_combinator(anchor, true)
+            let sibling = dom_non_document_type_child_node_next_element_sibling(element.dom_node()) else return false
+            if context.inside_has_argument_match and context.collect_per_element_selector_involvement_metadata:
+                dom_element_set_in_has_scope(sibling, true)
+                dom_element_set_in_subtree_of_has_pseudo_class_relative_selector_with_sibling_combinator(sibling, true)
+            if not selector_engine_matches_compound_selector(selector, (i32)compound_index, dom_element_abstract_element(sibling), shadow_host, context, scope, SelectorEngineSelectorKind.relative, anchor):
+                return false
+            return selector_engine_matches_relative_selector(selector, compound_index + 1, sibling, shadow_host, context, anchor, scope)
+        .subsequent_sibling:
+            if context.collect_per_element_selector_involvement_metadata:
+                dom_element_set_affected_by_has_pseudo_class_with_relative_selector_that_has_sibling_combinator(anchor, true)
+            var next = dom_non_document_type_child_node_next_element_sibling(element.dom_node())
+            while let sibling = next:
+                next = dom_non_document_type_child_node_next_element_sibling(sibling.dom_node())
+                if context.inside_has_argument_match and context.collect_per_element_selector_involvement_metadata:
+                    dom_element_set_in_has_scope(sibling, true)
+                    dom_element_set_in_subtree_of_has_pseudo_class_relative_selector_with_sibling_combinator(sibling, true)
+                if not selector_engine_matches_compound_selector(selector, (i32)compound_index, dom_element_abstract_element(sibling), shadow_host, context, scope, SelectorEngineSelectorKind.relative, anchor):
+                    continue
+                if selector_engine_matches_relative_selector(selector, compound_index + 1, sibling, shadow_host, context, anchor, scope):
+                    return true
+            return false
+        .column:
+            trap("TODO")
+        _:
+            return false
+
+## Ported from Libraries/LibWeb/CSS/SelectorEngine.cpp:331 Web::SelectorEngine::matches_has_pseudo_class.
+# https://drafts.csswg.org/selectors-4/#relational
+func selector_engine_matches_has_pseudo_class(selector: const CssSelector*, anchor: DomElement*, shadow_host: DomElement*?, context: SelectorEngineMatchContext*, scope: DomParentNode*?) -> bool:
+    let counters = dom_document_style_invalidation_counters(dom_node_document(anchor.dom_node()))
+    counters.has_match_invocations += 1
+
+    if let cache = context.has_result_cache:
+        if let cached = ak.hash_map_get_k(cache, SelectorEngineHasResultCacheKey(selector = selector, element = anchor)):
+            counters.has_result_cache_hits += 1
+            return *cached == SelectorEngineHasMatchResult.matched
+        counters.has_result_cache_misses += 1
+
+    let saved_inside_has = context.inside_has_argument_match
+    context.inside_has_argument_match = true
+    defer context.inside_has_argument_match = saved_inside_has  # ScopeGuard restore_inside_has
+
+    var result: bool
+    if context.collect_per_element_selector_involvement_metadata:
+        result = selector_engine_matches_relative_selector(selector, 0, anchor, shadow_host, context, anchor, scope)
+    elif let simple_selector = selector_engine_simple_has_child_tag_selector(selector):
+        result = selector_engine_matches_has_child_tag_fast_path(simple_selector, anchor, shadow_host, context)
+    elif let compound_selector = selector_engine_simple_has_descendant_tag_and_class_compound(selector):
+        result = selector_engine_matches_has_descendant_tag_and_class_fast_path(selector, compound_selector, anchor, shadow_host, context)
+    else:
+        result = selector_engine_matches_relative_selector(selector, 0, anchor, shadow_host, context, anchor, scope)
+
+    if let cache = context.has_result_cache:
+        discard(ak.hash_map_set(cache, SelectorEngineHasResultCacheKey(selector = selector, element = anchor),
+                                SelectorEngineHasMatchResult.matched if result else SelectorEngineHasMatchResult.not_matched))
+
+    return result
+
+# mark: Pseudo-class helpers ====================================================================
+
+## Ported from Libraries/LibWeb/CSS/SelectorEngine.cpp:365 Web::SelectorEngine::matches_hover_pseudo_class.
+func selector_engine_matches_hover_pseudo_class(element: DomElement*) -> bool:
+    let hovered_node = dom_document_hovered_node(dom_node_document(element.dom_node())) else return false
+    if element.dom_node() == hovered_node:
+        return true
+    return dom_node_is_shadow_including_ancestor_of(element.dom_node(), hovered_node)
+
+## Ported from Libraries/LibWeb/CSS/SelectorEngine.cpp:376 Web::SelectorEngine::matches_indeterminate_pseudo_class.
+# https://html.spec.whatwg.org/multipage/semantics-other.html#selector-indeterminate
+func selector_engine_matches_indeterminate_pseudo_class(element: DomElement*) -> bool:
+    # The :indeterminate pseudo-class must match any element falling into one of the following categories:
+    # - input elements whose type attribute is in the Checkbox state and whose indeterminate IDL attribute is set to true
+    # FIXME: - input elements whose type attribute is in the Radio Button state and whose radio button group contains no input elements whose checkedness state is true.
+    if let input_element = as_if_html_input_element(element):
+        match html_input_element_type_state(input_element):
+            .checkbox:
+                # https://whatpr.org/html-attr-input-switch/9546/semantics-other.html#selector-indeterminate
+                # input elements whose type attribute is in the Checkbox state, whose switch attribute is not set
+                return html_input_element_indeterminate(input_element) and not dom_element_has_attribute(element, html_attribute_names_switch)
+            _:
+                return false
+    # - progress elements with no value content attribute
+    if is_html_progress_element(element):
+        return not dom_element_has_attribute(element, html_attribute_names_value)
+    return false
+
+# mark: Attributes ==============================================================================
+
+## Ported from Libraries/LibWeb/CSS/SelectorEngine.cpp:399 Web::SelectorEngine::for_each_matching_attribute.
+func selector_engine_for_each_matching_attribute(attribute_selector: const CssSelectorSimpleSelectorAttribute*, style_sheet_for_rule: CssCssStyleSheet*?, element: DomElement*, process_attribute: ak.Function1[DomAttr*, ak.IterationDecision]):
+    let qualified_name = &attribute_selector.qualified_name
+    let attribute_name = qualified_name.name.name
+    let attributes = dom_element_attributes(element) else trap("an element without its NamedNodeMap")
+
+    match qualified_name.namespace_type:
+        # "In keeping with the Namespaces in the XML recommendation, default namespaces do not apply to attributes,
+        #  therefore attribute selectors without a namespace component apply only to attributes that have no namespace (equivalent to "|attr")"
+        .default_, .none_:
+            if let attribute = dom_named_node_map_get_attribute(attributes, attribute_name):
+                discard(ak.function1_call(&process_attribute, attribute))
+            return
+        .any:
+            # When comparing the name part of a CSS attribute selector to the names of attributes on HTML elements in HTML
+            # documents, the name part of the CSS attribute selector must first be converted to ASCII lowercase. The same
+            # selector when compared to other attributes must be compared according to its original case. In both cases, the
+            # comparison is case-sensitive.
+            # https://html.spec.whatwg.org/multipage/semantics-other.html#case-sensitivity-of-selectors
+            let case_insensitive = (dom_document_is_html_document(dom_node_document(element.dom_node())) and selector_engine_namespace_is(dom_element_namespace_uri(element), &namespace_html))
+
+            var i: u32 = 0
+            while (usize)i < dom_named_node_map_length(attributes):
+                let attr = dom_named_node_map_item(attributes, i) else trap("an attribute index out of range")
+                i += 1
+                let local_name = dom_attr_local_name(attr)
+                let matches = (ak.fly_string_equals_ignoring_ascii_case_fly_string(&local_name, &attribute_name) if case_insensitive else ak.fly_string_eq_fly_string(&local_name, &attribute_name))
+                if matches:
+                    if ak.function1_call(&process_attribute, attr) == ak.IterationDecision.break_:
+                        break
+            return
+        .named:
+            let style_sheet = style_sheet_for_rule else return
+            let selector_namespace = css_css_style_sheet_namespace_uri(style_sheet, ak.fly_string_bytes_as_string_view(&qualified_name.namespace_))
+            if selector_namespace == none:
+                return
+
+            if let attribute = dom_named_node_map_get_attribute_ns(attributes, selector_namespace, attribute_name):
+                discard(ak.function1_call(&process_attribute, attribute))
+            return
+        _:
+            trap("VERIFY_NOT_REACHED")
+
+## Ported from Libraries/LibWeb/CSS/SelectorEngine.cpp:446 Web::SelectorEngine::matches_single_attribute.
+func selector_engine_matches_single_attribute(attribute_selector: const CssSelectorSimpleSelectorAttribute*, attribute: DomAttr*, case_sensitivity: ak.CaseSensitivity) -> bool:
+    let case_insensitive_match = case_sensitivity == ak.CaseSensitivity.case_insensitive
+
+    match attribute_selector.match_type:
+        .exact_value_match:
+            let value = dom_attr_value(attribute)
+            if case_insensitive_match:
+                return ak.string_equals_ignoring_ascii_case_string(&value, &attribute_selector.value)
+            return ak.string_equals(&value, &attribute_selector.value)
+        .contains_word:
+            if ak.string_is_empty(&attribute_selector.value):
+                # This selector is always false is match value is empty.
+                return false
+            let value = dom_attr_value(attribute)
+            let value_view = ak.string_bytes_as_string_view(&value)
+            let view = ak.string_view_split_view_u8(&value_view, ' ')
+            let selector_value = ak.string_bytes_as_string_view(&attribute_selector.value)
+            for word in ak.vector_span_const(&view):
+                if case_insensitive_match:
+                    if ak.string_view_equals_ignoring_ascii_case(&word, selector_value):
+                        return true
+                elif ak.string_view_eq_string_view(&word, selector_value):
+                    return true
+            return false
+        .contains_string:
+            let value = dom_attr_value(attribute)
+            return (not ak.string_is_empty(&attribute_selector.value) and ak.string_contains_string_view(&value, ak.string_bytes_as_string_view(&attribute_selector.value), case_sensitivity))
+        .starts_with_segment:
+            # https://www.w3.org/TR/CSS2/selector.html#attribute-selectors
+            # [att|=val]
+            # Represents an element with the att attribute, its value either being exactly "val" or beginning with "val" immediately followed by "-" (U+002D).
+
+            let element_attr_value = dom_attr_value(attribute)
+            if ak.string_is_empty(&element_attr_value):
+                # If the attribute value on element is empty, the selector is true
+                # if the match value is also empty and false otherwise.
+                return ak.string_is_empty(&attribute_selector.value)
+            if ak.string_is_empty(&attribute_selector.value):
+                return false
+
+            let element_attribute_view = ak.string_bytes_as_string_view(&element_attr_value)
+            let selector_value_view = ak.string_bytes_as_string_view(&attribute_selector.value)
+            let element_attribute_length = ak.string_view_length(&element_attribute_view)
+            let attribute_length = ak.string_view_length(&selector_value_view)
+            if element_attribute_length < attribute_length:
+                return false
+
+            if attribute_length == element_attribute_length:
+                if case_insensitive_match:
+                    return ak.string_equals_ignoring_ascii_case_string(&element_attr_value, &attribute_selector.value)
+                return ak.string_equals(&element_attr_value, &attribute_selector.value)
+
+            let starts_with_case_sensitivity = ak.CaseSensitivity.case_insensitive if case_insensitive_match else ak.CaseSensitivity.case_sensitive
+            return (ak.string_starts_with_bytes(&element_attr_value, selector_value_view, starts_with_case_sensitivity) and ak.string_view_at(&element_attribute_view, attribute_length) == '-')
+        .starts_with_string:
+            let value = dom_attr_value(attribute)
+            let value_view = ak.string_bytes_as_string_view(&value)
+            return (not ak.string_is_empty(&attribute_selector.value) and ak.string_view_starts_with_string_view(&value_view, ak.string_bytes_as_string_view(&attribute_selector.value), case_sensitivity))
+        .ends_with_string:
+            let value = dom_attr_value(attribute)
+            let value_view = ak.string_bytes_as_string_view(&value)
+            return (not ak.string_is_empty(&attribute_selector.value) and ak.string_view_ends_with_string_view(&value_view, ak.string_bytes_as_string_view(&attribute_selector.value), case_sensitivity))
+        .has_attribute:
+            return true
+        _:
+            return false
+
+## matches_attribute's `case_sensitivity` lambda for CaseType::DefaultMatch: whether `name` is one
+## of the HTML attributes whose values are matched case-insensitively
+## (https://html.spec.whatwg.org/multipage/semantics-other.html#case-sensitivity-of-selectors).
+func selector_engine_matches_attribute_is_case_insensitive_html_attribute(name: const ak.FlyString*) -> bool:
+    let names = [
+        html_attribute_names_accept, html_attribute_names_accept_charset, html_attribute_names_align,
+        html_attribute_names_alink, html_attribute_names_axis, html_attribute_names_bgcolor, html_attribute_names_charset,
+        html_attribute_names_checked, html_attribute_names_clear, html_attribute_names_codetype, html_attribute_names_color,
+        html_attribute_names_compact, html_attribute_names_declare, html_attribute_names_defer, html_attribute_names_dir,
+        html_attribute_names_direction, html_attribute_names_disabled, html_attribute_names_enctype, html_attribute_names_face,
+        html_attribute_names_frame, html_attribute_names_hreflang, html_attribute_names_http_equiv, html_attribute_names_lang,
+        html_attribute_names_language, html_attribute_names_link, html_attribute_names_media, html_attribute_names_method,
+        html_attribute_names_multiple, html_attribute_names_nohref, html_attribute_names_noresize, html_attribute_names_noshade,
+        html_attribute_names_nowrap, html_attribute_names_readonly, html_attribute_names_rel, html_attribute_names_rev,
+        html_attribute_names_rules, html_attribute_names_scope, html_attribute_names_scrolling, html_attribute_names_selected,
+        html_attribute_names_shape, html_attribute_names_target, html_attribute_names_text, html_attribute_names_type,
+        html_attribute_names_valign, html_attribute_names_valuetype, html_attribute_names_vlink,
+    ]
+    for candidate in &names:
+        if ak.fly_string_eq_fly_string(name, candidate):
+            return true
+    return false
+
+## matches_attribute's `case_sensitivity` lambda.
+func selector_engine_matches_attribute_case_sensitivity(attribute: const CssSelectorSimpleSelectorAttribute*, element: DomElement*) -> ak.CaseSensitivity:
+    match attribute.case_type:
+        .case_insensitive_match:
+            return ak.CaseSensitivity.case_insensitive
+        .case_sensitive_match:
+            return ak.CaseSensitivity.case_sensitive
+        .default_match:
+            # See: https://html.spec.whatwg.org/multipage/semantics-other.html#case-sensitivity-of-selectors
+            if (dom_document_is_html_document(dom_node_document(element.dom_node())) and selector_engine_namespace_is(dom_element_namespace_uri(element), &namespace_html) and attribute.qualified_name.namespace_type == CssSelectorSimpleSelectorQualifiedNameNamespaceType.default_ and selector_engine_matches_attribute_is_case_insensitive_html_attribute(&attribute.qualified_name.name.name)):
+                return ak.CaseSensitivity.case_insensitive
+
+            return ak.CaseSensitivity.case_sensitive
+        _:
+            trap("VERIFY_NOT_REACHED")
+
+## The captures of matches_attribute's per-attribute lambda.
+struct SelectorEngineMatchesAttributeMatch:
+    var attribute: const CssSelectorSimpleSelectorAttribute*
+    var case_sensitivity: ak.CaseSensitivity
+    var found_matching_attribute: bool
+
+## matches_attribute's per-attribute lambda.
+func selector_engine_matches_attribute_match(context: void*?, attr: DomAttr*) -> ak.IterationDecision:
+    let captures = (SelectorEngineMatchesAttributeMatch*)(context else trap("no captures"))
+    if selector_engine_matches_single_attribute(captures.attribute, attr, captures.case_sensitivity):
+        captures.found_matching_attribute = true
+        return ak.IterationDecision.break_
+    return ak.IterationDecision.continue_
+
+## Ported from Libraries/LibWeb/CSS/SelectorEngine.cpp:509 Web::SelectorEngine::matches_attribute.
+func selector_engine_matches_attribute(attribute: const CssSelectorSimpleSelectorAttribute*, style_sheet_for_rule: CssCssStyleSheet*?, element: DomElement*) -> bool:
+    let case_sensitivity = selector_engine_matches_attribute_case_sensitivity(attribute, element)
+
+    var captures = SelectorEngineMatchesAttributeMatch(attribute = attribute, case_sensitivity = case_sensitivity, found_matching_attribute = false)
+    selector_engine_for_each_matching_attribute(attribute, style_sheet_for_rule, element,
+                                                ak.Function1[DomAttr*, ak.IterationDecision](call = selector_engine_matches_attribute_match, context = &captures))
+
+    return captures.found_matching_attribute

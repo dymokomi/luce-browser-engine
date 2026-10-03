@@ -1,0 +1,503 @@
+#==============================================================================================
+#
+#   tests_selector_engine - tests of SelectorEngine on DOM trees (region r38)
+#
+#   DESCRIPTION:
+#       Ladybird has no unit tests for SelectorEngine.cpp (it is tested through
+#       Tests/LibWeb/Text, which needs scripting). The oracle cases
+#       (tests_selector_engine_cases) are trees and querySelectorAll queries that the reference
+#       build's test-web ran: type, universal, id and class selectors (case-sensitivity),
+#       attribute selectors of every match type and case flag, the structural pseudo-classes
+#       (first/last/only child and of type, :nth-*() with An+B and `of S`, :empty, :root,
+#       :scope), combinators, :not/:is/:where/:has with every relative combinator, :lang(),
+#       :defined, :open and the state pseudo-classes nothing triggers in a static document,
+#       pseudo-elements and invalid or namespaced selectors. Each tree is built here as the HTML
+#       parser builds it (HTMLElement's constructor for each element, its attribute list, raw
+#       tree insertion: the element classes' constructors are stubs of r26/r27 and the DOM's own
+#       entry points reach style invalidation, region r42) in a
+#       document shaped as the reference's (html, head with two scripts, body with div#root and
+#       pre#out), and each query runs through the port's ParentNode::querySelectorAll.
+#
+#       The focused tests below pin what the oracle cannot reach through querySelectorAll: the
+#       :has() result cache, the per-element involvement metadata, the fast path and its
+#       backtracking, shadow hosts and the An+B / language-range helpers.
+#
+#==============================================================================================
+
+# mark: Building trees ==========================================================================
+
+## Whether `byte` may be part of a tag or attribute name in the oracle's markup.
+func test_selector_engine_is_name_byte(byte: u8) -> bool:
+    return ak.is_ascii_alphanumeric((u32)byte) or byte == '-' or byte == '_'
+
+## The void elements of the oracle's markup (no end tag; nothing is pushed).
+func test_selector_engine_is_void(name: str) -> bool:
+    return name == "img" or name == "br" or name == "hr" or name == "input"
+
+## Sets an attribute as the HTML parser does before inserting the element: into the attribute
+## list, and for id and class what Element::attribute_changed does (m_id, m_classes). The element
+## classes' own change steps are not run (most are stubs of regions r26/r27).
+func test_selector_engine_set_attribute(element: HtmlElement*, name: str, value: str):
+    let fly_name = ak.fly_string_from_str(name)
+    discard(test_html_put(element, fly_name, value))
+    let dom_element = element.dom_element()
+    let value_string = ak.string_from_str(value)
+    if name == "id":
+        dom_element.m_id = none if value.length == 0 else ak.fly_string_from_str(value)
+    elif name == "class":
+        dom_element_set_tokens_from_value(&dom_element.m_classes, &value_string)
+
+## The element class the HTML parser would make for `local_name`, where selector matching tells
+## the classes apart (:root, :heading, :open); HTMLElement otherwise.
+func test_selector_engine_class(local_name: str) -> const ak.ClassInfo*:
+    if local_name == "html":
+        return &html_html_element_class
+    if local_name == "head":
+        return &html_head_element_class
+    if local_name == "body":
+        return &html_body_element_class
+    if local_name.length == 2 and local_name.bytes[0] == 'h' and local_name.bytes[1] >= '1' and local_name.bytes[1] <= '6':
+        return &html_heading_element_class
+    if local_name == "details":
+        return &html_details_element_class
+    if local_name == "dialog":
+        return &html_dialog_element_class
+    return &html_element_class
+
+## An HTML element of `local_name`'s class (test_selector_engine_class) made as its constructor
+## makes it: every one of these constructors is HTMLElement's (the subclasses' are stubs of
+## regions r26/r27, trivial in C++), and HTMLElement's initialize.
+func test_selector_engine_create(realm: Realm*, document: DomDocument*, local_name: str) -> HtmlElement*:
+    let element = (HtmlElement*)web_allocate_cell(realm, test_selector_engine_class(local_name))
+    html_element_construct(element, document, test_html_qualified_name(local_name))
+    html_element_initialize_impl(element.js_cell(), realm)
+    # The ElementFactory's custom element state for an HTML element without `is` (set directly:
+    # set_custom_element_state's style invalidation is region r42's).
+    element.dom_element().m_custom_element_state = DomCustomElementState.uncustomized
+    return element
+
+## Builds `markup` (start tags with attributes, end tags, text; no implied tags, no comments) as
+## the children of `root`, in HTML elements made by the ElementFactory.
+func test_selector_engine_build(realm: Realm*, document: DomDocument*, root: DomNode*, markup: str):
+    let bytes = markup.bytes
+    var stack: ak.Vector[DomNode*]
+    ak.vector_append_t(&stack, root)
+    var i: usize = 0
+    while i < bytes.length:
+        if bytes[i] != '<':
+            let start = i
+            while i < bytes.length and bytes[i] != '<':
+                i += 1
+            let text = realm_create_dom_text_utf16_string(realm, document, ak.utf16_string_from_utf8_string_view(ak.sv((str)bytes[start..<i])))
+            tree_node_append_child(*ak.vector_last(&stack), text.dom_node())
+            continue
+        i += 1
+        if bytes[i] == '/':
+            while bytes[i] != '>':
+                i += 1
+            i += 1
+            discard(ak.vector_take_last(&stack))
+            continue
+        let name_start = i
+        while test_selector_engine_is_name_byte(bytes[i]):
+            i += 1
+        let name = (str)bytes[name_start..<i]
+        let element = test_selector_engine_create(realm, document, name)
+        while bytes[i] != '>':
+            if bytes[i] == ' ':
+                i += 1
+                continue
+            let attribute_start = i
+            while test_selector_engine_is_name_byte(bytes[i]):
+                i += 1
+            let attribute_name = (str)bytes[attribute_start..<i]
+            var value = ""
+            if bytes[i] == '=':
+                i += 1
+                if bytes[i] == '"':
+                    i += 1
+                    let value_start = i
+                    while bytes[i] != '"':
+                        i += 1
+                    value = (str)bytes[value_start..<i]
+                    i += 1
+                else:
+                    let value_start = i
+                    while bytes[i] != ' ' and bytes[i] != '>':
+                        i += 1
+                    value = (str)bytes[value_start..<i]
+            test_selector_engine_set_attribute(element, attribute_name, value)
+        i += 1
+        tree_node_append_child(*ak.vector_last(&stack), element.dom_node())
+        if not test_selector_engine_is_void(name):
+            ak.vector_append_t(&stack, element.dom_node())
+
+## An element of the test document: `local_name` with `id` (none: no id) appended to `parent`.
+func test_selector_engine_append(realm: Realm*, document: DomDocument*, parent: DomNode*, local_name: str, id: str = "") -> HtmlElement*:
+    let element = test_selector_engine_create(realm, document, local_name)
+    if id.length != 0:
+        test_selector_engine_set_attribute(element, "id", id)
+    tree_node_append_child(parent, element.dom_node())
+    return element
+
+## The oracle's `name`: an element's id, or its local name when it has none.
+func test_selector_engine_name(element: DomElement*) -> ak.FlyString:
+    if let id = dom_element_id(element):
+        return id
+    return dom_element_local_name(element)
+
+## The oracle's `describe`: "name(children...)".
+func test_selector_engine_describe(builder: ak.StringBuilder*, element: DomElement*):
+    let name = test_selector_engine_name(element)
+    ak.string_builder_append_string_view(builder, ak.fly_string_bytes_as_string_view(&name))
+    ak.string_builder_append_u8(builder, '(')
+    var first = true
+    for child in dom_node_children(element.dom_node()):
+        let child_element = as_if_dom_element(child) else continue
+        if not first:
+            ak.string_builder_append_u8(builder, ' ')
+        first = false
+        test_selector_engine_describe(builder, child_element)
+    ak.string_builder_append_u8(builder, ')')
+
+## The test document: html(head(script script) body(div#root pre#out)), as the reference's.
+struct TestSelectorEngineWorld:
+    var vm: Vm*
+    var realm: Realm*
+    var document: DomDocument*
+    var root: HtmlElement*
+
+## A test document shaped as the reference's.
+func test_selector_engine_world() -> TestSelectorEngineWorld:
+    let (vm, realm, document) = test_html_setup()
+    let html = test_selector_engine_append(realm, document, document.dom_node(), "html")
+    let head = test_selector_engine_append(realm, document, html.dom_node(), "head")
+    discard(test_selector_engine_append(realm, document, head.dom_node(), "script"))
+    discard(test_selector_engine_append(realm, document, head.dom_node(), "script"))
+    let body = test_selector_engine_append(realm, document, html.dom_node(), "body")
+    let root = test_selector_engine_append(realm, document, body.dom_node(), "div", "root")
+    discard(test_selector_engine_append(realm, document, body.dom_node(), "pre", "out"))
+    return TestSelectorEngineWorld(vm = vm, realm = realm, document = document, root = root)
+
+## Runs one query ("root <selector>" or "doc <selector>") and returns "<query> => <names>".
+func test_selector_engine_query(world: const TestSelectorEngineWorld*, query: ak.StringView) -> ak.String:
+    var out = ak.string_builder_new()
+    ak.string_builder_append_string_view(&out, query)
+    ak.string_builder_append(&out, " => ")
+    let is_document = ak.string_view_starts_with_string_view(&query, ak.sv("doc "))
+    let selector = ak.string_view_substring_view(&query, 4 if is_document else 5)
+    let scope = world.document.dom_parent_node() if is_document else world.root.dom_parent_node()
+    let list = dom_parent_node_query_selector_all(scope, selector) catch:
+        ak.string_builder_append(&out, "error")
+        return ak.string_builder_to_string_without_validation(&out)
+    var first = true
+    for index in 0..<dom_node_list_length(list):
+        let element = as_dom_element(dom_node_list_item(list, index) else trap("item in range"))
+        let name = test_selector_engine_name(element)
+        if ak.fly_string_eq_string_view(&name, ak.sv("out")):
+            continue
+        if not first:
+            ak.string_builder_append_u8(&out, ',')
+        first = false
+        ak.string_builder_append_string_view(&out, ak.fly_string_bytes_as_string_view(&name))
+    return ak.string_builder_to_string_without_validation(&out)
+
+# mark: The oracle cases ========================================================================
+
+test "SelectorEngine matches the reference build on the oracle trees and queries":
+    let world = test_selector_engine_world()
+    defer web_test_destroy_vm(world.vm)
+    # The engine runs with the heap as the current allocator (DESIGN.md §3.2).
+    let allocator: memory.Allocator = vm_heap(world.vm)
+    with allocator:
+        var description = ak.string_builder_new()
+        ak.string_builder_append(&description, "document: ")
+        test_selector_engine_describe(&description, as_dom_element(tree_node_first_child(world.document.dom_node()) else trap("html")))
+        let described = ak.string_builder_to_string_without_validation(&description)
+        assert(ak.string_eq_string_view(&described, ak.sv(test_selector_engine_document)), "the test document is shaped as the reference's")
+
+        var failures = 0
+        for test_case in &test_selector_engine_cases:
+            while let child = tree_node_first_child(world.root.dom_node()):
+                tree_node_remove_child(world.root.dom_node(), child)
+            test_selector_engine_build(world.realm, world.document, world.root.dom_node(), test_case.markup)
+
+            var actual = ak.string_builder_new()
+            let queries_view = ak.sv(test_case.queries)
+            let queries = ak.string_view_split_view_u8(&queries_view, '\n')
+            for query in ak.vector_span_const(&queries):
+                let result = test_selector_engine_query(&world, query)
+                ak.string_builder_append_string_view(&actual, ak.string_bytes_as_string_view(&result))
+                ak.string_builder_append_u8(&actual, '\n')
+            let actual_string = ak.string_builder_to_string_without_validation(&actual)
+            if not ak.string_eq_string_view(&actual_string, ak.sv(test_case.expected)):
+                let actual_view = ak.string_bytes_as_string_view(&actual_string)
+                print(f"tree {test_case.markup}\nexpected:\n{test_case.expected}actual:\n{(str)ak.string_view_bytes(&actual_view)}")
+                failures += 1
+        assert(failures == 0, "SelectorEngine oracle cases differ")
+
+# mark: Focused tests ===========================================================================
+
+## The element of `world`'s root subtree whose id is `id`.
+func test_selector_engine_by_id(world: const TestSelectorEngineWorld*, id: str) -> DomElement*:
+    for node in dom_node_subtree(world.root.dom_node()):
+        let element = as_if_dom_element(node) else continue
+        if let element_id = dom_element_id(element):
+            if ak.fly_string_eq_string_view(&element_id, ak.sv(id)):
+                return element
+    trap("no element with that id")
+
+## The one selector of `text`, parsed in a document-less context.
+func test_selector_engine_selector(text: str) -> CssSelector*:
+    var params: CssParsingParams = ---
+    css_parsing_params_construct_css_parsing_mode(&params)
+    let list = parse_selector(params, ak.sv(text)) else trap("the selector parses")
+    assert(ak.vector_size(&list) == 1)
+    return *ak.vector_first_const(&list)
+
+## SelectorEngine::matches of `selector` against `element` with `context` (no scope).
+func test_selector_engine_matches(selector: const CssSelector*, element: DomElement*, context: SelectorEngineMatchContext*, shadow_host: DomElement*? = none) -> bool:
+    return selector_engine_matches(selector, dom_element_abstract_element(element), shadow_host, context)
+
+## The selector of the first simple selector of `selector`'s first compound, which must be a
+## pseudo-class with one argument (the selector a :has() caches under).
+func test_selector_engine_first_argument(selector: const CssSelector*) -> const CssSelector*:
+    let compounds = css_selector_compound_selectors(selector)
+    let simple = ak.vector_first_const(&ak.vector_first_const(&compounds).simple_selectors)
+    let pseudo_class = css_selector_simple_selector_pseudo_class(simple)
+    return *ak.vector_first_const(&pseudo_class.argument_selector_list)
+
+## A :has() result cache entry.
+func test_selector_engine_cached(cache: ak.HashMap[SelectorEngineHasResultCacheKey, SelectorEngineHasMatchResult, SelectorEngineHasResultCacheKeyTraits]*, selector: const CssSelector*, element: DomElement*) -> SelectorEngineHasMatchResult?:
+    let result = ak.hash_map_get_k(cache, SelectorEngineHasResultCacheKey(selector = selector, element = element)) else return none
+    return *result
+
+test "the :has() result cache: the descendant fast path caches the ancestors in between, and repeats hit it (SelectorEngine.cpp:103, 331)":
+    let world = test_selector_engine_world()
+    defer web_test_destroy_vm(world.vm)
+    let allocator: memory.Allocator = vm_heap(world.vm)
+    with allocator:
+        test_selector_engine_build(world.realm, world.document, world.root.dom_node(), "<div id=a><p id=b><span id=c class=t></span></p></div><div id=d></div>")
+        let a = test_selector_engine_by_id(&world, "a")
+        let b = test_selector_engine_by_id(&world, "b")
+        let c = test_selector_engine_by_id(&world, "c")
+        let d = test_selector_engine_by_id(&world, "d")
+        let selector = test_selector_engine_selector(":has(.t)")
+        let argument = test_selector_engine_first_argument(selector)
+        assert(selector_engine_simple_has_descendant_tag_and_class_compound(argument) != none)
+        assert(selector_engine_simple_has_child_tag_selector(argument) == none)
+
+        var cache: ak.HashMap[SelectorEngineHasResultCacheKey, SelectorEngineHasMatchResult, SelectorEngineHasResultCacheKeyTraits]
+        var context = SelectorEngineMatchContext(has_result_cache = &cache)
+        let counters = dom_document_style_invalidation_counters(world.document)
+
+        # A miss: the anchor and the ancestors between it and the matching descendant are cached.
+        assert(test_selector_engine_matches(selector, a, &context))
+        assert(ak.hash_map_size(&cache) == 2)
+        assert(test_selector_engine_cached(&cache, argument, a) == SelectorEngineHasMatchResult.matched)
+        assert(test_selector_engine_cached(&cache, argument, b) == SelectorEngineHasMatchResult.matched)
+        assert(counters.has_match_invocations == 1 and counters.has_result_cache_misses == 1 and counters.has_result_cache_hits == 0)
+
+        # A hit: b was cached by a's walk.
+        assert(test_selector_engine_matches(selector, b, &context))
+        assert(counters.has_match_invocations == 2 and counters.has_result_cache_hits == 1)
+
+        # Misses that do not match are cached as NotMatched.
+        assert(not test_selector_engine_matches(selector, d, &context))
+        assert(not test_selector_engine_matches(selector, c, &context))
+        assert(test_selector_engine_cached(&cache, argument, d) == SelectorEngineHasMatchResult.not_matched)
+        assert(test_selector_engine_cached(&cache, argument, c) == SelectorEngineHasMatchResult.not_matched)
+        assert(ak.hash_map_size(&cache) == 4)
+        assert(counters.has_match_invocations == 4 and counters.has_result_cache_misses == 3 and counters.has_result_cache_hits == 1)
+
+        # The cache is consulted before anything else: a planted answer wins.
+        discard(ak.hash_map_set(&cache, SelectorEngineHasResultCacheKey(selector = argument, element = d), SelectorEngineHasMatchResult.matched))
+        assert(test_selector_engine_matches(selector, d, &context))
+
+        # Without a cache nothing is counted as a hit or a miss; :has(> span) takes the child fast path.
+        var uncached = SelectorEngineMatchContext()
+        let child_selector = test_selector_engine_selector(":has(> span)")
+        assert(selector_engine_simple_has_child_tag_selector(test_selector_engine_first_argument(child_selector)) != none)
+        assert(test_selector_engine_matches(child_selector, b, &uncached))
+        assert(not test_selector_engine_matches(child_selector, a, &uncached))
+        assert(counters.has_match_invocations == 7 and counters.has_result_cache_misses == 3 and counters.has_result_cache_hits == 2)
+
+        # HasResultCacheKey: equal keys hash alike; the traits' equality is the defaulted operator==.
+        let key = SelectorEngineHasResultCacheKey(selector = argument, element = a)
+        let same = SelectorEngineHasResultCacheKey(selector = argument, element = a)
+        let other = SelectorEngineHasResultCacheKey(selector = argument, element = b)
+        assert(selector_engine_has_result_cache_key_eq(&key, &same) and not selector_engine_has_result_cache_key_eq(&key, &other))
+        assert(selector_engine_has_result_cache_key_traits_hash(key) == ak.pair_int_hash(ak.ptr_hash_void(argument), ak.ptr_hash_void(a)))
+
+test "the per-element involvement metadata the invalidation code reads (SelectorEngine.cpp:659, 1478, 242)":
+    let world = test_selector_engine_world()
+    defer web_test_destroy_vm(world.vm)
+    let allocator: memory.Allocator = vm_heap(world.vm)
+    with allocator:
+        test_selector_engine_build(world.realm, world.document, world.root.dom_node(), "<ul id=u><li id=l1></li><li id=l2 class=x></li><li id=l3></li></ul>")
+        let l1 = test_selector_engine_by_id(&world, "l1")
+        let l2 = test_selector_engine_by_id(&world, "l2")
+        let l3 = test_selector_engine_by_id(&world, "l3")
+
+        # :first-child on the subject: the flag, but no structural flag for a non-subject.
+        var context = SelectorEngineMatchContext(subject = l1, collect_per_element_selector_involvement_metadata = true)
+        assert(test_selector_engine_matches(test_selector_engine_selector("li:first-child"), l1, &context))
+        assert(l1.m_affected_by_first_child_pseudo_class and not l1.m_affected_by_structural_pseudo_class_in_non_subject_position)
+        assert(css_pseudo_class_bitmap_get(&context.attempted_pseudo_class_matches, css_data.PseudoClass.first_child))
+
+        # `li:first-child + .x` on l2: the direct sibling flag and the sibling invalidation distance on
+        # the subject; the structural flag on the sibling matched in a non-subject position.
+        context = SelectorEngineMatchContext(subject = l2, collect_per_element_selector_involvement_metadata = true)
+        assert(test_selector_engine_matches(test_selector_engine_selector("li:first-child + .x"), l2, &context))
+        assert(l2.m_affected_by_direct_sibling_combinator and not l2.m_affected_by_sibling_combinator_in_non_subject_position)
+        assert(l2.m_sibling_invalidation_distance == 1)
+        assert(l1.m_affected_by_structural_pseudo_class_in_non_subject_position)
+
+        # `.x ~ li` on l3: the indirect sibling flag.
+        context = SelectorEngineMatchContext(subject = l3, collect_per_element_selector_involvement_metadata = true)
+        assert(test_selector_engine_matches(test_selector_engine_selector(".x ~ li"), l3, &context))
+        assert(l3.m_affected_by_indirect_sibling_combinator and not l3.m_affected_by_direct_sibling_combinator)
+
+        # :has(+ .x) on l1 (the subject): the subject-position flag, the anchor's sibling flag, and the
+        # :has() scope flags on the sibling the relative selector visited.
+        context = SelectorEngineMatchContext(subject = l1, collect_per_element_selector_involvement_metadata = true)
+        assert(test_selector_engine_matches(test_selector_engine_selector(":has(+ .x)"), l1, &context))
+        assert(l1.m_affected_by_has_pseudo_class_in_subject_position and not l1.m_affected_by_has_pseudo_class_in_non_subject_position)
+        assert(l1.m_affected_by_has_pseudo_class_with_relative_selector_that_has_sibling_combinator)
+        assert(l2.m_in_has_scope and l2.m_in_subtree_of_has_pseudo_class_relative_selector_with_sibling_combinator)
+        assert(not context.inside_has_argument_match)  # restored on the way out
+
+        # The positional pseudo-classes.
+        context = SelectorEngineMatchContext(subject = l2, collect_per_element_selector_involvement_metadata = true)
+        assert(test_selector_engine_matches(test_selector_engine_selector(":nth-child(2)"), l2, &context))
+        assert(l2.m_affected_by_forward_positional_pseudo_class and not l2.m_affected_by_backward_positional_pseudo_class)
+        context = SelectorEngineMatchContext(subject = l3, collect_per_element_selector_involvement_metadata = true)
+        assert(test_selector_engine_matches(test_selector_engine_selector(":nth-last-child(1)"), l3, &context))
+        assert(l3.m_affected_by_backward_positional_pseudo_class)
+
+        # Without collection nothing is written.
+        let u = test_selector_engine_by_id(&world, "u")
+        var plain = SelectorEngineMatchContext()
+        assert(test_selector_engine_matches(test_selector_engine_selector("ul:first-child"), u, &plain))
+        assert(not u.m_affected_by_first_child_pseudo_class)
+
+test "fast_matches (with its backtracking) agrees with the full matcher (SelectorEngine.cpp:1728, 1478)":
+    let world = test_selector_engine_world()
+    defer web_test_destroy_vm(world.vm)
+    let allocator: memory.Allocator = vm_heap(world.vm)
+    with allocator:
+        test_selector_engine_build(world.realm, world.document, world.root.dom_node(),
+                                   "<div id=k1 class=a><div id=k2 class=b><div id=k3 class=b><span id=k4 class=c></span></div></div></div><div id=k5 class=b><div id=k6 class=a><span id=k7 class=c></span></div></div>")
+        let texts = [".a > .b .c", ".a > .b > .c", ".b > .b > .c", ".a .b .c", ".b .a > .c", ".b > .a .c", "div > div > div > span", ".a > .b .b > .c", "div span:first-child", ".a [class] > .c"]
+        let ids = ["k1", "k2", "k3", "k4", "k5", "k6", "k7"]
+        for text in texts:
+            let selector = test_selector_engine_selector(text)
+            assert(css_selector_can_use_fast_matches(selector))
+            let last = (i32)ak.vector_size(&selector.m_compound_selectors) - 1
+            for id in ids:
+                let element = test_selector_engine_by_id(&world, id)
+                var fast_context = SelectorEngineMatchContext()
+                var full_context = SelectorEngineMatchContext()
+                let fast = selector_engine_fast_matches(selector, element, none, &fast_context)
+                let full = selector_engine_matches_compound_selector(selector, last, dom_element_abstract_element(element), none, &full_context, none, SelectorEngineSelectorKind.normal)
+                if fast != full:
+                    print(f"{text} on {id}: fast {fast}, full {full}")
+                assert(fast == full)
+        # The backtracking case: k4's nearest .b ancestor (k3) has no .a parent, the next one (k2) does.
+        var context = SelectorEngineMatchContext()
+        assert(selector_engine_fast_matches(test_selector_engine_selector(".a > .b .c"), test_selector_engine_by_id(&world, "k4"), none, &context))
+
+test "shadow hosts: :host, :host(), the blocked host, and traverse_up stopping at it (SelectorEngine.cpp:133, 578, 638)":
+    let world = test_selector_engine_world()
+    defer web_test_destroy_vm(world.vm)
+    let allocator: memory.Allocator = vm_heap(world.vm)
+    with allocator:
+        test_selector_engine_build(world.realm, world.document, world.root.dom_node(), "<div id=e class=x><span id=c></span></div><p id=o></p>")
+        let e = test_selector_engine_by_id(&world, "e")
+        let c = test_selector_engine_by_id(&world, "c")
+        let o = test_selector_engine_by_id(&world, "o")
+        var context = SelectorEngineMatchContext()
+
+        # :host matches the shadow host only, and only in the context of its shadow tree.
+        let host = test_selector_engine_selector(":host")
+        assert(test_selector_engine_matches(host, e, &context, e))
+        assert(not test_selector_engine_matches(host, e, &context))
+        assert(not test_selector_engine_matches(host, e, &context, o))
+        assert(test_selector_engine_matches(test_selector_engine_selector(":host(.x)"), e, &context, e))
+        assert(not test_selector_engine_matches(test_selector_engine_selector(":host(.y)"), e, &context, e))
+
+        # From within the shadow tree everything else is blocked from matching the host, including
+        # the arguments of :is() (matched with the same host).
+        assert(not test_selector_engine_matches(test_selector_engine_selector("div"), e, &context, e))
+        assert(test_selector_engine_matches(test_selector_engine_selector("div"), e, &context))
+        assert(not test_selector_engine_matches(test_selector_engine_selector(":is(div)"), e, &context, e))
+        let div_compounds = css_selector_compound_selectors(test_selector_engine_selector("div"))
+        let simple = ak.vector_first_const(&ak.vector_first_const(&div_compounds).simple_selectors)
+        assert(selector_engine_should_block_shadow_host_matching(simple, e, e))
+        assert(not selector_engine_should_block_shadow_host_matching(simple, e, c))
+        assert(not selector_engine_should_block_shadow_host_matching(simple, none, e))
+
+        # The full matcher's upward walk stops at the host (traverse_up), so `#root span` fails from
+        # inside it; the fast path walks parent_element() and does not stop (`div span` matches
+        # through div#root).
+        let descendant = test_selector_engine_selector("#root span")
+        let last = (i32)ak.vector_size(&descendant.m_compound_selectors) - 1
+        assert(not selector_engine_matches_compound_selector(descendant, last, dom_element_abstract_element(c), e, &context, none, SelectorEngineSelectorKind.normal))
+        assert(selector_engine_matches_compound_selector(descendant, last, dom_element_abstract_element(c), none, &context, none, SelectorEngineSelectorKind.normal))
+        assert(selector_engine_fast_matches(test_selector_engine_selector("div span"), c, e, &context))
+        assert(selector_engine_traverse_up_dom_node(c.dom_node(), e) == e.dom_node())
+        assert(selector_engine_traverse_up_dom_node(e.dom_node(), e) == none)
+        assert(selector_engine_traverse_up_dom_node(e.dom_node(), none) == world.root.dom_node())
+        assert(selector_engine_traverse_up_dom_node(none, none) == none)
+
+test "matches() and pseudo-element targets (SelectorEngine.cpp:1649)":
+    let world = test_selector_engine_world()
+    defer web_test_destroy_vm(world.vm)
+    let allocator: memory.Allocator = vm_heap(world.vm)
+    with allocator:
+        test_selector_engine_build(world.realm, world.document, world.root.dom_node(), "<p id=p class=x></p>")
+        let p = test_selector_engine_by_id(&world, "p")
+        let before = dom_element_abstract_element(p, css_data.PseudoElement.before)
+        let plain = dom_element_abstract_element(p)
+        var context = SelectorEngineMatchContext()
+        assert(selector_engine_matches(test_selector_engine_selector("p::before"), before, none, &context))
+        assert(selector_engine_matches(test_selector_engine_selector(".x::before"), before, none, &context))
+        assert(not selector_engine_matches(test_selector_engine_selector("p::after"), before, none, &context))
+        assert(not selector_engine_matches(test_selector_engine_selector("p::before"), plain, none, &context))
+        # A selector without a pseudo-element matches the element's pseudo-element targets too (the
+        # fast path, and the full one after the pseudo-element check, look at the element).
+        assert(selector_engine_matches(test_selector_engine_selector("p"), before, none, &context))
+        assert(selector_engine_matches(test_selector_engine_selector("p:nth-child(1)"), before, none, &context))
+        # ...but pseudo-classes on the target pseudo-element itself do not match.
+        var pseudo_context = SelectorEngineMatchContext()
+        let first_child = CssSelectorSimpleSelectorPseudoClassSelector(type_ = css_data.PseudoClass.first_child)
+        assert(not selector_engine_matches_pseudo_class(&first_child, before, none, &pseudo_context, none, SelectorEngineSelectorKind.normal))
+        assert(selector_engine_matches_pseudo_class(&first_child, plain, none, &pseudo_context, none, SelectorEngineSelectorKind.normal))
+
+test "language ranges match tags by RFC 4647 extended filtering (SelectorEngine.cpp:158)":
+    let cases = [
+        ("en", "en", true), ("en", "EN-us", true), ("en-US", "en", false), ("*", "fr", true), ("*-DE", "de-Latn-DE", true),
+        ("de-DE", "de-Latn-DE", true), ("de-DE", "de-x-DE", false), ("de-DE", "de-Latn-x-DE", false), ("de-*-DE", "de-DE", true),
+        ("zh-Hant", "zh-TW", false), ("en-GB", "en-GB-oed", true), ("e", "en", false), ("en-", "en", false),
+        ("en", "fr-en", false), ("x", "x-private", true),
+    ]
+    for test_case in cases:
+        let (range, tag, expected) = test_case
+        assert(selector_engine_language_range_matches_tag(ak.sv(range), ak.sv(tag)) == expected)
+
+test "class selectors match case-insensitively in quirks mode, on both paths (SelectorEngine.cpp:1410, 1702)":
+    let world = test_selector_engine_world()
+    defer web_test_destroy_vm(world.vm)
+    let allocator: memory.Allocator = vm_heap(world.vm)
+    with allocator:
+        test_selector_engine_build(world.realm, world.document, world.root.dom_node(), "<p id=p class=tEsT></p><b id=b></b>")
+        let p = test_selector_engine_by_id(&world, "p")
+        let b = test_selector_engine_by_id(&world, "b")
+        let fast = test_selector_engine_selector(".test")
+        let full = test_selector_engine_selector(".test + b")
+        var context = SelectorEngineMatchContext()
+        assert(not test_selector_engine_matches(fast, p, &context) and not test_selector_engine_matches(full, b, &context))
+        dom_document_set_quirks_mode(world.document, DomQuirksMode.yes)
+        assert(test_selector_engine_matches(fast, p, &context) and test_selector_engine_matches(full, b, &context))
+        dom_document_set_quirks_mode(world.document, DomQuirksMode.limited)
+        assert(not test_selector_engine_matches(fast, p, &context))
