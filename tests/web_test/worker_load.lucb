@@ -8,18 +8,24 @@
 #       HeadlessWebView then sets the 800x600 viewport. Phase 1 runs with scripting disabled
 #       (DESIGN.md §1.3), as SVG-as-image documents do upstream.
 #
-#       The document (DESIGN.md §6.1 step 3): phase 1 has no fetching, so the worker does what
-#       SVG/SVGDecodedImageData.cpp does for an image's bytes and what DocumentLoading.cpp's
-#       load_html_document does for a navigation response: a file: response whose URL list is
-#       the test's file URL (URL::create_with_file_scheme of its absolute path, as test-web
-#       loads it) and whose Content-Type is text/html, navigation params for it in the
-#       top-level traversable, Document::create_and_initialize, the new document made the
-#       traversable's active document (SVGDecodedImageData's activation, completed by
-#       Document::make_active as Navigable's activation of a history entry does), then
-#       HTMLParser::create_with_uncertain_encoding over the bytes and HTMLParser::run(url).
-#       The parser's "the end" completes the loading on the event loop (DOMContentLoaded, the
-#       load event, "completely finish loading"), and the page tells its client the document
-#       finished loading, which is when test-web injects its waiting script.
+#       The document (DESIGN.md §6.1 step 3): there is no navigation or body stream yet, so the
+#       worker does what SVG/SVGDecodedImageData.cpp does for an image's bytes and what
+#       DocumentLoading.cpp's load_document does for a navigation response: a file: response
+#       whose URL list is the test's file URL (URL::create_with_file_scheme of its absolute
+#       path, as test-web loads it) and whose Content-Type is the type LibCore guesses from the
+#       file's name (as ResourceLoader answers file: URLs), navigation params for it in the
+#       top-level traversable, the computed type of the response, Document::create_and_initialize,
+#       and the new document made the traversable's active document (SVGDecodedImageData's
+#       activation, completed by Document::make_active as Navigable's activation of a history
+#       entry does). An HTML document (load_html_document) is parsed by
+#       HTMLParser::create_with_uncertain_encoding over the bytes and HTMLParser::run(url); an XML
+#       document (load_xml_document: .xht, .xhtml, .svg, .xml) is made ready to run scripts, as
+#       the activation does, and given the bytes by load_xml_document's process_body steps, which
+#       decode them and run the XML parser (XMLDocumentBuilder over luce-xml). The parser's "the
+#       end" (HTML) or document_end (XML) completes the loading on the event loop
+#       (DOMContentLoaded, the load event, "completely finish loading"), and the page tells its
+#       client the document finished loading, which is when test-web injects its waiting
+#       script.
 #
 #       The waits (test-web's afterFontsAndPaint, natively): document.fonts.ready, then two
 #       animation frame callbacks (`requestAnimationFrame(() => requestAnimationFrame(...))`:
@@ -92,16 +98,73 @@ func worker_create_page(vm: web.Vm*, event_loop: WorkerEventLoop*, rendering: bo
 func worker_file_url(path: str) -> web_url.Url:
     return web_url.create_with_file_scheme(ak.byte_string_from_str(path), ak.byte_string_empty(), ak.byte_string_empty()) else trap("web_test: the test path is not a file URL")
 
-## A response of a navigation to `url` as a file: fetch delivers it: its URL list « url » and a
-## `Content-Type: text/html` header.
+## The registered types a test's file can be, in the order of LibCore's s_registered_mime_type
+## (Libraries/LibCore/MimeData.cpp): each name with the extensions it is guessed from.
+struct WorkerMimeTypeGuess:
+    let name: str
+    let extensions: str[3]
+
+## The rows of s_registered_mime_type that name the extensions of test documents, in order ("" ends
+## a row's extensions).
+let worker_mime_type_guesses: WorkerMimeTypeGuess[5] = [
+    WorkerMimeTypeGuess(name = "application/pdf", extensions = [".pdf", "", ""]),
+    WorkerMimeTypeGuess(name = "application/xhtml+xml", extensions = [".xhtml", ".xht", ""]),
+    WorkerMimeTypeGuess(name = "image/svg+xml", extensions = [".svg", "", ""]),
+    WorkerMimeTypeGuess(name = "text/html", extensions = [".html", ".htm", "/"]),
+    WorkerMimeTypeGuess(name = "text/xml", extensions = [".xml", "", ""]),
+]
+
+## Core::guess_mime_type_based_on_filename (Libraries/LibCore/MimeData.cpp:151), over the rows of
+## worker_mime_type_guesses: the type of the first row with an extension `path` ends with.
+func worker_guess_mime_type(path: str) -> str:
+    for mime_type in worker_mime_type_guesses:
+        for possible_extension in mime_type.extensions:
+            if possible_extension.length > 0 and strings.ends_with(path, possible_extension):
+                return mime_type.name
+    return "application/octet-stream"
+
+## A response of a navigation to the file `url` as a file: fetch delivers it
+## (ResourceLoader's response_headers_for_file): its URL list « url » and a Content-Type header
+## of the type guessed from the file's name.
 func worker_file_response(vm: web.Vm*, url: web_url.Url) -> web.FetchResponse*:
     let response = web.fetch_infrastructure_response_create(vm)
     ak.vector_append_t(web.fetch_response_url_list(response), url)
-    web.http_header_list_append(web.fetch_response_header_list(response), web.http_header_create(ak.sv("Content-Type"), ak.sv("text/html")))
+    let path_string = web_url.url_file_path(&url)
+    let mime_type = worker_guess_mime_type(ak.string_view_text(ak.byte_string_view(&path_string)))
+    web.http_header_list_append(web.fetch_response_header_list(response), web.http_header_create(ak.sv("Content-Type"), ak.sv(mime_type)))
     return response
 
-## Loads the HTML `bytes` of the file `url` into the page's top-level traversable as its active
-## document (see the header) and starts parsing them. Answers the document.
+## load_document, step 1: the computed type of the response (the supplied type of its
+## Content-Type header, sniffed in a browsing context over the file's first bytes).
+func worker_computed_type(response: web.FetchResponse*, bytes: const u8[]) -> web.MimeType:
+    var configuration = web.MimeSniffingConfiguration()
+    web.mime_sniffing_configuration_init_fields(&configuration)
+    configuration.sniffing_context = web.MimeSniffingContext.browsing
+    configuration.supplied_type = web.fetch_extract_mime_type(web.fetch_response_header_list(response))
+    let sniffed = bytes[..<bytes.length] if bytes.length <= 1445 else bytes[..<1445]
+    return web.mime_resource_sniff(sniffed, configuration)
+
+## The new document replaces the navigable's (see the header): SVGDecodedImageData::create's
+## replacement, then the activation of its history entry.
+func worker_activate_document(page: const WorkerPage*, document: web.DomDocument*):
+    let navigable = (web.HtmlNavigable*)page.traversable
+    # SVGDecodedImageData::create: the new document replaces the navigable's (FIXME there: use
+    # Navigable::navigate, which is phase 2), then the activation of its history entry.
+    # SVGDecodedImageData also destroys the replaced document. A navigation does not: it
+    # unloads the previous document and destroys it only when it is not salvageable
+    # (Document::unload, step 16), and neither the initial about:blank document nor a test
+    # document a reftest's reference replaces has done anything to lose that state.
+    web.html_navigable_set_ongoing_navigation(navigable, web.EmptyOrHtmlNavigableTraversalOrString.empty)
+    web.html_navigable_set_active_document(navigable, document)
+    web.dom_document_make_active(document)
+    # Navigable::activate_history_entry, step 6: set the initial visibility state of the document to the navigable's
+    # traversable navigable's system visibility state (a hidden document is not rendered).
+    web.dom_document_set_initial_visibility_state(document, web.html_traversable_navigable_system_visibility_state(page.traversable))
+
+## Loads the `bytes` of the file `url` into the page's top-level traversable as its active
+## document and starts parsing them, as load_document does for the computed type (see the
+## header): an HTML document (load_html_document) or an XML document (load_xml_document).
+## Answers the document.
 func worker_load_document(page: const WorkerPage*, vm: web.Vm*, url: web_url.Url, bytes: const u8[]) -> web.DomDocument*:
     let heap = web.vm_heap(vm)
     let navigable = (web.HtmlNavigable*)page.traversable
@@ -117,29 +180,44 @@ func worker_load_document(page: const WorkerPage*, vm: web.Vm*, url: web_url.Url
                                                                      origin, policy_container, (web.HtmlSandboxingFlagSet)0, coop, none,
                                                                      web.HtmlUserNavigationInvolvement.browser_ui)
 
-    # load_html_document, step 1: create and initialize a Document of "html" and "text/html".
-    let document = web.dom_document_create_and_initialize(web.DocumentDomDocumentType.html, ak.string_from_str("text/html"), navigation_params) else trap("web_test: Document::create_and_initialize threw")
-
-    # SVGDecodedImageData::create: the new document replaces the navigable's (FIXME there: use
-    # Navigable::navigate, which is phase 2), then the activation of its history entry.
-    # SVGDecodedImageData also destroys the replaced document. A navigation does not: it
-    # unloads the previous document and destroys it only when it is not salvageable
-    # (Document::unload, step 16), and neither the initial about:blank document nor a test
-    # document a reftest's reference replaces has done anything to lose that state.
-    web.html_navigable_set_ongoing_navigation(navigable, web.EmptyOrHtmlNavigableTraversalOrString.empty)
-    web.html_navigable_set_active_document(navigable, document)
-    web.dom_document_make_active(document)
-    # Navigable::activate_history_entry, step 6: set the initial visibility state of the document to the navigable's
-    # traversable navigable's system visibility state (a hidden document is not rendered).
-    web.dom_document_set_initial_visibility_state(document, web.html_traversable_navigable_system_visibility_state(page.traversable))
-    worker_stage("created")
-
-    # load_html_document, step 3: an HTML parser over the response's body.
+    let type_ = worker_computed_type(response, bytes)
     let input = ak.byte_buffer_copy_span_u8(bytes) else trap("out of memory")
-    let parser = web.html_parser_create_with_uncertain_encoding(document, input)
-    web.html_parser_run_url(parser, url)
-    worker_stage("parsed")
-    return document
+
+    # -> an HTML MIME type
+    if web.mime_type_is_html(&type_):
+        # load_html_document, step 1: create and initialize a Document of "html" and "text/html".
+        let document = web.dom_document_create_and_initialize(web.DocumentDomDocumentType.html, ak.string_from_str("text/html"), navigation_params) else trap("web_test: Document::create_and_initialize threw")
+        worker_activate_document(page, document)
+        worker_stage("created")
+
+        # load_html_document, step 3: an HTML parser over the response's body.
+        let parser = web.html_parser_create_with_uncertain_encoding(document, input)
+        web.html_parser_run_url(parser, url)
+        worker_stage("parsed")
+        return document
+
+    # -> an XML MIME type that is not an explicitly supported XML MIME type
+    if web.mime_type_is_xml(&type_):
+        # load_xml_document: create and initialize a Document of "xml" and the type's essence.
+        let document = web.dom_document_create_and_initialize(web.DocumentDomDocumentType.xml, web.mime_type_essence(&type_), navigation_params) else trap("web_test: Document::create_and_initialize threw")
+        worker_activate_document(page, document)
+        # Document::update_for_history_step_application, step 8.4: at this point scripts may run for
+        # the newly-created document (which starts a parser load_xml_document deferred).
+        web.dom_document_set_ready_to_run_scripts(document)
+        worker_stage("created")
+
+        # load_xml_document's process_body with the body's bytes, which Body::fully_read reads from
+        # the body's stream (phase 4): the charset of the type, decoding, then the XML parser.
+        var content_encoding: ak.String? = none
+        if let maybe_encoding = ak.ordered_hash_map_get_k_const(web.mime_type_parameters(&type_), ak.string_from_str("charset")):
+            content_encoding = *maybe_encoding
+        let process_body = new web.DocumentLoadingProcessXmlBody(document = document, url = url, content_encoding = content_encoding, mime = type_) else trap("out of memory")
+        web.DocumentLoadingProcessXmlBody.call(process_body, input)
+        worker_stage("parsed")
+        return document
+
+    let essence = web.mime_type_essence(&type_)
+    trap(f"web_test: unported: loading a document of type {ak.string_view_text(ak.string_bytes_as_string_view(&essence))}")
 
 ## Whether the client was told that `url` finished loading.
 func worker_finished_loading(client: WorkerPageClient*, url: const web_url.Url*) -> bool:

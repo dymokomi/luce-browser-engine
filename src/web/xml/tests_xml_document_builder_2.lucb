@@ -1,0 +1,131 @@
+#==============================================================================================
+#
+#   tests_xml_document_builder_2 - region p2x: where the port deviates, and what the oracle
+#                                  does not reach
+#
+#   DESCRIPTION:
+#       The cases of the oracle's cases.txt marked "!": luce-xml in libxml2's place builds
+#       these differently on purpose (external/lib_xml/parser's header), so they are pinned to
+#       the port's own results: entity references in attribute values are replaced (libxml2's
+#       SAX2 leaves `&e;` and writes `&amp;` as `&#38;`), an entity declared through a
+#       parameter entity is read, and a namespace error stops the parse before the builder
+#       sees the element (libxml2 goes on and the builder fails too). Then XML::Parser itself:
+#       luce-xml's error messages in the ParseError format, the parse error causes,
+#       preserve_cdata off, and set_source. (MAX_XML_TREE_DEPTH is not tested: a tree 5000
+#       elements deep takes minutes to build, here as in the reference build, since every
+#       insertion walks its ancestors.)
+#
+#==============================================================================================
+
+# mark: Helpers ==================================================================================
+
+## Runs `body` with a new VM's heap current, a settings realm and web_initialize_strings done.
+struct TestXmlWorld:
+    var vm: Vm*
+    var realm: Realm*
+
+## A case of `mode` over `source` (and `markup` for frag), its output normalized as the table's.
+func test_xml_case(world: TestXmlWorld*, mode: str, source: str, markup: str = "") -> ak.String:
+    let test_case = TestXmlDocumentCase(mode = mode, arguments = [source, markup], expected = "")
+    return test_xml_run(world.realm, &test_case)
+
+## Asserts that `actual` is `expected`, printing both when not.
+func test_xml_expect(actual: ak.String, expected: str):
+    if ak.string_eq_string_view(&actual, ak.sv(expected)):
+        return
+    let view = ak.string_bytes_as_string_view(&actual)
+    print(f"expected:\n{expected}actual:\n{(str)ak.string_view_bytes(&view)}")
+    assert(false, "output differs")
+
+## A new VM and its settings realm, strings initialized.
+func test_xml_world() -> TestXmlWorld:
+    web_initialize_strings()
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    return TestXmlWorld(vm = vm, realm = realm)
+
+# mark: Deviations ===============================================================================
+
+test "deviation: entity references in attribute values are replaced, as XML specifies":
+    var world = test_xml_world()
+    defer web_test_destroy_vm(world.vm)
+    let allocator: memory.Allocator = vm_heap(world.vm)
+    with allocator:
+        # The reference build keeps a="&e;".
+        test_xml_expect(test_xml_case(&world, "load", "<!DOCTYPE x [<!ENTITY e \"hi\">]><x a=\"&e;\">t</x>"),
+                        "has_error false\n| <!DOCTYPE x \"\" \"\">\n| <x> Element\n|   a=\"hi\"\n|   \"t\"\n")
+        # The reference build writes href="x?a=1&#38;b=2&#38;c<A".
+        test_xml_expect(test_xml_case(&world, "load", "<a href=\"x?a=1&amp;b=2&#38;c&lt;&#x41;\">t &amp; u &#60; v</a>"),
+                        "has_error false\n| <a> Element\n|   href=\"x?a=1&b=2&c<A\"\n|   \"t & u < v\"\n")
+
+test "deviation: an entity declared through a parameter entity reference is read":
+    var world = test_xml_world()
+    defer web_test_destroy_vm(world.vm)
+    let allocator: memory.Allocator = vm_heap(world.vm)
+    with allocator:
+        # The reference build drops &q; as undeclared.
+        test_xml_expect(test_xml_case(&world, "load", "<!DOCTYPE a [<!ENTITY % p \"<!ENTITY q 'v'>\"> %p;]><a>&nbsp;&q;</a>"),
+                        "has_error false\n| <!DOCTYPE a \"\" \"\">\n| <a> Element\n|   \"v\"\n")
+
+test "deviation: a namespace error stops the parse before the builder sees the element":
+    var world = test_xml_world()
+    defer web_test_destroy_vm(world.vm)
+    let allocator: memory.Allocator = vm_heap(world.vm)
+    with allocator:
+        # The reference build's builder also fails (has_error true): libxml2 goes on after the error.
+        let error_document = "has_error false\nerror *\n| <html html> HTMLHtmlElement\n|   <html body> HTMLBodyElement\n|     \"Failed to parse XML document: *\"\n"
+        test_xml_expect(test_xml_normalize(test_xml_case(&world, "load", "<svg:rect/>")), error_document)
+        test_xml_expect(test_xml_normalize(test_xml_case(&world, "load", "<a:b:c xmlns:a=\"urn:a\"/>")), error_document)
+        # The reference build's tree holds the element <x:a> was not (an Element whose validate_and_extract failed is not made).
+        test_xml_expect(test_xml_case(&world, "build", "<x:a/>"), "result false\n")
+
+# mark: XML::Parser ==============================================================================
+
+## Parses `source` into a new XML document with `options`; answers the ParseError, if any.
+func test_xml_parse(world: TestXmlWorld*, source: str, options: XmlParserOptions) -> (DomDocument*, XmlParseError?, usize):
+    let document = web_test_create_document(world.realm, DocumentDomDocumentType.xml)
+    var parser = xml_parser_create(ak.sv(source), options)
+    var builder = XmlDocumentBuilder(vtable = &xml_document_builder_vtable, m_document = document)
+    xml_document_builder_construct(&builder, document)
+    let result = xml_parser_parse_with_listener(&parser, &builder)
+    return (document, result, ak.vector_size(xml_parser_parse_error_causes(&parser)))
+
+test "XML::Parser: luce-xml's errors in the ParseError format, with their causes":
+    var world = test_xml_world()
+    defer web_test_destroy_vm(world.vm)
+    let allocator: memory.Allocator = vm_heap(world.vm)
+    with allocator:
+        let (document, result, causes) = test_xml_parse(&world, "<a>\n  <b></a>", XmlParserOptions())
+        let parse_error = result else trap("expected a parse error")
+        let message = xml_parse_error_to_string(&parse_error)
+        assert(ak.string_eq_string_view(&message, ak.sv("the end tag </a> does not match the start tag <b> at line: 2, col: 6 (offset 9)")))
+        assert(causes == 1)
+        # The builder kept what it built before the error, and the document ended.
+        let root = dom_document_document_element(document) else trap("the root element")
+        assert(tree_node_first_child(root.dom_node()) != none)
+        assert(dom_document_readiness(document) == HtmlDocumentReadyState.complete)
+
+        let (_, empty_result, _) = test_xml_parse(&world, "", XmlParserOptions())
+        let empty_error = empty_result else trap("expected a parse error")
+        let empty_message = xml_parse_error_to_string(&empty_error)
+        assert(ak.string_eq_string_view(&empty_message, ak.sv("the document has no root element at line: 1, col: 1 (offset 0)")))
+
+test "XML::Parser: without preserve_cdata a CDATA section is text, joined with the text around it":
+    var world = test_xml_world()
+    defer web_test_destroy_vm(world.vm)
+    let allocator: memory.Allocator = vm_heap(world.vm)
+    with allocator:
+        let (document, result, _) = test_xml_parse(&world, "<a>x<![CDATA[<y>]]>z</a>", XmlParserOptions(preserve_cdata = false))
+        assert(result == none)
+        var builder = ak.string_builder_new()
+        test_xml_dump_children(&builder, document.dom_node())
+        test_xml_expect(ak.string_builder_to_string_without_validation(&builder), "| <a> Element\n|   \"x<y>z\"\n")
+
+test "XMLDocumentBuilder::set_source: the document's source is the parser's":
+    var world = test_xml_world()
+    defer web_test_destroy_vm(world.vm)
+    let allocator: memory.Allocator = vm_heap(world.vm)
+    with allocator:
+        let (document, result, _) = test_xml_parse(&world, "<a>é</a>", XmlParserOptions())
+        assert(result == none)
+        let source = dom_document_source(document)
+        assert(ak.string_eq_string_view(&source, ak.sv("<a>é</a>")))

@@ -1,0 +1,352 @@
+#==============================================================================================
+#
+#   parser - XML::Parser over luce-xml: the parser XMLDocumentBuilder listens to
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibXML/Parser/Parser.cpp (lines 1-543) and Parser.h (lines 1-92),
+#       the parser behind every XML document LibWeb builds. Ladybird's XML::Parser is a
+#       wrapper over libxml2's SAX2 push parser: parse_with_listener hands the source to its
+#       listener (set_source), lets libxml2 parse it, and turns libxml2's SAX callbacks into
+#       XML::Listener calls (create_sax_handler's table of static handlers). Here luce-xml, our
+#       conforming XML 1.0 + Namespaces parser, takes libxml2's place (DESIGN.md §7.0 and §8.2,
+#       "Decisions of the phase-2 closure"): XmlParserContext, the C++ ParserContext, is the
+#       luce-xml Listener, and its event() calls the handlers below for the events libxml2
+#       would have called them for. XMLDocumentBuilder is LibWeb's only XML::Listener, so the
+#       handlers call its vtable's slots (its dispatchers) directly.
+#
+#       What the libxml2 options become:
+#
+#           xmlSwitchEncoding(UTF8)    the source is decoded already: xml.Options.assume_utf8
+#           XML_PARSE_NONET            luce-xml never fetches; resolve() answers no external
+#                                      entity and no external DTD subset
+#           XML_PARSE_NOWARNING        luce-xml reports errors only; an undeclared entity where
+#                                      XML allows one (libxml2's warning) is skipped
+#           XML_PARSE_NOCDATA          (preserve_cdata off) a CDATA section is text
+#           comment handler unset      (preserve_comments off) comments are dropped
+#           getEntity, externalSubset  (resolve_named_html_entity set) the HTML named
+#                                      characters of XHTML documents: resolve()'s `named`
+#           MAX_XML_TREE_DEPTH         the start handler's own check, as in C++
+#
+#       libxml2 recovers from namespace errors and some others and goes on calling handlers
+#       (the error still fails the parse); luce-xml stops at the first well-formedness or
+#       namespace error. Parse error messages are luce-xml's, not libxml2's. Attribute values
+#       are as XML specifies them (references replaced, §3.3.3): libxml2's SAX2 interface
+#       without XML_PARSE_NOENT leaves a declared entity's reference in an attribute value
+#       unexpanded and writes `&amp;` as `&#38;`, which the reference build keeps.
+#
+#       Parser::parse (the XML::Document tree builder) is not ported: LibWeb never calls it,
+#       and luce-xml has its own tree (xml.Document) for programs that want one.
+#
+#       Copyright (c) 2022, Ali Mohammad Pur <mpfard@serenityos.org>
+#       Copyright (c) 2026, the Ladybird developers.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Parser.h ================================================================================
+
+## XML::Parser::Options (Libraries/LibXML/Parser/Parser.h:55). LibWeb always sets
+## `resolve_named_html_entity` to Web::resolve_named_html_entity.
+pub struct XmlParserOptions:
+    pub var preserve_cdata: bool = true
+    pub var preserve_comments: bool = false
+    pub var treat_errors_as_fatal: bool = true
+    pub var resolve_named_html_entity: (func(ak.StringView) -> ak.String?)? = none
+
+## XML::ParseError (Libraries/LibXML/Parser/Parser.h:28): where and why a parse failed. Its
+## `Variant<ByteString, Expectation> error` is the ByteString alone: the parser never makes an
+## Expectation.
+pub struct XmlParseError:
+    pub var position: ak.LineTrackingLexerPosition
+    pub var error: ak.ByteString
+
+## XML::Parser (Libraries/LibXML/Parser/Parser.h:51).
+pub struct XmlParser:
+    pub var m_source: ak.StringView
+    pub var m_options: XmlParserOptions
+    pub var m_parse_errors: ak.Vector[XmlParseError]
+
+## Ported from Parser.h:62 XML::Parser::Parser(StringView, Options).
+pub func xml_parser_create(source: ak.StringView, options: XmlParserOptions = XmlParserOptions()) -> XmlParser:
+    return XmlParser(m_source = source, m_options = options)
+
+## Ported from Parser.h:76 XML::Parser::parse_error_causes.
+pub func xml_parser_parse_error_causes(this: const XmlParser*) -> const ak.Vector[XmlParseError]*:
+    return &this.m_parse_errors
+
+## Ported from Parser.h:84 AK::Formatter<XML::ParseError>::format: `"{} at line: {}, col: {} (offset {})"`.
+pub func xml_parse_error_to_string(parse_error: const XmlParseError*) -> ak.String:
+    var builder = ak.string_builder_new()
+    ak.string_builder_append_string_view(&builder, ak.byte_string_view(&parse_error.error))
+    let position = parse_error.position
+    var buffer: u8[96]
+    ak.string_builder_append(&builder, format(buffer, f" at line: {position.line}, col: {position.column} (offset {position.offset})") else trap("format"))
+    return ak.string_builder_to_string_without_validation(&builder)
+
+# mark: The parser context ======================================================================
+
+## Ported from Parser.cpp:17 MAX_XML_TREE_DEPTH.
+let xml_max_xml_tree_depth: i32 = 5000
+
+## ParserContext (Parser.cpp:19): what the handlers share, and the luce-xml listener that calls
+## them (libxml2's xmlSAXHandler, create_sax_handler). The tree-building members (root_node,
+## current_node, doctype, processing_instructions) and the document's version serve only
+## Parser::parse, which is not ported. `resolved_entities` keeps the answers of
+## get_entity_handler alive until the parse returns, as luce-xml needs (C++ copies each into a
+## static buffer).
+struct XmlParserContext: xml.Listener:
+    var listener: XmlDocumentBuilder*
+    var error: XmlParseError?
+    var document_ended: bool
+    var parse_errors: ak.Vector[XmlParseError]
+    var options: const XmlParserOptions*
+    var is_xhtml_document: bool
+    var depth: i32
+    var resolved_entities: ak.Vector[ak.String]
+
+    pub mutating func event(event: xml.Event) -> !: try xml_parser_context_event(&self, event)
+
+    pub mutating func resolve(request: const xml.EntityRequest*) -> const u8[]?: return xml_parser_context_resolve(&self, request)
+
+## The SAX handler table (Parser.cpp:430 create_sax_handler): each event to the handler libxml2
+## calls for it. The comment handler is set only when comments are preserved; with
+## XML_PARSE_NOCDATA (preserve_cdata off) libxml2 reports a CDATA section as characters.
+func xml_parser_context_event(context: XmlParserContext*, event: xml.Event) -> !:
+    match event:
+        .document_start(declaration):
+            xml_start_document_handler(context, declaration)
+        .doctype(doctype):
+            xml_internal_subset_handler(context, doctype)
+        .element_start(element):
+            try xml_start_element_ns_handler(context, element)
+        .element_end(name):
+            xml_end_element_ns_handler(context, name)
+        .text(text):
+            xml_characters_handler(context, text)
+        .cdata(text):
+            if context.options.preserve_cdata:
+                xml_cdata_block_handler(context, text)
+            else:
+                xml_characters_handler(context, text)
+        .processing_instruction(target, data):
+            xml_processing_instruction_handler(context, target, data)
+        .comment(text):
+            if context.options.preserve_comments:
+                xml_comment_handler(context, text)
+        .parse_error(failure):
+            xml_structured_error_handler(context, failure)
+        .document_end:
+            xml_end_document_handler(context)
+
+## What luce-xml asks the listener for. The external DTD subset is never read
+## (XML_PARSE_NONET, no XML_PARSE_DTDLOAD); asking for it is where libxml2 calls the
+## externalSubset handler. A `named` request is libxml2's getEntity for a name the document does
+## not declare. External entities are never read.
+func xml_parser_context_resolve(context: XmlParserContext*, request: const xml.EntityRequest*) -> const u8[]?:
+    let resolve_html_entities = context.options.resolve_named_html_entity != none
+    match request.kind:
+        .document_type:
+            if resolve_html_entities:
+                xml_external_subset_handler(context, request.public_id)
+            return none
+        .named:
+            if resolve_html_entities:
+                return xml_get_entity_handler(context, request.name)
+            return none
+        .parameter, .general:
+            return none
+
+# mark: Parser.cpp ==============================================================================
+
+## Ported from Parser.cpp:58 XML::is_known_xhtml_public_id.
+func xml_is_known_xhtml_public_id(public_id: str) -> bool:
+    let known: str[11] = ["-//W3C//DTD XHTML 1.0 Transitional//EN", "-//W3C//DTD XHTML 1.1//EN", "-//W3C//DTD XHTML 1.0 Strict//EN",
+                          "-//W3C//DTD XHTML 1.0 Frameset//EN", "-//W3C//DTD XHTML Basic 1.0//EN", "-//W3C//DTD XHTML 1.1 plus MathML 2.0//EN",
+                          "-//W3C//DTD XHTML 1.1 plus MathML 2.0 plus SVG 1.1//EN", "-//W3C//DTD MathML 2.0//EN",
+                          "-//WAPFORUM//DTD XHTML Mobile 1.0//EN", "-//WAPFORUM//DTD XHTML Mobile 1.1//EN", "-//WAPFORUM//DTD XHTML Mobile 1.2//EN"]
+    for candidate in known:
+        if public_id == candidate:
+            return true
+    return false
+
+## Ported from Parser.cpp:75 XML::external_subset_handler: the document is XHTML when its DOCTYPE
+## names a known XHTML public identifier.
+func xml_external_subset_handler(context: XmlParserContext*, external_id: str?):
+    let public_id = external_id else return
+    if xml_is_known_xhtml_public_id(public_id):
+        context.is_xhtml_document = true
+
+## The longest answer get_entity_handler gives (the size of its static buffer, Parser.cpp:88).
+let xml_xhtml_entity_utf8_buffer_size: usize = 32
+
+## Ported from Parser.cpp:90 XML::get_entity_handler, for a name the document does not declare
+## (luce-xml resolves the predefined entities and the document's own). For XHTML documents, named
+## character entities (e.g., &nbsp;) are resolved from the HTML entity table.
+func xml_get_entity_handler(context: XmlParserContext*, name: str) -> const u8[]?:
+    if not context.is_xhtml_document:
+        return none
+
+    # For XHTML documents, resolve named character entities (e.g., &nbsp;) using the
+    # HTML entity table. This avoids parsing a large embedded DTD on every document
+    # and matches the approach used by Blink and WebKit.
+    let resolve = context.options.resolve_named_html_entity else return none
+
+    let resolved = resolve(ak.sv(name)) else return none
+
+    let utf8_bytes = ak.string_bytes_as_string_view(&resolved)
+    if ak.string_view_length(&utf8_bytes) >= xml_xhtml_entity_utf8_buffer_size:
+        return none
+
+    ak.vector_append_t(&context.resolved_entities, resolved)
+    let kept = ak.vector_last(&context.resolved_entities)
+    let kept_view = ak.string_bytes_as_string_view(kept)
+    return ak.string_view_bytes(&kept_view)
+
+## Ported from Parser.cpp:130 XML::start_document_handler. (The document's version serves only
+## Parser::parse; XMLDocumentBuilder keeps Listener's empty document_start.)
+func xml_start_document_handler(context: XmlParserContext*, declaration: const xml.Declaration*):
+    discard(context)
+    discard(declaration)
+
+## Ported from Parser.cpp:149 XML::end_document_handler.
+func xml_end_document_handler(context: XmlParserContext*):
+    context.document_ended = true
+    xml_document_builder_document_end(context.listener)
+
+## Ported from Parser.cpp:160 XML::start_element_ns_handler. The name is the qualified name as
+## written (C++ joins libxml2's prefix and local name); the attributes are the namespace
+## declarations first, as libxml2 lists them apart (the binding of `xml`, which libxml2 never
+## reports, left out), then the others in order, the DTD's defaults last.
+func xml_start_element_ns_handler(context: XmlParserContext*, element: const xml.Element*) -> !:
+    context.depth += 1
+    if context.depth > xml_max_xml_tree_depth:
+        # (libxml2's input offset is not known here.)
+        let parse_error = XmlParseError(position = ak.LineTrackingLexerPosition(offset = 0), error = ak.byte_string_from_str("Excessive node nesting."))
+        ak.vector_append_t(&context.parse_errors, parse_error)
+
+        # (context->listener->error(parse_error): XMLDocumentBuilder keeps Listener's empty error.)
+
+        # xmlStopParser(parser_ctx);
+        error(ak.ak_error, "Excessive node nesting.")
+
+    let name = ak.byte_string_from_str(element.name.qualified)
+
+    var attrs: ak.OrderedHashMap[ak.ByteString, ak.ByteString, ByteStringTraits]
+
+    for attribute in element.attributes:
+        if attribute.name.namespace != xml.xmlns_namespace:
+            continue
+        if attribute.name.prefix == "xmlns" and attribute.name.local_name == "xml" and attribute.value == xml.xml_namespace:
+            continue
+        discard(ak.ordered_hash_map_set(&attrs, ak.byte_string_from_str(attribute.name.qualified), ak.byte_string_from_str(attribute.value)))
+
+    for attribute in element.attributes:
+        if attribute.name.namespace == xml.xmlns_namespace:
+            continue
+        discard(ak.ordered_hash_map_set(&attrs, ak.byte_string_from_str(attribute.name.qualified), ak.byte_string_from_str(attribute.value)))
+
+    xml_document_builder_element_start(context.listener, name, &attrs)
+
+## Ported from Parser.cpp:249 XML::end_element_ns_handler.
+func xml_end_element_ns_handler(context: XmlParserContext*, name: const xml.Name*):
+    context.depth -= 1
+    xml_document_builder_element_end(context.listener, ak.byte_string_from_str(name.qualified))
+
+## Ported from Parser.cpp:272 XML::characters_handler.
+func xml_characters_handler(context: XmlParserContext*, text: str):
+    xml_document_builder_text(context.listener, ak.sv(text))
+
+## Ported from Parser.cpp:301 XML::cdata_block_handler.
+func xml_cdata_block_handler(context: XmlParserContext*, value: str):
+    xml_document_builder_cdata_section(context.listener, ak.sv(value))
+
+## Ported from Parser.cpp:325 XML::comment_handler.
+func xml_comment_handler(context: XmlParserContext*, value: str):
+    xml_document_builder_comment(context.listener, ak.sv(value))
+
+## Ported from Parser.cpp:347 XML::processing_instruction_handler. (Processing instructions inside
+## a DTD subset are not document children: luce-xml does not report them.)
+func xml_processing_instruction_handler(context: XmlParserContext*, target: str, data: str):
+    xml_document_builder_processing_instruction(context.listener, ak.sv(target), ak.sv(data))
+
+## Ported from Parser.cpp:368 XML::internal_subset_handler: the DOCTYPE's name and external ID
+## (a missing system literal is empty).
+func xml_internal_subset_handler(context: XmlParserContext*, doctype: const xml.Doctype*):
+    var external_id: XmlExternalId? = none
+    if doctype.public_id != none or doctype.system_id != none:
+        var public_id: XmlPublicId? = none
+        if let external = doctype.public_id:
+            public_id = XmlPublicId(public_literal = ak.byte_string_from_str(external))
+        let system_literal = ak.byte_string_from_str(doctype.system_id else "")
+        external_id = XmlExternalId(public_id = public_id, system_id = XmlSystemId(system_literal = system_literal))
+
+    xml_document_builder_set_doctype(context.listener, XmlDoctype(type_ = ak.byte_string_from_str(doctype.name), external_id = external_id))
+
+## Ported from Parser.cpp:393 XML::structured_error_handler: the error luce-xml stopped at, with its
+## line, column and byte offset.
+func xml_structured_error_handler(context: XmlParserContext*, failure: const xml.ParseError*):
+    let position = ak.LineTrackingLexerPosition(offset = failure.position.offset, line = failure.position.line, column = failure.position.column)
+    let message = ak.sv(failure.message)
+    let parse_error = XmlParseError(position = position, error = ak.byte_string_from_string_view(ak.string_view_trim_whitespace(&message)))
+
+    ak.vector_append_t(&context.parse_errors, parse_error)
+
+    # (context->listener->error(parse_error): XMLDocumentBuilder keeps Listener's empty error.)
+
+    if context.error == none:
+        context.error = parse_error
+
+## Ported from Parser.cpp:452 XML::Parser::parse_with_listener. Answers the ParseError of the C++
+## `ErrorOr<void, ParseError>`, none when the document parsed.
+pub func xml_parser_parse_with_listener(this: XmlParser*, listener: XmlDocumentBuilder*) -> XmlParseError?:
+    xml_document_builder_set_source(listener, ak.byte_string_from_string_view(this.m_source)) catch:
+        return XmlParseError(position = ak.LineTrackingLexerPosition(), error = ak.byte_string_from_str("Failed to set source"))
+
+    var context = XmlParserContext(listener = listener, options = &this.m_options)
+
+    # XML_PARSE_NONET | XML_PARSE_NOWARNING (and XML_PARSE_NOCDATA): see the header. luce-xml's own
+    # depth limit is set past MAX_XML_TREE_DEPTH, which the start handler enforces.
+    var parser = xml.Parser(options = xml.Options(assume_utf8 = true, max_depth = (usize)xml_max_xml_tree_depth + 1))
+    defer parser.release()
+
+    var well_formed = true
+    parser.parse(ak.string_view_bytes(&this.m_source), &context) catch:
+        well_formed = false
+        recover ()
+
+    this.m_parse_errors = context.parse_errors
+
+    if not context.document_ended:
+        xml_document_builder_document_end(listener)
+
+    if let context_error = context.error:
+        if this.m_options.treat_errors_as_fatal:
+            return context_error
+
+    if not well_formed:
+        if not ak.vector_is_empty(&this.m_parse_errors):
+            return *ak.vector_first(&this.m_parse_errors)
+        return XmlParseError(position = ak.LineTrackingLexerPosition(), error = ak.byte_string_from_str("XML parsing failed"))
+
+    return none
+
+# mark: Parsing into an XMLDocumentBuilder =====================================================
+
+## The outcome of parsing into an XMLDocumentBuilder: parse_with_listener's error (formatted as
+## AK formats an XML::ParseError) and builder.has_error().
+pub struct XmlParseWithDocumentBuilderResult:
+    pub var parse_error: ak.String?
+    pub var builder_has_error: bool
+
+## `XML::Parser parser(source, options); XMLDocumentBuilder builder { document, scripting_support };
+## auto result = parser.parse_with_listener(builder);`, the three lines every caller in LibWeb
+## writes (DocumentLoading, SVGDecodedImageData; XMLFragmentParser keeps its own).
+pub func xml_parse_with_document_builder(document: DomDocument*, source: ak.String, options: XmlParserOptions,
+                                         scripting_support: XmlScriptingSupport = XmlScriptingSupport.enabled) -> XmlParseWithDocumentBuilderResult:
+    var parser = xml_parser_create(ak.string_bytes_as_string_view(&source), options)
+    var builder = XmlDocumentBuilder(vtable = &xml_document_builder_vtable, m_document = document)
+    xml_document_builder_construct(&builder, document, scripting_support)
+    var parse_error: ak.String? = none
+    if let result = xml_parser_parse_with_listener(&parser, &builder):
+        parse_error = xml_parse_error_to_string(&result)
+    return XmlParseWithDocumentBuilderResult(parse_error = parse_error, builder_has_error = xml_document_builder_has_error(&builder))

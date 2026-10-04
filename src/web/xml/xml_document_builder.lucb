@@ -1,0 +1,484 @@
+#==============================================================================================
+#
+#   xml_document_builder - XMLDocumentBuilder: the DOM an XML parser builds
+#
+#   DESCRIPTION:
+#       Port of LibWeb/XML/XMLDocumentBuilder.cpp (lines 1-433) with XMLDocumentBuilder.h
+#       (lines 1-64): resolve_named_html_entity (the HTML named characters an XHTML document
+#       may use), and the XML::Listener that builds a document's tree from an XML parser's
+#       events (external/lib_xml/parser: luce-xml in libxml2's place): namespace declarations
+#       kept on a stack and resolved as the builder sees them, elements made through the
+#       element factory (so XHTML, SVG and MathML elements are those classes), template
+#       contents, script elements under XML scripting support, text joined into the last text
+#       node, and "the end" of an XML parser in document_end. The builder is a plain struct (a
+#       C++ object on the caller's stack), not a cell.
+#
+#       Copyright (c) 2022, Ali Mohammad Pur <mpfard@serenityos.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Named character references ==============================================================
+
+## Ported from XMLDocumentBuilder.cpp:24 Web::resolve_named_html_entity: the characters of the HTML
+## named character reference `&entity_name;`, if there is one.
+pub func resolve_named_html_entity(entity_name: ak.StringView) -> ak.String?:
+    var matcher = html_syntax.NamedCharacterReferenceMatcher()
+    for c_ in ak.string_view_bytes(&entity_name):
+        if not html_syntax.named_character_reference_matcher_try_consume_ascii_char(&matcher, c_):
+            return none
+    if not html_syntax.named_character_reference_matcher_try_consume_ascii_char(&matcher, ';'):
+        return none
+
+    let codepoints = html_syntax.named_character_reference_matcher_code_points(&matcher) else return none
+
+    var builder = ak.string_builder_new()
+    ak.string_builder_append_code_point(&builder, codepoints.first)
+    if let second_codepoint = html_syntax.named_character_reference_second_codepoint_value(codepoints.second):
+        ak.string_builder_append_code_point(&builder, (u32)second_codepoint)
+
+    return ak.string_builder_to_string_without_validation(&builder)
+
+# mark: XMLDocumentBuilder ======================================================================
+
+## Ported from XMLDocumentBuilder.h:29 Web::XMLDocumentBuilder::has_error.
+pub func xml_document_builder_has_error(this: XmlDocumentBuilder*) -> bool:
+    return this.m_has_error
+
+## Ported from XMLDocumentBuilder.cpp:47 Web::XMLDocumentBuilder::XMLDocumentBuilder. (The
+## template node stack is a GC::RootVector in C++: here the builder lives on the stack, which the
+## collector scans.)
+pub func xml_document_builder_construct(this: XmlDocumentBuilder*, document: DomDocument*, scripting_support: XmlScriptingSupport = XmlScriptingSupport.enabled):
+    this.vtable = &xml_document_builder_vtable
+    this.class_id = xml_document_builder_class.first_id
+    xml_document_builder_init_fields(this)
+    this.m_document = document
+    this.m_template_node_stack = ak.Vector[DomNode*]()
+    this.m_current_node = document.dom_node()
+    this.m_scripting_support = scripting_support
+    this.m_has_error = false
+    this.m_namespace_stack = ak.Vector[XmlDocumentBuilderNamespaceStackEntry]()
+    ak.vector_append_t(&this.m_namespace_stack, XmlDocumentBuilderNamespaceStackEntry(depth = 1))
+
+## Ported from XMLDocumentBuilder.cpp:56 Web::XMLDocumentBuilder::set_source (override).
+pub func xml_document_builder_set_source_impl(this: XmlDocumentBuilder*, source: ak.ByteString) -> !:
+    dom_document_set_source(this.m_document, try ak.string_from_byte_string(source))
+
+## Ported from XMLDocumentBuilder.cpp:62 Web::XMLDocumentBuilder::set_doctype (override).
+pub func xml_document_builder_set_doctype_impl(this: XmlDocumentBuilder*, doctype: XmlDoctype):
+    if dom_document_doctype(this.m_document) != none:
+        return
+
+    let document_type = dom_document_type_create(this.m_document)
+    let name = ak.string_from_byte_string(doctype.type_) else trap("MUST: String::from_byte_string")
+    dom_document_type_set_name(document_type, name)
+
+    if let external_id = doctype.external_id:
+        let system_id = ak.string_from_byte_string(external_id.system_id.system_literal) else trap("MUST: String::from_byte_string")
+        dom_document_type_set_system_id(document_type, system_id)
+
+        if let public_id_literal = external_id.public_id:
+            let public_id = ak.string_from_byte_string(public_id_literal.public_literal) else trap("MUST: String::from_byte_string")
+            dom_document_type_set_public_id(document_type, public_id)
+
+    dom_node_insert_before(this.m_document.dom_node(), document_type.dom_node(), tree_node_first_child(this.m_document.dom_node()), false)
+
+## `namespaces.find_if([&](auto const& namespace_and_prefix) { return namespace_and_prefix.prefix == prefix; })`.
+func xml_document_builder_has_prefix(namespaces: const ak.Vector[XmlDocumentBuilderNamespaceAndPrefix]*, prefix: ak.ByteString?) -> bool:
+    for namespace_and_prefix in ak.vector_span_const(namespaces):
+        if xml_document_builder_optional_byte_string_eq(namespace_and_prefix.prefix, prefix):
+            return true
+    return false
+
+## `Optional<ByteString> == Optional<ByteString>`: both empty, or both the same bytes.
+func xml_document_builder_optional_byte_string_eq(a: ak.ByteString?, b: ak.ByteString?) -> bool:
+    if let a_value = a:
+        if let b_value = b:
+            return ak.byte_string_eq_byte_string(&a_value, &b_value)
+        return false
+    return b == none
+
+## `node->set_attribute_value(...)` with the parts validate_and_extract gave an attribute's name.
+func xml_document_builder_set_extracted_attribute(node: DomElement*, extracted_qualified_name: const DomQualifiedName*, value: ak.ByteString):
+    dom_element_set_attribute_value(node, dom_qualified_name_local_name(extracted_qualified_name),
+                                    ak.string_from_byte_string(value) else trap("MUST: String::from_byte_string"),
+                                    dom_qualified_name_prefix(extracted_qualified_name), dom_qualified_name_namespace(extracted_qualified_name))
+
+## `validate_and_extract(node->realm(), namespace_, MUST(String::from_byte_string(key)), DOM::ValidationContext::Element)`,
+## none when it throws (the exception is dropped, as C++ drops the error).
+func xml_document_builder_validate_and_extract(realm: Realm*, namespace_: ak.FlyString?, key: const ak.ByteString*) -> DomQualifiedName?:
+    let name = ak.fly_string_from_string(ak.string_from_byte_string(*key) else trap("MUST: String::from_byte_string"))
+    return dom_validate_and_extract(realm, namespace_, name, DomValidationContext.element) catch:
+        discard(idl_take_pending_exception())
+        recover none
+
+## Ported from XMLDocumentBuilder.cpp:87 Web::XMLDocumentBuilder::element_start (override).
+pub func xml_document_builder_element_start_impl(this: XmlDocumentBuilder*, name: ak.ByteString, attributes: const ak.OrderedHashMap[ak.ByteString, ak.ByteString, ByteStringTraits]*):
+    if this.m_has_error:
+        return
+
+    var namespaces: ak.Vector[XmlDocumentBuilderNamespaceAndPrefix]
+    for entry in ak.ordered_hash_map_begin_const(attributes):
+        let attribute_name = entry.key
+        let value = entry.value
+        if ak.byte_string_eq_string_view(&attribute_name, ak.sv("xmlns")) or ak.byte_string_starts_with_string_view(&attribute_name, ak.sv("xmlns:")):
+            let parts = ak.byte_string_split_limit(&attribute_name, ':', 2)
+            var prefix: ak.ByteString? = none
+            var namespace_ = value
+            if ak.vector_size(&parts) == 2:
+                namespace_ = value
+                prefix = *ak.vector_at_const(&parts, 1)
+
+            if xml_document_builder_has_prefix(&namespaces, prefix):
+                continue
+
+            let ns = ak.fly_string_from_string(ak.string_from_byte_string(namespace_) else trap("MUST: String::from_byte_string"))
+            ak.vector_append_t(&namespaces, XmlDocumentBuilderNamespaceAndPrefix(ns = ns, prefix = prefix))
+
+    if not ak.vector_is_empty(&namespaces):
+        ak.vector_append_t(&this.m_namespace_stack, XmlDocumentBuilderNamespaceStackEntry(namespaces = namespaces, depth = 1))
+    else:
+        ak.vector_last(&this.m_namespace_stack).depth += 1
+
+    let namespace_ = xml_document_builder_namespace_for_name(this, name)
+
+    let realm = dom_document_realm(this.m_document)
+    let qualified_name_or_error = xml_document_builder_validate_and_extract(realm, namespace_, &name)
+
+    if qualified_name_or_error == none:
+        this.m_has_error = true
+        return
+
+    let qualified_name = qualified_name_or_error else trap("unreachable")
+
+    let node = dom_create_element(this.m_document, dom_qualified_name_local_name(&qualified_name), dom_qualified_name_namespace(&qualified_name),
+                                  dom_qualified_name_prefix(&qualified_name)) catch:
+        discard(idl_take_pending_exception())
+        this.m_has_error = true
+        return
+
+    let current_node = this.m_current_node else trap("VERIFY: m_current_node")
+
+    # When an XML parser with XML scripting support enabled creates a script element,
+    # it must have its parser document set and its "force async" flag must be unset.
+    # FIXME: If the parser was created as part of the XML fragment parsing algorithm, then the element must be marked as "already started" also.
+    if this.m_scripting_support == XmlScriptingSupport.enabled and dom_node_is_html_script_element(node.dom_node()):
+        let script_element = as_html_script_element(node.dom_node())
+        html_script_element_set_parser_document(script_element, this.m_document)
+        html_script_element_set_force_async(script_element, false)
+    if dom_node_is_html_template_element(current_node):
+        # When an XML parser would append a node to a template element, it must instead append it to the template element's template contents (a DocumentFragment node).
+        ak.vector_append_t(&this.m_template_node_stack, current_node)
+        let content = html_template_element_content(as_html_template_element(current_node))
+        discard(dom_node_append_child(content.dom_node(), node.dom_node()) else trap("MUST: append_child"))
+    else:
+        discard(dom_node_append_child(current_node, node.dom_node()) else trap("MUST: append_child"))
+
+    for attribute in ak.ordered_hash_map_begin_const(attributes):
+        let key = attribute.key
+        if ak.byte_string_eq_string_view(&key, ak.sv("xmlns")) or ak.byte_string_starts_with_string_view(&key, ak.sv("xmlns:")):
+            # The prefix xmlns is used only to declare namespace bindings and is by definition bound to the namespace name http://www.w3.org/2000/xmlns/.
+            if not ak.byte_string_eq_string_view(&key, ak.sv("xmlns:")) and not ak.byte_string_eq_string_view(&key, ak.sv("xmlns:xmlns")):
+                if let extracted_qualified_name = xml_document_builder_validate_and_extract(dom_element_realm(node), namespace_xmlns, &key):
+                    xml_document_builder_set_extracted_attribute(node, &extracted_qualified_name, attribute.value)
+                    continue
+
+            this.m_has_error = true
+        elif ak.byte_string_contains_u8(&key, ':'):
+            if let namespace_for_key = xml_document_builder_namespace_for_name(this, key):
+                if let extracted_qualified_name = xml_document_builder_validate_and_extract(dom_element_realm(node), namespace_for_key, &key):
+                    xml_document_builder_set_extracted_attribute(node, &extracted_qualified_name, attribute.value)
+                    continue
+
+            if ak.byte_string_starts_with_string_view(&key, ak.sv("xml:")):
+                if let extracted_qualified_name = xml_document_builder_validate_and_extract(dom_element_realm(node), namespace_xml, &key):
+                    xml_document_builder_set_extracted_attribute(node, &extracted_qualified_name, attribute.value)
+                    continue
+
+            this.m_has_error = true
+        else:
+            let local_name = ak.fly_string_from_string(ak.string_from_byte_string(key) else trap("MUST: String::from_byte_string"))
+            dom_element_set_attribute_value(node, local_name, ak.string_from_byte_string(attribute.value) else trap("MUST: String::from_byte_string"))
+
+    this.m_current_node = node.dom_node()
+
+## element_end's spin_until condition for a pending parsing-blocking script (`[&] { ... }`).
+struct XmlDocumentBuilderElementEndScriptReady:
+    var document: DomDocument*
+    var pending_parsing_blocking_script: HtmlScriptElement*
+
+    static func call(context: void*?) -> bool:
+        let captures = (XmlDocumentBuilderElementEndScriptReady*)(context else trap("spin_until: no captures"))
+        return (not dom_document_has_a_style_sheet_that_is_blocking_scripts(captures.document) and html_script_element_is_ready_to_be_parser_executed(captures.pending_parsing_blocking_script))
+
+## Ported from XMLDocumentBuilder.cpp:193 Web::XMLDocumentBuilder::element_end (override).
+pub func xml_document_builder_element_end_impl(this: XmlDocumentBuilder*, name: ak.ByteString):
+    if this.m_has_error:
+        return
+
+    let last_entry = ak.vector_last(&this.m_namespace_stack)
+    last_entry.depth -= 1
+    if last_entry.depth == 0:
+        discard(ak.vector_take_last(&this.m_namespace_stack))
+
+    let current_node = this.m_current_node else trap("VERIFY: m_current_node")
+    let node_name = dom_node_node_name(current_node)
+    assert(ak.fly_string_equals_ignoring_ascii_case_string_view(&node_name, ak.byte_string_view(&name)))
+    # When an XML parser with XML scripting support enabled creates a script element, [...]
+    # When the element's end tag is subsequently parsed,
+    if this.m_scripting_support == XmlScriptingSupport.enabled and dom_node_is_html_script_element(current_node):
+        # the user agent must perform a microtask checkpoint,
+        html_perform_a_microtask_checkpoint()
+        # and then prepare the script element.
+        let script_element = as_html_script_element(current_node)
+        html_script_element_prepare_script_t(script_element)
+
+        # If this causes there to be a pending parsing-blocking script, then the user agent must run the following steps:
+        if let pending_parsing_blocking_script = dom_document_pending_parsing_blocking_script(this.m_document):
+            # 1. Block this instance of the XML parser, such that the event loop will not run tasks that invoke it.
+            # NOTE: Noop.
+
+            # 2. Spin the event loop until the parser's Document has no style sheet that is blocking scripts and the pending parsing-blocking script's "ready to be parser-executed" flag is set.
+            if dom_document_has_a_style_sheet_that_is_blocking_scripts(this.m_document) or not html_script_element_is_ready_to_be_parser_executed(pending_parsing_blocking_script):
+                let captures = new XmlDocumentBuilderElementEndScriptReady(document = this.m_document, pending_parsing_blocking_script = pending_parsing_blocking_script) else trap("out of memory")
+                let heap = gc.cell_heap(script_element.cell())
+                html_event_loop_spin_until(html_main_thread_event_loop(), gc.create_function0(heap, ak.Function0[bool](call = XmlDocumentBuilderElementEndScriptReady.call, context = captures)))
+
+            # 3. Unblock this instance of the XML parser, such that tasks that invoke it can again be run.
+            # NOTE: Noop.
+
+            # 4. Execute the script element given by the pending parsing-blocking script.
+            html_script_element_execute_script(pending_parsing_blocking_script)
+
+            # 5. Set the pending parsing-blocking script to null.
+            dom_document_set_pending_parsing_blocking_script(this.m_document, none)
+    elif this.m_scripting_support == XmlScriptingSupport.enabled and dom_node_is_svg_script_element(current_node):
+        # https://www.w3.org/TR/SVGMobile12/struct.html#ProgressiveRendering
+        # When an end element event occurs for a 'script' element, that element is processed according to the
+        # Script processing section of the Scripting chapter. Further parsing of the document will be blocked
+        # until processing of the 'script' is complete.
+        let script_element = as_svg_script_element(current_node)
+        svg_script_element_process_the_script_element(script_element)
+
+    var parent = dom_node_parent_node(current_node)
+    if let parent_node = parent:
+        if dom_node_is_document_fragment(parent_node):
+            let template_parent_node = ak.vector_take_last(&this.m_template_node_stack)
+            parent = template_parent_node
+    this.m_current_node = parent
+
+## Ported from XMLDocumentBuilder.cpp:250 Web::XMLDocumentBuilder::text (override).
+pub func xml_document_builder_text_impl(this: XmlDocumentBuilder*, data: ak.StringView):
+    if this.m_has_error:
+        return
+
+    let current_node = this.m_current_node else trap("VERIFY: m_current_node")
+    let last = tree_node_last_child(current_node)
+    if last != none and dom_node_is_text(last else trap("unreachable")):
+        let text_node = as_dom_text(last else trap("unreachable"))
+        let text_data = dom_character_data_data(text_node.dom_character_data())
+        ak.string_builder_append_utf16_view(&this.m_text_builder, ak.utf16_string_base_utf16_view(&text_data.utf16_string_base))
+        ak.string_builder_append_string_view(&this.m_text_builder, data)
+        dom_character_data_set_data(text_node.dom_character_data(), ak.string_builder_to_utf16_string(&this.m_text_builder))
+        ak.string_builder_clear(&this.m_text_builder)
+    elif not ak.string_view_is_empty(&data):
+        let node = dom_document_create_text_node(this.m_document, ak.utf16_string_from_utf8_string_view(data))
+        discard(dom_node_append_child(current_node, node.dom_node()) else trap("MUST: append_child"))
+
+## Ported from XMLDocumentBuilder.cpp:267 Web::XMLDocumentBuilder::comment (override).
+pub func xml_document_builder_comment_impl(this: XmlDocumentBuilder*, data: ak.StringView):
+    if this.m_has_error or this.m_current_node == none:
+        return
+
+    let current_node = this.m_current_node else trap("unreachable")
+    let comment = dom_document_create_comment(this.m_document, ak.utf16_string_from_utf8_string_view(data))
+    discard(dom_node_append_child(current_node, comment.dom_node()) else trap("MUST: append_child"))
+
+## Ported from XMLDocumentBuilder.cpp:275 Web::XMLDocumentBuilder::cdata_section (override).
+pub func xml_document_builder_cdata_section_impl(this: XmlDocumentBuilder*, data: ak.StringView):
+    if this.m_has_error or this.m_current_node == none:
+        return
+
+    let current_node = this.m_current_node else trap("unreachable")
+    let section = dom_document_create_cdata_section(this.m_document, ak.utf16_string_from_utf8_string_view(data)) else trap("MUST: create_cdata_section")
+    discard(dom_node_append_child(current_node, section.dom_node()) else trap("MUST: append_child"))
+
+## Ported from XMLDocumentBuilder.cpp:284 Web::XMLDocumentBuilder::processing_instruction (override).
+pub func xml_document_builder_processing_instruction_impl(this: XmlDocumentBuilder*, target: ak.StringView, data: ak.StringView):
+    if this.m_has_error or this.m_current_node == none:
+        return
+
+    let current_node = this.m_current_node else trap("unreachable")
+    let target_string = ak.string_from_utf8(target) else trap("MUST: String::from_utf8")
+    let processing_instruction = dom_document_create_processing_instruction(this.m_document, target_string, ak.utf16_string_from_utf8_string_view(data)) else trap("MUST: create_processing_instruction")
+    discard(dom_node_append_child(current_node, processing_instruction.dom_node()) else trap("MUST: append_child"))
+
+# mark: The end =================================================================================
+
+## document_end's first spin_until condition (`[&] { ... }`): the first deferred script is ready
+## and nothing blocks scripts.
+func xml_document_builder_first_deferred_script_ready(context: void*?) -> bool:
+    let document = (DomDocument*)(context else trap("spin_until: no document"))
+    let scripts = dom_document_scripts_to_execute_when_parsing_has_finished(document)
+    return html_script_element_is_ready_to_be_parser_executed(*ak.vector_first(scripts)) and not dom_document_has_a_style_sheet_that_is_blocking_scripts(document)
+
+## document_end's spin_until condition on the scripts that will execute as soon as possible.
+func xml_document_builder_no_asap_scripts(context: void*?) -> bool:
+    let document = (DomDocument*)(context else trap("spin_until: no document"))
+    return ak.vector_is_empty(dom_document_scripts_to_execute_as_soon_as_possible(document))
+
+## document_end's spin_until condition on the load event.
+func xml_document_builder_nothing_delays_the_load_event(context: void*?) -> bool:
+    let document = (DomDocument*)(context else trap("spin_until: no document"))
+    return not dom_document_anything_is_delaying_the_load_event(document)
+
+## document_end's DOMContentLoaded task (`[document = m_document] { ... }`).
+func xml_document_builder_dom_content_loaded_task(context: void*?):
+    let document = (DomDocument*)(context else trap("no document"))
+    # Set the Document's load timing info's DOM content loaded event start time to the current high resolution time given the Document's relevant global object.
+    dom_document_load_timing_info(document).dom_content_loaded_event_start_time = high_resolution_time_current_high_resolution_time(html_relevant_global_object((JsObject*)document))
+
+    # Fire an event named DOMContentLoaded at the Document object, with its bubbles attribute initialized to true.
+    let content_loaded_event = dom_event_create(dom_document_realm(document), html_event_names_dom_content_loaded)
+    dom_event_set_bubbles(content_loaded_event, true)
+    discard(dom_event_target_dispatch_event(document.dom_event_target(), content_loaded_event))
+
+    # Set the Document's load timing info's DOM content loaded event end time to the current high resolution time given the Document's relevant global object.
+    dom_document_load_timing_info(document).dom_content_loaded_event_end_time = high_resolution_time_current_high_resolution_time(html_relevant_global_object((JsObject*)document))
+
+    # FIXME: Enable the client message queue of the ServiceWorkerContainer object whose associated service worker client is the Document object's relevant settings object.
+
+    # FIXME: Invoke WebDriver BiDi DOM content loaded with the Document's browsing context, and a new WebDriver BiDi navigation status whose id is the Document object's navigation id, status is "pending", and url is the Document object's URL.
+
+## document_end's load task (`[document = m_document] { ... }`).
+func xml_document_builder_load_task(context: void*?):
+    let document = (DomDocument*)(context else trap("no document"))
+    # Update the current document readiness to "complete".
+    dom_document_update_readiness(document, HtmlDocumentReadyState.complete)
+
+    # If the Document object's browsing context is null, then abort these steps.
+    if dom_document_browsing_context(document) == none:
+        return
+
+    # Let window be the Document's relevant global object.
+    let window = as_html_window((gc.Cell*)html_relevant_global_object((JsObject*)document))
+
+    # Set the Document's load timing info's load event start time to the current high resolution time given window.
+    dom_document_load_timing_info(document).load_event_start_time = high_resolution_time_current_high_resolution_time((JsObject*)window)
+
+    # Fire an event named load at window, with legacy target override flag set.
+    # FIXME: The legacy target override flag is currently set by a virtual override of dispatch_event()
+    # We should reorganize this so that the flag appears explicitly here instead.
+    discard(dom_event_target_dispatch_event(window.dom_event_target(), dom_event_create(dom_document_realm(document), html_event_names_load)))
+
+    # FIXME: Invoke WebDriver BiDi load complete with the Document's browsing context, and a new WebDriver BiDi navigation status whose id is the Document object's navigation id, status is "complete", and url is the Document object's URL.
+
+    # FIXME: Set the Document object's navigation id to null.
+
+    # Set the Document's load timing info's load event end time to the current high resolution time given window.
+    # donor bug: the C++ sets dom_content_loaded_event_end_time here.
+    dom_document_load_timing_info(document).dom_content_loaded_event_end_time = high_resolution_time_current_high_resolution_time((JsObject*)window)
+
+    # Assert: Document's page showing is false.
+    assert(not dom_document_page_showing(document))
+
+    # Set the Document's page showing flag to true.
+    dom_document_set_page_showing(document, true)
+
+    # Fire a page transition event named pageshow at window with false.
+    html_window_fire_a_page_transition_event(window, html_event_names_pageshow, false)
+
+    # Completely finish loading the Document.
+    dom_document_completely_finish_loading(document)
+
+    # FIXME: Queue the navigation timing entry for the Document.
+
+## Ported from XMLDocumentBuilder.cpp:293 Web::XMLDocumentBuilder::document_end (override).
+pub func xml_document_builder_document_end_impl(this: XmlDocumentBuilder*):
+    let heap = gc.cell_heap(this.m_document.cell())
+
+    # When an XML parser reaches the end of its input, it must stop parsing.
+    # If the active speculative HTML parser is not null, then stop the speculative HTML parser and return.
+    # NOTE: Noop.
+
+    # Set the insertion point to undefined.
+    ak.vector_clear(&this.m_template_node_stack)
+    this.m_current_node = none
+
+    # Update the current document readiness to "interactive".
+    dom_document_update_readiness(this.m_document, HtmlDocumentReadyState.interactive)
+
+    # Pop all the nodes off the stack of open elements.
+    # NOTE: Noop.
+
+    if dom_document_browsing_context(this.m_document) == none or dom_document_is_decoded_svg(this.m_document):
+        # No need to spin the event loop waiting for scripts or load events
+        # when parsed via DOMParser or as a decoded SVG image.
+        dom_document_update_readiness(this.m_document, HtmlDocumentReadyState.complete)
+        return
+
+    # While the list of scripts that will execute when the document has finished parsing is not empty:
+    while not ak.vector_is_empty(dom_document_scripts_to_execute_when_parsing_has_finished(this.m_document)):
+        # Spin the event loop until the first script in the list of scripts that will execute when the document has finished parsing has its "ready to be parser-executed" flag set
+        # and the parser's Document has no style sheet that is blocking scripts.
+        html_event_loop_spin_until(html_main_thread_event_loop(),
+                                   gc.create_function0(heap, ak.Function0[bool](call = xml_document_builder_first_deferred_script_ready, context = this.m_document)))
+
+        # Execute the first script in the list of scripts that will execute when the document has finished parsing.
+        html_script_element_execute_script(*ak.vector_first(dom_document_scripts_to_execute_when_parsing_has_finished(this.m_document)))
+
+        # Remove the first script element from the list of scripts that will execute when the document has finished parsing (i.e. shift out the first entry in the list).
+        discard(ak.vector_take_first(dom_document_scripts_to_execute_when_parsing_has_finished(this.m_document)))
+    # Queue a global task on the DOM manipulation task source given the Document's relevant global object to run the following substeps:
+    discard(html_queue_global_task(HtmlTaskSource.dom_manipulation, (JsObject*)this.m_document,
+                                   gc.create_function0(heap, ak.Function0[unit](call = xml_document_builder_dom_content_loaded_task, context = this.m_document))))
+
+    # Spin the event loop until the set of scripts that will execute as soon as possible and the list of scripts that will execute in order as soon as possible are empty.
+    html_event_loop_spin_until(html_main_thread_event_loop(), gc.create_function0(heap, ak.Function0[bool](call = xml_document_builder_no_asap_scripts, context = this.m_document)))
+
+    # Spin the event loop until there is nothing that delays the load event in the Document.
+    html_event_loop_spin_until(html_main_thread_event_loop(), gc.create_function0(heap, ak.Function0[bool](call = xml_document_builder_nothing_delays_the_load_event, context = this.m_document)))
+
+    # Queue a global task on the DOM manipulation task source given the Document's relevant global object to run the following steps:
+    discard(html_queue_global_task(HtmlTaskSource.dom_manipulation, (JsObject*)this.m_document,
+                                   gc.create_function0(heap, ak.Function0[unit](call = xml_document_builder_load_task, context = this.m_document))))
+
+    # FIXME: If the Document's print when loaded flag is set, then run the printing steps.
+
+    # The Document is now ready for post-load tasks.
+    dom_document_set_ready_for_post_load_tasks(this.m_document, true)
+
+# mark: Namespaces ==============================================================================
+
+## Ported from XMLDocumentBuilder.cpp:409 Web::XMLDocumentBuilder::namespace_for_name: the namespace
+## the prefix of `name` (or the default namespace) is bound to, innermost declaration first.
+func xml_document_builder_namespace_for_name(this: XmlDocumentBuilder*, name: ak.ByteString) -> ak.FlyString?:
+    var prefix: ak.StringView? = none
+
+    let parts = ak.byte_string_split_limit(&name, ':', 3)
+    if ak.vector_size(&parts) > 2:
+        return none
+
+    if ak.vector_size(&parts) == 2:
+        if ak.byte_string_is_empty(ak.vector_at_const(&parts, 0)) or ak.byte_string_is_empty(ak.vector_at_const(&parts, 1)):
+            return none
+        prefix = ak.byte_string_view(ak.vector_at_const(&parts, 0))
+
+    var index = ak.vector_size(&this.m_namespace_stack)
+    while index > 0:
+        # for (auto const& stack_entry : m_namespace_stack.in_reverse())
+        index -= 1
+        let stack_entry = ak.vector_at_const(&this.m_namespace_stack, index)
+        for namespace_and_prefix in ak.vector_span_const(&stack_entry.namespaces):
+            if xml_document_builder_prefix_equals(namespace_and_prefix.prefix, prefix):
+                return namespace_and_prefix.ns
+
+    return none
+
+## `namespace_and_prefix.prefix == prefix`: an Optional<ByteString> against an Optional<StringView>.
+func xml_document_builder_prefix_equals(declared: ak.ByteString?, prefix: ak.StringView?) -> bool:
+    if let declared_value = declared:
+        if let prefix_value = prefix:
+            return ak.byte_string_eq_string_view(&declared_value, prefix_value)
+        return false
+    return prefix == none
