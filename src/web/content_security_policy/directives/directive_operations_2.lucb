@@ -1,0 +1,574 @@
+#==============================================================================================
+#
+#   directive_operations_2 - ContentSecurityPolicy::Directives operations: matching URLs,
+#   requests, responses, nonces and integrity metadata to source lists, the script
+#   directives' request checks, and matching elements to source lists (nonces and hashes)
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibWeb/ContentSecurityPolicy/Directives/DirectiveOperations.cpp
+#       (lines 447-1034): does_url_match_expression_in_origin_with_redirect_count through
+#       does_element_match_source_list_for_type_and_source. The SHA-2 hashes are luce-crypto's.
+#
+#       Copyright (c) 2025, Luke Wilde <luke@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Matching URLs to source lists ===========================================================
+
+## Ported from Libraries/LibWeb/ContentSecurityPolicy/Directives/DirectiveOperations.cpp:448 Web::ContentSecurityPolicy::Directives::does_url_match_expression_in_origin_with_redirect_count.
+# https://w3c.github.io/webappsec-csp/#match-url-to-source-expression
+pub func content_security_policy_directives_does_url_match_expression_in_origin_with_redirect_count(url: web_url.Url, expression: ak.String, origin: web_url.Origin, redirect_count: u8) -> ContentSecurityPolicyDirectivesMatchResult:
+    # Spec Note: origin is the origin of the resource relative to which the expression should be resolved.
+    #            "'self'", for instance, will have distinct meaning depending on that bit of context.
+
+    # 1. If expression is the string "*", return "Matches" if one or more of the following conditions is met:
+    #    1. url’s scheme is an HTTP(S) scheme.
+    #    2. url’s scheme is the same as origin’s scheme.
+    # Spec Note: This logic means that in order to allow a resource from a non-HTTP(S) scheme, it has to be either
+    #            explicitly specified (e.g. default-src * data: custom-scheme-1: custom-scheme-2:), or the protected
+    #            resource must be loaded from the same scheme.
+    var origin_scheme_string = ak.string_new()
+    if not web_url.origin_is_opaque(&origin):
+        if let scheme = web_url.origin_scheme(&origin):
+            origin_scheme_string = scheme
+    let origin_scheme = ak.string_bytes_as_string_view(&origin_scheme_string)
+
+    let url_scheme = web_url.url_scheme(&url)
+    let url_scheme_view = ak.string_bytes_as_string_view(&url_scheme)
+    if ak.string_eq_string_view(&expression, ak.sv("*")) and (fetch_is_http_or_https_scheme(url_scheme_view) or ak.string_eq_string_view(&url_scheme, origin_scheme)):
+        return ContentSecurityPolicyDirectivesMatchResult.matches
+
+    # 2. If expression matches the scheme-source or host-source grammar:
+    let expression_view = ak.string_bytes_as_string_view(&expression)
+    let scheme_source_parse_result = content_security_policy_directives_parse_source_expression(ContentSecurityPolicyProduction.scheme_source, expression_view)
+    let host_source_parse_result = content_security_policy_directives_parse_source_expression(ContentSecurityPolicyProduction.host_source, expression_view)
+    if scheme_source_parse_result != none or host_source_parse_result != none:
+        # 1. If expression has a scheme-part, and it does not scheme-part match url’s scheme, return "Does Not Match".
+        var maybe_scheme_part: ak.StringView? = none
+        if let scheme_source = scheme_source_parse_result:
+            maybe_scheme_part = scheme_source.scheme_part
+        elif let host_source = host_source_parse_result:
+            maybe_scheme_part = host_source.scheme_part
+
+        if let scheme_part = maybe_scheme_part:
+            if content_security_policy_directives_scheme_part_matches(scheme_part, url_scheme_view) == ContentSecurityPolicyDirectivesMatchResult.does_not_match:
+                return ContentSecurityPolicyDirectivesMatchResult.does_not_match
+
+        # 2. If expression matches the scheme-source grammar, return "Matches".
+        if scheme_source_parse_result != none:
+            return ContentSecurityPolicyDirectivesMatchResult.matches
+
+    # 3. If expression matches the host-source grammar:
+    if let host_source = host_source_parse_result:
+        # 1. If url’s host is null, return "Does Not Match".
+        if web_url.url_host(&url) == none:
+            return ContentSecurityPolicyDirectivesMatchResult.does_not_match
+
+        # 2. If expression does not have a scheme-part, and origin’s scheme does not scheme-part match url’s scheme,
+        #    return "Does Not Match".
+        # Spec Note: As with scheme-part above, we allow schemeless host-source expressions to be upgraded from
+        #            insecure schemes to secure schemes.
+        if host_source.scheme_part == none and content_security_policy_directives_scheme_part_matches(origin_scheme, url_scheme_view) == ContentSecurityPolicyDirectivesMatchResult.does_not_match:
+            return ContentSecurityPolicyDirectivesMatchResult.does_not_match
+
+        # 3. If expression’s host-part does not host-part match url’s host, return "Does Not Match".
+        let host_part = host_source.host_part else trap("VERIFY: host_source_parse_result->host_part.has_value()")
+        if content_security_policy_directives_host_part_matches(host_part, web_url.url_host(&url)) == ContentSecurityPolicyDirectivesMatchResult.does_not_match:
+            return ContentSecurityPolicyDirectivesMatchResult.does_not_match
+
+        # 4. Let port-part be expression’s port-part if present, and null otherwise.
+        let port_part = host_source.port_part
+
+        # 5. If port-part does not port-part match url, return "Does Not Match".
+        if content_security_policy_directives_port_part_matches(port_part, url) == ContentSecurityPolicyDirectivesMatchResult.does_not_match:
+            return ContentSecurityPolicyDirectivesMatchResult.does_not_match
+
+        # 6. If expression contains a non-empty path-part, and redirect count is 0, then:
+        if let path_part = host_source.path_part:
+            if not ak.string_view_is_empty(&path_part) and redirect_count == 0:
+                # 1. Let path be the resulting of joining url’s path on the U+002F SOLIDUS character (/).
+                # FIXME: File spec issue that if path_part is only '/', then plainly joining will always fail to match.
+                #        It should likely use the URL path serializer instead.
+                var builder = ak.string_builder_new()
+                ak.string_builder_append_u8(&builder, '/')
+                var paths = web_url.url_paths(&url)
+                for (index, segment) in ak.vector_span(&paths).indexed():
+                    if index > 0:
+                        ak.string_builder_append_u8(&builder, '/')
+                    ak.string_builder_append_string_view(&builder, ak.string_bytes_as_string_view(&segment))
+                let path = ak.string_builder_to_string(&builder) else trap("MUST: StringBuilder::to_string")
+
+                # 2. If expression’s path-part does not path-part match path, return "Does Not Match".
+                if content_security_policy_directives_path_part_matches(path_part, ak.string_bytes_as_string_view(&path)) == ContentSecurityPolicyDirectivesMatchResult.does_not_match:
+                    return ContentSecurityPolicyDirectivesMatchResult.does_not_match
+
+        # 7. Return "Matches".
+        return ContentSecurityPolicyDirectivesMatchResult.matches
+
+    # 4. If expression is an ASCII case-insensitive match for "'self'", return "Matches" if one or more of the
+    #    following conditions is met:
+    # Spec Note: Like the scheme-part logic above, the "'self'" matching algorithm allows upgrades to secure schemes
+    #            when it is safe to do so. We limit these upgrades to endpoints running on the default port for a
+    #            particular scheme or a port that matches the origin of the protected resource, as this seems
+    #            sufficient to deal with upgrades that can be reasonably expected to succeed.
+    if ak.string_equals_ignoring_ascii_case_string_view(&expression, ak.fly_string_bytes_as_string_view(&content_security_policy_directives_keyword_sources_self)):
+        # 1. origin is the same as url’s origin
+        if web_url.origin_is_same_origin(&origin, web_url.url_origin(&url)):
+            return ContentSecurityPolicyDirectivesMatchResult.matches
+
+        # 2. origin’s host is the same as url’s host, origin’s port and url’s port are either the same or the default
+        #    ports for their respective schemes, and one or more of the following conditions is met:
+        let origin_default_port = web_url.default_port_for_scheme(origin_scheme)
+        let url_default_port = web_url.default_port_for_scheme(url_scheme_view)
+
+        var origin_host: web_url.Host? = none
+        var origin_port: u16? = none
+
+        if not web_url.origin_is_opaque(&origin):
+            origin_host = web_url.origin_host(&origin)
+            origin_port = web_url.origin_port(&origin)
+
+        if content_security_policy_directives_optional_hosts_equal(origin_host, web_url.url_host(&url)) and (origin_port == web_url.url_port(&url) or (origin_port == origin_default_port and web_url.url_port(&url) == url_default_port)):
+            # 1. url’s scheme is "https" or "wss"
+            if ak.string_eq_string_view(&url_scheme, ak.sv("https")) or ak.string_eq_string_view(&url_scheme, ak.sv("wss")):
+                return ContentSecurityPolicyDirectivesMatchResult.matches
+
+            # 2. origin’s scheme is "http" and url’s scheme is "http" or "ws"
+            if ak.string_view_eq_string_view(&origin_scheme, ak.sv("http")) and (ak.string_eq_string_view(&url_scheme, ak.sv("http")) or ak.string_eq_string_view(&url_scheme, ak.sv("ws"))):
+                return ContentSecurityPolicyDirectivesMatchResult.matches
+
+    # 5. Return "Does Not Match".
+    return ContentSecurityPolicyDirectivesMatchResult.does_not_match
+
+## `Optional<URL::Host> == Optional<URL::Host>` of does_url_match_expression_in_origin_with_redirect_count: both
+## null, or both hosts and equal.
+func content_security_policy_directives_optional_hosts_equal(a: web_url.Host?, b: web_url.Host?) -> bool:
+    if let a_host = a:
+        if let b_host = b:
+            return web_url.host_eq(&a_host, b_host)
+        return false
+    return b == none
+
+## Ported from Libraries/LibWeb/ContentSecurityPolicy/Directives/DirectiveOperations.cpp:574 Web::ContentSecurityPolicy::Directives::does_url_match_source_list_in_origin_with_redirect_count.
+# https://w3c.github.io/webappsec-csp/#match-url-to-source-list
+pub func content_security_policy_directives_does_url_match_source_list_in_origin_with_redirect_count(url: web_url.Url, source_list: const ak.Vector[ak.String]*, origin: web_url.Origin, redirect_count: u8) -> ContentSecurityPolicyDirectivesMatchResult:
+    # 1. Assert: source list is not null.
+    # NOTE: Already done by source_list being passed by reference.
+
+    # 2. If source list is empty, return "Does Not Match".
+    # Spec Note: An empty source list (that is, a directive without a value: script-src, as opposed to script-src host1)
+    #            is equivalent to a source list containing 'none', and will not match any URL.
+    if ak.vector_is_empty(source_list):
+        return ContentSecurityPolicyDirectivesMatchResult.does_not_match
+
+    # 3. If source list’s size is 1, and source list[0] is an ASCII case-insensitive match for the string "'none'",
+    #    return "Does Not Match".
+    # Spec Note: The 'none' keyword has no effect when other source expressions are present. That is, the list « 'none' »
+    #            does not match any URL. A list consisting of « 'none', https://example.com », on the other hand, would
+    #            match https://example.com/.
+    if ak.vector_size(source_list) == 1 and ak.string_equals_ignoring_ascii_case_string_view(ak.vector_first_const(source_list), ak.sv("'none'")):
+        return ContentSecurityPolicyDirectivesMatchResult.does_not_match
+
+    # 4. For each expression of source list:
+    for expression in ak.vector_span_const(source_list):
+        # 1. If § 6.7.2.8 Does url match expression in origin with redirect count? returns "Matches" when executed
+        #    upon url, expression, origin, and redirect count, return "Matches".
+        if content_security_policy_directives_does_url_match_expression_in_origin_with_redirect_count(url, expression, origin, redirect_count) == ContentSecurityPolicyDirectivesMatchResult.matches:
+            return ContentSecurityPolicyDirectivesMatchResult.matches
+
+    # 5. Return "Does Not Match".
+    return ContentSecurityPolicyDirectivesMatchResult.does_not_match
+
+## Ported from Libraries/LibWeb/ContentSecurityPolicy/Directives/DirectiveOperations.cpp:606 Web::ContentSecurityPolicy::Directives::does_request_match_source_list.
+# https://w3c.github.io/webappsec-csp/#match-request-to-source-list
+pub func content_security_policy_directives_does_request_match_source_list(request: FetchRequest*, source_list: const ak.Vector[ak.String]*, policy: ContentSecurityPolicyPolicy*) -> ContentSecurityPolicyDirectivesMatchResult:
+    # Given a request request, a source list source list, and a policy policy, this algorithm returns the result of
+    # executing § 6.7.2.7 Does url match source list in origin with redirect count? on request’s current url, source
+    # list, policy’s self-origin, and request’s redirect count.
+    # Spec Note: This is generally used in directives' pre-request check algorithms to verify that a given request is
+    #            reasonable.
+    return content_security_policy_directives_does_url_match_source_list_in_origin_with_redirect_count(fetch_request_current_url(request), source_list, content_security_policy_policy_self_origin(policy), fetch_request_redirect_count(request))
+
+## Ported from Libraries/LibWeb/ContentSecurityPolicy/Directives/DirectiveOperations.cpp:617 Web::ContentSecurityPolicy::Directives::does_response_match_source_list.
+# https://w3c.github.io/webappsec-csp/#match-response-to-source-list
+pub func content_security_policy_directives_does_response_match_source_list(response: FetchResponse*, request: FetchRequest*, source_list: const ak.Vector[ak.String]*, policy: ContentSecurityPolicyPolicy*) -> ContentSecurityPolicyDirectivesMatchResult:
+    # Given a request request, and a source list source list, and a policy policy, this algorithm returns the result
+    # of executing § 6.7.2.7 Does url match source list in origin with redirect count? on response’s url, source list,
+    # policy’s self-origin, and request’s redirect count.
+    # Spec Note: This is generally used in directives' post-request check algorithms to verify that a given response
+    #            is reasonable.
+    # FIXME: File spec issue that it does specify to pass in response here.
+    let response_url = fetch_response_url(response) else trap("VERIFY: response->url().has_value()")
+    return content_security_policy_directives_does_url_match_source_list_in_origin_with_redirect_count(response_url, source_list, content_security_policy_policy_self_origin(policy), fetch_request_redirect_count(request))
+
+## Ported from Libraries/LibWeb/ContentSecurityPolicy/Directives/DirectiveOperations.cpp:631 Web::ContentSecurityPolicy::Directives::does_nonce_match_source_list.
+# https://w3c.github.io/webappsec-csp/#match-nonce-to-source-list
+pub func content_security_policy_directives_does_nonce_match_source_list(nonce: ak.String, source_list: const ak.Vector[ak.String]*) -> ContentSecurityPolicyDirectivesMatchResult:
+    # 1. Assert: source list is not null.
+    # Already done by only accept references.
+
+    # 2. If nonce is the empty string, return "Does Not Match".
+    if ak.string_is_empty(&nonce):
+        return ContentSecurityPolicyDirectivesMatchResult.does_not_match
+
+    # 3. For each expression of source list:
+    for expression in ak.vector_span_const(source_list):
+        # 1. If expression matches the nonce-source grammar, and nonce is identical to expression’s base64-value part,
+        #    return "Matches".
+        if let nonce_source_match_result = content_security_policy_directives_parse_source_expression(ContentSecurityPolicyProduction.nonce_source, ak.string_bytes_as_string_view(&expression)):
+            let base64_value = nonce_source_match_result.base64_value else trap("VERIFY: nonce_source_match_result->base64_value.has_value()")
+            if ak.string_eq_string_view(&nonce, base64_value):
+                return ContentSecurityPolicyDirectivesMatchResult.matches
+
+    # 4. Return "Does Not Match".
+    return ContentSecurityPolicyDirectivesMatchResult.does_not_match
+
+## Ported from Libraries/LibWeb/ContentSecurityPolicy/Directives/DirectiveOperations.cpp:658 Web::ContentSecurityPolicy::Directives::does_integrity_metadata_match_source_list.
+# https://w3c.github.io/webappsec-csp/#match-integrity-metadata-to-source-list
+# Spec Note: Here, we verify only whether the integrity metadata is a non-empty subset of the hash-source sources in
+#            source list. We rely on the browser’s enforcement of Subresource Integrity [SRI] to block non-matching
+#            resources upon response.
+func content_security_policy_directives_does_integrity_metadata_match_source_list(integrity_metadata: ak.String, source_list: const ak.Vector[ak.String]*) -> ContentSecurityPolicyDirectivesMatchResult:
+    # 1. Assert: source list is not null.
+    # NOTE: This is already done by passing in source_list by reference.
+
+    # 2. Let integrity expressions be the set of source expressions in source list that match the hash-source grammar.
+    var integrity_expressions = ak.Vector[ContentSecurityPolicySourceExpressionParseResult]()
+    for expression in ak.vector_span_const(source_list):
+        if let hash_source_parse_result = content_security_policy_directives_parse_source_expression(ContentSecurityPolicyProduction.hash_source, ak.string_bytes_as_string_view(&expression)):
+            ak.vector_append_t(&integrity_expressions, hash_source_parse_result)
+
+    # 3. If integrity expressions is empty, return "Does Not Match".
+    if ak.vector_is_empty(&integrity_expressions):
+        return ContentSecurityPolicyDirectivesMatchResult.does_not_match
+
+    # 4. Let integrity sources be the result of executing the algorithm defined in SRI § 3.3.3 Parse metadata. on
+    #    integrity metadata. [SRI]
+    var integrity_sources = sri_parse_metadata(ak.string_bytes_as_string_view(&integrity_metadata)) else trap("MUST: SRI::parse_metadata")
+
+    # 5. If integrity sources is "no metadata" or an empty set, return "Does Not Match".
+    # FIXME: File a spec issue stating that this is targetting an older version of the SRI spec, which does not return
+    #        "no metadata", but instead simply just returns an empty list if there is no metadata.
+    #        The up-to-date spec is located at https://w3c.github.io/webappsec-subresource-integrity/
+    if ak.vector_is_empty(&integrity_sources):
+        return ContentSecurityPolicyDirectivesMatchResult.does_not_match
+
+    # 6. For each source of integrity sources:
+    for source in ak.vector_span(&integrity_sources):
+        # 1. If integrity expressions does not contain a source expression whose hash-algorithm is an ASCII
+        #    case-insensitive match for source’s hash-algorithm, and whose base64-value is identical to source’s
+        #    base64-value, return "Does Not Match".
+        var found_match = false
+        for integrity_expression in ak.vector_span(&integrity_expressions):
+            let hash_algorithm = integrity_expression.hash_algorithm else trap("VERIFY: integrity_expression.hash_algorithm.has_value()")
+            let base64_value = integrity_expression.base64_value else trap("VERIFY: integrity_expression.base64_value.has_value()")
+
+            if ak.string_view_equals_ignoring_ascii_case(&hash_algorithm, ak.string_bytes_as_string_view(&source.algorithm)) and ak.string_eq_string_view(&source.base64_value, base64_value):
+                found_match = true
+                break
+
+        if not found_match:
+            return ContentSecurityPolicyDirectivesMatchResult.does_not_match
+
+    # 7. Return "Matches".
+    return ContentSecurityPolicyDirectivesMatchResult.matches
+
+# mark: Script directives' request checks =======================================================
+
+## `directive->value().find_if(...equals_ignoring_ascii_case(keyword))` is not the end: whether a directive's value
+## contains a source expression that is an ASCII case-insensitive match for `keyword`.
+func content_security_policy_directives_value_contains_ignoring_ascii_case(directive: ContentSecurityPolicyDirective*, keyword: ak.FlyString) -> bool:
+    for directive_value in ak.vector_span(&directive.m_value):
+        if ak.string_equals_ignoring_ascii_case_string_view(&directive_value, ak.fly_string_bytes_as_string_view(&keyword)):
+            return true
+    return false
+
+## Ported from Libraries/LibWeb/ContentSecurityPolicy/Directives/DirectiveOperations.cpp:708 Web::ContentSecurityPolicy::Directives::script_directives_pre_request_check.
+# https://w3c.github.io/webappsec-csp/#script-pre-request
+pub func content_security_policy_directives_script_directives_pre_request_check(request: FetchRequest*, directive: ContentSecurityPolicyDirective*, policy: ContentSecurityPolicyPolicy*) -> ContentSecurityPolicyResult:
+    # 1. If request’s destination is script-like:
+    if fetch_request_destination_is_script_like(request):
+        # 1. If the result of executing § 6.7.2.3 Does nonce match source list? on request’s cryptographic nonce
+        #    metadata and this directive’s value is "Matches", return "Allowed".
+        if content_security_policy_directives_does_nonce_match_source_list(fetch_request_cryptographic_nonce_metadata(request), &directive.m_value) == ContentSecurityPolicyDirectivesMatchResult.matches:
+            return ContentSecurityPolicyResult.allowed
+
+        # 2. If the result of executing § 6.7.2.4 Does integrity metadata match source list? on request’s integrity
+        #    metadata and this directive’s value is "Matches", return "Allowed".
+        if content_security_policy_directives_does_integrity_metadata_match_source_list(fetch_request_integrity_metadata(request), &directive.m_value) == ContentSecurityPolicyDirectivesMatchResult.matches:
+            return ContentSecurityPolicyResult.allowed
+
+        # 3. If directive’s value contains a source expression that is an ASCII case-insensitive match for the
+        #    "'strict-dynamic'" keyword-source:
+        # Spec Note: "'strict-dynamic'" is explained in more detail in § 8.2 Usage of "'strict-dynamic'".
+        #            https://w3c.github.io/webappsec-csp/#strict-dynamic-usage
+        if content_security_policy_directives_value_contains_ignoring_ascii_case(directive, content_security_policy_directives_keyword_sources_strict_dynamic):
+            # 1. If the request’s parser metadata is "parser-inserted", return "Blocked".
+            #    Otherwise, return "Allowed".
+            if fetch_request_parser_metadata(request) == FetchRequestParserMetadata.parser_inserted:
+                return ContentSecurityPolicyResult.blocked
+
+            return ContentSecurityPolicyResult.allowed
+
+        # 4. If the result of executing § 6.7.2.5 Does request match source list? on request, directive’s value, and
+        #    policy, is "Does Not Match", return "Blocked".
+        if content_security_policy_directives_does_request_match_source_list(request, &directive.m_value, policy) == ContentSecurityPolicyDirectivesMatchResult.does_not_match:
+            return ContentSecurityPolicyResult.blocked
+
+    # 2. Return "Allowed".
+    return ContentSecurityPolicyResult.allowed
+
+## Ported from Libraries/LibWeb/ContentSecurityPolicy/Directives/DirectiveOperations.cpp:747 Web::ContentSecurityPolicy::Directives::script_directives_post_request_check.
+# https://w3c.github.io/webappsec-csp/#script-post-request
+pub func content_security_policy_directives_script_directives_post_request_check(request: FetchRequest*, response: FetchResponse*, directive: ContentSecurityPolicyDirective*, policy: ContentSecurityPolicyPolicy*) -> ContentSecurityPolicyResult:
+    # 1. If request’s destination is script-like:
+    if fetch_request_destination_is_script_like(request):
+        # 1. If the result of executing § 6.7.2.3 Does nonce match source list? on request’s cryptographic nonce
+        #    metadata and this directive’s value is "Matches", return "Allowed".
+        if content_security_policy_directives_does_nonce_match_source_list(fetch_request_cryptographic_nonce_metadata(request), &directive.m_value) == ContentSecurityPolicyDirectivesMatchResult.matches:
+            return ContentSecurityPolicyResult.allowed
+
+        # 2. If the result of executing § 6.7.2.4 Does integrity metadata match source list? on request’s integrity
+        #    metadata and this directive’s value is "Matches", return "Allowed".
+        if content_security_policy_directives_does_integrity_metadata_match_source_list(fetch_request_integrity_metadata(request), &directive.m_value) == ContentSecurityPolicyDirectivesMatchResult.matches:
+            return ContentSecurityPolicyResult.allowed
+
+        # 3. If directive’s value contains "'strict-dynamic'":
+        # FIXME: Should this be case insensitive?
+        if content_security_policy_directives_value_contains_ignoring_ascii_case(directive, content_security_policy_directives_keyword_sources_strict_dynamic):
+            # 1. If request’s parser metadata is not "parser-inserted", return "Allowed".
+            #    Otherwise, return "Blocked".
+            if fetch_request_parser_metadata(request) != FetchRequestParserMetadata.parser_inserted:
+                return ContentSecurityPolicyResult.allowed
+
+            return ContentSecurityPolicyResult.blocked
+
+        # 4. If the result of executing § 6.7.2.6 Does response to request match source list? on response, request,
+        #    directive’s value, and policy, is "Does Not Match", return "Blocked".
+        if content_security_policy_directives_does_response_match_source_list(response, request, &directive.m_value, policy) == ContentSecurityPolicyDirectivesMatchResult.does_not_match:
+            return ContentSecurityPolicyResult.blocked
+
+    # 2. Return "Allowed".
+    return ContentSecurityPolicyResult.allowed
+
+# mark: Matching elements to source lists =======================================================
+
+## Ported from Libraries/LibWeb/ContentSecurityPolicy/Directives/DirectiveOperations.cpp:792 Web::ContentSecurityPolicy::Directives::does_a_source_list_allow_all_inline_behavior_for_type.
+func content_security_policy_directives_does_a_source_list_allow_all_inline_behavior_for_type(source_list: const ak.Vector[ak.String]*, type_: ContentSecurityPolicyInlineType) -> ContentSecurityPolicyAllowsResult:
+    # 1. Let allow all inline be false.
+    var allow_all_inline = false
+
+    # 2. For each expression of list:
+    for expression in ak.vector_span_const(source_list):
+        let expression_view = ak.string_bytes_as_string_view(&expression)
+
+        # 1. If expression matches the nonce-source or hash-source grammar, return "Does Not Allow".
+        let nonce_source_parse_result = content_security_policy_directives_parse_source_expression(ContentSecurityPolicyProduction.nonce_source, expression_view)
+        if nonce_source_parse_result != none:
+            return ContentSecurityPolicyAllowsResult.does_not_allow
+
+        let hash_source_parse_result = content_security_policy_directives_parse_source_expression(ContentSecurityPolicyProduction.hash_source, expression_view)
+        if hash_source_parse_result != none:
+            return ContentSecurityPolicyAllowsResult.does_not_allow
+
+        # 2. If type is "script", "script attribute" or "navigation" and expression matches the keyword-source
+        #    "'strict-dynamic'", return "Does Not Allow".
+        if type_ == ContentSecurityPolicyInlineType.script or type_ == ContentSecurityPolicyInlineType.script_attribute or type_ == ContentSecurityPolicyInlineType.navigation:
+            if ak.string_equals_ignoring_ascii_case_string_view(&expression, ak.fly_string_bytes_as_string_view(&content_security_policy_directives_keyword_sources_strict_dynamic)):
+                return ContentSecurityPolicyAllowsResult.does_not_allow
+
+        # 3. If expression is an ASCII case-insensitive match for the keyword-source "'unsafe-inline'", set allow all
+        #    inline to true.
+        if ak.string_equals_ignoring_ascii_case_string_view(&expression, ak.fly_string_bytes_as_string_view(&content_security_policy_directives_keyword_sources_unsafe_inline)):
+            allow_all_inline = true
+
+    # 3. If allow all inline is true, return "Allows". Otherwise, return "Does Not Allow".
+    return ContentSecurityPolicyAllowsResult.allows if allow_all_inline else ContentSecurityPolicyAllowsResult.does_not_allow
+
+## Ported from Libraries/LibWeb/ContentSecurityPolicy/Directives/DirectiveOperations.cpp:831 Web::ContentSecurityPolicy::Directives::is_element_nonceable.
+# https://w3c.github.io/webappsec-csp/#is-element-nonceable
+func content_security_policy_directives_is_element_nonceable(maybe_element: DomElement*?) -> ContentSecurityPolicyNonceableResult:
+    # SPEC ISSUE 7: This processing is meant to mitigate the risk of dangling markup attacks that steal the nonce from
+    #               an existing element in order to load injected script. It is fairly expensive, however, as it
+    #               requires that we walk through all attributes and their values in order to determine whether the
+    #               script should execute. Here, we try to minimize the impact by doing this check only for script
+    #               elements when a nonce is present, but we should probably consider this algorithm as "at risk"
+    #               until we know its impact. [Issue #w3c/webappsec-csp#98] (https://github.com/w3c/webappsec-csp/issues/98)
+
+    # FIXME: See FIXME in `does_element_match_source_list_for_type_and_source`
+    let element = maybe_element else return ContentSecurityPolicyNonceableResult.not_nonceable
+
+    # 1. If element does not have an attribute named "nonce", return "Not Nonceable".
+    if not is_html_element(element.cell()) and not is_svg_element(element.cell()):
+        return ContentSecurityPolicyNonceableResult.not_nonceable
+
+    if not dom_element_has_attribute(element, html_attribute_names_nonce):
+        return ContentSecurityPolicyNonceableResult.not_nonceable
+
+    # 2. If element is a script element, then for each attribute of element’s attribute list:
+    # FIXME: File spec issue to ask if this should include SVGScriptElement.
+    if is_html_script_element(element.cell()):
+        let attributes = dom_element_attributes(element) else trap("no attribute list")
+        for attribute_index in 0..<dom_named_node_map_length(attributes):
+            let attribute = dom_named_node_map_item(attributes, (u32)attribute_index) else trap("VERIFY: attribute")
+
+            # 1. If attribute’s name contains an ASCII case-insensitive match for "<script" or "<style", return
+            #    "Not Nonceable".
+            let attribute_name_fly_string = dom_attr_name(attribute)
+            let attribute_name = ak.fly_string_to_string_const(&attribute_name_fly_string)
+            if ak.string_contains_string_view(&attribute_name, ak.sv("<script"), ak.CaseSensitivity.case_insensitive) or ak.string_contains_string_view(&attribute_name, ak.sv("<style"), ak.CaseSensitivity.case_insensitive):
+                return ContentSecurityPolicyNonceableResult.not_nonceable
+
+            # 2. If attribute’s value contains an ASCII case-insensitive match for "<script" or "<style", return
+            #    "Not Nonceable".
+            let attribute_value = dom_attr_value(attribute)
+            if ak.string_contains_string_view(&attribute_value, ak.sv("<script"), ak.CaseSensitivity.case_insensitive) or ak.string_contains_string_view(&attribute_value, ak.sv("<style"), ak.CaseSensitivity.case_insensitive):
+                return ContentSecurityPolicyNonceableResult.not_nonceable
+
+    # 3. If element had a duplicate-attribute parse error during tokenization, return "Not Nonceable".
+    # SPEC ISSUE 6: We need some sort of hook in HTML to record this error if we’re planning on using it here.
+    #               [Issue #whatwg/html#3257] (https://github.com/whatwg/html/issues/3257)
+    if dom_element_had_duplicate_attribute_during_tokenization(element):
+        return ContentSecurityPolicyNonceableResult.not_nonceable
+
+    # 4. Return "Nonceable".
+    return ContentSecurityPolicyNonceableResult.nonceable
+
+## Applies `algorithm` ("SHA-256", "SHA-384" or "SHA-512") to `bytes` and base64 encodes the result: the
+## `apply_algorithm_to_source` lambda of does_element_match_source_list_for_type_and_source.
+func content_security_policy_directives_apply_algorithm_to_source(algorithm: ak.StringView, bytes: const u8[]) -> ak.String:
+    var digest: u8[64] = ---
+    if ak.string_view_eq_string_view(&algorithm, ak.sv("SHA-256")):
+        let length = crypto.digest(bytes, digest, "sha256") else trap("MUST: SHA256::hash")
+        return ak.encode_base64(digest[0..<length]) else trap("MUST: encode_base64")
+
+    if ak.string_view_eq_string_view(&algorithm, ak.sv("SHA-384")):
+        let length = crypto.digest(bytes, digest, "sha384") else trap("MUST: SHA384::hash")
+        return ak.encode_base64(digest[0..<length]) else trap("MUST: encode_base64")
+
+    if ak.string_view_eq_string_view(&algorithm, ak.sv("SHA-512")):
+        let length = crypto.digest(bytes, digest, "sha512") else trap("MUST: SHA512::hash")
+        return ak.encode_base64(digest[0..<length]) else trap("MUST: encode_base64")
+
+    trap("VERIFY_NOT_REACHED")
+
+## Ported from Libraries/LibWeb/ContentSecurityPolicy/Directives/DirectiveOperations.cpp:887 Web::ContentSecurityPolicy::Directives::does_element_match_source_list_for_type_and_source.
+# https://w3c.github.io/webappsec-csp/#match-element-to-source-list
+pub func content_security_policy_directives_does_element_match_source_list_for_type_and_source(element: DomElement*?, source_list: const ak.Vector[ak.String]*, type_: ContentSecurityPolicyInlineType, source: ak.String) -> ContentSecurityPolicyDirectivesMatchResult:
+    # Spec Note: Regardless of the encoding of the document, source will be converted to UTF-8 before applying any
+    #            hashing algorithms.
+
+    # 1. If § 6.7.3.2 Does a source list allow all inline behavior for type? returns "Allows" given list and type,
+    #    return "Matches".
+    if content_security_policy_directives_does_a_source_list_allow_all_inline_behavior_for_type(source_list, type_) == ContentSecurityPolicyAllowsResult.allows:
+        return ContentSecurityPolicyDirectivesMatchResult.matches
+
+    # 2. If type is "script" or "style", and § 6.7.3.1 Is element nonceable? returns "Nonceable" when executed upon
+    #    element:
+    # Spec Note: Nonces only apply to inline script and inline style, not to attributes of either element or to
+    #            javascript: navigations.
+    # FIXME: File spec issue that this algorithm doesn't handle `element` being null, which is it when doing a
+    #        javascript: URL navigation. For now, we say that the element is not nonceable if it's null, because
+    #        we simply can't pull a nonce attribute value from a null element.
+    if (type_ == ContentSecurityPolicyInlineType.script or type_ == ContentSecurityPolicyInlineType.style) and content_security_policy_directives_is_element_nonceable(element) == ContentSecurityPolicyNonceableResult.nonceable:
+        # 1. For each expression of list:
+        for expression in ak.vector_span_const(source_list):
+            # 1. If expression matches the nonce-source grammar, and element has a nonce attribute whose value is
+            #    expression's base64-value part, return "Matches".
+            if let nonce_source_parse_result = content_security_policy_directives_parse_source_expression(ContentSecurityPolicyProduction.nonce_source, ak.string_bytes_as_string_view(&expression)):
+                let nonceable_element = element else trap("VERIFY: element")
+                assert(is_html_element(nonceable_element.cell()) or is_svg_element(nonceable_element.cell()))
+
+                var element_nonce = ak.string_new()
+                if let html_element = as_if_html_element(nonceable_element.cell()):
+                    element_nonce = html_or_svg_element_nonce(&html_element.html_or_svg_element)
+                else:
+                    let svg_element = as_svg_element(nonceable_element.cell())
+                    element_nonce = html_or_svg_element_nonce(&svg_element.html_or_svg_element)
+
+                # (Optional<StringView> == String: a value equal to the nonce.)
+                if let base64_value = nonce_source_parse_result.base64_value:
+                    if ak.string_eq_string_view(&element_nonce, base64_value):
+                        return ContentSecurityPolicyDirectivesMatchResult.matches
+
+    # 3. Let unsafe-hashes flag be false.
+    var unsafe_hashes_flag = false
+
+    # 4. For each expression of list:
+    for expression in ak.vector_span_const(source_list):
+        # 1. If expression is an ASCII case-insensitive match for the keyword-source "'unsafe-hashes'", set
+        #    unsafe-hashes flag to true. Break out of the loop.
+        if ak.string_equals_ignoring_ascii_case_string_view(&expression, ak.fly_string_bytes_as_string_view(&content_security_policy_directives_keyword_sources_unsafe_hashes)):
+            unsafe_hashes_flag = true
+            break
+
+    # 5. If type is "script" or "style", or unsafe-hashes flag is true:
+    # NOTE: Hashes apply to inline script and inline style. If the "'unsafe-hashes'" source expression is present,
+    #       they will also apply to event handlers, style attributes and javascript: navigations.
+    if type_ == ContentSecurityPolicyInlineType.script or type_ == ContentSecurityPolicyInlineType.style or unsafe_hashes_flag:
+        # 1. Set source to the result of executing UTF-8 encode on the result of executing JavaScript string
+        #    converting on source.
+        let converted_source = web_infra.convert_to_scalar_value_string(ak.string_bytes_as_string_view(&source)) else trap("MUST: Infra::convert_to_scalar_value_string")
+
+        # NOTE: converted_source is already UTF-8 encoded.
+        let converted_source_view = ak.string_bytes_as_string_view(&converted_source)
+        let converted_source_bytes = ak.string_view_bytes(&converted_source_view)
+
+        # 2. For each expression of list:
+        for expression in ak.vector_span_const(source_list):
+            # 1. If expression is the "'strict-dynamic'" keyword-source:
+            if ak.string_equals_ignoring_ascii_case_string_view(&expression, ak.fly_string_bytes_as_string_view(&content_security_policy_directives_keyword_sources_strict_dynamic)):
+                # 1. If type is "script", and element is not parser-inserted, return "Matches".
+                if type_ == ContentSecurityPolicyInlineType.script:
+                    if let script_element = element:
+                        if let html_script_element = as_if_html_script_element(script_element.cell()):
+                            if not html_script_element_is_parser_inserted(html_script_element):
+                                return ContentSecurityPolicyDirectivesMatchResult.matches
+                        elif let svg_script_element = as_if_svg_script_element(script_element.cell()):
+                            if not svg_script_element_is_parser_inserted(svg_script_element):
+                                return ContentSecurityPolicyDirectivesMatchResult.matches
+
+            # 2. If expression matches the hash-source grammar:
+            if let hash_source_parse_result = content_security_policy_directives_parse_source_expression(ContentSecurityPolicyProduction.hash_source, ak.string_bytes_as_string_view(&expression)):
+                # 1. Let algorithm be null.
+                var algorithm: ak.StringView? = none
+
+                # 2. If expression’s hash-algorithm part is an ASCII case-insensitive match for "sha256", set
+                #    algorithm to SHA-256.
+                let hash_algorithm_from_expression = hash_source_parse_result.hash_algorithm else trap("VERIFY: hash_source_parse_result->hash_algorithm.has_value()")
+
+                if ak.string_view_equals_ignoring_ascii_case(&hash_algorithm_from_expression, ak.sv("sha256")):
+                    algorithm = ak.sv("SHA-256")
+
+                # 3. If expression’s hash-algorithm part is an ASCII case-insensitive match for "sha384", set
+                #    algorithm to SHA-384.
+                if ak.string_view_equals_ignoring_ascii_case(&hash_algorithm_from_expression, ak.sv("sha384")):
+                    algorithm = ak.sv("SHA-384")
+
+                # 4. If expression’s hash-algorithm part is an ASCII case-insensitive match for "sha512", set
+                #    algorithm to SHA-512.
+                if ak.string_view_equals_ignoring_ascii_case(&hash_algorithm_from_expression, ak.sv("sha512")):
+                    algorithm = ak.sv("SHA-512")
+
+                # 5. If algorithm is not null:
+                if let algorithm_name = algorithm:
+                    # 1. Let actual be the result of base64 encoding the result of applying algorithm to source.
+                    let actual = content_security_policy_directives_apply_algorithm_to_source(algorithm_name, converted_source_bytes)
+
+                    # 2. Let expected be expression’s base64-value part, with all '-' characters replaced with '+',
+                    #    and all '_' characters replaced with '/'.
+                    # Spec Note: This replacement normalizes hashes expressed in base64url encoding into base64
+                    #            encoding for matching.
+                    let base64_value = hash_source_parse_result.base64_value else trap("VERIFY: hash_source_parse_result->base64_value.has_value()")
+                    let base64_value_string = ak.string_from_utf8(base64_value) else trap("MUST: String::from_utf8")
+
+                    var expected = ak.string_replace(&base64_value_string, ak.sv("-"), ak.sv("+"), ak.ReplaceMode.all) else trap("MUST: String::replace")
+                    expected = ak.string_replace(&expected, ak.sv("_"), ak.sv("/"), ak.ReplaceMode.all) else trap("MUST: String::replace")
+
+                    # 3. If actual is identical to expected, return "Matches".
+                    if ak.string_equals(&actual, &expected):
+                        return ContentSecurityPolicyDirectivesMatchResult.matches
+
+    # 6. Return "Does Not Match".
+    return ContentSecurityPolicyDirectivesMatchResult.does_not_match

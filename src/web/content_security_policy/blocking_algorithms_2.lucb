@@ -1,0 +1,318 @@
+#==============================================================================================
+#
+#   blocking_algorithms_2 - ContentSecurityPolicy's checks of inline behavior, string and
+#   WebAssembly compilation, and <base>
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibWeb/ContentSecurityPolicy/BlockingAlgorithms.cpp (lines 398-742):
+#       should_elements_inline_type_behavior_be_blocked_by_content_security_policy,
+#       ensure_csp_does_not_block_string_compilation, ensure_csp_does_not_block_wasm_byte_compilation
+#       and is_base_allowed_for_document. Region r28 ported the inline and <base> checks for phase
+#       1 (a connected <style>, an element with an event handler content attribute and a
+#       <base href> reach them); region p2e ported the rest. String compilation needs
+#       TrustedTypes (phase 3), WebAssembly compilation its CompileError (phase 4).
+#
+#       Copyright (c) 2025, Luke Wilde <luke@ladybird.org>
+#       Copyright (c) 2025, Kenneth Myhra <kennethmyhra@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+## `source_list.find_if(...equals_ignoring_ascii_case(keyword))` is not the end: whether a source list holds a
+## source expression that is an ASCII case-insensitive match for `keyword`.
+func content_security_policy_source_list_contains_ignoring_ascii_case(source_list: const ak.Vector[ak.String]*, keyword: ak.FlyString) -> bool:
+    for directive_value in ak.vector_span_const(source_list):
+        if ak.string_equals_ignoring_ascii_case_string_view(&directive_value, ak.fly_string_bytes_as_string_view(&keyword)):
+            return true
+    return false
+
+## `policy->directives().find_if([](auto const& directive) { return directive->name() == name; })`: the policy's
+## first directive named `name`.
+func content_security_policy_policy_first_directive_named(policy: ContentSecurityPolicyPolicy*, name: ak.FlyString) -> ContentSecurityPolicyDirective*?:
+    for directive in ak.vector_span(&policy.m_directives):
+        if ak.string_eq_fly_string(&directive.m_name, &name):
+            return directive
+    return none
+
+## Steps 1-2 of the CSP compilation checks: the value of the policy's script-src directive, or else of its
+## default-src directive, or null.
+func content_security_policy_script_source_list(policy: ContentSecurityPolicyPolicy*) -> ak.Vector[ak.String]?:
+    # 1. Let source-list be null.
+    var maybe_source_list: ak.Vector[ak.String]? = none
+
+    # 2. If policy contains a directive whose name is "script-src", then set source-list to that directive's value.
+    if let script_src = content_security_policy_policy_first_directive_named(policy, content_security_policy_directives_names_script_src):
+        maybe_source_list = script_src.m_value
+    else:
+        #   Otherwise if policy contains a directive whose name is "default-src", then set source-list to that
+        #   directive’s value.
+        if let default_src = content_security_policy_policy_first_directive_named(policy, content_security_policy_directives_names_default_src):
+            maybe_source_list = default_src.m_value
+
+    return maybe_source_list
+
+# mark: Inline behavior =========================================================================
+
+## Ported from Libraries/LibWeb/ContentSecurityPolicy/BlockingAlgorithms.cpp:399 Web::ContentSecurityPolicy::should_elements_inline_type_behavior_be_blocked_by_content_security_policy.
+# https://w3c.github.io/webappsec-csp/#should-block-inline
+pub func content_security_policy_should_elements_inline_type_behavior_be_blocked_by_content_security_policy(realm: Realm*, element: DomElement*, type_: ContentSecurityPolicyInlineType, source: ak.String) -> ContentSecurityPolicyResult:
+    # Spec Note: The valid values for type are "script", "script attribute", "style", and "style attribute".
+    assert(type_ == ContentSecurityPolicyInlineType.script or type_ == ContentSecurityPolicyInlineType.script_attribute or type_ == ContentSecurityPolicyInlineType.style or type_ == ContentSecurityPolicyInlineType.style_attribute)
+
+    # 1. Assert: element is not null.
+    # NOTE: Already done by only accepting a GC::Ref.
+
+    # 2. Let result be "Allowed".
+    var result = ContentSecurityPolicyResult.allowed
+
+    # 3. For each policy of element’s Document's global object’s CSP list:
+    let global_object = realm_global_object(bind_platform_object_realm(dom_node_document(element.dom_node()).bind_platform_object()))
+    let csp_list = content_security_policy_policy_list_from_object(global_object) else trap("VERIFY: csp_list")
+
+    for policy in ak.vector_span(&csp_list.m_policies):
+        # 1. For each directive of policy’s directive set:
+        for directive in ak.vector_span(&policy.m_directives):
+            # 1. If directive’s inline check returns "Allowed" when executed upon element, type, policy and source,
+            #    skip to the next directive.
+            if content_security_policy_directive_inline_check(directive, realm_heap(realm), element, type_, policy, source) == ContentSecurityPolicyResult.allowed:
+                continue
+
+            # 2. Let directive-name be the result of executing § 6.8.2 Get the effective directive for inline checks
+            #    on type.
+            let directive_name = content_security_policy_directives_get_the_effective_directive_for_inline_checks(type_)
+
+            # 3. Otherwise, let violation be the result of executing § 2.4.1 Create a violation object for global,
+            #   policy, and directive on the current settings object’s global object, policy, and directive-name.
+            # FIXME: File spec issue about using "current settings object" here, as it can run outside of a script
+            #        context (for example, a just parsed inline script being prepared)
+            let violation = content_security_policy_violation_create_a_violation_object_for_global_policy_and_directive(realm, global_object, policy, ak.fly_string_to_string_const(&directive_name))
+
+            # 4. Set violation’s resource to "inline".
+            content_security_policy_violation_set_resource(violation, ContentSecurityPolicyViolationResourceType.resource(ContentSecurityPolicyViolationResource.inline_))
+
+            # 5. Set violation’s element to element.
+            content_security_policy_violation_set_element(violation, element)
+
+            # 6. If directive’s value contains the expression "'report-sample'", then set violation’s sample to the
+            #    substring of source containing its first 40 characters.
+            # FIXME: Should this be case insensitive?
+            if content_security_policy_source_list_contains_ignoring_ascii_case(&directive.m_value, content_security_policy_directives_keyword_sources_report_sample):
+                var source_view: ak.Utf8View = ---
+                ak.utf8_view_construct_string_view(&source_view, ak.string_bytes_as_string_view(&source))
+                let length = ak.utf8_view_length(&source_view)
+                let sample = ak.utf8_view_unicode_substring_view_usize(&source_view, 0, length if length < 40 else 40)
+                let sample_view = ak.utf8_view_as_string(&sample)
+                content_security_policy_violation_set_sample(violation, ak.string_from_utf8_without_validation(ak.string_view_bytes(&sample_view)))
+
+            # 7. Execute § 5.5 Report a violation on violation.
+            content_security_policy_violation_report_a_violation(violation, realm)
+
+            # 8. If policy’s disposition is "enforce", then set result to "Blocked".
+            if content_security_policy_policy_disposition(policy) == ContentSecurityPolicyPolicyDisposition.enforce:
+                result = ContentSecurityPolicyResult.blocked
+
+    # 4. Return result.
+    return result
+
+# mark: String and WebAssembly compilation ======================================================
+
+## `TrustedScriptOrString` as the input of get_trusted_type_compliant_string (its wider variant).
+func content_security_policy_trusted_script_input(source: TrustedTypesTrustedScriptOrString) -> TrustedTypesTrustedHtmlOrTrustedTypesTrustedScriptOrTrustedTypesTrustedScriptUrlOrUtf16String:
+    return match source:
+        .trusted_types_trusted_script(script) => TrustedTypesTrustedHtmlOrTrustedTypesTrustedScriptOrTrustedTypesTrustedScriptUrlOrUtf16String.trusted_types_trusted_script(script)
+        .utf16_string(string) => TrustedTypesTrustedHtmlOrTrustedTypesTrustedScriptOrTrustedTypesTrustedScriptUrlOrUtf16String.utf16_string(string)
+
+## Ported from Libraries/LibWeb/ContentSecurityPolicy/BlockingAlgorithms.cpp:467 Web::ContentSecurityPolicy::ensure_csp_does_not_block_string_compilation.
+# https://w3c.github.io/webappsec-csp/#can-compile-strings
+pub func content_security_policy_ensure_csp_does_not_block_string_compilation(realm: Realm*, parameter_strings: const ak.String[], body_string: ak.StringView, code_string: ak.StringView, compilation_type: JsCompilationType, parameter_args: const JsValue[], body_arg: JsValue) -> !:
+    var source_string = ak.utf16_string_new()
+
+    # 1. If compilationType is "TIMER", then:
+    if compilation_type == JsCompilationType.timer:
+        # 1. Let sourceString be codeString.
+        source_string = ak.utf16_string_from_utf8_string_view(code_string)
+    # 2. Else:
+    else:
+        # 1. Let compilationSink be "Function" if compilationType is "FUNCTION", and "eval" otherwise.
+        let compilation_sink = TrustedTypesInjectionSink.function if compilation_type == JsCompilationType.function else TrustedTypesInjectionSink.eval
+
+        # 2. Let isTrusted be true if bodyArg implements TrustedScript, and false otherwise.
+        var is_trusted = js_value_as_if_trusted_types_trusted_script(body_arg) != none
+
+        # 3. If isTrusted is true then:
+        if is_trusted:
+            # 1. If bodyString is not equal to bodyArg’s data, set isTrusted to false.
+            let body_trusted_script = js_value_as_if_trusted_types_trusted_script(body_arg) else trap("as<TrustedTypes::TrustedScript> failed")
+            let body_data = trusted_types_trusted_script_to_string(body_trusted_script)
+            if not ak.utf16_string_base_eq_string_view(&body_data.utf16_string_base, body_string):
+                is_trusted = false
+
+        # 4. If isTrusted is true, then:
+        if is_trusted:
+            # 1. Assert: parameterArgs’ [list/size=] is equal to [parameterStrings]' size.
+            assert(parameter_args.length == parameter_strings.length)
+
+            # 2. For each index of the range 0 to |parameterArgs]' [list/size=]:
+            for i in 0..<parameter_args.length:
+                # 1. Let arg be parameterArgs[index].
+                let arg = parameter_args[i]
+
+                # 2. If arg implements TrustedScript, then:
+                if let trusted_script = js_value_as_if_trusted_types_trusted_script(arg):
+                    # 1. if parameterStrings[index] is not equal to arg’s data, set isTrusted to false.
+                    let data = trusted_types_trusted_script_to_string(trusted_script)
+                    let parameter_string = parameter_strings[i]
+                    if not ak.utf16_string_base_eq_string_view(&data.utf16_string_base, ak.string_bytes_as_string_view(&parameter_string)):
+                        is_trusted = false
+                        break
+                # 3. Otherwise, set isTrusted to false.
+                else:
+                    is_trusted = false
+                    break
+
+        # 5. Let sourceToValidate be a new TrustedScript object created in realm whose data is set to codeString
+        #    if isTrusted is true, and codeString otherwise.
+        var source_to_validate = TrustedTypesTrustedScriptOrString.utf16_string(ak.utf16_string_from_utf8_string_view(code_string))
+        if is_trusted:
+            source_to_validate = .trusted_types_trusted_script(realm_create_trusted_types_trusted_script(realm, ak.utf16_string_from_utf8_string_view(code_string)))
+
+        # 6. Let sourceString be the result of executing the Get Trusted Type compliant string algorithm,
+        #    with TrustedScript, realm, sourceToValidate, compilationSink, and 'script'.
+        # 7. If the algorithm throws an error, throw an EvalError.
+        source_string = trusted_types_get_trusted_type_compliant_string(TrustedTypesTrustedTypeName.trusted_script, realm_global_object(realm), content_security_policy_trusted_script_input(source_to_validate), compilation_sink, ak.fly_string_to_string_const(&trusted_types_script)) catch:
+            try vm_throw_completion(realm_vm(realm), IdlSimpleExceptionType.eval_error, .string_view(ak.sv("Blocked by Content Security Policy")))
+
+        # 8. If sourceString is not equal to codeString, throw an EvalError.
+        if not ak.utf16_string_base_eq_string_view(&source_string.utf16_string_base, code_string):
+            try vm_throw_completion(realm_vm(realm), IdlSimpleExceptionType.eval_error, .string_view(ak.sv("Blocked by Content Security Policy")))
+
+    # 3. Let result be "Allowed".
+    var result = ContentSecurityPolicyResult.allowed
+
+    # 4. Let global be realm’s global object.
+    let global = realm_global_object(realm)
+
+    # 5. For each policy of global’s CSP list:
+    let csp_list = content_security_policy_policy_list_from_object(global) else trap("VERIFY: csp_list")
+    for policy in ak.vector_span(&csp_list.m_policies):
+        # 1. Let source-list be null.
+        # 2. If policy contains a directive whose name is "script-src", then set source-list to that directive's value.
+        #   Otherwise if policy contains a directive whose name is "default-src", then set source-list to that
+        #   directive’s value.
+        let maybe_source_list = content_security_policy_script_source_list(policy)
+
+        # 3. If source-list is not null, and does not contain a source expression which is an ASCII case-insensitive
+        #    match for the string "'unsafe-eval'", then:
+        if let source_list = maybe_source_list:
+            if not content_security_policy_source_list_contains_ignoring_ascii_case(&source_list, content_security_policy_directives_keyword_sources_unsafe_eval):
+                # 1. Let violation be the result of executing § 2.4.1 Create a violation object for global, policy,
+                #    and directive on global, policy, and "script-src".
+                let script_src_string = ak.fly_string_to_string_const(&content_security_policy_directives_names_script_src)
+                let violation = content_security_policy_violation_create_a_violation_object_for_global_policy_and_directive(realm, global, policy, script_src_string)
+
+                # 2. Set violation’s resource to "eval".
+                content_security_policy_violation_set_resource(violation, ContentSecurityPolicyViolationResourceType.resource(ContentSecurityPolicyViolationResource.eval))
+
+                # 3. If source-list contains the expression "'report-sample'", then set violation’s sample to the
+                #    substring of sourceString containing its first 40 characters.
+                # FIXME: Should this be case insensitive?
+                if content_security_policy_source_list_contains_ignoring_ascii_case(&source_list, content_security_policy_directives_keyword_sources_report_sample):
+                    let length = ak.utf16_string_base_length_in_code_units(&source_string.utf16_string_base)
+                    let source_view = ak.utf16_string_base_substring_view_usize(&source_string.utf16_string_base, 0, length if length < 40 else 40)
+                    content_security_policy_violation_set_sample(violation, ak.utf16_view_to_utf8_but_should_be_ported_to_utf16(&source_view))
+
+                # 4. Execute § 5.5 Report a violation on violation.
+                content_security_policy_violation_report_a_violation(violation, realm)
+
+                # 5. If policy’s disposition is "enforce", then set result to "Blocked".
+                if content_security_policy_policy_disposition(policy) == ContentSecurityPolicyPolicyDisposition.enforce:
+                    result = ContentSecurityPolicyResult.blocked
+
+    # 6. If result is "Blocked", throw an EvalError exception.
+    if result == ContentSecurityPolicyResult.blocked:
+        try vm_throw_completion(realm_vm(realm), IdlSimpleExceptionType.eval_error, .string_view(ak.sv("Blocked by Content Security Policy")))
+
+## Ported from Libraries/LibWeb/ContentSecurityPolicy/BlockingAlgorithms.cpp:623 Web::ContentSecurityPolicy::ensure_csp_does_not_block_wasm_byte_compilation.
+# https://w3c.github.io/webappsec-csp/#can-compile-wasm-bytes
+pub func content_security_policy_ensure_csp_does_not_block_wasm_byte_compilation(realm: Realm*) -> !:
+    # 1. Let global be realm’s global object.
+    let global = realm_global_object(realm)
+
+    # 2. Let result be "Allowed".
+    var result = ContentSecurityPolicyResult.allowed
+
+    # 3. For each policy of global’s CSP list:
+    let csp_list = content_security_policy_policy_list_from_object(global) else trap("VERIFY: csp_list")
+    for policy in ak.vector_span(&csp_list.m_policies):
+        # 1. Let source-list be null.
+        # 2. If policy contains a directive whose name is "script-src", then set source-list to that directive's value.
+        #   Otherwise if policy contains a directive whose name is "default-src", then set source-list to that
+        #   directive’s value.
+        let maybe_source_list = content_security_policy_script_source_list(policy)
+
+        # 3. If source-list is non-null, and does not contain a source expression which is an ASCII case-insensitive
+        #    match for the string "'unsafe-eval'", and does not contain a source expression which is an ASCII
+        #    case-insensitive match for the string "'wasm-unsafe-eval'", then:
+        if let source_list = maybe_source_list:
+            if (not content_security_policy_source_list_contains_ignoring_ascii_case(&source_list, content_security_policy_directives_keyword_sources_unsafe_eval) and not content_security_policy_source_list_contains_ignoring_ascii_case(&source_list, content_security_policy_directives_keyword_sources_wasm_unsafe_eval)):
+                # 1. Let violation be the result of executing § 2.4.1 Create a violation object for global, policy,
+                #    and directive on global, policy, and "script-src".
+                let script_src_string = ak.fly_string_to_string_const(&content_security_policy_directives_names_script_src)
+                let violation = content_security_policy_violation_create_a_violation_object_for_global_policy_and_directive(realm, global, policy, script_src_string)
+
+                # 2. Set violation’s resource to "wasm-eval".
+                content_security_policy_violation_set_resource(violation, ContentSecurityPolicyViolationResourceType.resource(ContentSecurityPolicyViolationResource.wasm_eval))
+
+                # 3. Execute § 5.5 Report a violation on violation.
+                content_security_policy_violation_report_a_violation(violation, realm)
+
+                # 4. If policy’s disposition is "enforce", then set result to "Blocked".
+                if content_security_policy_policy_disposition(policy) == ContentSecurityPolicyPolicyDisposition.enforce:
+                    result = ContentSecurityPolicyResult.blocked
+
+    # 4. If result is "Blocked", throw a WebAssembly.CompileError exception.
+    if result == ContentSecurityPolicyResult.blocked:
+        try vm_throw_completion_web_assembly_compile_error(realm_vm(realm), ak.sv("Blocked by Content Security Policy"))
+
+# mark: <base> ==================================================================================
+
+## Ported from Libraries/LibWeb/ContentSecurityPolicy/BlockingAlgorithms.cpp:695 Web::ContentSecurityPolicy::is_base_allowed_for_document.
+# https://w3c.github.io/webappsec-csp/#allow-base-for-document
+pub func content_security_policy_is_base_allowed_for_document(realm: Realm*, base: web_url.Url, document: DomDocument*) -> ContentSecurityPolicyResult:
+    # 1. For each policy of document’s global object’s csp list:
+    let csp_list = content_security_policy_policy_list_from_object(realm_global_object(bind_platform_object_realm(document.bind_platform_object()))) else trap("VERIFY: csp_list")
+    for policy in ak.vector_span(&csp_list.m_policies):
+        # 1. Let source list be null.
+        # NOTE: Not necessary.
+
+        # 2. If a directive whose name is "base-uri" is present in policy’s directive set, set source list to that
+        #    directive’s value.
+        let maybe_base_uri = content_security_policy_policy_first_directive_named(policy, content_security_policy_directives_names_base_uri)
+
+        # 3. If source list is null, skip to the next policy.
+        let base_uri = maybe_base_uri else continue
+
+        let source_list = &base_uri.m_value
+
+        # 4. If the result of executing § 6.7.2.7 Does url match source list in origin with redirect count? on base,
+        #    source list, policy’s self-origin, and 0 is "Does Not Match":
+        # Spec Note: We compare against the fallback base URL in order to deal correctly with things like an iframe
+        #            srcdoc Document which has been sandboxed into an opaque origin.
+        if content_security_policy_directives_does_url_match_source_list_in_origin_with_redirect_count(base, source_list, content_security_policy_policy_self_origin(policy), 0) == ContentSecurityPolicyDirectivesMatchResult.does_not_match:
+            # 1. Let violation be the result of executing § 2.4.1 Create a violation object for global, policy, and
+            #    directive on document’s global object, policy, and "base-uri".
+            let base_uri_string = ak.fly_string_to_string_const(&content_security_policy_directives_names_base_uri)
+            let violation = content_security_policy_violation_create_a_violation_object_for_global_policy_and_directive(realm, (JsObject*?)dom_document_window(document), policy, base_uri_string)
+
+            # 2. Set violation’s resource to "inline".
+            content_security_policy_violation_set_resource(violation, ContentSecurityPolicyViolationResourceType.resource(ContentSecurityPolicyViolationResource.inline_))
+
+            # 3. Execute § 5.5 Report a violation on violation.
+            content_security_policy_violation_report_a_violation(violation, realm)
+
+            # 4. If policy’s disposition is "enforce", return "Blocked".
+            if content_security_policy_policy_disposition(policy) == ContentSecurityPolicyPolicyDisposition.enforce:
+                return ContentSecurityPolicyResult.blocked
+
+    # 2. Return "Allowed".
+    return ContentSecurityPolicyResult.allowed

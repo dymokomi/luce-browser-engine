@@ -1,0 +1,450 @@
+#==============================================================================================
+#
+#   tests_csp_2 - region p2e's tests of what the oracle does not reach: serializing and
+#   cloning policies and CSP lists, directive lookup and removal, the CSP-derived sandboxing
+#   flags, violations and the securitypolicyviolation event reporting fires, the <meta>
+#   pragma and an inline <style> blocked by a policy, the sandbox and frame-ancestors checks,
+#   and what a collection keeps
+#
+#   DESCRIPTION:
+#       The scenarios run in the active document of a test page's top-level traversable (an
+#       about:blank document with a Window), as tests_csp_1's oracle cases do.
+#
+#==============================================================================================
+
+# mark: Helpers =================================================================================
+
+## A test page's window document, and its VM, for one test (tests_html_browsing's page).
+struct CspTestPage:
+    var vm: Vm*
+    var document: DomDocument*
+
+## Whether `string` is `text`.
+func csp_test_is(string: ak.String, text: str) -> bool:
+    return ak.string_eq_string_view(&string, ak.sv(text))
+
+## A policy parsed from `text` as a header delivers it, with the self-origin https://self.test.
+func csp_test_header_policy(page: const CspTestPage*, text: str, disposition: ContentSecurityPolicyPolicyDisposition = ContentSecurityPolicyPolicyDisposition.enforce) -> ContentSecurityPolicyPolicy*:
+    let policy = content_security_policy_policy_parse_a_serialized_csp(vm_heap(page.vm), ByteStringOrString.byte_string(ak.byte_string_from_str(text)), ContentSecurityPolicyPolicySource.header, disposition)
+    let self_url = web_url.parser_basic_parse(ak.sv("https://self.test/")) else trap("the URL parses")
+    content_security_policy_policy_set_self_origin(policy, web_url.url_origin(&self_url))
+    return policy
+
+## The names of a policy's directives, space separated, and the class of each: "name(Class) ...".
+func csp_test_directive_classes(policy: ContentSecurityPolicyPolicy*) -> ak.String:
+    var builder = ak.string_builder_new()
+    for (index, directive) in ak.vector_span(&policy.m_directives).indexed():
+        if index > 0:
+            ak.string_builder_append(&builder, " ")
+        ak.string_builder_append_string_view(&builder, ak.string_bytes_as_string_view(&directive.m_name))
+        ak.string_builder_append(&builder, "(")
+        ak.string_builder_append(&builder, directive.cell().vtable.class_info.name)
+        ak.string_builder_append(&builder, ")")
+    return ak.string_builder_to_string_without_validation(&builder)
+
+## The window's CSP list of the page.
+func csp_test_page_csp_list(page: const CspTestPage*) -> ContentSecurityPolicyPolicyList*:
+    return content_security_policy_policy_list_from_object(realm_global_object(dom_document_realm(page.document))) else trap("the window has a CSP list")
+
+## Runs the queued tasks of the main thread event loop whose source is "unspecified" (a reported
+## violation's), oldest first.
+func csp_test_run_unspecified_tasks():
+    let queue = html_event_loop_task_queue(html_main_thread_event_loop())
+    while let task = html_task_queue_take_first_runnable_matching(queue, ak.Function1[HtmlTask*, bool](call = csp_test_is_unspecified_task, context = none)):
+        html_task_execute(task)
+
+## The filter of csp_test_run_unspecified_tasks.
+func csp_test_is_unspecified_task(context: void*?, task: HtmlTask*) -> bool:
+    return task.m_source == HtmlTaskSource.unspecified
+
+## What a securitypolicyviolation listener saw.
+struct CspTestSeen:
+    var calls: i32
+    var event: JsValue
+
+## The listener's native function: records the event.
+func csp_test_record_event(context: void*?, vm: Vm*) -> JsValue!:
+    let seen = (CspTestSeen*)(context else trap("no captures"))
+    seen.calls += 1
+    seen.event = vm_argument(vm, 0)
+    return js_undefined()
+
+## An IDLEventListener over a native function recording into `seen`, in the page's realm.
+func csp_test_listener(page: const CspTestPage*, seen: CspTestSeen*) -> DomIdlEventListener*:
+    let realm = dom_document_realm(page.document)
+    let function = js_native_function_create(realm, JsNativeFunctionBehaviour(call = csp_test_record_event, context = seen), 1, ak.utf16_fly_string_new(), realm)
+    let callback = (IdlCallbackType*)web_allocate_cell(realm, &idl_callback_type_class)
+    idl_callback_type_construct_html_environment_settings_obje(callback, (JsObject*)function, dom_document_relevant_settings_object(page.document))
+    web_initialize_cell(callback.cell(), realm)
+    return dom_idl_event_listener_create(realm, callback)
+
+## The SecurityPolicyViolationEvent a listener saw.
+func csp_test_seen_event(seen: const CspTestSeen*) -> ContentSecurityPolicySecurityPolicyViolationEvent*:
+    return as_content_security_policy_security_policy_violation_event((gc.Cell*)js_value_as_object(seen.event))
+
+# mark: Serializing and cloning =================================================================
+
+test "CSP: policies and CSP lists serialize, deserialize and clone with their directive sets":
+    web_initialize_strings()
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    discard(web_test_install_agent(vm))
+    web_test_install_event_loop_plugin()
+    defer web_test_remove_event_loop_plugin()
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        let (test_page, traversable) = test_browsing_page_with_traversable(vm)
+        discard(test_page)
+        let page = CspTestPage(vm = vm, document = html_navigable_active_document(traversable.html_navigable()) else trap("no document"))
+        let heap = vm_heap(vm)
+
+        let policy = csp_test_header_policy(&page, "default-src 'self'; img-src * data:; frobnicate x", ContentSecurityPolicyPolicyDisposition.report)
+        assert(csp_test_is(csp_test_directive_classes(policy), "default-src(DefaultSourceDirective) img-src(ImageSourceDirective) frobnicate(Directive)"))
+
+        # Serialize: the names, values, disposition, source, self-origin and pre-parsed string.
+        var serialized = content_security_policy_policy_serialize(policy)
+        assert(ak.vector_size(&serialized.directives) == 3)
+        let img_src = ak.vector_at(&serialized.directives, 1)
+        assert(csp_test_is(img_src.name, "img-src") and ak.vector_size(&img_src.value) == 2 and csp_test_is(*ak.vector_at(&img_src.value, 1), "data:"))
+        assert(serialized.disposition == ContentSecurityPolicyPolicyDisposition.report and serialized.source == ContentSecurityPolicyPolicySource.header)
+        assert(csp_test_is(web_url.origin_serialize(&serialized.self_origin), "https://self.test"))
+        assert(csp_test_is(serialized.pre_parsed_policy_string, "default-src 'self'; img-src * data:; frobnicate x"))
+
+        # Deserialize: the same directive classes (the factory picks them by name).
+        let restored = content_security_policy_policy_create_from_serialized_policy(heap, &serialized)
+        assert(restored != policy)
+        assert(csp_test_is(csp_test_directive_classes(restored), "default-src(DefaultSourceDirective) img-src(ImageSourceDirective) frobnicate(Directive)"))
+        assert(content_security_policy_policy_disposition(restored) == ContentSecurityPolicyPolicyDisposition.report)
+        assert(csp_test_is(content_security_policy_policy_pre_parsed_policy_string(restored), "default-src 'self'; img-src * data:; frobnicate x"))
+
+        # Clone: new directive cells with equal names and values.
+        let clone = content_security_policy_policy_clone(policy, heap)
+        assert(clone != policy and *ak.vector_at(&clone.m_directives, 0) != *ak.vector_at(&policy.m_directives, 0))
+        assert(csp_test_is(csp_test_directive_classes(clone), "default-src(DefaultSourceDirective) img-src(ImageSourceDirective) frobnicate(Directive)"))
+        let clone_origin = content_security_policy_policy_self_origin(clone)
+        assert(web_url.origin_is_same_origin(&clone_origin, content_security_policy_policy_self_origin(policy)))
+
+        # A CSP list of both: serialized and recreated, and cloned.
+        var policies = ak.Vector[ContentSecurityPolicyPolicy*]()
+        ak.vector_append_t(&policies, policy)
+        ak.vector_append_t(&policies, csp_test_header_policy(&page, "script-src 'none'"))
+        let list = content_security_policy_policy_list_create(heap, &policies)
+        let serialized_list = content_security_policy_policy_list_serialize(list)
+        let recreated = content_security_policy_policy_list_create_serialized(heap, &serialized_list)
+        assert(ak.vector_size(&recreated.m_policies) == 2)
+        assert(csp_test_is(csp_test_directive_classes(*ak.vector_at(&recreated.m_policies, 1)), "script-src(ScriptSourceDirective)"))
+        let cloned_list = content_security_policy_policy_list_clone(list, heap)
+        assert(ak.vector_size(&cloned_list.m_policies) == 2 and *ak.vector_at(&cloned_list.m_policies, 0) != policy)
+        assert(content_security_policy_policy_list_contains_header_delivered_policy(cloned_list))
+
+# mark: Directive lookup, the pragma and sandboxing =============================================
+
+test "CSP: directive lookup and removal, the self-origin, the Names, and the CSP-derived sandboxing flags":
+    web_initialize_strings()
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    discard(web_test_install_agent(vm))
+    web_test_install_event_loop_plugin()
+    defer web_test_remove_event_loop_plugin()
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        let (test_page, traversable) = test_browsing_page_with_traversable(vm)
+        discard(test_page)
+        let page = CspTestPage(vm = vm, document = html_navigable_active_document(traversable.html_navigable()) else trap("no document"))
+        let heap = vm_heap(vm)
+
+        # The directive names and keywords are interned FlyStrings.
+        assert(ak.fly_string_eq_string_view(&content_security_policy_directives_names_script_src_elem, ak.sv("script-src-elem")))
+        assert(ak.fly_string_eq_string_view(&content_security_policy_directives_names_web_rtc, ak.sv("webrtc")))
+        assert(ak.fly_string_eq_string_view(&content_security_policy_directives_keyword_sources_wasm_unsafe_eval, ak.sv("'wasm-unsafe-eval'")))
+        assert(ak.fly_string_eq_string_view(&content_security_policy_directives_keyword_trusted_types_wild_card, ak.sv("*")))
+
+        let policy = csp_test_header_policy(&page, "report-uri /r; sandbox allow-scripts; report-uri /s; frame-ancestors 'none'; img-src *")
+        assert(content_security_policy_policy_contains_directive_with_name(policy, ak.sv("sandbox")))
+        assert(not content_security_policy_policy_contains_directive_with_name(policy, ak.sv("SANDBOX")))
+        let sandbox = content_security_policy_policy_get_directive_by_name(policy, ak.sv("sandbox")) else trap("no sandbox directive")
+        assert(is_content_security_policy_sandbox_directive(sandbox.cell()))
+        assert(content_security_policy_policy_get_directive_by_name(policy, ak.sv("script-src")) == none)
+
+        # remove_directive removes every directive of the name (duplicates were ignored while parsing).
+        content_security_policy_policy_remove_directive(policy, content_security_policy_directives_names_report_uri)
+        content_security_policy_policy_remove_directive(policy, content_security_policy_directives_names_frame_ancestors)
+        assert(csp_test_is(csp_test_directive_classes(policy), "sandbox(SandboxDirective) img-src(ImageSourceDirective)"))
+
+        # set_self_origin replaces the self-origin.
+        let other_url = web_url.parser_basic_parse(ak.sv("http://other.test:81/")) else trap("the URL parses")
+        content_security_policy_policy_set_self_origin(policy, web_url.url_origin(&other_url))
+        let origin = content_security_policy_policy_self_origin(policy)
+        assert(csp_test_is(web_url.origin_serialize(&origin), "http://other.test:81"))
+
+        # The CSP-derived sandboxing flags come from the last enforced policy's sandbox directive.
+        var policies = ak.Vector[ContentSecurityPolicyPolicy*]()
+        let list = content_security_policy_policy_list_create(heap, &policies)
+        assert(content_security_policy_policy_list_csp_derived_sandboxing_flags(list) == (HtmlSandboxingFlagSet)0)
+        content_security_policy_policy_list_enforce_policy(list, policy)
+        content_security_policy_policy_list_enforce_policy(list, csp_test_header_policy(&page, "sandbox allow-forms allow-scripts", ContentSecurityPolicyPolicyDisposition.report))
+        let flags = content_security_policy_policy_list_csp_derived_sandboxing_flags(list)
+        assert(flags == html_parse_a_sandboxing_directive(ak.KeyPath.vector_string(content_security_policy_directive_value(sandbox))))
+        assert(not html_has_flag(flags, HtmlSandboxingFlagSet.sandboxed_scripts) and html_has_flag(flags, HtmlSandboxingFlagSet.sandboxed_forms))
+
+        # A <meta http-equiv=Content-Security-Policy> enforces its policy in the window's CSP list,
+        # without report-uri, frame-ancestors and sandbox, its self-origin the document's.
+        let csp_list = csp_test_page_csp_list(&page)
+        assert(ak.vector_is_empty(&csp_list.m_policies))
+        let meta = dom_create_element(page.document, html_tag_names_meta, namespace_html) else trap("create_element")
+        dom_element_set_attribute_value(meta, html_attribute_names_http_equiv, ak.string_from_str("Content-Security-Policy"))
+        dom_element_set_attribute_value(meta, html_attribute_names_content, ak.string_from_str("style-src 'none'; report-uri /r; sandbox; img-src 'self'"))
+        let head = dom_document_head(page.document) else trap("no head")
+        discard(dom_node_append_child(head.dom_node(), meta.dom_node()) else trap("append_child"))
+        assert(ak.vector_size(&csp_list.m_policies) == 1)
+        let meta_policy = *ak.vector_at(&csp_list.m_policies, 0)
+        assert(content_security_policy_policy_source(meta_policy) == ContentSecurityPolicyPolicySource.meta)
+        assert(csp_test_is(csp_test_directive_classes(meta_policy), "style-src(StyleSourceDirective) img-src(ImageSourceDirective)"))
+        assert(not content_security_policy_policy_list_contains_header_delivered_policy(csp_list))
+        let document_origin = dom_document_origin(page.document)
+        assert(web_url.origin_is_same_origin(&document_origin, content_security_policy_policy_self_origin(meta_policy)))
+
+        # The policy blocks an inline <style>: its sheet is never created.
+        let style = dom_create_element(page.document, html_tag_names_style, namespace_html) else trap("create_element")
+        dom_node_set_text_content(style.dom_node(), ak.utf16_string_from_utf8_string_view(ak.sv("body { color: red }"))) else trap("set_text_content")
+        discard(dom_node_append_child(head.dom_node(), style.dom_node()) else trap("append_child"))
+        let style_element = as_html_style_element(style.cell())
+        assert(dom_style_element_base_sheet(&style_element.style_element_base) == none)
+        ak.vector_clear(&csp_list.m_policies)
+
+# mark: Violations ==============================================================================
+
+test "CSP: violations for a global and for a request, and reporting them fires securitypolicyviolation":
+    web_initialize_strings()
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    discard(web_test_install_agent(vm))
+    web_test_install_event_loop_plugin()
+    defer web_test_remove_event_loop_plugin()
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        let (test_page, traversable) = test_browsing_page_with_traversable(vm)
+        discard(test_page)
+        let page = CspTestPage(vm = vm, document = html_navigable_active_document(traversable.html_navigable()) else trap("no document"))
+        let realm = dom_document_realm(page.document)
+        let window = dom_document_window(page.document) else trap("no window")
+        csp_test_run_unspecified_tasks()
+
+        # A violation for the window: its URL is the document's, its referrer the document's (none here).
+        let policy = csp_test_header_policy(&page, "script-src 'none' 'report-sample'", ContentSecurityPolicyPolicyDisposition.report)
+        let violation = content_security_policy_violation_create_a_violation_object_for_global_policy_and_directive(realm, (JsObject*?)window, policy, ak.string_from_str("script-src-elem"))
+        assert(content_security_policy_violation_policy(violation) == policy)
+        assert(content_security_policy_violation_disposition(violation) == ContentSecurityPolicyPolicyDisposition.report)
+        assert(csp_test_is(content_security_policy_violation_effective_directive(violation), "script-src-elem"))
+        assert(content_security_policy_violation_referrer(violation) == none)
+        assert(content_security_policy_violation_status(violation) == 0 and content_security_policy_violation_line_number(violation) == 0)
+        assert(csp_test_is(content_security_policy_violation_sample(violation), ""))
+        let violation_url = content_security_policy_violation_url(violation)
+        assert(csp_test_is(web_url.url_serialize(&violation_url), "about:blank"))
+
+        # A violation without a global object has the empty URL.
+        let orphan = content_security_policy_violation_create_a_violation_object_for_global_policy_and_directive(realm, none, policy, ak.string_from_str("img-src"))
+        let orphan_url = content_security_policy_violation_url(orphan)
+        let orphan_scheme = web_url.url_scheme(&orphan_url)
+        assert(ak.string_is_empty(&orphan_scheme))
+
+        # Reporting fires securitypolicyviolation at the window's document (no element), in a queued task.
+        var at_document = CspTestSeen(calls = 0, event = js_undefined())
+        dom_event_target_add_event_listener(page.document.dom_event_target(), html_event_names_securitypolicyviolation, csp_test_listener(&page, &at_document), .bool_(false))
+        content_security_policy_violation_set_resource(violation, .resource(ContentSecurityPolicyViolationResource.inline_))
+        content_security_policy_violation_set_sample(violation, ak.string_from_str("alert(1)"))
+        content_security_policy_violation_set_status(violation, 200)
+        content_security_policy_violation_set_line_number(violation, 3)
+        content_security_policy_violation_set_column_number(violation, 7)
+        let source_file = web_url.parser_basic_parse(ak.sv("https://user:pass@self.test/app.js#frag")) else trap("the URL parses")
+        content_security_policy_violation_set_source_file(violation, source_file)
+        content_security_policy_violation_report_a_violation(violation, realm)
+        assert(at_document.calls == 0)
+        csp_test_run_unspecified_tasks()
+        assert(at_document.calls == 1)
+        let event = csp_test_seen_event(&at_document)
+        assert(event.event.m_is_trusted and event.event.m_bubbles and event.event.m_composed)
+        assert(csp_test_is(content_security_policy_security_policy_violation_event_blocked_uri(event), "inline"))
+        assert(csp_test_is(content_security_policy_security_policy_violation_event_document_uri(event), "about"))
+        assert(csp_test_is(content_security_policy_security_policy_violation_event_referrer(event), ""))
+        assert(csp_test_is(content_security_policy_security_policy_violation_event_effective_directive(event), "script-src-elem"))
+        assert(csp_test_is(content_security_policy_security_policy_violation_event_violated_directive(event), "script-src-elem"))
+        assert(csp_test_is(content_security_policy_security_policy_violation_event_original_policy(event), "script-src 'none' 'report-sample'"))
+        assert(content_security_policy_security_policy_violation_event_disposition(event) == BindSecurityPolicyViolationEventDisposition.report)
+        assert(csp_test_is(content_security_policy_security_policy_violation_event_source_file(event), "https://self.test/app.js"))
+        assert(csp_test_is(content_security_policy_security_policy_violation_event_sample(event), "alert(1)"))
+        assert(content_security_policy_security_policy_violation_event_status_code(event) == 200)
+        assert(content_security_policy_security_policy_violation_event_line_number(event) == 3 and content_security_policy_security_policy_violation_event_column_number(event) == 7)
+
+        # With a connected element as its target, the event is fired at the element and bubbles to the document.
+        let body = dom_document_body(page.document) else trap("no body")
+        var at_element = CspTestSeen(calls = 0, event = js_undefined())
+        dom_event_target_add_event_listener(body.dom_event_target(), html_event_names_securitypolicyviolation, csp_test_listener(&page, &at_element), .bool_(false))
+        let element_violation = content_security_policy_violation_create_a_violation_object_for_global_policy_and_directive(realm, (JsObject*?)window, policy, ak.string_from_str("style-src-attr"))
+        content_security_policy_violation_set_resource(element_violation, .resource(ContentSecurityPolicyViolationResource.inline_))
+        content_security_policy_violation_set_element(element_violation, body.dom_element())
+        content_security_policy_violation_report_a_violation(element_violation, realm)
+        csp_test_run_unspecified_tasks()
+        assert(at_element.calls == 1 and at_document.calls == 2)
+        assert(content_security_policy_violation_element(element_violation) == (DomElement*?)body.dom_element())
+
+        # An element that is not connected to the window's document: the event goes to the document.
+        let detached = dom_create_element(page.document, html_tag_names_div, namespace_html) else trap("create_element")
+        let detached_violation = content_security_policy_violation_create_a_violation_object_for_global_policy_and_directive(realm, (JsObject*?)window, policy, ak.string_from_str("style-src-attr"))
+        content_security_policy_violation_set_resource(detached_violation, .resource(ContentSecurityPolicyViolationResource.eval))
+        content_security_policy_violation_set_element(detached_violation, detached)
+        content_security_policy_violation_report_a_violation(detached_violation, realm)
+        csp_test_run_unspecified_tasks()
+        assert(at_element.calls == 1 and at_document.calls == 3)
+        assert(csp_test_is(content_security_policy_security_policy_violation_event_blocked_uri(csp_test_seen_event(&at_document)), "eval"))
+
+        # A violation with no global object and no element fires nothing.
+        content_security_policy_violation_set_resource(orphan, .resource(ContentSecurityPolicyViolationResource.wasm_eval))
+        content_security_policy_violation_report_a_violation(orphan, realm)
+        csp_test_run_unspecified_tasks()
+        assert(at_document.calls == 3)
+
+        # The inline check reports its sample: the first 40 code points of the source.
+        let csp_list = csp_test_page_csp_list(&page)
+        ak.vector_append_t(&csp_list.m_policies, csp_test_header_policy(&page, "style-src 'none' 'report-sample'"))
+        let style = dom_create_element(page.document, html_tag_names_style, namespace_html) else trap("create_element")
+        let source = ak.string_from_str("é123456789012345678901234567890123456789012345")
+        assert(content_security_policy_should_elements_inline_type_behavior_be_blocked_by_content_security_policy(realm, style, ContentSecurityPolicyInlineType.style, source) == ContentSecurityPolicyResult.blocked)
+        csp_test_run_unspecified_tasks()
+        assert(at_document.calls == 4)
+        let sampled = csp_test_seen_event(&at_document)
+        assert(csp_test_is(content_security_policy_security_policy_violation_event_sample(sampled), "é123456789012345678901234567890123456789"))
+        assert(csp_test_is(content_security_policy_security_policy_violation_event_effective_directive(sampled), "style-src-elem"))
+        assert(content_security_policy_security_policy_violation_event_disposition(sampled) == BindSecurityPolicyViolationEventDisposition.enforce)
+        ak.vector_clear(&csp_list.m_policies)
+
+test "CSP: SecurityPolicyViolationEvent::create keeps its init's attributes":
+    web_initialize_strings()
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    discard(web_test_install_agent(vm))
+    web_test_install_event_loop_plugin()
+    defer web_test_remove_event_loop_plugin()
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        let (test_page, traversable) = test_browsing_page_with_traversable(vm)
+        discard(test_page)
+        let document = html_navigable_active_document(traversable.html_navigable()) else trap("no document")
+        let realm = dom_document_realm(document)
+        var init = ContentSecurityPolicySecurityPolicyViolationEventInit(document_uri = ak.string_from_str("https://a.test/"), referrer = ak.string_from_str("r"), blocked_uri = ak.string_from_str("b"),
+                                                                         violated_directive = ak.string_from_str("v"), effective_directive = ak.string_from_str("e"), original_policy = ak.string_from_str("o"),
+                                                                         source_file = ak.string_from_str("s"), sample = ak.string_from_str("x"), disposition = BindSecurityPolicyViolationEventDisposition.report,
+                                                                         status_code = 404, line_number = 1, column_number = 2)
+        init.event_init.cancelable = true
+        let event = content_security_policy_security_policy_violation_event_construct_impl(realm, html_event_names_securitypolicyviolation, &init) else trap("construct_impl")
+        assert(is_content_security_policy_security_policy_violation_event(event.cell()))
+        assert(ak.fly_string_eq_fly_string(&event.event.m_type, &html_event_names_securitypolicyviolation))
+        assert(event.event.m_cancelable and not event.event.m_bubbles and not event.event.m_is_trusted)
+        assert(csp_test_is(content_security_policy_security_policy_violation_event_document_uri(event), "https://a.test/"))
+        assert(csp_test_is(content_security_policy_security_policy_violation_event_referrer(event), "r"))
+        assert(csp_test_is(content_security_policy_security_policy_violation_event_original_policy(event), "o"))
+        assert(content_security_policy_security_policy_violation_event_status_code(event) == 404)
+
+# mark: Sandbox, frame-ancestors and navigation responses =======================================
+
+test "CSP: the sandbox initialization, frame-ancestors for a top-level target, and navigation responses":
+    web_initialize_strings()
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    discard(web_test_install_agent(vm))
+    web_test_install_event_loop_plugin()
+    defer web_test_remove_event_loop_plugin()
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        let (test_page, traversable) = test_browsing_page_with_traversable(vm)
+        discard(test_page)
+        let page = CspTestPage(vm = vm, document = html_navigable_active_document(traversable.html_navigable()) else trap("no document"))
+        let navigable = traversable.html_navigable()
+
+        # sandbox only acts on worker global scopes: a Document is always allowed.
+        let policy = csp_test_header_policy(&page, "sandbox; frame-ancestors 'none'; default-src 'none'")
+        for directive in ak.vector_span(&policy.m_directives):
+            assert(content_security_policy_directive_initialization(directive, .dom_document(page.document), policy) == ContentSecurityPolicyResult.allowed)
+
+        # frame-ancestors: a local response URL, a "source" check, and a top-level target are allowed.
+        let frame_ancestors = content_security_policy_policy_get_directive_by_name(policy, ak.sv("frame-ancestors")) else trap("no frame-ancestors")
+        let request = fetch_request_create(vm)
+        fetch_request_set_url(request, web_url.parser_basic_parse(ak.sv("https://evil.test/")) else trap("the URL parses"))
+        fetch_request_set_client(request, dom_document_relevant_settings_object(page.document))
+        let response = fetch_infrastructure_response_create(vm)
+        ak.vector_append_t(fetch_response_url_list(response), web_url.parser_basic_parse(ak.sv("https://evil.test/")) else trap("the URL parses"))
+        let local_response = fetch_infrastructure_response_create(vm)
+        ak.vector_append_t(fetch_response_url_list(local_response), web_url.about_blank())
+        assert(content_security_policy_directive_navigation_response_check(frame_ancestors, request, ContentSecurityPolicyNavigationType.other, local_response, navigable, ContentSecurityPolicyDirectiveCheckType.response, policy) == ContentSecurityPolicyResult.allowed)
+        assert(content_security_policy_directive_navigation_response_check(frame_ancestors, request, ContentSecurityPolicyNavigationType.other, response, navigable, ContentSecurityPolicyDirectiveCheckType.source, policy) == ContentSecurityPolicyResult.allowed)
+        assert(content_security_policy_directive_navigation_response_check(frame_ancestors, request, ContentSecurityPolicyNavigationType.other, response, navigable, ContentSecurityPolicyDirectiveCheckType.response, policy) == ContentSecurityPolicyResult.allowed)
+
+        # Should the navigation response be blocked? Not for a top-level target, nor without a request.
+        var policies = ak.Vector[ContentSecurityPolicyPolicy*]()
+        ak.vector_append_t(&policies, policy)
+        let response_csp_list = content_security_policy_policy_list_create(vm_heap(vm), &policies)
+        fetch_request_set_policy_container(request, FetchRequestPolicyContainerType.html_policy_container(heap_allocate_html_policy_container(vm_heap(vm))))
+        assert(content_security_policy_should_navigation_response_to_navigation_request_of_type_in_target_be_blocked_by_content_security_policy(request, response, response_csp_list, ContentSecurityPolicyNavigationType.other, navigable) == ContentSecurityPolicyResult.allowed)
+        assert(content_security_policy_should_navigation_response_to_navigation_request_of_type_in_target_be_blocked_by_content_security_policy(none, response, response_csp_list, ContentSecurityPolicyNavigationType.other, navigable) == ContentSecurityPolicyResult.allowed)
+
+        # Reporting the violations of a request's report-only policies queues their reports.
+        let report_policy = csp_test_header_policy(&page, "img-src 'none'", ContentSecurityPolicyPolicyDisposition.report)
+        let report_container = heap_allocate_html_policy_container(vm_heap(vm))
+        ak.vector_append_t(&report_container.csp_list.m_policies, report_policy)
+        ak.vector_append_t(&report_container.csp_list.m_policies, csp_test_header_policy(&page, "img-src 'none'"))
+        fetch_request_set_policy_container(request, FetchRequestPolicyContainerType.html_policy_container(report_container))
+        fetch_request_set_destination(request, FetchRequestDestination.image)
+        var seen = CspTestSeen(calls = 0, event = js_undefined())
+        dom_event_target_add_event_listener(page.document.dom_event_target(), html_event_names_securitypolicyviolation, csp_test_listener(&page, &seen), .bool_(false))
+        csp_test_run_unspecified_tasks()
+        content_security_policy_report_content_security_policy_violations_for_request(dom_document_realm(page.document), request)
+        csp_test_run_unspecified_tasks()
+        assert(seen.calls == 1)
+        let event = csp_test_seen_event(&seen)
+        assert(csp_test_is(content_security_policy_security_policy_violation_event_effective_directive(event), "img-src"))
+        assert(csp_test_is(content_security_policy_security_policy_violation_event_blocked_uri(event), "https://evil.test/"))
+        assert(content_security_policy_security_policy_violation_event_disposition(event) == BindSecurityPolicyViolationEventDisposition.report)
+
+# mark: Collections =============================================================================
+
+## The cells a collection must keep: a policy (held only through a CSP list), its directives, and a
+## violation's policy and element.
+struct CspTestCells:
+    var list: ContentSecurityPolicyPolicyList*
+    var violation: ContentSecurityPolicyViolation*
+
+## Makes the cells of the collection test in a frame of its own, so that no stack word but the
+## returned ones keeps them.
+noinline func csp_test_make_cells(page: const CspTestPage*) -> CspTestCells:
+    let heap = vm_heap(page.vm)
+    var policies = ak.Vector[ContentSecurityPolicyPolicy*]()
+    ak.vector_append_t(&policies, csp_test_header_policy(page, "script-src 'self'; img-src *"))
+    let list = content_security_policy_policy_list_create(heap, &policies)
+    let realm = dom_document_realm(page.document)
+    let element = dom_create_element(page.document, html_tag_names_div, namespace_html) else trap("create_element")
+    let violation = content_security_policy_violation_create_a_violation_object_for_global_policy_and_directive(realm, (JsObject*?)dom_document_window(page.document), csp_test_header_policy(page, "default-src 'none'"), ak.string_from_str("img-src"))
+    content_security_policy_violation_set_element(violation, element)
+    return CspTestCells(list = list, violation = violation)
+
+test "CSP: a collection keeps a CSP list's policies and their directives, and a violation's policy and element":
+    web_initialize_strings()
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    discard(web_test_install_agent(vm))
+    web_test_install_event_loop_plugin()
+    defer web_test_remove_event_loop_plugin()
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        let (test_page, traversable) = test_browsing_page_with_traversable(vm)
+        discard(test_page)
+        let page = CspTestPage(vm = vm, document = html_navigable_active_document(traversable.html_navigable()) else trap("no document"))
+        let cells = csp_test_make_cells(&page)
+        gc.heap_collect_garbage(vm_heap(vm))
+        gc.heap_collect_garbage(vm_heap(vm))
+        let policy = *ak.vector_at(&cells.list.m_policies, 0)
+        assert(csp_test_is(csp_test_directive_classes(policy), "script-src(ScriptSourceDirective) img-src(ImageSourceDirective)"))
+        assert(csp_test_is(content_security_policy_directive_name(*ak.vector_at(&policy.m_directives, 1)), "img-src"))
+        let violation_policy = content_security_policy_violation_policy(cells.violation)
+        assert(csp_test_is(csp_test_directive_classes(violation_policy), "default-src(DefaultSourceDirective)"))
+        let element = content_security_policy_violation_element(cells.violation) else trap("no element")
+        assert(is_html_div_element(element.cell()))

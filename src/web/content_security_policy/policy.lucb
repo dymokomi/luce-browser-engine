@@ -1,0 +1,253 @@
+#==============================================================================================
+#
+#   policy - ContentSecurityPolicy::Policy: parsing a serialized CSP and a response's CSP
+#   headers, the directive set, cloning and serializing
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibWeb/ContentSecurityPolicy/Policy.cpp (lines 1-228) and the inline
+#       functions of Policy.h (lines 41-55). SerializedPolicy.cpp holds only the IPC encoder
+#       and decoder, which are not ported.
+#
+#       Copyright (c) 2025, Luke Wilde <luke@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Creation ================================================================================
+
+## Ported from Libraries/LibWeb/ContentSecurityPolicy/Policy.h:72 Web::ContentSecurityPolicy::Policy::Policy
+## (`= default`, with the default member initializers: an empty directive set, "enforce", "header", no
+## self-origin and the empty pre-parsed string).
+func content_security_policy_policy_construct(this: ContentSecurityPolicyPolicy*):
+    this.m_disposition = ContentSecurityPolicyPolicyDisposition.enforce
+    this.m_source = ContentSecurityPolicyPolicySource.header
+    this.m_pre_parsed_policy_string = ak.string_new()
+
+## `heap.allocate<Policy>()`: a policy cell constructed under DeferGC.
+func heap_allocate_content_security_policy_policy(heap: gc.Heap*) -> ContentSecurityPolicyPolicy*:
+    let policy = (ContentSecurityPolicyPolicy*)web_heap_allocate_cell(heap, &content_security_policy_policy_class)
+    gc.heap_defer_gc(heap)
+    content_security_policy_policy_construct(policy)
+    gc.heap_undefer_gc(heap)
+    return policy
+
+# mark: Parsing =================================================================================
+
+## Ported from Libraries/LibWeb/ContentSecurityPolicy/Policy.cpp:22 Web::ContentSecurityPolicy::Policy::parse_a_serialized_csp.
+# https://w3c.github.io/webappsec-csp/#abstract-opdef-parse-a-serialized-csp
+pub func content_security_policy_policy_parse_a_serialized_csp(heap: gc.Heap*, serialized: ByteStringOrString, source: ContentSecurityPolicyPolicySource, disposition: ContentSecurityPolicyPolicyDisposition) -> ContentSecurityPolicyPolicy*:
+    # To parse a serialized CSP, given a byte sequence or string serialized, a source source, and a disposition disposition,
+    # execute the following steps.
+    # This algorithm returns a Content Security Policy object. If serialized could not be parsed, the object’s directive
+    # set will be empty.
+
+    # 1. If serialized is a byte sequence, then set serialized to be the result of isomorphic decoding serialized.
+    let serialized_string = match serialized:
+        .string(string) => string
+        .byte_string(byte_string) => text_codec.isomorphic_decode(ak.byte_string_view(&byte_string))
+
+    # 2. Let policy be a new policy with an empty directive set, a source of source, and a disposition of disposition.
+    let policy = heap_allocate_content_security_policy_policy(heap)
+    policy.m_pre_parsed_policy_string = serialized_string
+    policy.m_source = source
+    policy.m_disposition = disposition
+
+    # 3. For each token returned by strictly splitting serialized on the U+003B SEMICOLON character (;):
+    var tokens = ak.string_split(&serialized_string, (u32)';', ak.SplitBehavior.keep_empty) else trap("MUST: String::split")
+    let is_ascii_whitespace = ak.CharPredicateFunction(function = web_infra.is_ascii_whitespace)
+    for token in ak.vector_span(&tokens):
+        # 1. Strip leading and trailing ASCII whitespace from token.
+        let stripped_token = ak.string_trim_string_view(&token, ak.sv(web_infra.ascii_whitespace)) else trap("MUST: String::trim")
+        let stripped_token_view = ak.string_bytes_as_string_view(&stripped_token)
+
+        # 2. If token is an empty string, or if token is not an ASCII string, continue.
+        if ak.string_is_empty(&stripped_token) or not ak.string_view_is_ascii(&stripped_token_view):
+            continue
+
+        # 3. Let directive name be the result of collecting a sequence of code points from token which are not
+        #    ASCII whitespace.
+        var lexer = ak.generic_lexer_new(stripped_token_view)
+        let directive_name = ak.generic_lexer_consume_until_tt_predicate(&lexer, &is_ascii_whitespace)
+
+        # 4. Set directive name to be the result of running ASCII lowercase on directive name.
+        # Spec Note: Directive names are case-insensitive, that is: script-SRC 'none' and ScRiPt-sRc 'none' are
+        #            equivalent.
+        let lowercase_directive_name = ak.string_view_to_ascii_lowercase_string(&directive_name)
+
+        # 5. If policy’s directive set contains a directive whose name is directive name, continue.
+        if content_security_policy_policy_contains_directive_with_name(policy, ak.string_bytes_as_string_view(&lowercase_directive_name)):
+            # Spec Note: In this case, the user agent SHOULD notify developers that a duplicate directive was
+            #            ignored. A console warning might be appropriate, for example.
+            ak.dbgln(f"Ignoring duplicate Content Security Policy directive: {ak.string_view_text(ak.string_bytes_as_string_view(&lowercase_directive_name))}")
+            continue
+
+        # 6. Let directive value be the result of splitting token on ASCII whitespace.
+        let rest_of_the_token = ak.generic_lexer_consume_all(&lexer)
+        var directive_value_views = ak.string_view_split_view_if(&rest_of_the_token, &is_ascii_whitespace)
+
+        var directive_value = ak.Vector[ak.String]()
+        for directive_value_view in ak.vector_span(&directive_value_views):
+            let directive_value_entry = ak.string_from_utf8(directive_value_view) else trap("MUST: String::from_utf8")
+            ak.vector_append_t(&directive_value, directive_value_entry)
+
+        # 7. Let directive be a new directive whose name is directive name, and value is directive value.
+        let directive = content_security_policy_directives_create_directive(heap, lowercase_directive_name, directive_value)
+
+        # 8. Append directive to policy’s directive set.
+        ak.vector_append_t(&policy.m_directives, directive)
+
+    # 4. Return policy.
+    return policy
+
+## `tokens_or_failure.get_pointer<Vector<ByteString>>()` of parse_a_responses_content_security_policies: the
+## values when the header list had the header and they parsed.
+func content_security_policy_header_list_values(tokens_or_failure: EmptyOrVectorOrHttpHeaderListExtractHeaderParseFailure) -> ak.Vector[ak.ByteString]?:
+    match tokens_or_failure:
+        .vector_byte_string(tokens): return tokens
+        _: return none
+
+## Ported from Libraries/LibWeb/ContentSecurityPolicy/Policy.cpp:94 Web::ContentSecurityPolicy::Policy::parse_a_responses_content_security_policies.
+# https://w3c.github.io/webappsec-csp/#abstract-opdef-parse-a-responses-content-security-policies
+pub func content_security_policy_policy_parse_a_responses_content_security_policies(heap: gc.Heap*, response: FetchResponse*) -> ContentSecurityPolicyPolicyList*:
+    # To parse a response’s Content Security Policies given a response response, execute the following steps.
+    # This algorithm returns a list of Content Security Policy objects. If the policies cannot be parsed,
+    # the returned list will be empty.
+
+    # 1. Let policies be an empty list.
+    var policies = ak.Vector[ContentSecurityPolicyPolicy*]()
+
+    # 2. For each token returned by extracting header list values given Content-Security-Policy and response’s header
+    #    list:
+    let enforce_policy_tokens_or_failure = http_header_list_extract_header_list_values(fetch_response_header_list(response), ak.sv("Content-Security-Policy"))
+
+    if let enforce_policy_tokens = content_security_policy_header_list_values(enforce_policy_tokens_or_failure):
+        for enforce_policy_token in ak.vector_span_const(&enforce_policy_tokens):
+            # 1. Let policy be the result of parsing token, with a source of "header", and a disposition of "enforce".
+            let policy = content_security_policy_policy_parse_a_serialized_csp(heap, .byte_string(enforce_policy_token), ContentSecurityPolicyPolicySource.header, ContentSecurityPolicyPolicyDisposition.enforce)
+
+            # 2. If policy’s directive set is not empty, append policy to policies.
+            if not ak.vector_is_empty(&policy.m_directives):
+                ak.vector_append_t(&policies, policy)
+
+    # 3. For each token returned by extracting header list values given Content-Security-Policy-Report-Only and
+    #    response’s header list:
+    let report_policy_tokens_or_failure = http_header_list_extract_header_list_values(fetch_response_header_list(response), ak.sv("Content-Security-Policy-Report-Only"))
+
+    if let report_policy_tokens = content_security_policy_header_list_values(report_policy_tokens_or_failure):
+        for report_policy_token in ak.vector_span_const(&report_policy_tokens):
+            # 1. Let policy be the result of parsing token, with a source of "header", and a disposition of "report".
+            let policy = content_security_policy_policy_parse_a_serialized_csp(heap, .byte_string(report_policy_token), ContentSecurityPolicyPolicySource.header, ContentSecurityPolicyPolicyDisposition.report)
+
+            # 2. If policy’s directive set is not empty, append policy to policies.
+            if not ak.vector_is_empty(&policy.m_directives):
+                ak.vector_append_t(&policies, policy)
+
+    # 4. For each policy of policies:
+    for policy in ak.vector_span(&policies):
+        # 1. Set policy’s self-origin to response’s url's origin.
+        let url = fetch_response_url(response) else trap("VERIFY: the response has a URL")
+        policy.m_self_origin = web_url.url_origin(&url)
+
+    # 5. Return policies.
+    return content_security_policy_policy_list_create(heap, &policies)
+
+## Ported from Libraries/LibWeb/ContentSecurityPolicy/Policy.cpp:142 Web::ContentSecurityPolicy::Policy::create_from_serialized_policy.
+pub func content_security_policy_policy_create_from_serialized_policy(heap: gc.Heap*, serialized_policy: const ContentSecurityPolicySerializedPolicy*) -> ContentSecurityPolicyPolicy*:
+    let policy = heap_allocate_content_security_policy_policy(heap)
+
+    for serialized_directive in ak.vector_span_const(&serialized_policy.directives):
+        let directive = content_security_policy_directives_create_directive(heap, serialized_directive.name, ak.vector_clone(&serialized_directive.value))
+        ak.vector_append_t(&policy.m_directives, directive)
+
+    policy.m_disposition = serialized_policy.disposition
+    policy.m_source = serialized_policy.source
+    policy.m_self_origin = serialized_policy.self_origin
+    policy.m_pre_parsed_policy_string = serialized_policy.pre_parsed_policy_string
+    return policy
+
+# mark: The directive set =======================================================================
+
+## Ported from Libraries/LibWeb/ContentSecurityPolicy/Policy.h:45 Web::ContentSecurityPolicy::Policy::directives.
+## (A copy of the Vector struct: its buffer is shared, and no caller changes it.)
+pub func content_security_policy_policy_directives(this: ContentSecurityPolicyPolicy*) -> ak.Vector[ContentSecurityPolicyDirective*]:
+    return this.m_directives
+
+## Ported from Libraries/LibWeb/ContentSecurityPolicy/Policy.h:46 Web::ContentSecurityPolicy::Policy::disposition.
+pub func content_security_policy_policy_disposition(this: ContentSecurityPolicyPolicy*) -> ContentSecurityPolicyPolicyDisposition:
+    return this.m_disposition
+
+## Ported from Libraries/LibWeb/ContentSecurityPolicy/Policy.h:47 Web::ContentSecurityPolicy::Policy::source.
+pub func content_security_policy_policy_source(this: ContentSecurityPolicyPolicy*) -> ContentSecurityPolicyPolicySource:
+    return this.m_source
+
+## Ported from Libraries/LibWeb/ContentSecurityPolicy/Policy.h:48 Web::ContentSecurityPolicy::Policy::self_origin.
+pub func content_security_policy_policy_self_origin(this: ContentSecurityPolicyPolicy*) -> web_url.Origin:
+    return this.m_self_origin else trap("VERIFY: Optional::value of the policy's self-origin")
+
+## Ported from Libraries/LibWeb/ContentSecurityPolicy/Policy.h:49 Web::ContentSecurityPolicy::Policy::pre_parsed_policy_string.
+pub func content_security_policy_policy_pre_parsed_policy_string(this: ContentSecurityPolicyPolicy*) -> ak.String:
+    return this.m_pre_parsed_policy_string
+
+## Ported from Libraries/LibWeb/ContentSecurityPolicy/Policy.cpp:159 Web::ContentSecurityPolicy::Policy::contains_directive_with_name.
+pub func content_security_policy_policy_contains_directive_with_name(this: ContentSecurityPolicyPolicy*, name: ak.StringView) -> bool:
+    # m_directives.find_if([name](auto const& directive) { return directive->name() == name; })
+    for directive in ak.vector_span(&this.m_directives):
+        if ak.string_eq_string_view(&directive.m_name, name):
+            return true
+    return false
+
+## Ported from Libraries/LibWeb/ContentSecurityPolicy/Policy.cpp:167 Web::ContentSecurityPolicy::Policy::get_directive_by_name.
+pub func content_security_policy_policy_get_directive_by_name(this: ContentSecurityPolicyPolicy*, name: ak.StringView) -> ContentSecurityPolicyDirective*?:
+    # m_directives.find_if([name](auto const& directive) { return directive->name() == name; })
+    for directive in ak.vector_span(&this.m_directives):
+        if ak.string_eq_string_view(&directive.m_name, name):
+            return directive
+
+    return none
+
+# mark: Cloning and serializing =================================================================
+
+## Ported from Libraries/LibWeb/ContentSecurityPolicy/Policy.cpp:179 Web::ContentSecurityPolicy::Policy::clone.
+pub func content_security_policy_policy_clone(this: ContentSecurityPolicyPolicy*, heap: gc.Heap*) -> ContentSecurityPolicyPolicy*:
+    let policy = heap_allocate_content_security_policy_policy(heap)
+
+    for directive in ak.vector_span(&this.m_directives):
+        let cloned_directive = content_security_policy_directive_clone(directive, heap)
+        ak.vector_append_t(&policy.m_directives, cloned_directive)
+
+    policy.m_disposition = this.m_disposition
+    policy.m_source = this.m_source
+    policy.m_self_origin = this.m_self_origin
+    policy.m_pre_parsed_policy_string = this.m_pre_parsed_policy_string
+    return policy
+
+## Ported from Libraries/LibWeb/ContentSecurityPolicy/Policy.cpp:194 Web::ContentSecurityPolicy::Policy::serialize.
+pub func content_security_policy_policy_serialize(this: ContentSecurityPolicyPolicy*) -> ContentSecurityPolicySerializedPolicy:
+    var serialized_directives = ak.Vector[ContentSecurityPolicySerializedDirective]()
+
+    for directive in ak.vector_span(&this.m_directives):
+        ak.vector_append_t(&serialized_directives, content_security_policy_directive_serialize(directive))
+
+    return ContentSecurityPolicySerializedPolicy(directives = serialized_directives, disposition = this.m_disposition, source = this.m_source,
+                                                 self_origin = this.m_self_origin else trap("VERIFY: Optional::value of the policy's self-origin"), pre_parsed_policy_string = this.m_pre_parsed_policy_string)
+
+## Ported from Libraries/LibWeb/ContentSecurityPolicy/Policy.cpp:211 Web::ContentSecurityPolicy::Policy::remove_directive.
+pub func content_security_policy_policy_remove_directive(this: ContentSecurityPolicyPolicy*, name: ak.FlyString):
+    # m_directives.remove_all_matching([&name](auto const& directive) { return directive->name() == name; })
+    var index: usize = 0
+    while index < ak.vector_size(&this.m_directives):
+        let directive = *ak.vector_at(&this.m_directives, index)
+        if ak.string_eq_fly_string(&directive.m_name, &name):
+            ak.vector_remove(&this.m_directives, index)
+        else:
+            index += 1
+
+## Ported from Libraries/LibWeb/ContentSecurityPolicy/Policy.cpp:218 Web::ContentSecurityPolicy::Policy::set_self_origin.
+pub func content_security_policy_policy_set_self_origin(this: ContentSecurityPolicyPolicy*, origin: web_url.Origin):
+    this.m_self_origin = origin
+
+## Ported from Libraries/LibWeb/ContentSecurityPolicy/Policy.cpp:223 Web::ContentSecurityPolicy::Policy::visit_edges (override).
+pub func content_security_policy_policy_visit_edges_impl(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (ContentSecurityPolicyPolicy*)base
+    gc.cell_visit_edges_impl(base, visitor)
+    gc.cell_visitor_visit_vector(visitor, &this.m_directives)

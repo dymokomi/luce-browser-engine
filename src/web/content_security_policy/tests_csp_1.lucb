@@ -1,0 +1,506 @@
+#==============================================================================================
+#
+#   tests_csp_1 - region p2e's oracle runner: every case of tests_csp_cases run and printed as
+#   the reference build's oracle prints it
+#
+#   DESCRIPTION:
+#       The oracle (luce-browser-tools, oracles/luce-browser-engine/csp) runs Ladybird's
+#       ContentSecurityPolicy and SRI: parsing serialized policies and response headers, source
+#       expressions, URL and source-list matching, effective directives and fallback lists, the
+#       directives' pre-request, post-request, inline, pre-navigation and WebRTC checks, should
+#       a request, a response, an element's inline behavior, a navigation and a <base> be
+#       blocked, the integrity policy, violations, and SRI's metadata and hashes. Requests and
+#       elements live in the active document of a test page's top-level traversable (an
+#       about:blank document with a Window); policies the element, <base> and navigation checks
+#       consult are enforced in that window's CSP list for the case.
+#
+#==============================================================================================
+
+# mark: Helpers =================================================================================
+
+## The page, window document and heap the cases run in.
+struct CspTestContext:
+    var vm: Vm*
+    var document: DomDocument*
+
+## The arguments of a case.
+func csp_test_arguments(test_case: const CspCase*) -> ak.Vector[ak.StringView]:
+    var arguments = ak.Vector[ak.StringView]()
+    if test_case.argument_count == 0:
+        return arguments
+    var start: usize = 0
+    for (index, byte) in test_case.arguments.indexed():
+        if byte == 0x1f:
+            ak.vector_append_t(&arguments, ak.string_view_from_bytes(test_case.arguments[start..<index]))
+            start = index + 1
+    ak.vector_append_t(&arguments, ak.string_view_from_bytes(test_case.arguments[start..]))
+    assert(ak.vector_size(&arguments) == test_case.argument_count)
+    return arguments
+
+## The oracle's `escape`: `\\`, `\n`, `\t`, and `\xHH` for every other control or non-ASCII byte.
+func csp_test_escape(builder: ak.StringBuilder*, view: ak.StringView):
+    let digits = "0123456789ABCDEF"
+    for byte in ak.string_view_bytes(&view):
+        if byte == '\\':
+            ak.string_builder_append(builder, "\\\\")
+        elif byte == '\n':
+            ak.string_builder_append(builder, "\\n")
+        elif byte == '\t':
+            ak.string_builder_append(builder, "\\t")
+        elif byte < 0x20 or byte >= 0x7f:
+            ak.string_builder_append(builder, "\\x")
+            ak.string_builder_append_code_point(builder, digits.bytes[(usize)(byte >> 4)])
+            ak.string_builder_append_code_point(builder, digits.bytes[(usize)(byte & 0x0f)])
+        else:
+            ak.string_builder_append_code_point(builder, byte)
+
+## The oracle's `esc` of a String.
+func csp_test_escape_string(builder: ak.StringBuilder*, string: ak.String):
+    csp_test_escape(builder, ak.string_bytes_as_string_view(&string))
+
+## A String of an argument.
+func csp_test_string(view: ak.StringView) -> ak.String:
+    return ak.string_from_utf8(view) else trap("the argument is UTF-8")
+
+## The URL of an argument (it parses).
+func csp_test_url(view: ak.StringView) -> web_url.Url:
+    return web_url.parser_basic_parse(view) else trap("the test URL parses")
+
+## The origin of an argument: "opaque", or the origin of a URL.
+func csp_test_origin(view: ak.StringView) -> web_url.Origin:
+    if ak.string_view_eq_string_view(&view, ak.sv("opaque")):
+        return web_url.origin_create_opaque()
+    let url = csp_test_url(view)
+    return web_url.url_origin(&url)
+
+## The disposition of an argument.
+func csp_test_disposition(view: ak.StringView) -> ContentSecurityPolicyPolicyDisposition:
+    if ak.string_view_eq_string_view(&view, ak.sv("report")):
+        return ContentSecurityPolicyPolicyDisposition.report
+    return ContentSecurityPolicyPolicyDisposition.enforce
+
+## The oracle's `policy_of`: a header-delivered policy with a self-origin.
+func csp_test_policy(context: const CspTestContext*, serialized: ak.StringView, self_origin: str = "https://self.test/", disposition: str = "enforce") -> ContentSecurityPolicyPolicy*:
+    return csp_test_policy_with(context, serialized, ak.sv(self_origin), ak.sv(disposition))
+
+## csp_test_policy with the self-origin and disposition of arguments.
+func csp_test_policy_with(context: const CspTestContext*, serialized: ak.StringView, self_origin: ak.StringView, disposition: ak.StringView) -> ContentSecurityPolicyPolicy*:
+    let policy = content_security_policy_policy_parse_a_serialized_csp(vm_heap(context.vm), ByteStringOrString.string(csp_test_string(serialized)), ContentSecurityPolicyPolicySource.header, csp_test_disposition(disposition))
+    if not ak.string_view_is_empty(&self_origin):
+        policy.m_self_origin = csp_test_origin(self_origin)
+    return policy
+
+## The destination of an argument ("-" is none), by its string.
+func csp_test_destination(view: ak.StringView) -> FetchRequestDestination?:
+    if ak.string_view_eq_string_view(&view, ak.sv("-")):
+        return none
+    for value: i32 in 0..=21:
+        let destination = (FetchRequestDestination)value
+        if ak.string_view_eq_string_view(&view, fetch_request_destination_to_string(destination)):
+            return destination
+    trap("unknown destination")
+
+## The initiator of an argument ("-" is none).
+func csp_test_initiator(view: ak.StringView) -> FetchRequestInitiator?:
+    let names: str[6] = ["download", "imageset", "manifest", "prefetch", "prerender", "xslt"]
+    for (index, name) in names.indexed():
+        if ak.string_view_eq_string_view(&view, ak.sv(name)):
+            return (FetchRequestInitiator)(i32)index
+    return none
+
+## The inline type of an argument.
+func csp_test_inline_type(view: ak.StringView) -> ContentSecurityPolicyInlineType:
+    let names: str[5] = ["navigation", "script", "script-attribute", "style", "style-attribute"]
+    for (index, name) in names.indexed():
+        if ak.string_view_eq_string_view(&view, ak.sv(name)):
+            return (ContentSecurityPolicyInlineType)(i32)index
+    trap("unknown inline type")
+
+## The production of an argument.
+func csp_test_production(view: ak.StringView) -> ContentSecurityPolicyProduction:
+    let names: str[5] = ["scheme", "host", "keyword", "nonce", "hash"]
+    for (index, name) in names.indexed():
+        if ak.string_view_eq_string_view(&view, ak.sv(name)):
+            return (ContentSecurityPolicyProduction)(i32)index
+    trap("unknown production")
+
+## The oracle's `request_of`: a request from the arguments at `i` (URL list, destination, initiator,
+## nonce, integrity metadata, parser metadata, redirect count), its client the window's.
+func csp_test_request(context: const CspTestContext*, a: const ak.StringView[], i: usize) -> FetchRequest*:
+    let request = fetch_request_create(context.vm)
+    var urls = ak.Vector[web_url.Url]()
+    var parts = ak.string_view_split_view_u8(&a[i], '|')
+    for part in ak.vector_span(&parts):
+        ak.vector_append_t(&urls, csp_test_url(part))
+    fetch_request_set_url_list(request, urls)
+    fetch_request_set_destination(request, csp_test_destination(a[i + 1]))
+    fetch_request_set_initiator(request, csp_test_initiator(a[i + 2]))
+    fetch_request_set_cryptographic_nonce_metadata(request, csp_test_string(a[i + 3]))
+    fetch_request_set_integrity_metadata(request, csp_test_string(a[i + 4]))
+    if ak.string_view_eq_string_view(&a[i + 5], ak.sv("parser-inserted")):
+        fetch_request_set_parser_metadata(request, FetchRequestParserMetadata.parser_inserted)
+    elif ak.string_view_eq_string_view(&a[i + 5], ak.sv("not-parser-inserted")):
+        fetch_request_set_parser_metadata(request, FetchRequestParserMetadata.not_parser_inserted)
+    fetch_request_set_redirect_count(request, ak.string_view_to_number_u8(&a[i + 6]) else trap("a redirect count"))
+    fetch_request_set_client(request, dom_document_relevant_settings_object(context.document))
+    return request
+
+## The oracle's `element_of`: none ("-") or an element of the window's document ("html:tag" or
+## "svg:tag") with "name=value" attributes and the flags "flag:parser-inserted" and
+## "flag:duplicate-attribute".
+func csp_test_element(context: const CspTestContext*, a: const ak.StringView[], i: usize) -> DomElement*?:
+    if ak.string_view_eq_string_view(&a[i], ak.sv("-")):
+        return none
+    let colon = ak.string_view_find_u8(&a[i], ':') else trap("a namespace")
+    let prefix = ak.string_view_substring_view_usize(&a[i], 0, colon)
+    let namespace_ = namespace_svg if ak.string_view_eq_string_view(&prefix, ak.sv("svg")) else namespace_html
+    let local_name = ak.fly_string_from_utf8(ak.string_view_substring_view(&a[i], colon + 1)) else trap("a tag name")
+    let element = dom_create_element(context.document, local_name, namespace_) else trap("create_element")
+    for j in (i + 1)..<a.length:
+        if ak.string_view_eq_string_view(&a[j], ak.sv("flag:parser-inserted")):
+            if let script = as_if_html_script_element(element.cell()):
+                script.m_parser_document = context.document
+            if let script = as_if_svg_script_element(element.cell()):
+                script.m_parser_inserted = true
+            continue
+        if ak.string_view_eq_string_view(&a[j], ak.sv("flag:duplicate-attribute")):
+            element.m_had_duplicate_attribute_during_tokenization = true
+            continue
+        let equals = ak.string_view_find_u8(&a[j], '=') else trap("an attribute")
+        let name = ak.fly_string_from_utf8(ak.string_view_substring_view_usize(&a[j], 0, equals)) else trap("an attribute name")
+        dom_element_set_attribute_value(element, name, csp_test_string(ak.string_view_substring_view(&a[j], equals + 1)))
+    return element
+
+## The window's CSP list.
+func csp_test_window_csp_list(context: const CspTestContext*) -> ContentSecurityPolicyPolicyList*:
+    let global = realm_global_object(dom_document_realm(context.document))
+    return content_security_policy_policy_list_from_object(global) else trap("the window has a CSP list")
+
+## A new policy container whose CSP list holds `policy`.
+func csp_test_policy_container(context: const CspTestContext*, policy: ContentSecurityPolicyPolicy*) -> HtmlPolicyContainer*:
+    let container = heap_allocate_html_policy_container(vm_heap(context.vm))
+    ak.vector_append_t(&container.csp_list.m_policies, policy)
+    return container
+
+## The oracle's `result`.
+func csp_test_result(builder: ak.StringBuilder*, result: ContentSecurityPolicyResult):
+    ak.string_builder_append(builder, "Allowed" if result == ContentSecurityPolicyResult.allowed else "Blocked")
+
+## The oracle's `match`.
+func csp_test_match(builder: ak.StringBuilder*, result: ContentSecurityPolicyDirectivesMatchResult):
+    ak.string_builder_append(builder, "Matches" if result == ContentSecurityPolicyDirectivesMatchResult.matches else "DoesNotMatch")
+
+## The oracle's `describe_policy`.
+func csp_test_describe_policy(builder: ak.StringBuilder*, policy: ContentSecurityPolicyPolicy*):
+    ak.string_builder_append(builder, "enforce" if policy.m_disposition == ContentSecurityPolicyPolicyDisposition.enforce else "report")
+    ak.string_builder_append(builder, "/header" if policy.m_source == ContentSecurityPolicyPolicySource.header else "/meta")
+    ak.string_builder_append(builder, " self=")
+    if let self_origin = policy.m_self_origin:
+        csp_test_escape_string(builder, web_url.origin_serialize(&self_origin))
+    else:
+        ak.string_builder_append(builder, "-")
+    ak.string_builder_append(builder, " pre=")
+    csp_test_escape_string(builder, policy.m_pre_parsed_policy_string)
+    ak.string_builder_append(builder, " [")
+    for (index, directive) in ak.vector_span(&policy.m_directives).indexed():
+        if index > 0:
+            ak.string_builder_append(builder, " ; ")
+        csp_test_escape_string(builder, directive.m_name)
+        ak.string_builder_append(builder, "(")
+        ak.string_builder_append(builder, directive.cell().vtable.class_info.name)
+        ak.string_builder_append(builder, ")")
+        for value in ak.vector_span(&directive.m_value):
+            ak.string_builder_append(builder, " ")
+            csp_test_escape_string(builder, value)
+    ak.string_builder_append(builder, "]")
+
+## The oracle's `opt` of a parse result part.
+func csp_test_part(builder: ak.StringBuilder*, label: str, part: ak.StringView?):
+    ak.string_builder_append(builder, label)
+    if let value = part:
+        csp_test_escape(builder, value)
+    else:
+        ak.string_builder_append(builder, "-")
+
+## A FlyString argument, or none for "-".
+func csp_test_optional_fly_string(view: ak.StringView) -> ak.FlyString?:
+    if ak.string_view_eq_string_view(&view, ak.sv("-")):
+        return none
+    return ak.fly_string_from_utf8(view) else trap("a name")
+
+## `name:Result ` for each directive of a policy: the oracle's per-directive results.
+func csp_test_directive_name(builder: ak.StringBuilder*, directive: ContentSecurityPolicyDirective*):
+    csp_test_escape_string(builder, directive.m_name)
+    ak.string_builder_append(builder, ":")
+
+## An integrity policy from comma-separated sources and destinations.
+func csp_test_fill_integrity_policy(policy: HtmlIntegrityPolicy*, sources: ak.StringView, destinations: ak.StringView):
+    var source_parts = ak.string_view_split_view_u8(&sources, ',')
+    for part in ak.vector_span(&source_parts):
+        ak.vector_append_t(&policy.sources, csp_test_string(part))
+    var destination_parts = ak.string_view_split_view_u8(&destinations, ',')
+    for part in ak.vector_span(&destination_parts):
+        ak.vector_append_t(&policy.blocked_destinations, csp_test_destination(part) else trap("a destination"))
+
+# mark: The operations ==========================================================================
+
+## The parsing, matching and effective-directive operations of the oracle (true when `op` is one).
+func csp_test_run_parsing(builder: ak.StringBuilder*, context: const CspTestContext*, op: str, a: const ak.StringView[]) -> bool:
+    let heap = vm_heap(context.vm)
+    if op == "parse":
+        let source = ContentSecurityPolicyPolicySource.meta if ak.string_view_eq_string_view(&a[0], ak.sv("meta")) else ContentSecurityPolicyPolicySource.header
+        let policy = content_security_policy_policy_parse_a_serialized_csp(heap, ByteStringOrString.string(csp_test_string(a[2])), source, csp_test_disposition(a[1]))
+        csp_test_describe_policy(builder, policy)
+    elif op == "headers":
+        let response = fetch_infrastructure_response_create(context.vm)
+        ak.vector_append_t(fetch_response_url_list(response), csp_test_url(a[0]))
+        var index: usize = 1
+        while index + 1 < a.length:
+            http_header_list_append(fetch_response_header_list(response), http_header_create(a[index], a[index + 1]))
+            index += 2
+        let list = content_security_policy_policy_parse_a_responses_content_security_policies(heap, response)
+        ak.format_u64(builder, (u64)ak.vector_size(&list.m_policies))
+        for policy in ak.vector_span(&list.m_policies):
+            ak.string_builder_append(builder, " || ")
+            csp_test_describe_policy(builder, policy)
+    elif op == "expr":
+        let parsed = content_security_policy_directives_parse_source_expression(csp_test_production(a[0]), a[1])
+        if let result = parsed:
+            csp_test_part(builder, "scheme=", result.scheme_part)
+            csp_test_part(builder, " host=", result.host_part)
+            csp_test_part(builder, " port=", result.port_part)
+            csp_test_part(builder, " path=", result.path_part)
+            csp_test_part(builder, " keyword=", result.keyword_source)
+            csp_test_part(builder, " base64=", result.base64_value)
+            csp_test_part(builder, " hash=", result.hash_algorithm)
+        else:
+            ak.string_builder_append(builder, "none")
+    elif op == "url_expr":
+        let redirect_count = ak.string_view_to_number_u8(&a[2]) else trap("a redirect count")
+        csp_test_match(builder, content_security_policy_directives_does_url_match_expression_in_origin_with_redirect_count(csp_test_url(a[0]), csp_test_string(a[3]), csp_test_origin(a[1]), redirect_count))
+    elif op == "url_list":
+        var list = ak.Vector[ak.String]()
+        for index in 3..<a.length:
+            ak.vector_append_t(&list, csp_test_string(a[index]))
+        let redirect_count = ak.string_view_to_number_u8(&a[2]) else trap("a redirect count")
+        csp_test_match(builder, content_security_policy_directives_does_url_match_source_list_in_origin_with_redirect_count(csp_test_url(a[0]), &list, csp_test_origin(a[1]), redirect_count))
+    elif op == "effective":
+        let request = fetch_request_create(context.vm)
+        fetch_request_set_destination(request, csp_test_destination(a[0]))
+        fetch_request_set_initiator(request, csp_test_initiator(a[1]))
+        if let name = content_security_policy_directives_get_the_effective_directive_for_request(request):
+            ak.string_builder_append_string_view(builder, ak.fly_string_bytes_as_string_view(&name))
+        else:
+            ak.string_builder_append(builder, "null")
+    elif op == "inline_effective":
+        let name = content_security_policy_directives_get_the_effective_directive_for_inline_checks(csp_test_inline_type(a[0]))
+        ak.string_builder_append_string_view(builder, ak.fly_string_bytes_as_string_view(&name))
+    elif op == "fallback":
+        ak.string_builder_append(builder, "[")
+        var list = content_security_policy_directives_get_fetch_directive_fallback_list(csp_test_optional_fly_string(a[0]))
+        for item in ak.vector_span(&list):
+            ak.string_builder_append(builder, " ")
+            ak.string_builder_append_string_view(builder, item)
+        ak.string_builder_append(builder, " ]")
+    elif op == "execute":
+        let policy = csp_test_policy(context, a[2])
+        let directive_name = ak.fly_string_from_utf8(a[1]) else trap("a name")
+        let result = content_security_policy_directives_should_fetch_directive_execute(csp_test_optional_fly_string(a[0]), directive_name, policy)
+        ak.string_builder_append(builder, "Yes" if result == ContentSecurityPolicyShouldExecute.yes else "No")
+    else:
+        return false
+    return true
+
+## The request, response and element checks of the oracle (true when `op` is one).
+func csp_test_run_checks(builder: ak.StringBuilder*, context: const CspTestContext*, op: str, a: const ak.StringView[]) -> bool:
+    let heap = vm_heap(context.vm)
+    let realm = dom_document_realm(context.document)
+    if op == "request":
+        let policy = csp_test_policy_with(context, a[0], a[1], ak.sv("enforce"))
+        let request = csp_test_request(context, a, 2)
+        for directive in ak.vector_span(&policy.m_directives):
+            csp_test_directive_name(builder, directive)
+            csp_test_result(builder, content_security_policy_directive_pre_request_check(directive, heap, request, policy))
+            ak.string_builder_append(builder, " ")
+        ak.string_builder_append(builder, "; violates=")
+        if let violating = content_security_policy_does_request_violate_policy(heap, request, policy):
+            csp_test_escape_string(builder, violating.m_name)
+        else:
+            ak.string_builder_append(builder, "none")
+    elif op == "response":
+        let policy = csp_test_policy_with(context, a[0], a[1], ak.sv("enforce"))
+        let request = csp_test_request(context, a, 2)
+        let response = fetch_infrastructure_response_create(context.vm)
+        if not ak.string_view_eq_string_view(&a[9], ak.sv("-")):
+            ak.vector_append_t(fetch_response_url_list(response), csp_test_url(a[9]))
+        for directive in ak.vector_span(&policy.m_directives):
+            csp_test_directive_name(builder, directive)
+            csp_test_result(builder, content_security_policy_directive_post_request_check(directive, heap, request, response, policy))
+            ak.string_builder_append(builder, " ")
+    elif op == "should_request":
+        let policy = csp_test_policy_with(context, a[0], a[2], a[1])
+        let request = csp_test_request(context, a, 3)
+        fetch_request_set_policy_container(request, FetchRequestPolicyContainerType.html_policy_container(csp_test_policy_container(context, policy)))
+        csp_test_result(builder, content_security_policy_should_request_be_blocked_by_content_security_policy(realm, request))
+    elif op == "should_response":
+        let policy = csp_test_policy_with(context, a[0], a[2], a[1])
+        let request = csp_test_request(context, a, 3)
+        fetch_request_set_policy_container(request, FetchRequestPolicyContainerType.html_policy_container(csp_test_policy_container(context, policy)))
+        let response = fetch_infrastructure_response_create(context.vm)
+        ak.vector_append_t(fetch_response_url_list(response), csp_test_url(a[10]))
+        csp_test_result(builder, content_security_policy_should_response_to_request_be_blocked_by_content_security_policy(realm, response, request))
+    elif op == "element":
+        let policy = csp_test_policy_with(context, a[0], ak.sv("https://self.test/"), a[1])
+        let type_ = csp_test_inline_type(a[2])
+        let source = csp_test_string(a[3])
+        let element = csp_test_element(context, a, 4)
+        for directive in ak.vector_span(&policy.m_directives):
+            csp_test_directive_name(builder, directive)
+            csp_test_result(builder, content_security_policy_directive_inline_check(directive, heap, element, type_, policy, source))
+            ak.string_builder_append(builder, " ")
+        if let the_element = element:
+            if type_ != ContentSecurityPolicyInlineType.navigation:
+                let list = csp_test_window_csp_list(context)
+                ak.vector_append_t(&list.m_policies, policy)
+                let blocked = content_security_policy_should_elements_inline_type_behavior_be_blocked_by_content_security_policy(realm, the_element, type_, source)
+                ak.vector_clear(&list.m_policies)
+                ak.string_builder_append(builder, "; ")
+                csp_test_result(builder, blocked)
+    elif op == "matches_element":
+        var list = ak.Vector[ak.String]()
+        var parts = ak.string_view_split_view_u8(&a[0], ' ')
+        for part in ak.vector_span(&parts):
+            ak.vector_append_t(&list, csp_test_string(part))
+        let element = csp_test_element(context, a, 3)
+        csp_test_match(builder, content_security_policy_directives_does_element_match_source_list_for_type_and_source(element, &list, csp_test_inline_type(a[1]), csp_test_string(a[2])))
+    else:
+        return false
+    return true
+
+## The navigation, <base>, integrity, WebRTC, violation and SRI operations of the oracle.
+func csp_test_run(builder: ak.StringBuilder*, context: const CspTestContext*, test_case: const CspCase*):
+    let vector = csp_test_arguments(test_case)
+    let a = ak.vector_span_const(&vector)
+    let op = test_case.op
+    if csp_test_run_parsing(builder, context, op, a) or csp_test_run_checks(builder, context, op, a):
+        return
+    let realm = dom_document_realm(context.document)
+    if op == "navigation":
+        let policy = csp_test_policy_with(context, a[0], a[1], ak.sv("enforce"))
+        let request = fetch_request_create(context.vm)
+        fetch_request_set_url(request, csp_test_url(a[2]))
+        fetch_request_set_policy_container(request, FetchRequestPolicyContainerType.html_policy_container(csp_test_policy_container(context, policy)))
+        fetch_request_set_client(request, dom_document_relevant_settings_object(context.document))
+        let type_ = ContentSecurityPolicyNavigationType.form_submission if ak.string_view_eq_string_view(&a[3], ak.sv("form")) else ContentSecurityPolicyNavigationType.other
+        for directive in ak.vector_span(&policy.m_directives):
+            csp_test_directive_name(builder, directive)
+            csp_test_result(builder, content_security_policy_directive_pre_navigation_check(directive, request, type_, policy))
+            ak.string_builder_append(builder, " ")
+        ak.string_builder_append(builder, "; ")
+        csp_test_result(builder, content_security_policy_should_navigation_request_of_type_be_blocked_by_content_security_policy(request, type_))
+    elif op == "base":
+        let policy = csp_test_policy_with(context, a[0], a[2], a[1])
+        let list = csp_test_window_csp_list(context)
+        ak.vector_append_t(&list.m_policies, policy)
+        let result = content_security_policy_is_base_allowed_for_document(realm, csp_test_url(a[3]), context.document)
+        ak.vector_clear(&list.m_policies)
+        csp_test_result(builder, result)
+    elif op == "integrity":
+        let container = heap_allocate_html_policy_container(vm_heap(context.vm))
+        csp_test_fill_integrity_policy(&container.integrity_policy, a[0], a[1])
+        csp_test_fill_integrity_policy(&container.report_only_integrity_policy, a[2], a[3])
+        let request = fetch_request_create(context.vm)
+        fetch_request_set_url(request, csp_test_url(a[4]))
+        fetch_request_set_destination(request, csp_test_destination(a[5]))
+        var mode = FetchRequestMode.no_cors
+        if ak.string_view_eq_string_view(&a[6], ak.sv("cors")):
+            mode = FetchRequestMode.cors
+        elif ak.string_view_eq_string_view(&a[6], ak.sv("same-origin")):
+            mode = FetchRequestMode.same_origin
+        fetch_request_set_mode(request, mode)
+        fetch_request_set_integrity_metadata(request, csp_test_string(a[7]))
+        fetch_request_set_policy_container(request, FetchRequestPolicyContainerType.html_policy_container(container))
+        fetch_request_set_client(request, dom_document_relevant_settings_object(context.document))
+        csp_test_result(builder, content_security_policy_should_request_be_blocked_by_integrity_policy(request))
+    elif op == "webrtc":
+        let policy = csp_test_policy(context, a[0])
+        for directive in ak.vector_span(&policy.m_directives):
+            csp_test_directive_name(builder, directive)
+            csp_test_result(builder, content_security_policy_directive_webrtc_pre_connect_check(directive, policy))
+            ak.string_builder_append(builder, " ")
+    elif op == "blocked_uri":
+        let policy = csp_test_policy(context, ak.sv("default-src 'none'"))
+        let violation = content_security_policy_violation_create_a_violation_object_for_global_policy_and_directive(realm, (JsObject*?)dom_document_window(context.document), policy, ak.string_from_str("default-src"))
+        if ak.string_view_eq_string_view(&a[0], ak.sv("inline")):
+            content_security_policy_violation_set_resource(violation, .resource(ContentSecurityPolicyViolationResource.inline_))
+        elif ak.string_view_eq_string_view(&a[0], ak.sv("eval")):
+            content_security_policy_violation_set_resource(violation, .resource(ContentSecurityPolicyViolationResource.eval))
+        elif ak.string_view_eq_string_view(&a[0], ak.sv("wasm-eval")):
+            content_security_policy_violation_set_resource(violation, .resource(ContentSecurityPolicyViolationResource.wasm_eval))
+        else:
+            content_security_policy_violation_set_resource(violation, .url(csp_test_url(a[0])))
+        csp_test_escape_string(builder, content_security_policy_violation_obtain_the_blocked_uri_of_resource(violation))
+    elif op == "violation_request":
+        let policy = csp_test_policy(context, a[0])
+        let request = csp_test_request(context, a, 1)
+        let violation = content_security_policy_violation_create_a_violation_object_for_request_and_policy(realm, request, policy)
+        csp_test_escape_string(builder, content_security_policy_violation_effective_directive(violation))
+        ak.string_builder_append(builder, " ; ")
+        csp_test_escape_string(builder, content_security_policy_violation_obtain_the_blocked_uri_of_resource(violation))
+        ak.string_builder_append(builder, " ; ")
+        if let referrer = content_security_policy_violation_referrer(violation):
+            csp_test_escape_string(builder, web_url.url_serialize(&referrer))
+        else:
+            ak.string_builder_append(builder, "-")
+    elif op == "sri_parse":
+        var metadata = sri_parse_metadata(a[0]) else trap("MUST: parse_metadata")
+        ak.string_builder_append(builder, "[")
+        for item in ak.vector_span(&metadata):
+            ak.string_builder_append(builder, " ")
+            csp_test_escape_string(builder, item.algorithm)
+            ak.string_builder_append(builder, ":")
+            csp_test_escape_string(builder, item.base64_value)
+        ak.string_builder_append(builder, " ] strongest [")
+        var strongest = sri_get_strongest_metadata_from_set(&metadata) else trap("MUST: get_strongest_metadata_from_set")
+        for item in ak.vector_span(&strongest):
+            ak.string_builder_append(builder, " ")
+            csp_test_escape_string(builder, item.algorithm)
+            ak.string_builder_append(builder, ":")
+            csp_test_escape_string(builder, item.base64_value)
+        ak.string_builder_append(builder, " ]")
+    elif op == "sri_match":
+        let bytes = ak.byte_buffer_copy_span_u8(ak.string_view_bytes(&a[0])) else trap("MUST: ByteBuffer::copy")
+        let matches = sri_do_bytes_match_metadata_list(&bytes, a[1]) else trap("MUST: do_bytes_match_metadata_list")
+        ak.string_builder_append(builder, "true" if matches else "false")
+    elif op == "sri_hash":
+        let bytes = ak.byte_buffer_copy_span_u8(ak.string_view_bytes(&a[1])) else trap("MUST: ByteBuffer::copy")
+        csp_test_escape_string(builder, sri_apply_algorithm_to_bytes(a[0], &bytes) else trap("MUST: apply_algorithm_to_bytes"))
+    else:
+        trap("unknown op")
+
+# mark: The cases ===============================================================================
+
+test "ContentSecurityPolicy and SRI give the reference build's results":
+    web_initialize_strings()
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    discard(web_test_install_agent(vm))
+    web_test_install_event_loop_plugin()
+    defer web_test_remove_event_loop_plugin()
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        let (page, traversable) = test_browsing_page_with_traversable(vm)
+        discard(page)
+        let document = html_navigable_active_document(traversable.html_navigable()) else trap("no active document")
+        let context = CspTestContext(vm = vm, document = document)
+        var failures = 0
+        for test_case in &csp_cases:
+            var builder = ak.string_builder_new()
+            csp_test_run(&builder, &context, test_case)
+            let result = ak.string_builder_string_view(&builder)
+            if not ak.string_view_eq_string_view(&result, ak.string_view_from_bytes(test_case.expected)):
+                var arguments = ak.string_builder_new()
+                csp_test_escape(&arguments, ak.string_view_from_bytes(test_case.arguments))
+                print(f"{test_case.op} {ak.string_view_text(ak.string_builder_string_view(&arguments))}:\n  expected {(str)test_case.expected}\n  got      {ak.string_view_text(result)}")
+                failures += 1
+        assert(failures == 0)
