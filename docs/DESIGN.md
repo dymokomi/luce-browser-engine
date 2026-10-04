@@ -1286,6 +1286,26 @@ The skeleton must type-check (`luce-base check`) before any region starts; the g
 re-run only by the lead, never by region agents, and only onto files no region has touched
 (types files and untouched stubs).
 
+**Later phases.** The generator never writes into a ported repository. For a new phase (P2 was
+the first) it plans twice against the ported engine (`--baseline`): the previous phase's scope and
+the new one, into scratch trees. From the baseline it takes the namemap's names (a declaration or
+function the namemap or a `## Ported from` line names keeps that name; a new one never takes a name
+the port gives to something else) and the class ids (a new class shares its nearest numbered
+ancestor's id and is recognized by its ClassInfo, since renumbering would rewrite every ported
+types fragment). Declarations new in the phase that would land in a lower package go to `web`
+instead, the lower packages being pinned. A merge step then brings over only what the new plan
+adds: new declarations into the types fragments (after their generated neighbour) or new ones, a
+struct still declared opaque (or that a region filled in part) replaced by its full declaration,
+the region stub fragments, the closure stubs of the new regions' files moved out of
+`stubs/stub_closure.lucb` with their hand-written signatures, and the new namemap, regions and
+`gc_fields` rows. Since the regions settled them, stubs follow these conventions: a C++ `T const&`
+parameter or result is `const T*` unless `T` is a small immutable value (strings, URLs, origins,
+qualified names, pixel units, colors, geometry, enums, variants, optionals); C++ default arguments
+become default parameter values where a constant expresses them (`Optional<T> {}` is `none`, a
+`Variant<Empty, …> {}` is `.empty`); a private member or internal-linkage function is marked to
+become module-private when ported (an unused private function is a warning, so the stub stays
+`pub`).
+
 **Visit-edges lint.** From the model the generator also writes, per cell class, the list of
 fields whose type is a GC pointer or contains one, committed as `docs/gc_fields.tsv`; a Luce test in
 each package (`tests/visit_edges`) reads it and checks that each field name appears in the ported
@@ -1728,10 +1748,59 @@ generated as soon as the lower packages' *types* exist, because stubs in lower p
 **Wave 3 (convergence):** triage by the runner's failure and trap statistics; fix regions own
 their bugs; the expected-failures list shrinks to reviewed reasons.
 
-P2 (≈45k donor lines: Fetch 11.6k, Loader, HTML/Scripting fetching, navigation 8k, image
-requests, CSP 6k, XML, codecs), P3 (bindings generator, WebIDL 3k, Bindings 2.3k, the JS-facing
-halves of DOM/HTML/CSS, Range/TreeWalker/MutationObserver, UIEvents, Streams, XHR, Encoding, …)
-and P4 are planned when P1 converges, from the same skeleton tooling with a wider scope.
+**Phase 2 (loading).** P1 ported the callers already: navigation and session history
+(`Navigable`, `TraversableNavigable`, `NavigableContainer`, r28), `<img>` and its
+`SharedResourceRequest`/`ImageRequest` (r26), `<link>` style sheets and `@import` (r26, r37),
+`CSS/Fetch` and `url()` (r36), `@font-face`'s `FontLoader` (r41), `<object>`/`<iframe>` (r27, r28),
+`SVGDecodedImageData` (r56), XML documents in `DocumentLoading` (r17), MimeSniff and the
+`ImageCodecPlugin` seam (r13). Their paths stop in what P2 ports, the regions below. The skeleton
+was generated for them against the ported engine (§4.4, "Later phases"): their types are declared
+whole (`Fetch::Infrastructure::Request`, `Response` and its filtered responses, `FetchController`,
+`FetchParams`, `ResourceLoader`, `Policy`, the 26 directive classes, `XMLDocumentBuilder`, …),
+every function has a typed stub in `stubs/stub_p2<x>_<name>[_N].lucb`, and the closure stubs that
+P1 regions wrote for these files (with their signatures) moved there from `stubs/stub_closure.lucb`.
+
+| Region | Content | Size | Deps |
+| --- | --- | ---: | --- |
+| p2b | `fetch_http`: `Fetch/Infrastructure/HTTP/*` (Requests 1.1k, Responses 0.7k, Bodies, CORS, MIME, Statuses) and LibHTTP's `HeaderList`, `Header`, `Method`, `Status`, `HTTP` (r28 ported the header-list parts P1 needed, `external/lib_http`) | ≈3.7k | — |
+| p2a | `fetch_infrastructure`: `FetchController`, `FetchParams`, `FetchAlgorithms`, `FetchRecord`, `FetchTimingInfo`, `ConnectionTimingInfo`, `Task`, `URL`, `NetworkPartitionKey`, the port/MIME/nosniff blocking checks, `IncrementalReadLoopReadRequest`; `ReferrerPolicy/*`, `SecureContexts/*` | ≈2.3k | p2b |
+| p2e | `csp_policy`: `ContentSecurityPolicy/` `BlockingAlgorithms`, `Policy`, `PolicyList`, `SerializedPolicy`, `Violation`, `SecurityPolicyViolationEvent`; `Directives/` `Directive`, `DirectiveFactory`, `Names`, `KeywordSources`, `KeywordTrustedTypes`, `SerializedDirective` | ≈2.6k | p2b |
+| p2f | `csp_directives`: `Directives/DirectiveOperations` (1.1k), `SourceExpression` and the 22 directive classes | ≈3.5k | p2e |
+| p2d | `loader_resources`: `Loader/*` (`ResourceLoader`, `FileRequest`, `LoadRequest`, `GeneratedPagesLoader`, `ContentFilter`, `ProxyMappings`), `HTML/PotentialCORSRequest`, `PreloadEntry`, `NavigationObserver`, `BitmapDecodedImageData`, `XML/XMLDocumentBuilder`; the LibCore seams `Core::Resource` and `Core::Promise` (not ported: implemented over luce-std) | ≈2.6k | p2b |
+| p2c | `fetch_fetching`: `Fetch/Fetching/*` (`Fetching.cpp` 2.5k: fetch, main fetch, scheme/HTTP/redirect/network fetch, CORS preflight; `FetchedDataReceiver`, `PendingResponse`, `Checks`) | ≈3.1k | p2a, p2b, p2d, p2e |
+
+In dependency order: p2b, then p2a, p2e and p2d in parallel, then p2f and p2c (≈17.7k donor
+lines in all; `docs/regions.tsv` has the files). `stubs/stub_p2_closure.lucb` holds the virtuals
+of `Streams::ReadRequest`, whose class the P2 types pull in whole (Streams stay P4).
+
+Decisions of the phase-2 closure:
+
+- The JS-facing Fetch API (`Fetch/Body`, `BodyInit`, `Headers`, `HeadersIterator`, `Request`,
+  `Response`, `FetchMethod`, `Enums`) and script fetching (`HTML/Scripting/Fetching`) are P3;
+  the Navigation API (`HTML/Navigation`, `History`) stays P3 as before.
+- The XML parser is luce-xml's (§7.0): `XMLDocumentBuilder` is the listener it drives. Its
+  `XML::Listener` base is LibXML's, outside the port, so the builder's overrides are generated as
+  the builder's own vtable (`XmlDocumentBuilderVTable`): the luce-xml adapter calls those slots.
+  `xml_parse_with_document_builder` (r17's seam, now in p2d's stubs) is where the adapter goes.
+- The image decoders are luce-png, luce-jpeg and the new sibling packages behind the ported
+  `Platform::ImageCodecPlugin` (§7.0); no LibGfx decoder is ported. `BitmapDecodedImageData`
+  holds what they return.
+- `ResourceLoader`'s `Requests::RequestClient` (LibRequests) stays opaque: it is the
+  `RequestClient` seam of §7.1, written by p2d over `file:`/`data:`/`resource:` and, for `http(s):`,
+  luce-http-client.
+- Closure stubs that only scripting or user input reaches were relabeled from `unported (P2)` to P3
+  or P4: blob URLs and `Blob`/`File` (`FileAPI`), `FileList` (P4), storage, `document.cookie`'s
+  `HTTP::Cookie::parse_cookie`, `DOMURL::url_encode` (form encoding), `Core::System`
+  (`navigator`), `PerformanceEntryTuple`.
+- New classes share the class id of their nearest numbered ancestor (GC::Cell's 0, JS::Cell's 1,
+  PlatformObject's 6, DOM::Event's for `SecurityPolicyViolationEvent`) and are recognized by their
+  ClassInfo, as r14's `Realm` and r55's `DOMRect`: renumbering would rewrite every ported types
+  fragment. r28's hand-filled `Fetch::Infrastructure::Response` (id 0) is now generated whole with
+  JS::Cell's id, `is<Response>` covering its five filtered subclasses.
+
+P3 (bindings generator, WebIDL 3k, Bindings 2.3k, the JS-facing halves of DOM/HTML/CSS,
+Range/TreeWalker/MutationObserver, UIEvents, Streams, XHR, Encoding, …) and P4 are planned when P2
+converges, from the same skeleton tooling with a wider scope.
 
 ### 8.3 Estimate
 
