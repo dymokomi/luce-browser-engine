@@ -1,0 +1,114 @@
+#==============================================================================================
+#
+#   request_client - Requests::RequestClient and Requests::Request: the RequestClient seam
+#   ResourceLoader starts its network requests through
+#
+#   DESCRIPTION:
+#       Ladybird's LibRequests talks to the RequestServer process over IPC. The port replaces
+#       the connection with an in-process seam (DESIGN.md §7.1): RequestsRequestClient has a
+#       vtable of the messages RequestClient sends (start_request, stop_request,
+#       ensure_connection), which an embedder implements (in_process_request_client.lucb is
+#       the engine's), and the functions below keep LibRequests' side of the protocol: request
+#       ids, the requests' callbacks, and the replies (headers, data, completion) that a
+#       client implementation delivers on the event loop. After Libraries/LibRequests/
+#       Request.cpp (lines 27-113) and RequestClient.cpp (lines 37-62); the buffered mode,
+#       certificates and WebSockets, which LibWeb's loads do not use, are not ported.
+#
+#       Copyright (c) 2018-2020, Andreas Kling <andreas@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: RequestClient ===========================================================================
+
+## A client of the seam: `vtable` the implementation's messages, its requests made in `heap`.
+pub func requests_request_client_construct(this: RequestsRequestClient*, vtable: const RequestsRequestClientVTable*, heap: gc.Heap*):
+    this.vtable = vtable
+    this.m_heap = heap
+    this.m_next_request_id = 0
+
+## Ported from Libraries/LibRequests/RequestClient.cpp:37 Requests::RequestClient::start_request: a new request
+## with the next id, which the implementation starts; none when it could not.
+pub func requests_request_client_start_request(this: RequestsRequestClient*, method: ak.ByteString, url: web_url.Url, request_headers: const HttpHeaderList*?,
+                                               request_body: const u8[], cache_mode: HttpCacheMode = HttpCacheMode.default,
+                                               include_credentials: HttpIncludeCredentials = HttpIncludeCredentials.yes, proxy_data: CoreProxyData = CoreProxyData()) -> RequestsRequest*?:
+    let request_id = this.m_next_request_id
+    this.m_next_request_id += 1
+
+    let request = requests_request_create_from_id(this, request_id)
+    let arguments = RequestsStartRequest(method = method, url = url, request_headers = request_headers, request_body = request_body, cache_mode = cache_mode,
+                                         include_credentials = include_credentials, proxy = proxy_data)
+    if not this.vtable.start_request(this, request, &arguments):
+        return none
+    return request
+
+## Ported from Libraries/LibRequests/RequestClient.cpp:49 Requests::RequestClient::stop_request.
+pub func requests_request_client_stop_request(this: RequestsRequestClient*, request: RequestsRequest*) -> bool:
+    return this.vtable.stop_request(this, request)
+
+## Ported from Libraries/LibRequests/RequestClient.cpp:56 Requests::RequestClient::ensure_connection.
+pub func requests_request_client_ensure_connection(this: RequestsRequestClient*, url: web_url.Url, cache_level: RequestServerCacheLevel):
+    this.m_next_request_id += 1
+    this.vtable.ensure_connection(this, url, cache_level)
+
+# mark: Request =================================================================================
+
+## Ported from Libraries/LibRequests/Request.h:56 Requests::Request::create_from_id: a request cell of the
+## client's heap.
+pub func requests_request_create_from_id(client: RequestsRequestClient*, request_id: u64) -> RequestsRequest*:
+    let heap = client.m_heap
+    let request = (RequestsRequest*)web_heap_allocate_cell(heap, &requests_request_class)
+    gc.heap_defer_gc(heap)
+    requests_request_construct(request, client, request_id)
+    gc.heap_undefer_gc(heap)
+    return request
+
+## Ported from Libraries/LibRequests/Request.cpp:27 Requests::Request::Request.
+func requests_request_construct(this: RequestsRequest*, client: RequestsRequestClient*, request_id: u64):
+    this.m_client = client
+    this.m_request_id = request_id
+    this.m_mode = RequestsRequestMode.unknown
+
+## Ported from Libraries/LibRequests/Request.h:61 Requests::Request::id.
+pub func requests_request_id(this: const RequestsRequest*) -> u64:
+    return this.m_request_id
+
+## Ported from Libraries/LibRequests/Request.cpp:33 Requests::Request::stop.
+pub func requests_request_stop(this: RequestsRequest*) -> bool:
+    ak.function3_clear(&this.on_headers_received)
+    ak.function3_clear(&this.on_finish)
+    ak.function0_clear(&this.on_certificate_requested)
+
+    ak.function1_clear(&this.on_data_received)
+    this.m_mode = RequestsRequestMode.unknown
+
+    let client = this.m_client else return false
+    return requests_request_client_stop_request(client, this)
+
+## Ported from Libraries/LibRequests/Request.cpp:97 Requests::Request::set_unbuffered_request_callbacks.
+pub func requests_request_set_unbuffered_request_callbacks(this: RequestsRequest*, on_headers_received: ak.Function3[HttpHeaderList*, u32?, ak.String?, unit],
+                                                           on_data_received: ak.Function1[const u8[], unit], on_finish: ak.Function3[u64, RequestsRequestTimingInfo, RequestsNetworkError?, unit]):
+    assert(this.m_mode == RequestsRequestMode.unknown)
+    this.m_mode = RequestsRequestMode.unbuffered
+
+    this.on_headers_received = on_headers_received
+    this.on_finish = on_finish
+
+    # set_up_internal_stream_data(move(on_data_received)): the client hands over the data itself.
+    this.on_data_received = on_data_received
+
+## Ported from Libraries/LibRequests/Request.cpp:107 Requests::Request::did_finish (Badge<RequestClient>).
+pub func requests_request_did_finish(this: RequestsRequest*, total_size: u64, timing_info: RequestsRequestTimingInfo, network_error: RequestsNetworkError?):
+    if ak.function3_is_set(&this.on_finish):
+        ak.function3_call(&this.on_finish, total_size, timing_info, network_error)
+
+## Ported from Libraries/LibRequests/Request.cpp:113 Requests::Request::did_receive_headers (Badge<RequestClient>).
+pub func requests_request_did_receive_headers(this: RequestsRequest*, response_headers: HttpHeaderList*, response_code: u32?, reason_phrase: ak.String?):
+    if ak.function3_is_set(&this.on_headers_received):
+        ak.function3_call(&this.on_headers_received, response_headers, response_code, reason_phrase)
+
+## The body bytes the server sent (what Request's read notifier reads from the request's descriptor and hands
+## to the DataReceived callback, Request.cpp:141): delivered to the callback while the request is not stopped.
+pub func requests_request_did_receive_data(this: RequestsRequest*, data: const u8[]):
+    if ak.function1_is_set(&this.on_data_received):
+        ak.function1_call(&this.on_data_received, data)

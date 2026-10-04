@@ -1,0 +1,101 @@
+#==============================================================================================
+#
+#   system - the LibCore calls of the loader, over luce-std: System::stat, fstat and getcwd,
+#   MappedFile::map, DirIterator and File::adopt_fd
+#
+#   DESCRIPTION:
+#       LibCore is not ported (DESIGN.md §1.1); the few calls Core::Resource, the generated
+#       pages and ResourceLoader's file loads make are written here over luce-std `files`
+#       and `os`, as region p2d's LibCore seams.
+#
+#       A file descriptor comes back from PageClient::request_file (FileRequest). luce-std
+#       opens and reads files by path, so a descriptor is reached through its /dev/fd/N name
+#       (macOS and Linux both have it): its metadata is fstat's, and reading it reads the
+#       file from its start. File::adopt_fd's descriptor is closed when the read is done, as
+#       the C++ File's destructor closes it.
+#
+#==============================================================================================
+
+extern func posix_close as "close"(descriptor: i32) -> i32
+
+## A NUL-terminated copy of `path` for luce-std (atomic managed memory).
+func core_c_path(path: ak.StringView) -> libc.str:
+    let bytes = ak.string_view_bytes(&path)
+    let copy = ak.alloc_atomic(bytes.length + 1)
+    memory.copy(copy, bytes, bytes.length)
+    copy[bytes.length] = 0
+    return (libc.str)(str)copy[..<bytes.length]
+
+## The /dev/fd name of a descriptor, NUL-terminated (atomic managed memory).
+func core_descriptor_path(fd: i32) -> libc.str:
+    var digits: u8[12]
+    var count: usize = 0
+    var value = (u32)fd
+    while true:
+        digits[count] = '0' + (u8)(value % 10)
+        count += 1
+        value = value // 10
+        if value == 0:
+            break
+    let prefix = "/dev/fd/"
+    let path = ak.alloc_atomic(prefix.length + count + 1)
+    memory.copy(path, prefix.bytes, prefix.length)
+    for index in 0..<count:
+        path[prefix.length + index] = digits[count - 1 - index]
+    path[prefix.length + count] = 0
+    return (libc.str)(str)path[..<prefix.length + count]
+
+## `Core::System::stat(path)`: the metadata of the file `path` names.
+pub func core_system_stat(path: ak.StringView) -> std_files.Metadata!:
+    return try std_files.metadata(core_c_path(path))
+
+## `Core::System::fstat(fd)`: the metadata of the open file `fd`.
+pub func core_system_fstat(fd: i32) -> std_files.Metadata!:
+    return try std_files.metadata(core_descriptor_path(fd))
+
+## `S_ISDIR(st.st_mode)`.
+pub func core_system_is_directory(metadata: const std_files.Metadata*) -> bool:
+    return metadata.kind == std_files.FileKind.directory
+
+## `Core::System::getcwd()`.
+pub func core_system_getcwd() -> ak.ByteString!:
+    # os.cwd answers storage of the current allocator: managed memory, collected.
+    let directory = try os.cwd()
+    return ak.byte_string_from_str(directory)
+
+## Reads the file `path` names whole into an atomic ByteBuffer: luce-std reads into the C heap
+## (the read's own allocations are never managed), and the bytes are copied out.
+func core_read_file(path: libc.str) -> ak.ByteBuffer!:
+    var bytes: u8[]
+    with memory.heap:
+        bytes = try std_files.read(path)
+    defer free(bytes) in memory.heap
+    return try ak.byte_buffer_copy_span_u8(bytes)
+
+## `Core::MappedFile::map(path)`: the bytes of the file `path` names (read, not mapped).
+pub func core_mapped_file_map(path: ak.StringView) -> ak.ByteBuffer!:
+    return try core_read_file(core_c_path(path))
+
+## `Core::DirIterator(path, Core::DirIterator::SkipParentAndBaseDir)`: the names in the directory
+## `path`, without `.` and `..`. luce-std lists them sorted by bytes, where readdir's order is the
+## file system's.
+pub func core_dir_iterator_names(path: ak.StringView) -> ak.Vector[ak.ByteString]!:
+    var names: str[]
+    with memory.heap:
+        names = try std_files.list(core_c_path(path))
+    var result: ak.Vector[ak.ByteString]
+    for name in names:
+        ak.vector_append_t(&result, ak.byte_string_from_str(name))
+    with memory.heap:
+        std_files.release_list(names)
+    return result
+
+## `Core::File::adopt_fd(fd, Core::File::OpenMode::Read)` then `read_until_eof()`: the bytes of the
+## open file `fd`, which is closed afterwards (the adopting File's destructor).
+pub func core_file_read_until_eof(fd: i32) -> ak.ByteBuffer!:
+    defer core_system_close(fd)
+    return try core_read_file(core_descriptor_path(fd))
+
+## `Core::System::close(fd)`; a failure is ignored, as a File's destructor ignores it.
+pub func core_system_close(fd: i32):
+    discard(posix_close(fd))

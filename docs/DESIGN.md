@@ -1576,7 +1576,7 @@ Ladybird's implementation, so the work benefits the whole ecosystem. Decisions:
 | Segmentation, bidi, line-break classes | LibUnicode over ICU (`Segmenter` 30 uses in Layout/CSS/DOM, `line_break_class`, `bidirectional_class`) | `web_unicode` | UAX #29 (grapheme via luce-std `unicode`, word), UAX #14 line breaking (ICU's default rules), UCD property lookups | IDNA (UTS #46) for `web_url` hosts in P2 | luce-std `unicode` |
 | Normalization, case | ICU | `web_unicode` → luce-std `unicode` (`normalize`, `to_upper`, `case_fold`) | yes | | luce-std |
 | Image decoding | `ImageCodecPlugin` → out-of-process decoders over libpng/libjpeg-turbo/libwebp/… | `Platform::ImageCodecPlugin` (ported seam) | none needed (P1 has no images) | luce-png, luce-jpeg, luce-tiff; ports of LibGfx's pure-C++ GIF, BMP, ICO, TinyVG loaders; WebP/AVIF/JXL later | luce-png, luce-jpeg, luce-tiff |
-| Networking | `ResourceLoader` → RequestServer (curl) | `web.RequestClient` (one method: start a request, deliver headers/body chunks/end on the event loop) | `file:` and `data:` in-process | `http(s):` over luce-http-client; its TLS is a single restricted profile today (CHACHA20-POLY1305, X25519, P-256/P-384 pinned roots), so general browsing needs a general TLS stack and a CA store first | luce-http-client, luce-tls |
+| Networking | `ResourceLoader` → RequestServer (curl) | `RequestsRequestClient` (region p2d: a vtable of start/stop/ensure-connection; the request delivers headers, body chunks and its end on the event loop) | `InProcessRequestClient`: `file:`, `data:` and `http(s):` in process (HTTP/1.1 on luce-std `net`, TLS 1.3 on luce-tls with the public roots, gzip/deflate on luce-compress), blocking the event loop per request | non-blocking requests once the event loop seam watches sockets; connection reuse, HTTP/2, a cache | luce-std, luce-tls, luce-compress |
 | Compression | zlib (Content-Encoding, WOFF, PNG) | `web_fonts` (WOFF) and the engine (Content-Encoding) call luce-compress | — | gzip/deflate: luce-compress; Brotli, Zstd: missing | luce-compress |
 | XML | LibXML over libxml2 | `web.XmlParser` | — | a Luce XML 1.0 parser (P2) | new |
 | Regex | LibRegex (Rust) | — | — | luce-regex's ECMAScript dialect | luce-regex |
@@ -1785,9 +1785,9 @@ Decisions of the phase-2 closure:
 - The image decoders are luce-png, luce-jpeg and the new sibling packages behind the ported
   `Platform::ImageCodecPlugin` (§7.0); no LibGfx decoder is ported. `BitmapDecodedImageData`
   holds what they return.
-- `ResourceLoader`'s `Requests::RequestClient` (LibRequests) stays opaque: it is the
-  `RequestClient` seam of §7.1, written by p2d over `file:`/`data:`/`resource:` and, for `http(s):`,
-  luce-http-client.
+- `ResourceLoader`'s `Requests::RequestClient` (LibRequests) is the `RequestClient` seam of §7.1,
+  written by p2d with an in-process client over `file:`/`data:` and, for `http(s):`, luce-std `net`
+  and luce-tls (§7.0; luce-http-client is cleartext IPv4 only).
 - Closure stubs that only scripting or user input reaches were relabeled from `unported (P2)` to P3
   or P4: blob URLs and `Blob`/`File` (`FileAPI`), `FileList` (P4), storage, `document.cookie`'s
   `HTTP::Cookie::parse_cookie`, `DOMURL::url_encode` (form encoding), `Core::System`

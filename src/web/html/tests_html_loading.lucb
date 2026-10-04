@@ -1,0 +1,163 @@
+#==============================================================================================
+#
+#   tests_html_loading - NavigationObserver and preloaded resources (region p2d)
+#
+#   DESCRIPTION:
+#       Ladybird has no unit tests for NavigationObserver or PreloadEntry. These pin, from the
+#       C++: an observer registered with its navigable on creation, its callbacks set and
+#       cleared, and unregistered when it is collected; a preload entry's members and what it
+#       keeps alive; consuming a preloaded resource whose response is or is not there yet, and
+#       one that is not in the document's map (the keys' URL, destination, mode and credentials
+#       mode all count). The preload keys' hash is pinned by tests_loader_1's oracle cases.
+#
+#==============================================================================================
+
+# mark: NavigationObserver ======================================================================
+
+## A Function0 that counts its calls.
+func test_html_loading_count(context: void*?):
+    let count = (i32*)(context else trap("no counter"))
+    *count += 1
+
+## Makes an observer of `navigable` from a frame of its own, with both callbacks; answers a Weak to it.
+noinline func test_html_loading_make_observer(realm: Realm*, navigable: HtmlNavigable*, count: i32*) -> gc.Weak[HtmlNavigationObserver]:
+    let observer = realm_create_html_navigation_observer(realm, realm, navigable)
+    html_navigation_observer_set_navigation_complete(observer, ak.Function0[unit](call = test_html_loading_count, context = count))
+    html_navigation_observer_set_ongoing_navigation_changed(observer, ak.Function0[unit](call = test_html_loading_count, context = count))
+    return gc.make_weak[HtmlNavigationObserver](observer)
+
+test "NavigationObserver: registered with its navigable, its callbacks set and cleared, unregistered when collected":
+    web_initialize_strings()
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    discard(web_test_install_agent(vm))
+    web_test_install_event_loop_plugin()
+    defer web_test_remove_event_loop_plugin()
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        let (page, traversable) = test_browsing_page_with_traversable(vm)
+        let navigable = traversable.html_navigable()
+        let document = html_navigable_active_document(navigable) else trap("an active document")
+        let realm = dom_document_realm(document)
+        assert(ak.intrusive_list_is_empty(&navigable.m_navigation_observers))
+
+        let count = new i32 else trap("out of memory")
+        let observer = realm_create_html_navigation_observer(realm, realm, navigable)
+        assert(is_html_navigation_observer(observer) and observer.m_navigable == navigable)
+        assert(ak.intrusive_list_size_slow(&navigable.m_navigation_observers) == 1)
+        assert(html_navigation_observer_navigation_complete(observer) == none and html_navigation_observer_ongoing_navigation_changed(observer) == none)
+
+        html_navigation_observer_set_navigation_complete(observer, ak.Function0[unit](call = test_html_loading_count, context = count))
+        let complete = html_navigation_observer_navigation_complete(observer) else trap("a navigation_complete callback")
+        ak.function0_call(&complete.function)
+        assert(*count == 1)
+        html_navigation_observer_set_ongoing_navigation_changed(observer, ak.Function0[unit](call = test_html_loading_count, context = count))
+        assert(html_navigation_observer_ongoing_navigation_changed(observer) != none)
+        # An empty function, or none, clears a callback.
+        html_navigation_observer_set_navigation_complete(observer, ak.Function0[unit]())
+        assert(html_navigation_observer_navigation_complete(observer) == none)
+        html_navigation_observer_set_ongoing_navigation_changed(observer, none)
+        assert(html_navigation_observer_ongoing_navigation_changed(observer) == none)
+
+        # An observer nothing holds is collected, and its finalize unregisters it.
+        let weak = test_html_loading_make_observer(realm, navigable, count)
+        assert(ak.intrusive_list_size_slow(&navigable.m_navigation_observers) == 2)
+        web_test_clobber_stack()
+        gc.heap_collect_garbage(vm_heap(vm))
+        assert(not web_test_alive(&weak))
+        assert(ak.intrusive_list_size_slow(&navigable.m_navigation_observers) == 1)
+        assert(page_top_level_traversable(page) == traversable)
+
+# mark: Preloaded resources =====================================================================
+
+## A Function1 that records the response it is called with.
+func test_html_loading_response(context: void*?, response: FetchResponse*):
+    let seen = (FetchResponse*?*)(context else trap("no slot"))
+    *seen = response
+
+## The key of a preload of `url`: an image, no-cors, include.
+func test_html_loading_key(url: str) -> HtmlPreloadKey:
+    return HtmlPreloadKey(url = web_url.parser_basic_parse(ak.sv(url)) else trap("the URL parses"), destination = FetchRequestDestination.image,
+                          mode = FetchRequestMode.no_cors, credentials_mode = FetchRequestCredentialsMode.include)
+
+test "PreloadEntry: preload keys of requests, entries, and consuming a preloaded resource":
+    web_initialize_strings()
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    discard(web_test_install_agent(vm))
+    web_test_install_event_loop_plugin()
+    defer web_test_remove_event_loop_plugin()
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        let (page, traversable) = test_browsing_page_with_traversable(vm)
+        let navigable = traversable.html_navigable()
+        let window = html_navigable_active_window(navigable) else trap("an active window")
+        let document = html_window_associated_document(window)
+        let realm = dom_document_realm(document)
+        assert(page_top_level_traversable(page) == traversable)
+
+        # A request's preload key: its URL, destination, mode and credentials mode.
+        let request = html_create_potential_cors_request(vm, web_url.parser_basic_parse(ak.sv("https://example.com/a.png")) else trap("a URL"), FetchRequestDestination.image,
+                                                         HtmlCorsSettingAttribute.no_cors)
+        let key = html_create_a_preload_key(request)
+        let expected = test_html_loading_key("https://example.com/a.png")
+        assert(html_preload_key_eq(&key, &expected))
+        let other_mode = HtmlPreloadKey(url = expected.url, destination = expected.destination, mode = FetchRequestMode.cors, credentials_mode = expected.credentials_mode)
+        assert(not html_preload_key_eq(&key, &other_mode))
+        let no_destination = HtmlPreloadKey(url = expected.url, destination = none, mode = expected.mode, credentials_mode = expected.credentials_mode)
+        assert(not html_preload_key_eq(&key, &no_destination))
+
+        # An entry: no response, no callback; its integrity metadata.
+        let entry = realm_create_html_preload_entry(realm)
+        assert(is_html_preload_entry(entry))
+        assert(html_preload_entry_response(entry) == none and html_preload_entry_on_response_available(entry) == none)
+        assert(ak.string_is_empty(&entry.integrity_metadata))
+        html_preload_entry_set_integrity_metadata(entry, ak.string_from_str("sha256-abc"))
+        assert(ak.string_eq_string_view(&entry.integrity_metadata, ak.sv("sha256-abc")))
+
+        # Consuming it before its response: the callback becomes the entry's, and the key leaves the map.
+        let preloads = dom_document_map_of_preloaded_resources(document)
+        discard(ak.hash_map_set(preloads, key, entry))
+        let seen = new FetchResponse*? else trap("out of memory")
+        let on_response_available = gc.create_function1(vm_heap(vm), ak.Function1[FetchResponse*, unit](call = test_html_loading_response, context = seen))
+        assert(not html_consume_a_preloaded_resource(window, other_mode.url, FetchRequestDestination.image, FetchRequestMode.cors, FetchRequestCredentialsMode.include,
+                                                     ak.String(), on_response_available))
+        assert(html_consume_a_preloaded_resource(window, key.url, FetchRequestDestination.image, FetchRequestMode.no_cors, FetchRequestCredentialsMode.include,
+                                                 ak.string_from_str("sha256-other"), on_response_available))
+        assert(ak.hash_map_size(preloads) == 0)
+        assert(html_preload_entry_on_response_available(entry) == on_response_available and *seen == none)
+        assert(not html_consume_a_preloaded_resource(window, key.url, FetchRequestDestination.image, FetchRequestMode.no_cors, FetchRequestCredentialsMode.include,
+                                                     ak.String(), on_response_available))
+
+        # Consuming one whose response is there: the callback hears it at once.
+        let second = realm_create_html_preload_entry(realm)
+        let response = fetch_infrastructure_response_create(vm)
+        html_preload_entry_set_response(second, response)
+        discard(ak.hash_map_set(preloads, key, second))
+        assert(html_consume_a_preloaded_resource(window, key.url, FetchRequestDestination.image, FetchRequestMode.no_cors, FetchRequestCredentialsMode.include,
+                                                 ak.String(), on_response_available))
+        assert(*seen == response and html_preload_entry_on_response_available(second) == none)
+
+## An entry with a response and a callback, made from a frame of its own: Weaks to the three.
+noinline func test_html_loading_make_entry(vm: Vm*, realm: Realm*, root: gc.Root[HtmlPreloadEntry]*) -> (gc.Weak[FetchResponse], gc.Weak[gc.Function1[FetchResponse*, unit]]):
+    let entry = realm_create_html_preload_entry(realm)
+    let response = fetch_infrastructure_response_create(vm)
+    html_preload_entry_set_response(entry, response)
+    let callback = gc.create_function1(vm_heap(vm), ak.Function1[FetchResponse*, unit](call = test_html_loading_response, context = none))
+    entry.on_response_available = callback
+    *root = gc.root_create(entry)
+    return (gc.make_weak[FetchResponse](response), gc.make_weak[gc.Function1[FetchResponse*, unit]](callback))
+
+test "PreloadEntry: visit_edges keeps its response and its callback":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let realm = web_test_create_realm(vm)
+    var root: gc.Root[HtmlPreloadEntry] = ---
+    let (response, callback) = test_html_loading_make_entry(vm, realm, &root)
+    web_test_clobber_stack()
+    gc.heap_collect_garbage(vm_heap(vm))
+    assert(web_test_alive(&response) and web_test_alive(&callback))
+    gc.root_release(&root)
+    web_test_clobber_stack()
+    gc.heap_collect_garbage(vm_heap(vm))
+    assert(not web_test_alive(&response) and not web_test_alive(&callback))
