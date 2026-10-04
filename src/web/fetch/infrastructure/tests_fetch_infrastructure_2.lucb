@@ -1,0 +1,457 @@
+#==============================================================================================
+#
+#   tests_fetch_infrastructure_2 - Fetch/Infrastructure: what the oracle does not reach
+#
+#   DESCRIPTION:
+#       Ladybird has no unit tests for these files; the oracle (tests_fetch_infrastructure_1)
+#       pins the pure functions and the controller's state. These pin, from the C++: fetch
+#       algorithms empty or set, a controller's timing steps, manual redirect and full timing
+#       info, the holder, queueing fetch tasks on a parallel queue, a global object and through
+#       a controller, stopping a fetch (its queued tasks cancelled, its algorithms emptied),
+#       fetch params' defaults and setters, fetch records leaving their fetch group when
+#       collected, network partition keys, a client's referrer, the incrementally-read loop's
+#       close and error steps, and what each cell keeps alive through collections (the pending
+#       request only weakly).
+#
+#==============================================================================================
+
+# mark: Helpers =================================================================================
+
+## A counter of calls, with the last argument seen.
+struct FetchTestCalls:
+    var count: i32
+    var last: void*?
+
+## A Function1[FetchResponse*, unit] callback that counts its calls and keeps its argument.
+func fetch_test_count_response_call(context: void*?, response: FetchResponse*):
+    let calls = (FetchTestCalls*)(context else trap("no counter"))
+    calls.count += 1
+    calls.last = (void*?)response
+
+## A Function1[JsObject*, unit] callback that counts its calls and keeps its argument.
+func fetch_test_count_object_call(context: void*?, object: JsObject*):
+    let calls = (FetchTestCalls*)(context else trap("no counter"))
+    calls.count += 1
+    calls.last = (void*?)object
+
+## A Function1[ak.ByteBuffer, unit] callback that counts its calls.
+func fetch_test_count_bytes_call(context: void*?, bytes: ak.ByteBuffer):
+    let calls = (FetchTestCalls*)(context else trap("no counter"))
+    calls.count += 1
+
+## A Function0 callback that counts its calls.
+func fetch_test_count_call0(context: void*?):
+    let calls = (FetchTestCalls*)(context else trap("no counter"))
+    calls.count += 1
+
+## A Function1[JsValue, unit] callback that counts its calls.
+func fetch_test_count_value_call(context: void*?, value: JsValue):
+    let calls = (FetchTestCalls*)(context else trap("no counter"))
+    calls.count += 1
+    if js_value_is_undefined(value):
+        calls.last = context
+
+## A counter in the VM's heap (the callbacks that use it may run after the test's frame changed).
+func fetch_test_calls() -> FetchTestCalls*:
+    return new FetchTestCalls(count = 0, last = none) else trap("out of memory")
+
+## The task of the main thread event loop's queue whose id is `id`.
+func fetch_test_queued_task(id: u64) -> HtmlTask*?:
+    let queue = html_event_loop_task_queue(html_main_thread_event_loop())
+    for task in ak.vector_span(&queue.m_tasks):
+        if html_task_id(task) == id:
+            return task
+    return none
+
+## A GC::Function that counts its calls in `calls`.
+func fetch_test_steps(vm: Vm*, calls: FetchTestCalls*) -> gc.Function0[unit]*:
+    return gc.create_function0(vm_heap(vm), ak.Function0[unit](call = fetch_test_count_call0, context = calls))
+
+# mark: FetchAlgorithms, FetchController ========================================================
+
+test "FetchAlgorithms: an empty Input gives empty algorithms; a set algorithm is the caller's":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let empty = fetch_algorithms_create(vm, FetchAlgorithmsInput())
+    assert(fetch_algorithms_process_request_body_chunk_length(empty).call == none)
+    assert(fetch_algorithms_process_request_end_of_body(empty).call == none)
+    assert(fetch_algorithms_process_early_hints_response(empty).call == none)
+    assert(fetch_algorithms_process_response(empty).call == none)
+    assert(fetch_algorithms_process_response_end_of_body(empty).call == none)
+    assert(fetch_algorithms_process_response_consume_body(empty).call == none)
+
+    let calls = fetch_test_calls()
+    let response = fetch_infrastructure_response_create(vm)
+    let algorithms = fetch_algorithms_create_with_process_response(vm, ak.Function1[FetchResponse*, unit](call = fetch_test_count_response_call, context = calls))
+    let process_response = fetch_algorithms_process_response(algorithms)
+    ak.function1_call(&process_response, response)
+    assert(calls.count == 1 and calls.last == (void*?)response)
+    assert(fetch_algorithms_process_response_consume_body(algorithms).call == none)
+    let consume = fetch_algorithms_create_with_process_response_consume_body(vm, ak.Function2[FetchResponse*, FetchAlgorithmsBodyBytes, unit]())
+    assert(fetch_algorithms_process_response(consume).call == none)
+
+test "FetchController: report timing steps, the next manual redirect, the full timing info; the holder":
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    let controller = fetch_controller_create(vm)
+    assert(fetch_controller_state(controller) == FetchControllerState.ongoing)
+    assert(controller.m_fetch_params == none and controller.m_full_timing_info == none)
+
+    let timing_calls = fetch_test_calls()
+    fetch_controller_set_report_timing_steps(controller, ak.Function1[JsObject*, unit](call = fetch_test_count_object_call, context = timing_calls))
+    let global = realm_global_object(realm)
+    fetch_controller_report_timing(controller, global)
+    assert(timing_calls.count == 1 and timing_calls.last == (void*?)global)
+
+    let redirect_calls = fetch_test_calls()
+    fetch_controller_set_next_manual_redirect_steps(controller, ak.Function0[unit](call = fetch_test_count_call0, context = redirect_calls))
+    fetch_controller_process_next_manual_redirect(controller)
+    fetch_controller_process_next_manual_redirect(controller)
+    assert(redirect_calls.count == 2)
+
+    let timing_info = fetch_timing_info_create(vm)
+    fetch_controller_set_full_timing_info(controller, timing_info)
+    assert(fetch_controller_extract_full_timing_info(controller) == timing_info)
+
+    let holder = fetch_controller_holder_create(vm)
+    assert(fetch_controller_holder_controller(holder) == none)
+    fetch_controller_holder_set_controller(holder, controller)
+    assert(fetch_controller_holder_controller(holder) == controller)
+
+# mark: Fetch tasks =============================================================================
+
+test "queue_fetch_task: a parallel queue enqueues, a global object queues a networking task; a controller tracks its tasks":
+    discard(install_test_event_loop())
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    let global = realm_global_object(realm)
+    let calls = fetch_test_calls()
+
+    let parallel_queue = html_parallel_queue_create()
+    let parallel_id = fetch_queue_fetch_task_fetch_task_destination(.html_parallel_queue(parallel_queue), fetch_test_steps(vm, calls))
+    let parallel_task = fetch_test_queued_task(parallel_id) else trap("the parallel queue's task is queued")
+    assert(html_task_source(parallel_task) == parallel_queue.m_task_source.source)
+
+    let global_id = fetch_queue_fetch_task_fetch_task_destination(.js_object(global), fetch_test_steps(vm, calls))
+    let global_task = fetch_test_queued_task(global_id) else trap("the global task is queued")
+    assert(html_task_source(global_task) == HtmlTaskSource.networking)
+    html_task_execute(global_task)
+    assert(calls.count == 1)
+
+    let controller = fetch_controller_create(vm)
+    let first_id = fetch_queue_fetch_task_fetch_controller(controller, .js_object(global), fetch_test_steps(vm, calls))
+    let second_id = fetch_queue_fetch_task_fetch_controller(controller, .html_parallel_queue(parallel_queue), fetch_test_steps(vm, calls))
+    assert(controller.m_next_fetch_task_id == 2)
+    assert(ak.hash_map_size(&controller.m_ongoing_fetch_tasks) == 2)
+    assert(*(ak.hash_map_get_k(&controller.m_ongoing_fetch_tasks, 0) else trap("fetch task 0")) == first_id)
+    assert(*(ak.hash_map_get_k(&controller.m_ongoing_fetch_tasks, 1) else trap("fetch task 1")) == second_id)
+
+    # Running a tracked task forgets it, then runs the algorithm.
+    html_task_execute(fetch_test_queued_task(second_id) else trap("the second fetch task is queued"))
+    assert(calls.count == 2)
+    assert(ak.hash_map_size(&controller.m_ongoing_fetch_tasks) == 1)
+    assert(not ak.hash_map_contains_k(&controller.m_ongoing_fetch_tasks, 1))
+    html_unique_task_source_destruct(&parallel_queue.m_task_source)
+
+test "stop_fetch: the queued fetch tasks are cancelled and the algorithms emptied; ignored once aborted or terminated":
+    discard(install_test_event_loop())
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    let global = realm_global_object(realm)
+    let calls = fetch_test_calls()
+    let algorithms = fetch_algorithms_create_with_process_response(vm, ak.Function1[FetchResponse*, unit](call = fetch_test_count_response_call, context = calls))
+    let params = fetch_params_create(vm, fetch_request_create(vm), fetch_timing_info_create(vm))
+    fetch_params_set_algorithms(params, algorithms)
+    let controller = fetch_params_controller(params)
+
+    let tracked_1 = fetch_queue_fetch_task_fetch_controller(controller, .js_object(global), fetch_test_steps(vm, calls))
+    let untracked = fetch_queue_fetch_task_fetch_task_destination(.js_object(global), fetch_test_steps(vm, calls))
+    let tracked_2 = fetch_queue_fetch_task_fetch_controller(controller, .js_object(global), fetch_test_steps(vm, calls))
+    fetch_controller_stop_fetch(controller)
+
+    assert(fetch_controller_state(controller) == FetchControllerState.stopped)
+    assert(fetch_test_queued_task(tracked_1) == none)
+    assert(fetch_test_queued_task(tracked_2) == none)
+    assert(fetch_test_queued_task(untracked) != none)
+    assert(ak.hash_map_is_empty(&controller.m_ongoing_fetch_tasks))
+    assert(fetch_params_algorithms(params) != algorithms)
+    assert(fetch_algorithms_process_response(fetch_params_algorithms(params)).call == none)
+    # Stopped, the controller is neither aborted nor canceled.
+    assert(not fetch_params_is_aborted(params) and not fetch_params_is_canceled(params))
+
+    # A terminated controller is not stopped: its tasks stay queued.
+    let terminated = fetch_controller_create(vm)
+    let kept = fetch_queue_fetch_task_fetch_controller(terminated, .js_object(global), fetch_test_steps(vm, calls))
+    fetch_controller_terminate(terminated)
+    fetch_controller_stop_fetch(terminated)
+    assert(fetch_controller_state(terminated) == FetchControllerState.terminated)
+    assert(fetch_test_queued_task(kept) != none)
+    assert(ak.hash_map_size(&terminated.m_ongoing_fetch_tasks) == 1)
+    assert(calls.count == 0)
+
+# mark: FetchParams, FetchRecord ================================================================
+
+test "FetchParams: create's defaults, its setters, and the controller's fetch params":
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    let request = fetch_request_create(vm)
+    let timing_info = fetch_timing_info_create(vm)
+    let params = fetch_params_create(vm, request, timing_info)
+    assert(fetch_params_request(params) == request)
+    assert(fetch_params_timing_info(params) == timing_info)
+    assert(fetch_params_controller(params).m_fetch_params == params)
+    assert(fetch_params_task_destination_const(params) == .empty)
+    assert(fetch_params_cross_origin_isolated_capability(params) == HtmlCanUseCrossOriginIsolatedApIs.no)
+    assert(fetch_params_preloaded_response_candidate_const(params) == .empty)
+    assert(fetch_algorithms_process_response(fetch_params_algorithms(params)).call == none)
+
+    let global = realm_global_object(realm)
+    fetch_params_set_task_destination(params, .js_object(global))
+    assert(*fetch_params_task_destination(params) == .js_object(global))
+    fetch_params_set_cross_origin_isolated_capability(params, HtmlCanUseCrossOriginIsolatedApIs.yes)
+    assert(fetch_params_cross_origin_isolated_capability(params) == HtmlCanUseCrossOriginIsolatedApIs.yes)
+    let response = fetch_infrastructure_response_create(vm)
+    fetch_params_set_preloaded_response_candidate(params, .fetch_response(response))
+    assert(*fetch_params_preloaded_response_candidate(params) == .fetch_response(response))
+    let other_request = fetch_request_create(vm)
+    fetch_params_set_request(params, other_request)
+    assert(fetch_params_request(params) == other_request)
+
+    # A copy shares every member, and does not become its controller's fetch params.
+    let copy = fetch_params_copy(params)
+    assert(copy != params)
+    assert(fetch_params_task_destination_const(copy) == .js_object(global))
+    assert(fetch_params_preloaded_response_candidate_const(copy) == .fetch_response(response))
+    assert(fetch_params_cross_origin_isolated_capability(copy) == HtmlCanUseCrossOriginIsolatedApIs.yes)
+    assert(fetch_params_controller(copy).m_fetch_params == params)
+
+test "FetchRecord: a request and a controller; a collected record leaves its fetch group":
+    web_test_clobber_stack()
+    run_fetch_test_fetch_records()
+
+## A fetch record of `vm` in `settings`' fetch group, out of the test's frame: a Weak of it.
+noinline func make_fetch_test_record(vm: Vm*, settings: HtmlEnvironmentSettingsObject*) -> gc.Weak[FetchRecord]:
+    let record = fetch_record_create(vm, fetch_request_create(vm))
+    ak.intrusive_list_append(html_environment_settings_object_fetch_group(settings), record, offsetof(FetchRecord, m_list_node))
+    return gc.make_weak[FetchRecord](record)
+
+noinline func run_fetch_test_fetch_records():
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    let settings = web_test_settings_of(realm)
+    let fetch_group = html_environment_settings_object_fetch_group(settings)
+    # (Every record is in a fetch group, as fetching puts it: finalizing a record removes it from its list, which
+    # VERIFYs that it is in one.)
+    let request = fetch_request_create(vm)
+    let record = fetch_record_create(vm, request)
+    ak.intrusive_list_append(fetch_group, record, offsetof(FetchRecord, m_list_node))
+    assert(fetch_record_request(record) == request and fetch_record_fetch_controller(record) == none)
+    let controller = fetch_controller_create(vm)
+    let with_controller = fetch_record_create_fetch_controller(vm, request, controller)
+    ak.intrusive_list_append(fetch_group, with_controller, offsetof(FetchRecord, m_list_node))
+    assert(fetch_record_fetch_controller(with_controller) == controller)
+    fetch_record_set_fetch_controller(with_controller, none)
+    assert(fetch_record_fetch_controller(with_controller) == none)
+    let other_request = fetch_request_create(vm)
+    fetch_record_set_request(record, other_request)
+    assert(fetch_record_request(record) == other_request)
+
+    assert(ak.intrusive_list_size_slow(fetch_group) == 2)
+    let weak = make_fetch_test_record(vm, settings)
+    assert(ak.intrusive_list_size_slow(fetch_group) == 3)
+    web_test_clobber_stack()
+    gc.heap_collect_garbage(vm_heap(vm))
+    assert(not web_test_alive(&weak))
+    assert(ak.intrusive_list_size_slow(fetch_group) == 2)
+    assert(ak.intrusive_list_first(fetch_group) == record)
+    assert(ak.intrusive_list_last(fetch_group) == with_controller)
+    web_test_destroy_vm(vm)
+
+# mark: Network partition keys, a client's referrer =============================================
+
+test "the network partition key of an environment and of a request (reserved client, then client)":
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    let settings = web_test_settings_of(realm)
+    let environment = settings.html_environment()
+
+    # No top-level origin: the top-level creation URL's origin (about:blank's is opaque).
+    environment.top_level_origin = none
+    environment.top_level_creation_url = fetch_http_test_url(ak.sv("https://top.test/page"))
+    let key = fetch_determine_the_network_partition_key_html_environment(environment)
+    let top_level_creation_url = environment.top_level_creation_url else trap("set above")
+    let top_origin = web_url.url_origin(&top_level_creation_url)
+    assert(web_url.origin_is_same_origin(&key.top_level_origin, top_origin))
+    assert(key.second_key == none)
+
+    let origin_url = fetch_http_test_url(ak.sv("https://origin.test/"))
+    environment.top_level_origin = web_url.url_origin(&origin_url)
+    let keyed = fetch_determine_the_network_partition_key_html_environment(environment)
+    assert(web_url.origin_is_same_origin(&keyed.top_level_origin, web_url.url_origin(&origin_url)))
+
+    let request = fetch_request_create(vm)
+    assert(fetch_determine_the_network_partition_key_fetch_request(request) == none)
+    fetch_request_set_client(request, settings)
+    let client_key = fetch_determine_the_network_partition_key_fetch_request(request) else trap("a key of the client")
+    assert(web_url.origin_is_same_origin(&client_key.top_level_origin, web_url.url_origin(&origin_url)))
+
+    # A reserved client comes first.
+    let reserved_environment = web_test_settings_of(web_test_create_settings_realm(vm)).html_environment()
+    let reserved_url = fetch_http_test_url(ak.sv("https://reserved.test/"))
+    reserved_environment.top_level_origin = web_url.url_origin(&reserved_url)
+    fetch_request_set_reserved_client(request, reserved_environment)
+    let reserved_key = fetch_determine_the_network_partition_key_fetch_request(request) else trap("a key of the reserved client")
+    assert(web_url.origin_is_same_origin(&reserved_key.top_level_origin, web_url.url_origin(&reserved_url)))
+
+test "determine_requests_referrer: the client of a non-Window global refers by its creation URL":
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    let settings = web_test_settings_of(realm)
+    let request = fetch_request_create(vm)
+    fetch_request_set_client(request, settings)
+    fetch_request_set_referrer_policy(request, ReferrerPolicyReferrerPolicy.unsafe_url)
+    fetch_request_set_url(request, fetch_http_test_url(ak.sv("https://a.test/x")))
+    assert(fetch_request_referrer(request) == .fetch_request_referrer(FetchRequestReferrer.client))
+
+    # about:blank, the test environment's creation URL, has a local scheme: no referrer.
+    assert(referrer_policy_determine_requests_referrer(request) == none)
+
+    settings.html_environment().creation_url = fetch_http_test_url(ak.sv("https://user:pass@ref.test/page?q#frag"))
+    let referrer = referrer_policy_determine_requests_referrer(request) else trap("a referrer")
+    let serialized = web_url.url_serialize(&referrer)
+    assert(ak.string_eq_string_view(&serialized, ak.sv("https://ref.test/page?q")))
+
+    fetch_request_set_referrer_policy(request, ReferrerPolicyReferrerPolicy.origin)
+    let origin_referrer = referrer_policy_determine_requests_referrer(request) else trap("a referrer")
+    let origin_serialized = web_url.url_serialize(&origin_referrer)
+    assert(ak.string_eq_string_view(&origin_serialized, ak.sv("https://ref.test/")))
+
+# mark: IncrementalReadLoopReadRequest ==========================================================
+
+test "IncrementalReadLoopReadRequest: its close and error steps queue fetch tasks to the task destination":
+    discard(install_test_event_loop())
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    let global = realm_global_object(realm)
+    let heap = vm_heap(vm)
+    let chunk_calls = fetch_test_calls()
+    let end_calls = fetch_test_calls()
+    let error_calls = fetch_test_calls()
+    # (The reader is opaque until phase 4: any cell stands in for it.)
+    let reader = (StreamsReadableStreamDefaultReader*)(void*)fetch_request_create(vm)
+    let body = fetch_test_body(vm, (gc.Cell*)fetch_request_create(vm), .empty, none)
+    let read_request = realm_create_fetch_incremental_read_loop_read_request(realm, body, reader, .js_object(global), gc.create_function1(heap, ak.Function1[ak.ByteBuffer, unit](call = fetch_test_count_bytes_call, context = chunk_calls)), fetch_test_steps(vm, end_calls), gc.create_function1(heap, ak.Function1[JsValue, unit](call = fetch_test_count_value_call, context = error_calls)))
+
+    streams_read_request_on_close(read_request.streams_read_request())
+    let close_task = html_task_queue_last_added_task(html_event_loop_task_queue(html_main_thread_event_loop())) else trap("on_close queued a task")
+    assert(html_task_source(close_task) == HtmlTaskSource.networking)
+    assert(end_calls.count == 0)
+    html_task_execute(close_task)
+    assert(end_calls.count == 1)
+
+    streams_read_request_on_error(read_request.streams_read_request(), js_undefined())
+    let error_task = html_task_queue_last_added_task(html_event_loop_task_queue(html_main_thread_event_loop())) else trap("on_error queued a task")
+    html_task_execute(error_task)
+    assert(error_calls.count == 1 and error_calls.last == (void*?)error_calls)
+    assert(chunk_calls.count == 0)
+
+# mark: Collections =============================================================================
+
+test "what fetch params, controllers, holders, algorithms and read requests keep alive; the pending request is weak":
+    web_test_clobber_stack()
+    run_fetch_test_infrastructure_visit_edges()
+
+## The Weaks of the cells a FetchParams and its controller keep.
+struct FetchTestKept:
+    var request: gc.Weak[FetchRequest]
+    var algorithms: gc.Weak[FetchAlgorithms]
+    var controller: gc.Weak[FetchController]
+    var timing_info: gc.Weak[FetchTimingInfo]
+    var preloaded_response: gc.Weak[FetchResponse]
+    var full_timing_info: gc.Weak[FetchTimingInfo]
+    var steps: gc.Weak[gc.Function0[unit]]
+    var report_timing_steps: gc.Weak[gc.Function1[JsObject*, unit]]
+    var process_response: gc.Weak[gc.Function1[FetchResponse*, unit]]
+    var pending_request: gc.Weak[gc.Cell]
+    var read_request_body: gc.Weak[FetchBody]
+    var read_request_reader: gc.Weak[FetchRequest]
+
+## The cells of the visit_edges test, made out of the test's frame: Weaks of them; the params, the holder and the
+## read request are rooted.
+noinline func make_fetch_test_kept(vm: Vm*, realm: Realm*, params_root: gc.Root[FetchParams]*, holder_root: gc.Root[FetchControllerHolder]*, read_request_root: gc.Root[FetchIncrementalReadLoopReadRequest]*) -> FetchTestKept:
+    let request = fetch_request_create(vm)
+    let timing_info = fetch_timing_info_create(vm)
+    let params = fetch_params_create(vm, request, timing_info)
+    let algorithms = fetch_algorithms_create_with_process_response(vm, ak.Function1[FetchResponse*, unit](call = fetch_test_count_response_call, context = none))
+    fetch_params_set_algorithms(params, algorithms)
+    let response = fetch_infrastructure_response_create(vm)
+    fetch_params_set_preloaded_response_candidate(params, .fetch_response(response))
+    let controller = fetch_params_controller(params)
+    let full_timing_info = fetch_timing_info_create(vm)
+    fetch_controller_set_full_timing_info(controller, full_timing_info)
+    fetch_controller_set_report_timing_steps(controller, ak.Function1[JsObject*, unit](call = fetch_test_count_object_call, context = none))
+    fetch_controller_set_next_manual_redirect_steps(controller, ak.Function0[unit](call = fetch_test_count_call0, context = none))
+    # (A Requests::Request is a cell of the RequestClient seam: any cell stands in for it.)
+    let pending_request = fetch_request_create(vm)
+    fetch_controller_set_pending_request(controller, (RequestsRequest*?)(void*)pending_request)
+    *params_root = gc.root_create(params)
+
+    let holder = fetch_controller_holder_create(vm)
+    fetch_controller_holder_set_controller(holder, fetch_controller_create(vm))
+    *holder_root = gc.root_create(holder)
+
+    let reader_cell = fetch_request_create(vm)
+    let body = fetch_test_body(vm, (gc.Cell*)fetch_request_create(vm), .empty, none)
+    let read_request = realm_create_fetch_incremental_read_loop_read_request(realm, body, (StreamsReadableStreamDefaultReader*)(void*)reader_cell, .empty, gc.create_function1(vm_heap(vm), ak.Function1[ak.ByteBuffer, unit]()), gc.create_function0(vm_heap(vm), ak.Function0[unit]()), gc.create_function1(vm_heap(vm), ak.Function1[JsValue, unit]()))
+    *read_request_root = gc.root_create(read_request)
+
+    return FetchTestKept(
+        request = gc.make_weak[FetchRequest](request),
+        algorithms = gc.make_weak[FetchAlgorithms](algorithms),
+        controller = gc.make_weak[FetchController](controller),
+        timing_info = gc.make_weak[FetchTimingInfo](timing_info),
+        preloaded_response = gc.make_weak[FetchResponse](response),
+        full_timing_info = gc.make_weak[FetchTimingInfo](full_timing_info),
+        steps = gc.make_weak[gc.Function0[unit]](controller.m_next_manual_redirect_steps),
+        report_timing_steps = gc.make_weak[gc.Function1[JsObject*, unit]](controller.m_report_timing_steps),
+        process_response = gc.make_weak[gc.Function1[FetchResponse*, unit]](algorithms.m_process_response),
+        pending_request = gc.make_weak[gc.Cell]((gc.Cell*)pending_request),
+        read_request_body = gc.make_weak[FetchBody](body),
+        read_request_reader = gc.make_weak[FetchRequest](reader_cell),
+    )
+
+noinline func run_fetch_test_infrastructure_visit_edges():
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    var params = gc.root_create[FetchParams](none)
+    var holder = gc.root_create[FetchControllerHolder](none)
+    var read_request = gc.root_create[FetchIncrementalReadLoopReadRequest](none)
+    let kept = make_fetch_test_kept(vm, realm, &params, &holder, &read_request)
+    web_test_clobber_stack()
+    gc.heap_collect_garbage(vm_heap(vm))
+    assert(web_test_alive(&kept.request))
+    assert(web_test_alive(&kept.algorithms))
+    assert(web_test_alive(&kept.controller))
+    assert(web_test_alive(&kept.timing_info))
+    assert(web_test_alive(&kept.preloaded_response))
+    assert(web_test_alive(&kept.full_timing_info))
+    assert(web_test_alive(&kept.steps))
+    assert(web_test_alive(&kept.report_timing_steps))
+    assert(web_test_alive(&kept.process_response))
+    assert(web_test_alive(&kept.read_request_body))
+    assert(web_test_alive(&kept.read_request_reader))
+    # The pending request is only weakly held: collected, the controller forgets it.
+    assert(not web_test_alive(&kept.pending_request))
+    let params_cell = gc.root_ptr(&params) else trap("rooted")
+    assert(gc.weak_ptr(&fetch_params_controller(params_cell).m_pending_request) == none)
+    let holder_cell = gc.root_ptr(&holder) else trap("rooted")
+    assert(fetch_controller_holder_controller(holder_cell) != none)
+
+    gc.root_release(&params)
+    gc.root_release(&holder)
+    gc.root_release(&read_request)
+    web_test_clobber_stack()
+    gc.heap_collect_garbage(vm_heap(vm))
+    assert(not web_test_alive(&kept.request))
+    assert(not web_test_alive(&kept.controller))
+    assert(not web_test_alive(&kept.full_timing_info))
+    assert(not web_test_alive(&kept.read_request_body))
+    web_test_destroy_vm(vm)

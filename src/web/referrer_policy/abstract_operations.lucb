@@ -1,0 +1,235 @@
+#==============================================================================================
+#
+#   abstract_operations - Referrer Policy: parsing the Referrer-Policy header, a request's
+#   referrer policy on redirect, determining a request's referrer, stripping a URL for use
+#   as a referrer
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibWeb/ReferrerPolicy/AbstractOperations.cpp (lines 22-237).
+#
+#       Copyright (c) 2022, Linus Groh <linusg@serenityos.org>
+#       Copyright (c) 2024, Jamie Mansfield <jmansfield@cadixdev.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: The Referrer-Policy header ==============================================================
+
+## Ported from Libraries/LibWeb/ReferrerPolicy/AbstractOperations.cpp:22 Web::ReferrerPolicy::parse_a_referrer_policy_from_a_referrer_policy_header.
+# https://w3c.github.io/webappsec-referrer-policy/#parse-referrer-policy-from-header
+pub func referrer_policy_parse_a_referrer_policy_from_a_referrer_policy_header(response: FetchResponse*) -> ReferrerPolicyReferrerPolicy:
+    # 1. Let policy-tokens be the result of extracting header list values given `Referrer-Policy` and response’s header list.
+    let policy_tokens_or_failure = http_header_list_extract_header_list_values(fetch_response_header_list(response), ak.sv("Referrer-Policy"))
+
+    # 2. Let policy be the empty string.
+    var policy = ReferrerPolicyReferrerPolicy.empty_string
+
+    # 3. For each token in policy-tokens, if token is a referrer policy and token is not the empty string, then set policy to token.
+    match policy_tokens_or_failure:
+        .vector_byte_string(policy_tokens):
+            for token in &ak.vector_span_const(&policy_tokens):
+                if let referrer_policy = referrer_policy_from_string(ak.byte_string_view(token)):
+                    if referrer_policy != ReferrerPolicyReferrerPolicy.empty_string:
+                        policy = referrer_policy
+        _: discard(0)
+
+    # 4. Return policy.
+    return policy
+
+## Ported from Libraries/LibWeb/ReferrerPolicy/AbstractOperations.cpp:44 Web::ReferrerPolicy::set_request_referrer_policy_on_redirect.
+# https://w3c.github.io/webappsec-referrer-policy/#set-requests-referrer-policy-on-redirect
+pub func referrer_policy_set_request_referrer_policy_on_redirect(request: FetchRequest*, response: FetchResponse*):
+    # 1. Let policy be the result of executing § 8.1 Parse a referrer policy from a Referrer-Policy header on
+    #    actualResponse.
+    let policy = referrer_policy_parse_a_referrer_policy_from_a_referrer_policy_header(response)
+
+    # 2. If policy is not the empty string, then set request’s referrer policy to policy.
+    if policy != ReferrerPolicyReferrerPolicy.empty_string:
+        fetch_request_set_referrer_policy(request, policy)
+
+# mark: Determining a request's referrer ========================================================
+
+## determine_requests_referrer's "client" case: the referrer source of request’s client, or no referrer.
+func referrer_policy_referrer_source_of_client(environment: HtmlEnvironmentSettingsObject*?, referrer: FetchRequestReferrer) -> web_url.Url?:
+    # Note: If request’s referrer is "no-referrer", Fetch will not call into this algorithm.
+    assert(referrer == FetchRequestReferrer.client)
+
+    # FIXME: Add a const global_object() getter to ESO
+    let settings_object = environment else trap("VERIFY: request's client is non-null")
+    let global_object = html_environment_settings_object_global_object(settings_object)
+
+    # 1. If environment’s global object is a Window object, then
+    if let window = as_if_html_window((gc.Cell*)global_object):
+        # 1. Let document be the associated Document of environment’s global object.
+        let document = html_window_associated_document(window)
+
+        # 2. If document’s origin is an opaque origin, return no referrer.
+        let origin = dom_document_origin(document)
+        if web_url.origin_is_opaque(&origin):
+            return none
+
+        # FIXME: 3. While document is an iframe srcdoc document, let document be document’s browsing context’s
+        #           browsing context container’s node document.
+
+        # 4. Let referrerSource be document’s URL.
+        return dom_document_url(document)
+    # 2. Otherwise, let referrerSource be environment’s creation URL.
+    else:
+        return settings_object.html_environment().creation_url
+
+## `referrer_url.has_value() && is_url_potentially_trustworthy(*referrer_url) == PotentiallyTrustworthy &&
+## is_url_potentially_trustworthy(request.current_url()) == NotTrustworthy`: a downgrade from a potentially
+## trustworthy referrer URL.
+func referrer_policy_is_a_downgrade(referrer_url: web_url.Url?, request: FetchRequest*) -> bool:
+    let url = referrer_url else return false
+    return secure_contexts_is_url_potentially_trustworthy(url) == SecureContextsTrustworthiness.potentially_trustworthy and secure_contexts_is_url_potentially_trustworthy(fetch_request_current_url(request)) == SecureContextsTrustworthiness.not_trustworthy
+
+## `referrer_url.has_value() && referrer_url->origin().is_same_origin(request.current_url().origin())`.
+func referrer_policy_is_same_origin(referrer_url: web_url.Url?, request: FetchRequest*) -> bool:
+    let url = referrer_url else return false
+    let origin = web_url.url_origin(&url)
+    let current_url = fetch_request_current_url(request)
+    return web_url.origin_is_same_origin(&origin, web_url.url_origin(&current_url))
+
+## Ported from Libraries/LibWeb/ReferrerPolicy/AbstractOperations.cpp:56 Web::ReferrerPolicy::determine_requests_referrer.
+# https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer
+pub func referrer_policy_determine_requests_referrer(request: FetchRequest*) -> web_url.Url?:
+    # 1. Let policy be request’s referrer policy.
+    let policy = fetch_request_referrer_policy(request)
+
+    # 2. Let environment be request’s client.
+    let environment = fetch_request_client(request)
+
+    # 3. Switch on request’s referrer:
+    let referrer_source: web_url.Url? = match fetch_request_referrer(request):
+        # "client"
+        .fetch_request_referrer(referrer) => referrer_policy_referrer_source_of_client(environment, referrer)
+        # a URL
+        # Let referrerSource be request’s referrer.
+        .url(url) => url
+    # NOTE: This only happens in step 1.2. of the "client" case above.
+    if referrer_source == none:
+        return none
+
+    # 4. Let request’s referrerURL be the result of stripping referrerSource for use as a referrer.
+    var referrer_url = referrer_policy_strip_url_for_use_as_referrer(referrer_source)
+
+    # 5. Let referrerOrigin be the result of stripping referrerSource for use as a referrer, with the origin-only flag
+    #    set to true.
+    let referrer_origin = referrer_policy_strip_url_for_use_as_referrer(referrer_source, ReferrerPolicyOriginOnly.yes)
+
+    # 6. If the result of serializing referrerURL is a string whose length is greater than 4096, set referrerURL to
+    #    referrerOrigin.
+    if let url = referrer_url:
+        let serialized_referrer_url = web_url.url_serialize(&url)
+        let serialized_bytes = ak.string_bytes_as_string_view(&serialized_referrer_url)
+        if ak.string_view_length(&serialized_bytes) > 4096:
+            referrer_url = referrer_origin
+
+    # 7. The user agent MAY alter referrerURL or referrerOrigin at this point to enforce arbitrary policy
+    #    considerations in the interests of minimizing data leakage. For example, the user agent could strip the URL
+    #    down to an origin, modify its host, replace it with an empty string, etc.
+
+    # 8. Execute the statements corresponding to the value of policy:
+    # Note: If request’s referrer policy is the empty string, Fetch will not call into this algorithm.
+    assert(policy != ReferrerPolicyReferrerPolicy.empty_string)
+    match policy:
+        # "no-referrer"
+        .no_referrer:
+            # Return no referrer
+            return none
+        # "origin"
+        .origin:
+            # Return referrerOrigin
+            return referrer_origin
+        # "unsafe-url"
+        .unsafe_url:
+            # Return referrerURL.
+            return referrer_url
+        # "strict-origin"
+        .strict_origin:
+            # 1. If referrerURL is a potentially trustworthy URL and request’s current URL is not a potentially
+            #    trustworthy URL, then return no referrer.
+            if referrer_policy_is_a_downgrade(referrer_url, request):
+                return none
+
+            # 2. Return referrerOrigin.
+            return referrer_origin
+        # "strict-origin-when-cross-origin"
+        .strict_origin_when_cross_origin:
+            # 1. If the origin of referrerURL and the origin of request’s current URL are the same, then return
+            #    referrerURL.
+            if referrer_policy_is_same_origin(referrer_url, request):
+                return referrer_url
+
+            # 2. If referrerURL is a potentially trustworthy URL and request’s current URL is not a potentially
+            #    trustworthy URL, then return no referrer.
+            if referrer_policy_is_a_downgrade(referrer_url, request):
+                return none
+
+            # 3. Return referrerOrigin.
+            return referrer_origin
+        # "same-origin"
+        .same_origin:
+            # 1. If the origin of referrerURL and the origin of request’s current URL are the same, then return
+            #    referrerURL.
+            if referrer_policy_is_same_origin(referrer_url, request):
+                return referrer_url
+
+            # 2. Return no referrer.
+            return none
+        # "origin-when-cross-origin"
+        .origin_when_cross_origin:
+            # 1. If the origin of referrerURL and the origin of request’s current URL are the same, then return
+            #    referrerURL.
+            if referrer_policy_is_same_origin(referrer_url, request):
+                return referrer_url
+
+            # 2. Return referrerOrigin.
+            return referrer_origin
+        # "no-referrer-when-downgrade"
+        .no_referrer_when_downgrade:
+            # 1. If referrerURL is a potentially trustworthy URL and request’s current URL is not a potentially
+            #    trustworthy URL, then return no referrer.
+            if referrer_policy_is_a_downgrade(referrer_url, request):
+                return none
+
+            # 2. Return referrerURL.
+            return referrer_url
+        _: trap("VERIFY_NOT_REACHED")
+
+# mark: Stripping a URL =========================================================================
+
+## Ported from Libraries/LibWeb/ReferrerPolicy/AbstractOperations.cpp:207 Web::ReferrerPolicy::strip_url_for_use_as_referrer.
+# https://w3c.github.io/webappsec-referrer-policy/#strip-url
+pub func referrer_policy_strip_url_for_use_as_referrer(url: web_url.Url?, origin_only: ReferrerPolicyOriginOnly = ReferrerPolicyOriginOnly.no) -> web_url.Url?:
+    # 1. If url is null, return no referrer.
+    var stripped = url else return none
+
+    # 2. If url’s scheme is a local scheme, then return no referrer.
+    let scheme = web_url.url_scheme(&stripped)
+    for local_scheme in fetch_local_schemes:
+        if ak.string_eq_string_view(&scheme, ak.sv(local_scheme)):
+            return none
+
+    # 3. Set url’s username to the empty string.
+    web_url.url_set_username(&stripped, ak.sv(""))
+
+    # 4. Set url’s password to the empty string.
+    web_url.url_set_password(&stripped, ak.sv(""))
+
+    # 5. Set url’s fragment to null.
+    web_url.url_set_fragment(&stripped, none)
+
+    # 6. If the origin-only flag is true, then:
+    if origin_only == ReferrerPolicyOriginOnly.yes:
+        # 1. Set url’s path to « the empty string ».
+        var paths = ak.Vector[ak.ByteString]()
+        ak.vector_append_t(&paths, ak.byte_string_empty())
+        web_url.url_set_paths(&stripped, paths)
+
+        # 2. Set url’s query to null.
+        web_url.url_set_query(&stripped, none)
+
+    # 7. Return url.
+    return stripped
