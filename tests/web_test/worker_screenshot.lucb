@@ -1,0 +1,150 @@
+#==============================================================================================
+#
+#   worker_screenshot - the Screenshot mode, expected PNGs, and the PNGs of failed comparisons
+#
+#   DESIGN.md §6.4. Port of what Tests/LibWeb/test-web/main.cpp does with images:
+#   run_screenshot_test (afterFontsAndPaint, a screenshot of the test, its `<meta name=fuzzy>`
+#   configurations with their references ignored, the expectation Screenshot/expected/T/N.png
+#   decoded and compared by fuzzy_screenshot_match, a missing or undecodable expectation
+#   failing the test), dump_screenshot_to_file and write_screenshot_failure_results (the
+#   actual and expected screenshots and, when their sizes agree, a diff image: differing
+#   pixels red, the others the two mixed and washed out towards white).
+#
+#   Images are decoded and encoded with our luce-png (DESIGN.md §7.0), not Ladybird's
+#   ImageDecoder and PNGWriter (Gfx::PNGWriter over libpng): a PNG decodes into an
+#   unpremultiplied BGRA8888 bitmap, as Ladybird's PNG decoder gives it, and a bitmap
+#   encodes as 8-bit RGBA from its colors (get_pixel). Rebaselining (test-web's --rebaseline
+#   writing the expectation) is not ported: the expected PNGs are Ladybird's (§6.4).
+#
+#   A Ref test whose reference is an image (a `<link rel=match>` to a .png) compares the
+#   test's screenshot with the decoded image the same way (worker_modes); no Ref test at the
+#   pin has one.
+#
+#       Copyright (c) 2024-2026, the Ladybird developers.
+#       Copyright (c) 2026 the luce-browser authors.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: PNG files ===============================================================================
+
+## An image that cannot be used as an expectation.
+let screenshot_invalid: ErrorCode = ErrorCode.package(202)
+
+## Writes `text` to standard error (a failure to is ignored).
+func worker_warn(text: fmt):
+    io.stderr().write(text) catch failure: return
+
+## Whether `path` names an image the worker decodes as a reference or expectation.
+func worker_is_image_path(path: str) -> bool:
+    return strings.ends_with(path, ".png")
+
+## The PNG file at `path` as an unpremultiplied BGRA8888 bitmap, or the reason it is not one.
+func worker_decode_png(path: str) -> gfx.Bitmap*!:
+    let data = try files.read(c_path(path))
+    let found = try png.info(data)
+    if found.width == 0 or found.height == 0 or found.width > 1 << 20 or found.height > 1 << 20:
+        error(screenshot_invalid, "the PNG's size is out of range")
+    let pixels = try alloc u8[found.width * found.height * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    try png.decode_rgba8(data, pixels, png.DecodeOptions(threads = 1))
+
+    let size = gfx.IntSize(m_width = (i32)found.width, m_height = (i32)found.height)
+    let bitmap = try gfx.bitmap_create_alpha_type(gfx.BitmapFormat.bgra8888, gfx.AlphaType.unpremultiplied, size)
+    for y in 0..<found.height:
+        let row = gfx.bitmap_scanline(bitmap, (i32)y) else trap("VERIFY: bitmap data")
+        let source = pixels[y * found.width * 4..]
+        for x in 0..<found.width:
+            let red = (u32)source[x * 4]
+            let green = (u32)source[x * 4 + 1]
+            let blue = (u32)source[x * 4 + 2]
+            let alpha = (u32)source[x * 4 + 3]
+            row[x] = (alpha << 24) | (red << 16) | (green << 8) | blue
+    return bitmap
+
+## dump_screenshot_to_file: `bitmap` encoded as a PNG at `path` (its colors as 8-bit RGBA).
+func worker_write_png(bitmap: const gfx.Bitmap*, path: str) -> !:
+    let width = (usize)gfx.bitmap_width(bitmap)
+    let height = (usize)gfx.bitmap_height(bitmap)
+    let pixels = try alloc u8[width * height * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    for y in 0..<height:
+        for x in 0..<width:
+            let color = gfx.bitmap_get_pixel(bitmap, (i32)x, (i32)y)
+            let at = (y * width + x) * 4
+            pixels[at] = gfx.color_red(&color)
+            pixels[at + 1] = gfx.color_green(&color)
+            pixels[at + 2] = gfx.color_blue(&color)
+            pixels[at + 3] = gfx.color_alpha(&color)
+    var encoded = Buffer()
+    defer encoded.close()
+    try png.encode_rgba8(pixels, width, height, &encoded, png.EncodeOptions(threads = 1))
+    make_directories(directory_of(path))
+    try files.write(c_path(path), encoded.view())
+
+## write_screenshot_failure_results: BASE.actual.png, BASE.expected.png and, when the sizes
+## agree, BASE.diff.png. A file that cannot be written is reported, not fatal.
+func worker_write_screenshot_failure_results(base: str, actual: const gfx.Bitmap*, expected: const gfx.Bitmap*):
+    worker_write_png(actual, cat([base, ".actual.png"])) catch failure:
+        worker_warn(f"web_test: cannot write {base}.actual.png: {failure.message}\n")
+        return
+    worker_write_png(expected, cat([base, ".expected.png"])) catch failure:
+        worker_warn(f"web_test: cannot write {base}.expected.png: {failure.message}\n")
+        return
+
+    # Generate a diff image.
+    let width = gfx.bitmap_width(actual)
+    let height = gfx.bitmap_height(actual)
+    if width != gfx.bitmap_width(expected) or height != gfx.bitmap_height(expected):
+        return
+    let diff = gfx.bitmap_create_int_size(gfx.BitmapFormat.bgra8888, gfx.IntSize(m_width = width, m_height = height)) catch failure: return
+    let red = gfx.color_new_u8_u8_u8(255, 0, 0)
+    let white = gfx.color_new_named_color(gfx.ColorNamedColor.white)
+    for y in 0..<height:
+        for x in 0..<width:
+            let pixel = gfx.bitmap_get_pixel(actual, x, y)
+            let other = gfx.bitmap_get_pixel(expected, x, y)
+            if not gfx.color_eq(&pixel, other):
+                gfx.bitmap_set_pixel(diff, x, y, red)
+            else:
+                let mixed = gfx.color_mixed_with(&pixel, other, 0.5)
+                gfx.bitmap_set_pixel(diff, x, y, gfx.color_mixed_with(&mixed, white, 0.8))
+    worker_write_png(diff, cat([base, ".diff.png"])) catch failure:
+        worker_warn(f"web_test: cannot write {base}.diff.png: {failure.message}\n")
+        return
+
+## The images of a failed comparison, when the driver asked for them (--images).
+func worker_write_failure_images(images: str?, actual: const gfx.Bitmap*, expected: const gfx.Bitmap*):
+    if let base = images:
+        worker_write_screenshot_failure_results(base, actual, expected)
+
+# mark: The Screenshot mode =====================================================================
+
+## run_screenshot_test (see the header): writes "pass" or "fail".
+func worker_run_screenshot(page: const WorkerPage*, event_loop: WorkerEventLoop*, url: web_url.Url, document: web.DomDocument*, expectation_path: str,
+                           images: str?, output: WorkerOutput*):
+    worker_after_fonts_and_paint(page, event_loop, document)
+    let actual = worker_take_screenshot(page, event_loop) else trap("web_test: the screenshot has no bitmap")
+
+    # Read fuzzy configurations (ignore match/mismatch references for Screenshot tests).
+    let metadata = worker_load_reference_test_metadata(page)
+    var fuzzy: ak.Vector[FuzzyMatch]
+    for configuration in ak.vector_span_const(&metadata.fuzzy):
+        var unreferenced = configuration
+        unreferenced.reference = none
+        ak.vector_append_t(&fuzzy, unreferenced)
+
+    let expected = worker_decode_png(expectation_path) catch failure:
+        # Not rebaselining and no valid expectation loaded.
+        worker_warn(f"web_test: Could not decode expected screenshot PNG {expectation_path}: {failure.message}\n")
+        output.put("fail\n")
+        return
+    worker_stage("expectation-decoded")
+
+    let test_url_string = web_url.url_serialize(&url)
+    let test_url = ak.string_view_text(ak.string_bytes_as_string_view(&test_url_string))
+    if fuzzy_screenshot_match(test_url, &url, actual, expected, ak.vector_span_const(&fuzzy), true):
+        output.put("pass\n")
+        return
+    worker_write_failure_images(images, actual, expected)
+    output.put("fail\n")

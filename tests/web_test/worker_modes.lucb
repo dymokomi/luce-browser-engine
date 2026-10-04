@@ -27,7 +27,15 @@
 #       (Libraries/LibWeb/Internals/Internals.cpp load_reference_test_metadata: the
 #       `<link rel=match|mismatch>` references and `<meta name=fuzzy>` configurations); the
 #       first reference loaded into the same page, waited for and taken a screenshot of; the
-#       two compared (fuzzy.lucb). The result is a line "pass" or "fail".
+#       two compared (fuzzy.lucb). The result is a line "pass" or "fail"; a failed comparison
+#       writes its images (worker_screenshot). A reference that is an image is decoded and
+#       compared as it is (worker_screenshot).
+#
+#       Screenshot: worker_screenshot.
+#
+#       Documents that are not HTML (XML: .svg, .xht, .xhtml; PDF) need phase 2's loading and
+#       XML parser, so a test or reference that is one traps `unported (P2)`, naming its
+#       extension.
 #
 #       Crash: afterFontsAndPaint; the result is "pass" (a test fails only by not getting
 #       there: a trap, a signal or the driver's timeout).
@@ -78,6 +86,24 @@ func worker_absolute_path(path: str) -> str:
     let directory = os.cwd() catch failure: trap("web_test: no working directory")
     let pieces: str[3] = [directory, "/", path]
     return strings.join(pieces, "") catch failure: trap("out of memory")
+
+## Traps `unported (P2)` when `path` is not an HTML document (see the header).
+func worker_require_html(path: str):
+    if strings.ends_with(path, ".html") or strings.ends_with(path, ".htm"):
+        return
+    var extension = "none"
+    if let dot = strings.last(path, '.'):
+        extension = (str)path.bytes[dot..]
+    trap(f"web_test: unported (P2): loading a document that is not HTML ({extension})")
+
+## The Screenshot expectation of the test at `path` under the test root `root`:
+## ROOT/Screenshot/input/T/N.html's is ROOT/Screenshot/expected/T/N.png (driver_collect).
+func worker_screenshot_expectation_path(root: str, path: str) -> str:
+    let prefix = cat([root, "/Screenshot/input/"])
+    if not strings.starts_with(path, prefix):
+        trap(f"web_test: a Screenshot test is not under {prefix}: {path}")
+    let trail = (str)path.bytes[prefix.length..]
+    return cat([root, "/Screenshot/expected/", path_title(trail), ".png"])
 
 ## The bytes of the file `path`.
 func worker_read_file(path: str) -> u8[]:
@@ -200,15 +226,15 @@ func worker_load_reference_test_metadata(page: const WorkerPage*) -> WorkerRefer
 func worker_load_and_wait(page: const WorkerPage*, event_loop: WorkerEventLoop*, vm: web.Vm*, url: web_url.Url) -> web.DomDocument*:
     let path_string = web_url.url_file_path(&url)
     let path = ak.string_view_text(ak.byte_string_view(&path_string))
-    if not strings.ends_with(path, ".html") and not strings.ends_with(path, ".htm"):
-        trap(f"web_test: unported (P2): loading a document that is not HTML ({path})")
+    worker_require_html(path)
     let bytes = worker_read_file(path)
     let document = worker_load_document(page, vm, url, bytes)
     worker_wait_for_load(page, event_loop, &url)
     return document
 
 ## The Ref mode (see the header): writes "pass" or "fail".
-func worker_run_ref(page: const WorkerPage*, event_loop: WorkerEventLoop*, vm: web.Vm*, url: web_url.Url, document: web.DomDocument*, output: WorkerOutput*):
+func worker_run_ref(page: const WorkerPage*, event_loop: WorkerEventLoop*, vm: web.Vm*, url: web_url.Url, document: web.DomDocument*, images: str?,
+                    output: WorkerOutput*):
     worker_after_fonts_and_paint(page, event_loop, document)
     let actual = worker_take_screenshot(page, event_loop) else trap("web_test: the screenshot has no bitmap")
 
@@ -225,15 +251,26 @@ func worker_run_ref(page: const WorkerPage*, event_loop: WorkerEventLoop*, vm: w
         should_match = false
         reference_url = *ak.vector_at_const(&metadata.mismatch_references, 0)
 
-    let reference_document = worker_load_and_wait(page, event_loop, vm, reference_url)
-    worker_stage("reference-loaded")
-    worker_after_fonts_and_paint(page, event_loop, reference_document)
-    let expected = worker_take_screenshot(page, event_loop) else trap("web_test: the screenshot has no bitmap")
+    var expected: gfx.Bitmap* = ---
+    let reference_path_string = web_url.url_file_path(&reference_url)
+    let reference_path = ak.string_view_text(ak.byte_string_view(&reference_path_string))
+    if worker_is_image_path(reference_path):
+        expected = worker_decode_png(reference_path) catch failure: trap(f"web_test: cannot decode the reference image {reference_path}: {failure.message}")
+        worker_stage("reference-decoded")
+    else:
+        let reference_document = worker_load_and_wait(page, event_loop, vm, reference_url)
+        worker_stage("reference-loaded")
+        worker_after_fonts_and_paint(page, event_loop, reference_document)
+        expected = worker_take_screenshot(page, event_loop) else trap("web_test: the screenshot has no bitmap")
 
     let test_url_string = web_url.url_serialize(&url)
     let test_url = ak.string_view_text(ak.string_bytes_as_string_view(&test_url_string))
     let screenshot_matches = fuzzy_screenshot_match(test_url, &reference_url, actual, expected, ak.vector_span_const(&metadata.fuzzy), should_match)
-    output.put("pass\n" if should_match == screenshot_matches else "fail\n")
+    if should_match == screenshot_matches:
+        output.put("pass\n")
+        return
+    worker_write_failure_images(images, actual, expected)
+    output.put("fail\n")
 
 ## The Crash mode: getting here is passing.
 func worker_run_crash(page: const WorkerPage*, event_loop: WorkerEventLoop*, document: web.DomDocument*, output: WorkerOutput*):
@@ -259,6 +296,7 @@ func worker_main(path: str, options: const Options*) -> i32:
         worker_stage("page")
 
         let absolute_path = worker_absolute_path(path)
+        worker_require_html(absolute_path)
         let url = worker_file_url(absolute_path)
         let bytes = worker_read_file(absolute_path)
         let document = worker_load_document(&page, vm, url, bytes)
@@ -266,7 +304,10 @@ func worker_main(path: str, options: const Options*) -> i32:
 
         match options.mode:
             .layout: worker_run_layout(&page, &event_loop, document, &output, not options.no_rendering)
-            .ref: worker_run_ref(&page, &event_loop, vm, url, document, &output)
+            .ref: worker_run_ref(&page, &event_loop, vm, url, document, options.images, &output)
             .crash: worker_run_crash(&page, &event_loop, document, &output)
+            .screenshot:
+                let expectation_path = worker_screenshot_expectation_path(options.root, path)
+                worker_run_screenshot(&page, &event_loop, url, document, expectation_path, options.images, &output)
         worker_stage("done")
     return 0

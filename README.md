@@ -27,8 +27,9 @@ of this repository.
 ## Testing
 
 `./test.sh` type-checks every module, runs the unit tests and the generators' comparisons, then runs
-Ladybird's phase-1 Layout, Ref and Crash tests (copied in `tests/libweb`) through the headless runner
-`tests/web_test` against `tests/expected_failures` (see `docs/regions/r57.md`).
+Ladybird's phase-1 and phase-2 Layout, Ref, Crash and Screenshot tests (copied in `tests/libweb`)
+through the headless runner `tests/web_test` against `tests/expected_failures` (see
+`docs/regions/r57.md`). The runner decodes and writes PNGs with luce-png.
 
 ## License
 

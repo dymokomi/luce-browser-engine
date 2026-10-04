@@ -11,7 +11,8 @@
 #       stopped (test-web's per-test timeout, 30 s by default).
 #
 #       A child's outcome: it exited 0 having written its result (then the result is judged:
-#       a Layout dump against its expectation, "pass" or "fail" from a Ref or Crash worker), it
+#       a Layout dump against its expectation, "pass" or "fail" from a Ref, Crash or Screenshot
+#       worker, which also writes the PNGs of a failed comparison into the results), it
 #       trapped (its standard error holds "trap: FILE:LINE:COLUMN: MESSAGE"; an `unported:`
 #       message names the next function the test needs), it died some other way (a signal, an
 #       exit status), or it timed out. The last "web_test: stage NAME" line it wrote tells how
@@ -60,6 +61,9 @@ struct TestResult:
     var trap_message: str
     ## What differed, for a failure; how it died, for a crash.
     var detail: str
+    ## A failed screenshot comparison's statistics, from the worker's log (fuzzy.lucb's
+    ## messages), for results.tsv; empty otherwise.
+    var statistics: str
     ## The worker's result (a Layout test's dumps, also when it stopped partway).
     var output: str
     ## The worker's standard output and error.
@@ -94,6 +98,17 @@ func trap_message(log: str) -> str?:
                 return parts.1
             return location_and_message
     return none
+
+## The statistics of a failed screenshot comparison `log` reports (fuzzy_screenshot_match's "pixel
+## error count N, with maximum error M" or its fuzzy mismatch lines), or "".
+func screenshot_statistics(log: str) -> str:
+    var lines = strings.SplitIterator.over(log, "\n") catch failure: return ""
+    while let line = lines.next():
+        if let at = strings.find(line, ": Screenshot mismatch: "):
+            return (str)line.bytes[at + ": Screenshot mismatch: ".length..]
+        if let at = strings.find(line, ": Fuzzy mismatch: "):
+            return (str)line.bytes[at + 2..]
+    return ""
 
 ## `message` with the working directory left out of every path in it: ./test.sh runs web_test from the repository
 ## root, so a trap that names a file (a test, its reference) names it relative to the repository, and the notes of
@@ -138,7 +153,7 @@ func judge_layout(test_case: const Test*, output: str) -> (Outcome, str, bool):
 ## and its result file.
 func judge(test_case: const Test*, exit_code: i64?, failure: str, log: str, out_path: str) -> TestResult:
     var result = TestResult(outcome = Outcome.crash, skip = SkipReason.none_, stage = last_stage(log), trap_message = "", detail = "",
-                            output = read_text_file(out_path) else "", log = log)
+                            statistics = "", output = read_text_file(out_path) else "", log = log)
     if test_case.mode == TestMode.layout:
         let expectation_path = test_case.expectation_path else ""
         if let expected = read_text_file(expectation_path):
@@ -160,12 +175,13 @@ func judge(test_case: const Test*, exit_code: i64?, failure: str, log: str, out_
             result.outcome = outcome
             result.detail = detail
             result.layout_tree_matches = tree_matches
-        .ref, .crash:
+        .ref, .crash, .screenshot:
             if trim_trailing_newlines(result.output) == "pass":
                 result.outcome = Outcome.pass
             else:
                 result.outcome = Outcome.fail
-                result.detail = "the screenshots differ" if test_case.mode == TestMode.ref else "no result"
+                result.detail = "no result" if test_case.mode == TestMode.crash else "the screenshots differ"
+                result.statistics = screenshot_statistics(log)
     return result
 
 ## `value` in decimal.
@@ -193,19 +209,22 @@ struct Running:
     var started: u64
     var out_path: str
 
-## Starts the worker of `job`.
+## Starts the worker of `job`. A Ref or Screenshot worker writes the PNGs of a failed comparison
+## beside the test's other results (--images).
 func start_job(options: const Options*, program: str, work: str, tests: const Test[], job: Job) -> Running:
     let test_case = &tests[job.index]
     let out_path = cat([work, "/", format_count((u64)job.index), ".out" if not job.no_rendering else ".retry.out"])
-    let mode = test_mode_name(test_case.mode)
     let input = cat([options.root, "/", test_case.relative_path])
-    var command: process.Command = ---
+    var arguments: str[10] = ["--one", input, "--mode", test_mode_name(test_case.mode), "--root", options.root, "--out", out_path, "", ""]
+    var count: usize = 8
     if job.no_rendering:
-        let arguments: str[9] = ["--one", input, "--mode", mode, "--root", options.root, "--out", out_path, "--no-rendering"]
-        command = process.Command(program, arguments, output_limit = 4194304) catch failure: trap(f"web_test: cannot start a worker: {failure.message}")
-    else:
-        let arguments: str[8] = ["--one", input, "--mode", mode, "--root", options.root, "--out", out_path]
-        command = process.Command(program, arguments, output_limit = 4194304) catch failure: trap(f"web_test: cannot start a worker: {failure.message}")
+        arguments[count] = "--no-rendering"
+        count += 1
+    elif test_case.mode == TestMode.ref or test_case.mode == TestMode.screenshot:
+        arguments[count] = "--images"
+        arguments[count + 1] = cat([options.results, "/", test_case.relative_path])
+        count += 2
+    let command = process.Command(program, arguments[..<count], output_limit = 4194304) catch failure: trap(f"web_test: cannot start a worker: {failure.message}")
     return Running(job = job, command = command, started = time.now(), out_path = out_path)
 
 ## The captured output of a finished command.
@@ -228,7 +247,8 @@ func run_tests(options: const Options*, tests: const Test[], skips: const SkipRe
     var results: ak.Vector[TestResult]
     var queue: ak.Vector[Job]
     for index in 0..<tests.length:
-        ak.vector_append_t(&results, TestResult(outcome = Outcome.skipped, skip = skips[index], stage = "", trap_message = "", detail = "", output = "", log = "", trap_message_without_rendering = ""))
+        ak.vector_append_t(&results, TestResult(outcome = Outcome.skipped, skip = skips[index], stage = "", trap_message = "", detail = "", statistics = "",
+                                                output = "", log = "", trap_message_without_rendering = ""))
         if skips[index] == SkipReason.none_:
             ak.vector_append_t(&queue, Job(index = index, no_rendering = false))
 
@@ -258,7 +278,7 @@ func run_tests(options: const Options*, tests: const Test[], skips: const SkipRe
                 let log = command_output(&done.command)
                 done.command.close()
                 result = TestResult(outcome = Outcome.timeout, skip = SkipReason.none_, stage = last_stage(log), trap_message = "",
-                                    detail = cat(["no result after ", format_count(options.timeout_seconds), " s"]), output = "", log = log)
+                                    detail = cat(["no result after ", format_count(options.timeout_seconds), " s"]), statistics = "", output = "", log = log)
             else:
                 let log = command_output(&done.command)
                 let failure = command_failure(&done.command)

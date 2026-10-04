@@ -1411,15 +1411,20 @@ size, and applies Ladybird's rule (`test-web/Fuzzy.cpp`): identical bitmaps pass
 first fuzzy entry whose `reference` matches (or has none) must contain both the maximum channel
 difference and the number of differing pixels; without a fuzzy entry a difference fails. Both
 sides go through our rasterizer, so reftests test layout and painting logic independently of
-Skia. Reference files that are images (17 `.png` in `Ref/expected`) wait for P2 decoding.
+Skia. A reference that is an image would be decoded with luce-png and compared as it is (no Ref
+test at the pin has one: the `.png` files in `Ref/expected` are images the references load).
 
 ### 6.4 Crash, Screenshot and Text tests
 
 - **Crash**: pass if the worker finishes (no trap, no timeout).
-- **Screenshot** (97 inputs, 100 expected PNGs rendered by Skia): our rasterizer will not match
-  Skia's anti-aliasing exactly. P2 runs them with a per-suite tolerance and records the diff
-  statistics; after human review, a Luce-rendered baseline set may be kept beside (not instead
-  of) the Ladybird PNGs. *(Open, §9.)*
+- **Screenshot** (97 inputs, 100 expected PNGs rendered by Skia; the 67 that need no script are
+  copied with P2): the worker renders the page, decodes the expected PNG with luce-png and
+  applies Ladybird's fuzzy rule (the test's `<meta name=fuzzy>`, its references ignored, as
+  test-web does); a failed comparison writes the actual, expected and diff PNGs and its
+  statistics into the results. Our rasterizer does not match Skia's anti-aliasing everywhere:
+  the tests whose picture is right but whose pixels are not Skia's are listed with the reason
+  `raster` (r57's notes). After human review, a Luce-rendered baseline set may be kept beside
+  (not instead of) the Ladybird PNGs. *(Open, §9.)*
 - **Text** (4,785 inputs): P3, through luce-js; the runner then implements `internals` and the
   JS-driven waits like `test-web`.
 

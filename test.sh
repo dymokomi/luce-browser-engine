@@ -13,11 +13,23 @@ done
 
 for module in src/web tools/gen_css_values tools/embed_css tools/gen_dom_tree tools/gen_aria_roles tests/web_test; do
     echo "== luce-base check $module -W"
-    # -W reports warnings without failing, so any output at all fails the run.
-    output=$(luce-base check "$module" -W 2>&1) || { echo "$output"; exit 1; }
+    # -W makes any warning fail the check, so any output at all fails the run, except warnings in
+    # the code of another package (luce-png and luce-raster, which web_test uses, have some at
+    # their pinned commits; they are theirs to fix): those are shown, and the module must then
+    # check without -W.
+    status=0
+    output=$(luce-base check "$module" -W 2>&1) || status=$?
+    pattern='^luce-base: luce_[a-z_]+/src/[^ ]*: warning: '
+    dependency_warnings=$(printf '%s\n' "$output" | grep -E "$pattern" || true)
+    output=$(printf '%s\n' "$output" | grep -v -E "$pattern" || true)
     if [ -n "$output" ]; then
         echo "$output"
         exit 1
+    fi
+    if [ "$status" -ne 0 ]; then
+        [ -n "$dependency_warnings" ] || exit 1
+        printf '%s\n' "$dependency_warnings" | sed 's/^/(another package) /'
+        luce-base check "$module"
     fi
 done
 
@@ -60,10 +72,10 @@ luce-base build tools/gen_aria_roles -o build/gen_aria_roles
 build/gen_aria_roles data/aria "$generated/aria"
 cmp "$generated/aria/aria_roles.lucb" src/web/generated/aria/aria_roles.lucb
 
-# Ladybird's Layout, Ref and Crash tests (the copy in tests/libweb) through the headless runner,
+# Ladybird's Layout, Ref, Crash and Screenshot tests (the copy in tests/libweb) through the headless runner,
 # one worker process per test, against tests/expected_failures: an unexpected failure or an
 # unexpected pass fails the run (DESIGN.md §6). After a change that makes tests pass or fail,
 # review build/web_test_results and run `build/web_test --update-failures`.
-echo "== web_test layout ref crash"
+echo "== web_test layout ref crash screenshot"
 luce-base build tests/web_test -o build/web_test
-build/web_test layout ref crash
+build/web_test layout ref crash screenshot

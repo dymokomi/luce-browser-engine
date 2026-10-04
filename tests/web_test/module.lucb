@@ -1,12 +1,12 @@
 #==============================================================================================
 #
-#   web_test - the headless runner of Ladybird's Layout, Ref and Crash tests over the engine
+#   web_test - the headless runner of Ladybird's Layout, Ref, Crash and Screenshot tests over the engine
 #
 #   DESCRIPTION:
 #       DESIGN.md §6. One program with two modes:
 #
-#         web_test [layout] [ref] [crash] [-f GLOB] [-j N] [--update-failures] [--timeout S]
-#                  [--root DIR] [--results DIR] [--expected-failures DIR] [-v]
+#         web_test [layout] [ref] [crash] [screenshot] [-f GLOB] [-j N] [--update-failures]
+#                  [--timeout S] [--root DIR] [--results DIR] [--expected-failures DIR] [-v]
 #             The driver: walks the repository's copy of Ladybird's tests (tests/libweb, §6.8),
 #             honors TestConfig.ini's skip lists, runs every test in a child process (a trap
 #             cannot be caught and must not end the run) with a timeout, compares the outcomes
@@ -15,8 +15,8 @@
 #             under the results directory and prints a summary with the most frequent
 #             `unported:` traps.
 #
-#         web_test --one PATH --mode layout|ref|crash [--root DIR] [--out FILE]
-#                  [--no-rendering]
+#         web_test --one PATH --mode layout|ref|crash|screenshot [--root DIR] [--out FILE]
+#                  [--no-rendering] [--images BASE]
 #             The worker: one page, one test (driver_*.lucb runs it; worker_*.lucb is it). It
 #             does natively what Ladybird's test-web does through injected JavaScript and IPC
 #             (Tests/LibWeb/test-web/main.cpp, Services/WebContent): the platform plugins in
@@ -24,7 +24,10 @@
 #             1, scripting disabled), the document of a file: response parsed and loaded, the
 #             load event, document.fonts.ready and two animation frames, a screenshot, and the
 #             result: the layout, paint and stacking-context dumps (layout), whether the test
-#             and its reference render alike (ref), or nothing but finishing (crash).
+#             and its reference render alike (ref), nothing but finishing (crash), or whether
+#             the test renders as its expected PNG (screenshot, decoded with luce-png). A Ref or
+#             Screenshot comparison that fails writes BASE.actual.png, BASE.expected.png and
+#             BASE.diff.png (--images; the driver gives the test's path in the results).
 #
 #       The worker writes its result to --out (or standard output) and reports how far it got
 #       on standard error ("web_test: stage NAME"), so the driver can tell where a test that
@@ -42,6 +45,8 @@ from luce_std import files
 from luce_browser_foundation import gc
 from luce_browser_render import gfx
 import io
+from luce_png import png
+from luce_raster.binary import Buffer
 from luce_std import math
 import memory
 import os
@@ -55,11 +60,15 @@ import web
 
 # mark: The command line ========================================================================
 
-## The suites a test belongs to (Ladybird's TestMode, for the three phase-1 suites).
+## The suites a test belongs to (Ladybird's TestMode, without Text, which needs script).
 enum TestMode:
     layout
     ref
     crash
+    screenshot
+
+## The suites, in the order the driver runs and reports them.
+let test_modes: TestMode[4] = [TestMode.layout, TestMode.ref, TestMode.crash, TestMode.screenshot]
 
 ## The name of a mode, as the command line and the expected-failures files spell it.
 func test_mode_name(mode: TestMode) -> str:
@@ -67,12 +76,14 @@ func test_mode_name(mode: TestMode) -> str:
         .layout => "layout"
         .ref => "ref"
         .crash => "crash"
+        .screenshot => "screenshot"
 
 ## The mode a command-line word names, if any.
 func test_mode_from_name(name: str) -> TestMode?:
     if name == "layout": return TestMode.layout
     if name == "ref": return TestMode.ref
     if name == "crash": return TestMode.crash
+    if name == "screenshot": return TestMode.screenshot
     return none
 
 ## What the command line asked for.
@@ -84,10 +95,13 @@ struct Options:
     var out: str?
     ## Worker mode: dump without rendering (--no-rendering, see worker_modes).
     var no_rendering: bool
+    ## Worker mode: where a failed screenshot comparison writes its PNGs (--images BASE:
+    ## BASE.actual.png, BASE.expected.png, BASE.diff.png).
+    var images: str?
     ## The copy of Ladybird's Tests/LibWeb (--root).
     var root: str
-    ## Driver mode: the suites to run (none named: all three).
-    var suites: bool[3]
+    ## Driver mode: the suites to run, by test_mode_index (none named: all of them).
+    var suites: bool[4]
     ## Driver mode: only the tests whose path matches (-f).
     var filter: str?
     ## Driver mode: workers run at once (-j).
@@ -105,9 +119,9 @@ struct Options:
 
 ## The usage text.
 func usage():
-    io.stderr().write("usage: web_test [layout] [ref] [crash] [-f GLOB] [-j N] [--update-failures] [--timeout SECONDS]\n") catch failure: return
+    io.stderr().write("usage: web_test [layout] [ref] [crash] [screenshot] [-f GLOB] [-j N] [--update-failures] [--timeout SECONDS]\n") catch failure: return
     io.stderr().write("                [--root DIR] [--results DIR] [--expected-failures DIR] [-v]\n") catch failure: return
-    io.stderr().write("       web_test --one PATH --mode layout|ref|crash [--root DIR] [--out FILE] [--no-rendering]\n") catch failure: return
+    io.stderr().write("       web_test --one PATH --mode layout|ref|crash|screenshot [--root DIR] [--out FILE] [--no-rendering] [--images BASE]\n") catch failure: return
 
 ## The options of `arguments` (the program name first), or none when they are not understood.
 func parse_options(arguments: const str[]) -> Options?:
@@ -129,6 +143,9 @@ func parse_options(arguments: const str[]) -> Options?:
             index += 1
         elif argument == "--no-rendering":
             options.no_rendering = true
+        elif argument == "--images" and has_value:
+            options.images = arguments[index]
+            index += 1
         elif argument == "--root" and has_value:
             options.root = arguments[index]
             index += 1
@@ -156,8 +173,8 @@ func parse_options(arguments: const str[]) -> Options?:
             options.suites[(usize)test_mode_index(mode)] = true
         else:
             return none
-    if not options.suites[0] and not options.suites[1] and not options.suites[2]:
-        options.suites = [true, true, true]
+    if not options.suites[0] and not options.suites[1] and not options.suites[2] and not options.suites[3]:
+        options.suites = [true, true, true, true]
     return options
 
 ## The index of a mode in Options.suites.
@@ -166,6 +183,7 @@ func test_mode_index(mode: TestMode) -> u8:
         .layout => 0
         .ref => 1
         .crash => 2
+        .screenshot => 3
 
 ## A non-negative decimal count, if `text` is one.
 func parse_count(text: str) -> usize?:
