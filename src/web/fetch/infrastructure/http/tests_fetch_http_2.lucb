@@ -1,0 +1,390 @@
+#==============================================================================================
+#
+#   tests_fetch_http_2 - Fetch::Infrastructure's requests, responses and bodies as cells
+#
+#   DESCRIPTION:
+#       Ladybird has no unit tests for Requests.cpp, Responses.cpp and Bodies.cpp. These pin
+#       what the oracle's cases (tests_fetch_http_1) do not reach, read from the C++: a new
+#       request's and response's defaults, URLs and URL lists, the copies clone makes, filtered
+#       responses forwarding their setters to the internal response, the header list templates
+#       of HeaderList.h, a body's resource-header (sniff) bytes, and the edges visit_edges keeps.
+#       A Streams::ReadableStream is opaque until phase 4; a body made here takes another cell
+#       as its stream, which it never reads.
+#
+#==============================================================================================
+
+# mark: Helpers =================================================================================
+
+## A URL of a test (`URL::Parser::basic_parse`).
+func fetch_test_url(text: str) -> web_url.Url:
+    return web_url.parser_basic_parse(ak.sv(text)) else trap("the test URL parses")
+
+## Whether `url` serializes as `text`.
+func fetch_test_url_is(url: web_url.Url, text: str) -> bool:
+    let serialized = web_url.url_serialize(&url)
+    return ak.string_eq_string_view(&serialized, ak.sv(text))
+
+## Whether a header list holds exactly `expected`, as (name, value) pairs in order.
+func fetch_test_headers_are(list: const HttpHeaderList*, expected: const str[]) -> bool:
+    let headers = http_header_list_headers(list)
+    if ak.vector_size(headers) * 2 != expected.length:
+        return false
+    for (index, header) in ak.vector_span_const(headers).indexed():
+        if not ak.byte_string_eq_string_view(&header.name, ak.sv(expected[index * 2])):
+            return false
+        if not ak.byte_string_eq_string_view(&header.value, ak.sv(expected[index * 2 + 1])):
+            return false
+    return true
+
+## A body of `vm` whose source is `source` and whose stream is `stream_cell` (any cell: the opaque
+## ReadableStream is never read by these tests).
+func fetch_test_body(vm: Vm*, stream_cell: gc.Cell*, source: FetchBodySourceType, length: u64?) -> FetchBody*:
+    return fetch_body_create_fetch_body_source_type(vm, (StreamsReadableStream*)(void*)stream_cell, source, length)
+
+## A byte buffer holding `bytes`.
+func fetch_test_byte_buffer(bytes: const u8[]) -> ak.ByteBuffer:
+    return ak.byte_buffer_copy_void((const void*)bytes.data, bytes.length) else trap("out of memory")
+
+# mark: Requests ================================================================================
+
+test "a new request: its defaults, header list and request time":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let request = fetch_request_create(vm)
+    let method = fetch_request_method(request)
+    assert(ak.byte_string_eq_string_view(&method, ak.sv("GET")))
+    assert(http_header_list_is_empty(fetch_request_header_list(request)))
+    assert(fetch_request_body_is_empty(request))
+    assert(fetch_request_client(request) == none)
+    assert(fetch_request_reserved_client(request) == none)
+    match fetch_request_traversable_for_user_prompts(request):
+        .fetch_request_traversable_for_user_prompts(value): assert(value == FetchRequestTraversableForUserPrompts.client)
+        _: assert(false)
+    match fetch_request_origin(request):
+        .fetch_request_origin(value): assert(value == FetchRequestOrigin.client)
+        _: assert(false)
+    match fetch_request_policy_container(request):
+        .fetch_request_policy_container(value): assert(value == FetchRequestPolicyContainer.client)
+        _: assert(false)
+    match fetch_request_referrer(request):
+        .fetch_request_referrer(value): assert(value == FetchRequestReferrer.client)
+        _: assert(false)
+    assert(fetch_request_service_workers_mode(request) == FetchRequestServiceWorkersMode.all)
+    assert(fetch_request_priority(request) == FetchRequestPriority.auto)
+    assert(fetch_request_referrer_policy(request) == ReferrerPolicyReferrerPolicy.empty_string)
+    assert(fetch_request_mode(request) == FetchRequestMode.no_cors)
+    assert(fetch_request_credentials_mode(request) == FetchRequestCredentialsMode.same_origin)
+    assert(fetch_request_cache_mode(request) == HttpCacheMode.default)
+    assert(fetch_request_redirect_mode(request) == FetchRequestRedirectMode.follow)
+    assert(fetch_request_response_tainting(request) == FetchRequestResponseTainting.basic)
+    assert(fetch_request_destination(request) == none)
+    assert(fetch_request_initiator(request) == none)
+    assert(fetch_request_initiator_type(request) == none)
+    assert(fetch_request_redirect_count(request) == 0)
+    assert(not fetch_request_keepalive(request) and not fetch_request_done(request) and not fetch_request_use_cors_preflight(request))
+    let integrity = fetch_request_integrity_metadata(request)
+    let empty = ak.string_new()
+    assert(ak.string_equals(&integrity, &empty))
+    assert(ak.vector_is_empty(fetch_request_url_list(request)))
+
+test "a request's URL is the first of its URL list and its current URL the last":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let request = fetch_request_create(vm)
+    fetch_request_set_url(request, fetch_test_url("https://a.test/first"))
+    assert(fetch_test_url_is(fetch_request_url(request), "https://a.test/first"))
+    ak.vector_append_t(fetch_request_url_list(request), fetch_test_url("https://b.test/second"))
+    assert(fetch_test_url_is(fetch_request_url(request), "https://a.test/first"))
+    assert(fetch_test_url_is(fetch_request_current_url(request), "https://b.test/second"))
+
+    # set_url replaces the whole list.
+    fetch_request_set_url(request, fetch_test_url("https://c.test/third"))
+    assert(ak.vector_size(fetch_request_url_list(request)) == 1)
+    assert(fetch_test_url_is(fetch_request_current_url(request), "https://c.test/third"))
+
+test "cloning a request copies its members and header list, not its URL list's storage":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let realm = web_test_create_realm(vm)
+    let request = fetch_request_create(vm)
+    fetch_request_set_method(request, ak.byte_string_from_str("POST"))
+    fetch_request_set_url(request, fetch_test_url("https://a.test/x"))
+    http_header_list_append(fetch_request_header_list(request), http_header_create(ak.sv("Accept"), ak.sv("*/*")))
+    fetch_request_set_destination(request, FetchRequestDestination.image)
+    fetch_request_set_mode(request, FetchRequestMode.cors)
+    let origin_url = fetch_test_url("https://a.test/")
+    fetch_request_set_origin(request, .origin(web_url.url_origin(&origin_url)))
+    fetch_request_set_redirect_count(request, 3)
+    fetch_request_set_body(request, .byte_buffer(fetch_test_byte_buffer(b"body")))
+
+    let clone = fetch_request_clone(request, realm)
+    assert(clone != request)
+    let method = fetch_request_method(clone)
+    assert(ak.byte_string_eq_string_view(&method, ak.sv("POST")))
+    assert(fetch_request_destination(clone) == FetchRequestDestination.image)
+    assert(fetch_request_mode(clone) == FetchRequestMode.cors)
+    assert(fetch_request_redirect_count(clone) == 3)
+    assert(fetch_test_headers_are(fetch_request_header_list(clone), ["Accept", "*/*"]))
+    assert(fetch_request_header_list(clone) != fetch_request_header_list(request))
+    assert(fetch_test_url_is(fetch_request_url(clone), "https://a.test/x"))
+    # The body is not copied (only a body cell is cloned).
+    assert(fetch_request_body_is_empty(clone))
+
+    # The copies are the clone's own.
+    ak.vector_append_t(fetch_request_url_list(clone), fetch_test_url("https://b.test/y"))
+    http_header_list_append(fetch_request_header_list(clone), http_header_create(ak.sv("X"), ak.sv("1")))
+    assert(ak.vector_size(fetch_request_url_list(request)) == 1)
+    assert(fetch_test_headers_are(fetch_request_header_list(request), ["Accept", "*/*"]))
+    let serialized_origin = fetch_request_serialize_origin(clone)
+    assert(ak.string_eq_string_view(&serialized_origin, ak.sv("https://a.test")))
+
+test "a request's cross-origin embedder policy allows credentials unless it is a no-cors request with a client":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let request = fetch_request_create(vm)
+    let origin_url = fetch_test_url("https://a.test/")
+    fetch_request_set_origin(request, .origin(web_url.url_origin(&origin_url)))
+    fetch_request_set_url(request, fetch_test_url("https://b.test/x"))
+    fetch_request_set_mode(request, FetchRequestMode.cors)
+    assert(fetch_request_cross_origin_embedder_policy_allows_credentials(request))
+    fetch_request_set_mode(request, FetchRequestMode.no_cors)
+    # 3. If request's client is null, then return true.
+    assert(fetch_request_cross_origin_embedder_policy_allows_credentials(request))
+
+# mark: Responses ===============================================================================
+
+test "a new response: status 200, default type, credentials included, a monotonic response time":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let response = fetch_infrastructure_response_create(vm)
+    assert(fetch_response_type(response) == FetchResponseType.default)
+    assert(fetch_response_status(response) == 200)
+    assert(fetch_response_request_includes_credentials(response))
+    assert(not fetch_response_range_requested(response) and not fetch_response_timing_allow_passed(response) and not fetch_response_aborted(response))
+    assert(fetch_response_redirect_taint(response) == FetchRedirectTaint.same_origin)
+    assert(fetch_response_cache_state(response) == none)
+    assert(fetch_response_url(response) == none)
+    assert(fetch_response_body(response) == none)
+    let status_message = fetch_response_status_message(response)
+    assert(ak.byte_string_is_empty(&status_message))
+    assert(not fetch_response_is_network_error(response))
+    assert(fetch_response_unsafe_response(response) == response)
+
+test "a filtered response forwards its setters to the internal response, except its own members":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let internal = fetch_infrastructure_response_create(vm)
+    http_header_list_append(fetch_response_header_list(internal), http_header_create(ak.sv("Set-Cookie"), ak.sv("a=1")))
+    let basic = (FetchResponse*)fetch_basic_filtered_response_create(vm, internal)
+    assert(fetch_filtered_response_internal_response(basic) == internal)
+
+    fetch_response_set_status(basic, 404)
+    assert(fetch_response_status(internal) == 404)
+    fetch_response_set_url_list(basic, ak.Vector[web_url.Url]())
+    ak.vector_append_t(fetch_response_url_list(basic), fetch_test_url("https://a.test/x"))
+    assert(fetch_test_url_is(fetch_response_url(internal) else trap("a URL"), "https://a.test/x"))
+    fetch_response_set_cache_state(basic, FetchResponseCacheState.validated)
+    assert(fetch_response_cache_state(internal) == FetchResponseCacheState.validated)
+    fetch_response_set_timing_allow_passed(basic, true)
+    assert(fetch_response_timing_allow_passed(internal))
+
+    # The basic filtered response's header list is its own (without Set-Cookie); setting one sets the internal's.
+    assert(http_header_list_is_empty(fetch_response_header_list(basic)))
+    let replacement = http_header_list_create()
+    fetch_response_set_header_list(basic, replacement)
+    assert(fetch_response_header_list(internal) == replacement)
+    assert(fetch_response_header_list(basic) != replacement)
+
+    # An opaque filtered response answers its own status, URL list and body.
+    let opaque = (FetchResponse*)fetch_opaque_filtered_response_create(vm, internal)
+    assert(fetch_response_status(opaque) == 0)
+    assert(ak.vector_is_empty(fetch_response_url_list(opaque)))
+    assert(fetch_response_type(opaque) == FetchResponseType.opaque)
+    assert(fetch_response_status(internal) == 404)
+
+test "cloning a response: a filtered response clones its internal response into the same kind":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let realm = web_test_create_realm(vm)
+    let internal = fetch_infrastructure_response_create(vm)
+    fetch_response_set_status(internal, 206)
+    fetch_response_set_status_message(internal, ak.byte_string_from_str("Partial"))
+    ak.vector_append_t(fetch_response_url_list(internal), fetch_test_url("https://a.test/x"))
+    http_header_list_append(fetch_response_header_list(internal), http_header_create(ak.sv("Content-Type"), ak.sv("text/plain")))
+    var exposed = ak.Vector[ak.ByteString]()
+    ak.vector_append_t(&exposed, ak.byte_string_from_str("X-Exposed"))
+    fetch_response_set_cors_exposed_header_name_list(internal, exposed)
+
+    let clone = fetch_response_clone(internal, realm)
+    assert(clone != internal)
+    assert(fetch_response_status(clone) == 206)
+    let status_message = fetch_response_status_message(clone)
+    assert(ak.byte_string_eq_string_view(&status_message, ak.sv("Partial")))
+    assert(fetch_test_headers_are(fetch_response_header_list(clone), ["Content-Type", "text/plain"]))
+    assert(fetch_response_header_list(clone) != fetch_response_header_list(internal))
+    assert(ak.vector_size(fetch_response_cors_exposed_header_name_list(clone)) == 1)
+    ak.vector_append_t(fetch_response_url_list(clone), fetch_test_url("https://b.test/y"))
+    assert(ak.vector_size(fetch_response_url_list(internal)) == 1)
+
+    let cors = (FetchResponse*)fetch_cors_filtered_response_create(vm, internal)
+    let cors_clone = fetch_response_clone(cors, realm)
+    assert(is_fetch_cors_filtered_response(cors_clone))
+    let cloned_internal = fetch_filtered_response_internal_response(cors_clone)
+    assert(cloned_internal != internal)
+    assert(fetch_response_status(cloned_internal) == 206)
+
+# mark: HeaderList.h's templates ================================================================
+
+## delete_all_matching's callback in the test: headers whose value is "drop".
+func fetch_test_value_is_drop(context: void*?, header: const HttpHeader*) -> bool:
+    return ak.byte_string_eq_string_view(&header.value, ak.sv("drop"))
+
+## The state of for_each_header_value's callback in the test: the values seen, and where to stop.
+struct FetchTestHeaderValues:
+    var values: ak.Vector[ak.ByteString]
+    var stop_after: usize
+
+## for_each_header_value's callback in the test.
+func fetch_test_collect_header_value(context: void*?, value: ak.StringView) -> ak.IterationDecision:
+    let state = (FetchTestHeaderValues*)(context else trap("no state"))
+    ak.vector_append_t(&state.values, ak.byte_string_from_string_view(value))
+    if ak.vector_size(&state.values) == state.stop_after:
+        return ak.IterationDecision.break_
+    return ak.IterationDecision.continue_
+
+test "HeaderList: create with headers, clear, delete_all_matching and for_each_header_value":
+    var headers = ak.Vector[HttpHeader]()
+    ak.vector_append_t(&headers, http_header_create(ak.sv("A"), ak.sv("1")))
+    ak.vector_append_t(&headers, http_header_create(ak.sv("B"), ak.sv("drop")))
+    ak.vector_append_t(&headers, http_header_create(ak.sv("a"), ak.sv("2")))
+    ak.vector_append_t(&headers, http_header_create(ak.sv("A"), ak.sv("3")))
+    let list = http_header_list_create(headers)
+    assert(fetch_test_headers_are(list, ["A", "1", "B", "drop", "a", "2", "A", "3"]))
+
+    var state = FetchTestHeaderValues(values = ak.Vector[ak.ByteString](), stop_after = 2)
+    http_header_list_for_each_header_value(list, ak.sv("a"), ak.Function1[ak.StringView, ak.IterationDecision](call = fetch_test_collect_header_value, context = &state))
+    assert(ak.vector_size(&state.values) == 2)
+    assert(ak.byte_string_eq_string_view(ak.vector_at(&state.values, 1), ak.sv("2")))
+
+    http_header_list_delete_all_matching(list, ak.Function1[const HttpHeader*, bool](call = fetch_test_value_is_drop, context = none))
+    assert(fetch_test_headers_are(list, ["A", "1", "a", "2", "A", "3"]))
+
+    http_header_list_clear(list)
+    assert(http_header_list_is_empty(list))
+
+# mark: Bodies ==================================================================================
+
+## wait_for_sniff_bytes's callback in the test: the bytes it was given.
+struct FetchTestSniffed:
+    var calls: usize
+    var bytes: ak.ByteBuffer
+
+## wait_for_sniff_bytes's callback in the test.
+func fetch_test_on_sniff_bytes(context: void*?, bytes: const u8[]):
+    let sniffed = (FetchTestSniffed*)(context else trap("no state"))
+    sniffed.calls += 1
+    sniffed.bytes = fetch_test_byte_buffer(bytes)
+
+test "Body: a byte-sequence source's sniff bytes are at most 1445 of its bytes, at once":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let stream_cell = (gc.Cell*)fetch_infrastructure_response_create(vm)
+    var big: u8[2000]
+    for i in 0..<big.length:
+        big[i] = (u8)(i % 251)
+    let body = fetch_test_body(vm, stream_cell, .byte_buffer(fetch_test_byte_buffer(big)), 2000)
+    assert(fetch_body_length(body) == 2000)
+    let bytes = fetch_body_sniff_bytes_if_available(body) else trap("a byte source has sniff bytes")
+    assert(bytes.length == fetch_max_sniff_bytes)
+    assert(bytes[1444] == (u8)(1444 % 251))
+    let source_buffer = fetch_body_source_byte_buffer(body) else trap("the source is a byte buffer")
+    assert(ak.byte_buffer_size(source_buffer) == 2000)
+
+    var sniffed = FetchTestSniffed(calls = 0, bytes = ak.ByteBuffer())
+    fetch_body_wait_for_sniff_bytes(body, gc.create_function1(vm_heap(vm), ak.Function1[const u8[], unit](call = fetch_test_on_sniff_bytes, context = &sniffed)))
+    assert(sniffed.calls == 1)
+    assert(ak.byte_buffer_size(&sniffed.bytes) == fetch_max_sniff_bytes)
+
+test "Body: a streaming body's sniff bytes arrive when 1445 bytes were appended or the stream completed":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let stream_cell = (gc.Cell*)fetch_infrastructure_response_create(vm)
+    let body = fetch_body_create(vm, (StreamsReadableStream*)(void*)stream_cell)
+    assert(fetch_body_sniff_bytes_if_available(body) == none)
+    assert(fetch_body_source_byte_buffer(body) == none)
+
+    var sniffed = FetchTestSniffed(calls = 0, bytes = ak.ByteBuffer())
+    fetch_body_wait_for_sniff_bytes(body, gc.create_function1(vm_heap(vm), ak.Function1[const u8[], unit](call = fetch_test_on_sniff_bytes, context = &sniffed)))
+    assert(sniffed.calls == 0)
+
+    var chunk: u8[1000]
+    for i in 0..<chunk.length:
+        chunk[i] = 7
+    fetch_body_append_sniff_bytes(body, chunk)
+    assert(sniffed.calls == 0)
+    fetch_body_append_sniff_bytes(body, chunk)
+    assert(sniffed.calls == 1)
+    assert(ak.byte_buffer_size(&sniffed.bytes) == fetch_max_sniff_bytes)
+
+    # Complete: further bytes and completions change nothing.
+    fetch_body_append_sniff_bytes(body, chunk)
+    fetch_body_set_sniff_bytes_complete(body)
+    assert(sniffed.calls == 1)
+    let bytes = fetch_body_sniff_bytes_if_available(body) else trap("complete")
+    assert(bytes.length == fetch_max_sniff_bytes)
+
+    # A short stream: its bytes when it completes.
+    let short_body = fetch_body_create(vm, (StreamsReadableStream*)(void*)stream_cell)
+    fetch_body_append_sniff_bytes(short_body, b"<html>")
+    assert(fetch_body_sniff_bytes_if_available(short_body) == none)
+    fetch_body_set_sniff_bytes_complete(short_body)
+    let short_bytes = fetch_body_sniff_bytes_if_available(short_body) else trap("complete")
+    assert(short_bytes.length == 6)
+
+# mark: visit_edges =============================================================================
+
+test "a request keeps its body, a response its body and a filtered response its internal response":
+    web_test_clobber_stack()
+    run_fetch_test_visit_edges()
+
+## The cells of the visit_edges test, made out of the test's frame: Weaks of them.
+noinline func make_fetch_test_cells(vm: Vm*, request: FetchRequest*, response: FetchResponse*) -> (gc.Weak[FetchBody], gc.Weak[FetchBody], gc.Weak[FetchResponse]):
+    let stream_cell = (gc.Cell*)fetch_infrastructure_response_create(vm)
+    let request_body = fetch_test_body(vm, stream_cell, .empty, none)
+    fetch_request_set_body(request, .fetch_body(request_body))
+    let response_body = fetch_test_body(vm, stream_cell, .empty, none)
+    let internal = fetch_infrastructure_response_create(vm)
+    fetch_response_set_body(internal, response_body)
+    let filtered = (FetchResponse*)fetch_basic_filtered_response_create(vm, internal)
+    fetch_response_set_body(response, response_body)
+    discard(filtered)
+    return (gc.make_weak[FetchBody](request_body), gc.make_weak[FetchBody](response_body), gc.make_weak[FetchResponse](internal))
+
+## The filtered response of the visit_edges test, kept by a root.
+noinline func make_fetch_test_filtered(vm: Vm*, internal_weak: const gc.Weak[FetchResponse]*) -> gc.Root[FetchResponse]:
+    let internal = gc.weak_ptr(internal_weak) else trap("the internal response lives")
+    return gc.root_create((FetchResponse*)fetch_basic_filtered_response_create(vm, internal))
+
+noinline func run_fetch_test_visit_edges():
+    let vm = web_test_create_vm()
+    # The request and the response are roots (gc.Root), as the cells that hold them would be.
+    var request = gc.root_create(fetch_request_create(vm))
+    var response = gc.root_create(fetch_infrastructure_response_create(vm))
+    let (request_body, response_body, internal) = make_fetch_test_cells(vm, gc.root_ptr(&request) else trap("rooted"), gc.root_ptr(&response) else trap("rooted"))
+    var filtered = make_fetch_test_filtered(vm, &internal)
+    web_test_clobber_stack()
+    gc.heap_collect_garbage(vm_heap(vm))
+    assert(web_test_alive(&request_body))
+    assert(web_test_alive(&response_body))
+    assert(web_test_alive(&internal))
+
+    fetch_request_set_body(gc.root_ptr(&request) else trap("rooted"), .empty)
+    gc.root_release(&filtered)
+    web_test_clobber_stack()
+    gc.heap_collect_garbage(vm_heap(vm))
+    assert(not web_test_alive(&request_body))
+    assert(web_test_alive(&response_body))
+    assert(not web_test_alive(&internal))
+    gc.root_release(&request)
+    gc.root_release(&response)
+    web_test_destroy_vm(vm)

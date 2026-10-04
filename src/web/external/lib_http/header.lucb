@@ -1,0 +1,344 @@
+#==============================================================================================
+#
+#   header - HTTP::Header: header names and values, forbidden headers, getting, decoding and
+#   splitting, sorted-lowercase name sets, content ranges and single range header values
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibHTTP/Header.cpp (lines 21-349) with Header.h. The IPC encoder and
+#       decoder of a Header (Header.cpp lines 351-366) are not ported: LibIPC is not part of
+#       the port (DESIGN.md §1.1).
+#
+#       Copyright (c) 2024, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2022-2023, Linus Groh <linusg@serenityos.org>
+#       Copyright (c) 2026, Shannon Booth <shannon@serenityos.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Header ==================================================================================
+
+## Ported from Libraries/LibHTTP/Header.cpp:23 HTTP::Header::isomorphic_encode.
+pub func http_header_isomorphic_encode(name: ak.StringView, value: ak.StringView) -> HttpHeader:
+    return HttpHeader(name = text_codec.isomorphic_encode(name), value = text_codec.isomorphic_encode(value))
+
+## Ported from Libraries/LibHTTP/Header.cpp:29 HTTP::extract_token_headers (internal linkage).
+# https://www.rfc-editor.org/rfc/rfc9110.html#name-recipient-requirements
+func http_extract_token_headers(value: const ak.ByteString*) -> ak.Vector[ak.ByteString]?:
+    var result = ak.Vector[ak.ByteString]()
+    var parts = ak.byte_string_split(value, ',', ak.SplitBehavior.nothing)
+    for part in &ak.vector_span(&parts):
+        let trimmed = ak.byte_string_trim(part, ak.sv(http_http_whitespace), ak.TrimMode.both)
+        if ak.byte_string_is_empty(&trimmed):
+            continue
+        if not http_is_header_name(ak.byte_string_view(&trimmed)):
+            return none
+        ak.vector_append_t(&result, trimmed)
+    return result
+
+## Ported from Libraries/LibHTTP/Header.cpp:44 HTTP::Header::extract_header_values.
+# https://fetch.spec.whatwg.org/#extract-header-values
+pub func http_header_extract_header_values(this: const HttpHeader*) -> ak.Vector[ak.ByteString]?:
+    # NB: There is some specification work to try and rework this function, see: https://github.com/whatwg/fetch/issues/814
+
+    # 1. If parsing header’s value, per the ABNF for header’s name, fails, then return failure.
+    # 2. Return one or more values resulting from parsing header’s value, per the ABNF for header’s name.
+
+    # ABNF taken from:
+    #  * https://fetch.spec.whatwg.org/#http-new-header-syntax
+    #  * https://httpwg.org/specs/rfc9110.html#field.accept-ranges
+
+    let name = ak.byte_string_view(&this.name)
+
+    # Access-Control-Expose-Headers = #field-name (field-name = token)
+    # Access-Control-Allow-Headers  = #field-name (field-name = token)
+    # Access-Control-Allow-Methods  = #method     (method = token)
+    if ak.string_view_is_one_of_ignoring_ascii_case(&name, ["Access-Control-Expose-Headers", "Access-Control-Allow-Headers", "Access-Control-Allow-Methods"]):
+        return http_extract_token_headers(&this.value)
+
+    # Access-Control-Request-Headers = 1#field-name      (field-name = token)
+    # Accept-Ranges                  = acceptable-ranges (acceptable-ranges = 1#range-unit, range-unit = token)
+    if ak.string_view_is_one_of_ignoring_ascii_case(&name, ["Access-Control-Request-Headers", "Accept-Ranges"]):
+        if let headers = http_extract_token_headers(&this.value):
+            if ak.vector_is_empty(&headers):
+                return none
+            return headers
+        return none
+
+    # FIXME: What other headers should we handle here (or elsewhere?)
+    var values = ak.Vector[ak.ByteString]()
+    ak.vector_append_t(&values, this.value)
+    return values
+
+# mark: Header names and values =================================================================
+
+## Ported from Libraries/LibHTTP/Header.cpp:83 HTTP::is_header_name.
+# https://fetch.spec.whatwg.org/#header-name
+pub func http_is_header_name(header_name: ak.StringView) -> bool:
+    # A header name is a byte sequence that matches the field-name token production.
+    if ak.string_view_is_empty(&header_name):
+        return false
+    for byte in ak.string_view_bytes(&header_name):
+        if not http_is_http_token_code_point(byte):
+            return false
+    return true
+
+## Ported from Libraries/LibHTTP/Header.cpp:90 HTTP::is_header_value.
+# https://fetch.spec.whatwg.org/#header-value
+pub func http_is_header_value(header_value: ak.StringView) -> bool:
+    # A header value is a byte sequence that matches the following conditions:
+    # - Has no leading or trailing HTTP tab or space bytes.
+    # - Contains no 0x00 (NUL) or HTTP newline bytes.
+    if ak.string_view_is_empty(&header_value):
+        return true
+
+    let first_byte = ak.string_view_at(&header_value, 0)
+    let last_byte = ak.string_view_at(&header_value, ak.string_view_length(&header_value) - 1)
+
+    if http_is_http_tab_or_space(first_byte) or http_is_http_tab_or_space(last_byte):
+        return false
+
+    for byte in ak.string_view_bytes(&header_value):
+        if byte == 0x00 or http_is_http_newline(byte):
+            return false
+    return true
+
+## Ported from Libraries/LibHTTP/Header.cpp:110 HTTP::normalize_header_value.
+# https://fetch.spec.whatwg.org/#concept-header-value-normalize
+pub func http_normalize_header_value(potential_value: ak.StringView) -> ak.StringView:
+    # To normalize a byte sequence potentialValue, remove any leading and trailing HTTP whitespace bytes from
+    # potentialValue.
+    if ak.string_view_is_empty(&potential_value):
+        return ak.StringView()
+    return ak.string_view_trim(&potential_value, ak.sv(http_http_whitespace), ak.TrimMode.both)
+
+# mark: Forbidden headers =======================================================================
+
+## Ported from Libraries/LibHTTP/Header.cpp:120 HTTP::is_forbidden_request_header.
+# https://fetch.spec.whatwg.org/#forbidden-header-name
+pub func http_is_forbidden_request_header(header: const HttpHeader*) -> bool:
+    let name = ak.byte_string_view(&header.name)
+    let value = ak.byte_string_view(&header.value)
+
+    # 1. If name is a byte-case-insensitive match for one of:
+    # [...]
+    # then return true.
+    if ak.string_view_is_one_of_ignoring_ascii_case(&name, ["Accept-Charset", "Accept-Encoding", "Access-Control-Request-Headers", "Access-Control-Request-Method", "Connection", "Content-Length", "Cookie", "Cookie2", "Date", "DNT", "Expect", "Host", "Keep-Alive", "Origin", "Referer", "Set-Cookie", "TE", "Trailer", "Transfer-Encoding", "Upgrade", "Via"]):
+        return true
+
+    # 2. If name when byte-lowercased starts with `proxy-` or `sec-`, then return true.
+    if ak.string_view_starts_with_string_view(&name, ak.sv("proxy-"), ak.CaseSensitivity.case_insensitive) or ak.string_view_starts_with_string_view(&name, ak.sv("sec-"), ak.CaseSensitivity.case_insensitive):
+        return true
+
+    # 3. If name is a byte-case-insensitive match for one of:
+    # - `X-HTTP-Method`
+    # - `X-HTTP-Method-Override`
+    # - `X-Method-Override`
+    # then:
+    if ak.string_view_is_one_of_ignoring_ascii_case(&name, ["X-HTTP-Method", "X-HTTP-Method-Override", "X-Method-Override"]):
+        # 1. Let parsedValues be the result of getting, decoding, and splitting value.
+        var parsed_values = http_get_decode_and_split_header_value(value)
+
+        # 2. For each method of parsedValues: if the isomorphic encoding of method is a forbidden method, then return true.
+        # NB: The values returned from get_decode_and_split_header_value have already been decoded.
+        for method in &ak.vector_span(&parsed_values):
+            if http_is_forbidden_method(ak.string_bytes_as_string_view(method)):
+                return true
+
+    # 4. Return false.
+    return false
+
+## Ported from Libraries/LibHTTP/Header.cpp:181 HTTP::is_forbidden_response_header_name.
+# https://fetch.spec.whatwg.org/#forbidden-response-header-name
+pub func http_is_forbidden_response_header_name(header_name: ak.StringView) -> bool:
+    # A forbidden response-header name is a header name that is a byte-case-insensitive match for one of:
+    # - `Set-Cookie`
+    # - `Set-Cookie2`
+    return ak.string_view_is_one_of_ignoring_ascii_case(&header_name, ["Set-Cookie", "Set-Cookie2"])
+
+# mark: Getting, decoding and splitting =========================================================
+
+## The predicate `is_any_of("\",")` of get_decode_and_split_header_value.
+struct HttpIsQuoteOrComma: ak.CharPredicate:
+    var unused: u8
+
+    func matches(ch: u8) -> bool:
+        return ch == '"' or ch == ','
+
+## Ported from Libraries/LibHTTP/Header.cpp:192 HTTP::get_decode_and_split_header_value.
+# https://fetch.spec.whatwg.org/#header-value-get-decode-and-split
+pub func http_get_decode_and_split_header_value(value: ak.StringView) -> ak.Vector[ak.String]:
+    # 1. Let input be the result of isomorphic decoding value.
+    let input = text_codec.isomorphic_decode(value)
+
+    # 2. Let position be a position variable for input, initially pointing at the start of input.
+    var lexer = ak.generic_lexer_new(ak.string_bytes_as_string_view(&input))
+
+    # 3. Let values be a list of strings, initially « ».
+    var values = ak.Vector[ak.String]()
+
+    # 4. Let temporaryValue be the empty string.
+    var temporary_value_builder = ak.string_builder_new()
+
+    # 5. While true:
+    let is_quote_or_comma = HttpIsQuoteOrComma()
+    while true:
+        # 1. Append the result of collecting a sequence of code points that are not U+0022 (") or U+002C (,) from
+        #    input, given position, to temporaryValue.
+        # NOTE: The result might be the empty string.
+        ak.string_builder_append_string_view(&temporary_value_builder, ak.generic_lexer_consume_until_tt_predicate(&lexer, &is_quote_or_comma))
+
+        # 2. If position is not past the end of input and the code point at position within input is U+0022 ("):
+        if not ak.generic_lexer_is_eof(&lexer) and ak.generic_lexer_peek(&lexer) == '"':
+            # 1. Append the result of collecting an HTTP quoted string from input, given position, to temporaryValue.
+            let quoted_string = http_collect_an_http_quoted_string(&lexer)
+            ak.string_builder_append_string_view(&temporary_value_builder, ak.string_bytes_as_string_view(&quoted_string))
+
+            # 2. If position is not past the end of input, then continue.
+            if not ak.generic_lexer_is_eof(&lexer):
+                continue
+
+        # 3. Remove all HTTP tab or space from the start and end of temporaryValue.
+        let temporary_value_view = ak.string_builder_string_view(&temporary_value_builder)
+        let temporary_value = ak.string_from_utf8(ak.string_view_trim(&temporary_value_view, ak.sv(http_http_tab_or_space), ak.TrimMode.both)) else trap("MUST: String::from_utf8")
+
+        # 4. Append temporaryValue to values.
+        ak.vector_append_t(&values, temporary_value)
+
+        # 5. Set temporaryValue to the empty string.
+        ak.string_builder_clear(&temporary_value_builder)
+
+        # 6. If position is past the end of input, then return values.
+        if ak.generic_lexer_is_eof(&lexer):
+            return values
+
+        # 7. Assert: the code point at position within input is U+002C (,).
+        assert(ak.generic_lexer_peek(&lexer) == ',')
+
+        # 8. Advance position by 1.
+        ak.generic_lexer_ignore(&lexer, 1)
+
+## `a < b` on two ByteStrings, the order AK's quick_sort uses for convert_header_names_to_a_sorted_lowercase_set.
+func http_byte_string_less_than(context: void*?, a: const ak.ByteString*, b: const ak.ByteString*) -> bool:
+    return ak.byte_string_lt(a, b)
+
+## Ported from Libraries/LibHTTP/Header.cpp:245 HTTP::convert_header_names_to_a_sorted_lowercase_set.
+# https://fetch.spec.whatwg.org/#convert-header-names-to-a-sorted-lowercase-set
+pub func http_convert_header_names_to_a_sorted_lowercase_set(header_names: const ak.ByteString[]) -> ak.Vector[ak.ByteString]:
+    # 1. Let headerNamesSet be a new ordered set.
+    var header_names_seen: ak.HashTable[ak.StringView, ak.CaseInsensitiveAsciiStringViewTraits]
+    var header_names_set = ak.Vector[ak.ByteString]()
+
+    # 2. For each name of headerNames, append the result of byte-lowercasing name to headerNamesSet.
+    for name in &header_names:
+        if ak.hash_table_contains_t(&header_names_seen, ak.byte_string_view(name)):
+            continue
+
+        discard(ak.hash_table_set(&header_names_seen, ak.byte_string_view(name)))
+        ak.vector_append_t(&header_names_set, ak.byte_string_to_lowercase(name))
+
+    # 3. Return the result of sorting headerNamesSet in ascending order with byte less than.
+    ak.quick_sort_t_collection_t_less_than(ak.vector_span(&header_names_set), ak.Function2[const ak.ByteString*, const ak.ByteString*, bool](call = http_byte_string_less_than, context = none))
+    return header_names_set
+
+# mark: Ranges ==================================================================================
+
+## Ported from Libraries/LibHTTP/Header.cpp:266 HTTP::build_content_range.
+# https://fetch.spec.whatwg.org/#build-a-content-range
+pub func http_build_content_range(range_start: u64, range_end: u64, full_length: u64) -> ak.ByteString:
+    # 1. Let contentRange be `bytes `.
+    # 2. Append rangeStart, serialized and isomorphic encoded, to contentRange.
+    # 3. Append 0x2D (-) to contentRange.
+    # 4. Append rangeEnd, serialized and isomorphic encoded to contentRange.
+    # 5. Append 0x2F (/) to contentRange.
+    # 6. Append fullLength, serialized and isomorphic encoded to contentRange.
+    # 7. Return contentRange.
+    var builder = ak.string_builder_new()
+    ak.string_builder_append(&builder, "bytes ")
+    ak.format_u64(&builder, range_start)
+    ak.string_builder_append(&builder, "-")
+    ak.format_u64(&builder, range_end)
+    ak.string_builder_append(&builder, "/")
+    ak.format_u64(&builder, full_length)
+    return ak.string_builder_to_byte_string(&builder)
+
+## `is_ascii_digit` as a GenericLexer predicate.
+struct HttpIsAsciiDigit: ak.CharPredicate:
+    var unused: u8
+
+    func matches(ch: u8) -> bool:
+        return ak.is_ascii_digit(ch)
+
+## Ported from Libraries/LibHTTP/Header.cpp:279 HTTP::parse_single_range_header_value.
+# https://fetch.spec.whatwg.org/#simple-range-header-value
+pub func http_parse_single_range_header_value(value: ak.StringView, allow_whitespace: bool) -> HttpRangeHeaderValue?:
+    let is_tab_or_space = HttpIsHttpTabOrSpace()
+    let is_digit = HttpIsAsciiDigit()
+
+    # 1. Let data be the isomorphic decoding of value.
+    let data = text_codec.isomorphic_decode(value)
+
+    # 2. If data does not start with "bytes", then return failure.
+    let data_view = ak.string_bytes_as_string_view(&data)
+    if not ak.string_view_starts_with_string_view(&data_view, ak.sv("bytes")):
+        return none
+
+    # 3. Let position be a position variable for data, initially pointing at the 5th code point of data.
+    var lexer = ak.generic_lexer_new(data_view)
+    ak.generic_lexer_ignore(&lexer, 5)
+
+    # 4. If allowWhitespace is true, collect a sequence of code points that are HTTP tab or space, from data given position.
+    if allow_whitespace:
+        discard(ak.generic_lexer_consume_while(&lexer, &is_tab_or_space))
+
+    # 5. If the code point at position within data is not U+003D (=), then return failure.
+    # 6. Advance position by 1.
+    if not ak.generic_lexer_consume_specific_t_char_type(&lexer, '='):
+        return none
+
+    # 7. If allowWhitespace is true, collect a sequence of code points that are HTTP tab or space, from data given position.
+    if allow_whitespace:
+        discard(ak.generic_lexer_consume_while(&lexer, &is_tab_or_space))
+
+    # 8. Let rangeStart be the result of collecting a sequence of code points that are ASCII digits, from data given position.
+    let range_start = ak.generic_lexer_consume_while(&lexer, &is_digit)
+
+    # 9. Let rangeStartValue be rangeStart, interpreted as decimal number, if rangeStart is not the empty string;
+    #    otherwise null.
+    let range_start_value = ak.string_view_to_number_u64(&range_start)
+
+    # 10. If allowWhitespace is true, collect a sequence of code points that are HTTP tab or space, from data given position.
+    if allow_whitespace:
+        discard(ak.generic_lexer_consume_while(&lexer, &is_tab_or_space))
+
+    # 11. If the code point at position within data is not U+002D (-), then return failure.
+    # 12. Advance position by 1.
+    if not ak.generic_lexer_consume_specific_t_char_type(&lexer, '-'):
+        return none
+
+    # 13. If allowWhitespace is true, collect a sequence of code points that are HTTP tab or space, from data given position.
+    if allow_whitespace:
+        discard(ak.generic_lexer_consume_while(&lexer, &is_tab_or_space))
+
+    # 14. Let rangeEnd be the result of collecting a sequence of code points that are ASCII digits, from data given position.
+    let range_end = ak.generic_lexer_consume_while(&lexer, &is_digit)
+
+    # 15. Let rangeEndValue be rangeEnd, interpreted as decimal number, if rangeEnd is not the empty string; otherwise null.
+    let range_end_value = ak.string_view_to_number_u64(&range_end)
+
+    # 16. If position is not past the end of data, then return failure.
+    if not ak.generic_lexer_is_eof(&lexer):
+        return none
+
+    # 17. If rangeEndValue and rangeStartValue are null, then return failure.
+    if range_end_value == none and range_start_value == none:
+        return none
+
+    # 18. If rangeStartValue and rangeEndValue are numbers, and rangeStartValue is greater than rangeEndValue, then
+    #     return failure.
+    if let start = range_start_value:
+        if let end = range_end_value:
+            if start > end:
+                return none
+
+    # 19. Return (rangeStartValue, rangeEndValue).
+    return HttpRangeHeaderValue(start = range_start_value, end = range_end_value)
