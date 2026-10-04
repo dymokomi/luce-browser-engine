@@ -107,13 +107,14 @@ in `module.lucb`.
   top-level target, navigation responses without a request, reporting a request's report-only violations; and a
   collection keeping a CSP list's policies, their directives and a violation's policy and element.
 
-`luce-base test src/web`: 605 passed (7 new).
+`luce-base test src/web`: 623 passed after merging p2d (7 new). The CSP tests install the test Core::EventLoop
+(queueing a violation's task wakes it) before their VM and remove it after it is destroyed.
 
 ## web_test
 
-The pass counts do not change (Layout 864 of 922, Ref 609 of 820, Crash 41 of 52, Screenshot 30 of 67): no Layout,
+The pass counts do not change, before and after merging p2d (Layout 864 of 922, Ref 609 of 820, Crash 41 of 52, Screenshot 30 of 67): no Layout,
 Ref, Crash or Screenshot test has a policy, and the inline and `<base>` checks answered "Allowed" over the empty CSP
-lists before as now.
+lists before as now; `--update-failures` left the lists as they were.
 
 ## Deviations and notes
 

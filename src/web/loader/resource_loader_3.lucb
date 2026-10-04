@@ -1,0 +1,252 @@
+#==============================================================================================
+#
+#   resource_loader_3 - ResourceLoader::load and its network requests
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibWeb/Loader/ResourceLoader.cpp (lines 354-522): load, which
+#       dispatches on the URL's scheme, and the network request's start, response headers and
+#       finish. load's lambdas share one capture struct (ResourceLoaderLoad), made in managed
+#       memory, holding the copy of the LoadRequest the C++ lambdas capture and the three
+#       callbacks (GC::Root in C++: the struct's scan keeps them).
+#
+#       Copyright (c) 2018-2024, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2022, Dex♪ <dexes.ttp@gmail.com>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: load ====================================================================================
+
+## The captures of ResourceLoader::load's lambdas: `this`, the request (by value), the callbacks, and for a network
+## load the protocol request and its id.
+struct ResourceLoaderLoad:
+    var this: ResourceLoader*
+    var request: LoadRequest
+    var on_headers_received: gc.Function3[const HttpHeaderList*, u32?, const (ak.String?)*, unit]*
+    var on_data_received: gc.Function1[const u8[], unit]*
+    var on_complete: gc.Function3[bool, const RequestsRequestTimingInfo*, ak.StringView?, unit]*
+    var protocol_request: RequestsRequest*?
+    var request_id: u64
+
+    ## `on_headers_received->function()(response_headers, status_code, reason_phrase)`.
+    func headers_received(response_headers: const HttpHeaderList*, status_code: u32?, reason_phrase: ak.String?):
+        let phrase = reason_phrase
+        ak.function3_call(&self.on_headers_received.function, response_headers, status_code, &phrase)
+
+    ## `on_complete->function()(success, timing_info, error_message)`.
+    func complete(success: bool, timing_info: RequestsRequestTimingInfo, error_message: ak.StringView?):
+        ak.function3_call(&self.on_complete.function, success, &timing_info, error_message)
+
+    ## The about: callback: the page's bytes.
+    static func about_loaded(context: void*?, data: const u8[], timing_info: const RequestsRequestTimingInfo*, response_headers: const HttpHeaderList*):
+        let captures = (ResourceLoaderLoad*)(context else trap("load: no captures"))
+        log_success(&captures.request)
+        captures.headers_received(response_headers, none, none)
+        ak.function1_call(&captures.on_data_received.function, data)
+        captures.complete(true, *timing_info, none)
+
+    ## The resource: on_resource callback.
+    static func resource_loaded(context: void*?, load_result: const ResourceLoaderFileLoadResult*):
+        let captures = (ResourceLoaderLoad*)(context else trap("load: no captures"))
+        captures.headers_received(load_result.response_headers, none, none)
+        ak.function1_call(&captures.on_data_received.function, load_result.data)
+        captures.complete(true, load_result.timing_info, none)
+
+    ## The resource: on_error callback.
+    static func resource_failed(context: void*?, message: ak.ByteString):
+        let captures = (ResourceLoaderLoad*)(context else trap("load: no captures"))
+        let fixme_implement_timing_info = RequestsRequestTimingInfo()
+        captures.complete(false, fixme_implement_timing_info, ak.byte_string_view(&message))
+
+    ## The file: on_file callback.
+    static func file_loaded(context: void*?, load_result: const ResourceLoaderFileLoadResult*):
+        let captures = (ResourceLoaderLoad*)(context else trap("load: no captures"))
+        log_success(&captures.request)
+        captures.headers_received(load_result.response_headers, none, none)
+        ak.function1_call(&captures.on_data_received.function, load_result.data)
+        captures.complete(true, load_result.timing_info, none)
+
+    ## The file: on_error callback.
+    static func file_failed(context: void*?, message: ak.ByteString):
+        let captures = (ResourceLoaderLoad*)(context else trap("load: no captures"))
+        log_failure(&captures.request, ak.byte_string_view(&message))
+        captures.complete(false, RequestsRequestTimingInfo(), ak.byte_string_view(&message))
+
+    ## protocol_headers_received.
+    static func protocol_headers_received(context: void*?, response_headers: HttpHeaderList*, status_code: u32?, reason_phrase: ak.String?):
+        let captures = (ResourceLoaderLoad*)(context else trap("load: no captures"))
+        resource_loader_handle_network_response_headers(captures.this, &captures.request, response_headers)
+
+        if let page = load_request_page(&captures.request):
+            page_client_page_did_receive_network_response_headers(page_client(page), captures.request_id, status_code else 0, reason_phrase,
+                                                                  *http_header_list_headers(response_headers))
+
+        captures.headers_received(response_headers, status_code, reason_phrase)
+
+    ## protocol_data_received.
+    static func protocol_data_received(context: void*?, data: const u8[]):
+        let captures = (ResourceLoaderLoad*)(context else trap("load: no captures"))
+        if let page = load_request_page(&captures.request):
+            page_client_page_did_receive_network_response_body(page_client(page), captures.request_id, data)
+        ak.function1_call(&captures.on_data_received.function, data)
+
+    ## protocol_complete.
+    static func protocol_complete(context: void*?, total_size: u64, timing_info: RequestsRequestTimingInfo, network_error: RequestsNetworkError?):
+        let captures = (ResourceLoaderLoad*)(context else trap("load: no captures"))
+        let protocol_request = captures.protocol_request else trap("VERIFY: a network load's request")
+        resource_loader_finish_network_request(captures.this, protocol_request)
+
+        if let page = load_request_page(&captures.request):
+            page_client_page_did_finish_network_request(page_client(page), requests_request_id(protocol_request), total_size, timing_info, network_error)
+
+        if let failure = network_error:
+            var error_description = ak.string_builder_new()
+            ak.string_builder_append(&error_description, "Request finished with error: ")
+            ak.string_builder_append_string_view(&error_description, requests_network_error_to_string(failure))
+            log_failure(&captures.request, ak.string_builder_string_view(&error_description))
+            captures.complete(false, timing_info, ak.string_builder_string_view(&error_description))
+        else:
+            log_success(&captures.request)
+            captures.complete(true, timing_info, none)
+
+## `ByteString::formatted("Protocol not implemented: {}", url.scheme())`.
+func resource_loader_not_implemented_error(url: const web_url.Url*) -> ak.ByteString:
+    let scheme = web_url.url_scheme(url)
+    var builder = ak.string_builder_new()
+    ak.string_builder_append(&builder, "Protocol not implemented: ")
+    ak.string_builder_append_string_view(&builder, ak.string_bytes_as_string_view(&scheme))
+    return ak.string_builder_to_byte_string(&builder)
+
+## Ported from Libraries/LibWeb/Loader/ResourceLoader.cpp:354 Web::ResourceLoader::load.
+pub func resource_loader_load(this: ResourceLoader*, request: LoadRequest*, on_headers_received: gc.Function3[const HttpHeaderList*, u32?, const (ak.String?)*, unit]*?,
+                              on_data_received: gc.Function1[const u8[], unit]*?, on_complete: gc.Function3[bool, const RequestsRequestTimingInfo*, ak.StringView?, unit]*?) -> RequestsRequest*?:
+    let url = load_request_url(request) else trap("VERIFY: a load request's URL")
+
+    log_request_start(request)
+    load_request_start_timer(request)
+
+    let captures = new ResourceLoaderLoad(this = this, request = *request, on_headers_received = on_headers_received else trap("VERIFY: on_headers_received"),
+                                          on_data_received = on_data_received else trap("VERIFY: on_data_received"),
+                                          on_complete = on_complete else trap("VERIFY: on_complete"), protocol_request = none, request_id = 0) else trap("out of memory")
+
+    if should_block_request(request):
+        captures.complete(false, RequestsRequestTimingInfo(), ak.sv("Request was blocked"))
+        return none
+
+    let scheme = web_url.url_scheme(&url)
+    if ak.string_eq_string_view(&scheme, ak.sv("about")):
+        resource_loader_handle_about_load_request(this, request, ak.Function3[const u8[], const RequestsRequestTimingInfo*, const HttpHeaderList*, unit](call = ResourceLoaderLoad.about_loaded, context = captures))
+        return none
+
+    if ak.string_eq_string_view(&scheme, ak.sv("resource")):
+        resource_loader_handle_resource_load_request(this, request, ak.Function1[const ResourceLoaderFileLoadResult*, unit](call = ResourceLoaderLoad.resource_loaded, context = captures),
+                                                     ak.Function1[ak.ByteString, unit](call = ResourceLoaderLoad.resource_failed, context = captures))
+        return none
+
+    if ak.string_eq_string_view(&scheme, ak.sv("file")):
+        resource_loader_handle_file_load_request(this, request, ak.Function1[const ResourceLoaderFileLoadResult*, unit](call = ResourceLoaderLoad.file_loaded, context = captures),
+                                                 ak.Function1[ak.ByteString, unit](call = ResourceLoaderLoad.file_failed, context = captures))
+
+        return none
+
+    if not ak.string_eq_string_view(&scheme, ak.sv("http")) and not ak.string_eq_string_view(&scheme, ak.sv("https")):
+        let not_implemented_error = resource_loader_not_implemented_error(&url)
+        log_failure(request, ak.byte_string_view(&not_implemented_error))
+        captures.complete(false, RequestsRequestTimingInfo(), ak.byte_string_view(&not_implemented_error))
+        return none
+
+    let maybe_protocol_request = resource_loader_start_network_request(this, request)
+    if maybe_protocol_request == none:
+        captures.complete(false, RequestsRequestTimingInfo(), ak.sv("Failed to start network request"))
+        return none
+    let protocol_request = maybe_protocol_request else trap("VERIFY_NOT_REACHED")
+
+    captures.protocol_request = protocol_request
+    captures.request_id = requests_request_id(protocol_request)
+
+    requests_request_set_unbuffered_request_callbacks(protocol_request, ak.Function3[HttpHeaderList*, u32?, ak.String?, unit](call = ResourceLoaderLoad.protocol_headers_received, context = captures),
+                                                      ak.Function1[const u8[], unit](call = ResourceLoaderLoad.protocol_data_received, context = captures),
+                                                      ak.Function3[u64, RequestsRequestTimingInfo, RequestsNetworkError?, unit](call = ResourceLoaderLoad.protocol_complete, context = captures))
+    return protocol_request
+
+# mark: Network requests ========================================================================
+
+## The lambda of on_certificate_requested: no certificate.
+func resource_loader_no_certificate(context: void*?) -> RequestsRequestCertificateAndKey:
+    return RequestsRequestCertificateAndKey(certificate = ak.byte_string_empty(), key = ak.byte_string_empty())
+
+## Ported from Libraries/LibWeb/Loader/ResourceLoader.cpp:460 Web::ResourceLoader::start_network_request.
+func resource_loader_start_network_request(this: ResourceLoader*, request: const LoadRequest*) -> RequestsRequest*?:
+    let url = load_request_url(request) else trap("VERIFY: a load request's URL")
+    let proxy = proxy_mappings_proxy_for_url(proxy_mappings_the(), url)
+
+    # FIXME: We could put this request in a queue until the client connection is re-established.
+    if this.m_request_client == none:
+        log_failure(request, ak.sv("RequestServer is currently unavailable"))
+        return none
+    let request_client = this.m_request_client else trap("VERIFY_NOT_REACHED")
+
+    let maybe_protocol_request = requests_request_client_start_request(request_client, load_request_method(request), url, load_request_headers(request),
+                                                                       ak.byte_buffer_bytes_const(load_request_body(request)), load_request_cache_mode(request),
+                                                                       load_request_include_credentials(request), proxy)
+    if maybe_protocol_request == none:
+        log_failure(request, ak.sv("Failed to initiate load"))
+        return none
+    let protocol_request = maybe_protocol_request else trap("VERIFY_NOT_REACHED")
+
+    protocol_request.on_certificate_requested = ak.Function0[RequestsRequestCertificateAndKey](call = resource_loader_no_certificate, context = none)
+
+    if let page = load_request_page(request):
+        var initiator_type_string: ak.String? = none
+        if let initiator_type = load_request_initiator_type(request):
+            let initiator = fetch_initiator_type_to_string(initiator_type)
+            initiator_type_string = ak.fly_string_to_string_const(&initiator)
+        page_client_page_did_start_network_request(page_client(page), requests_request_id(protocol_request), url, load_request_method(request),
+                                                   *http_header_list_headers(load_request_headers(request)), ak.byte_buffer_bytes_const(load_request_body(request)), initiator_type_string)
+
+    this.m_pending_loads += 1
+    if ak.function0_is_set(&this.on_load_counter_change):
+        ak.function0_call(&this.on_load_counter_change)
+
+    # m_active_requests.set(*protocol_request): the table lives in the C heap; the root keeps the request.
+    let root = gc.root_create(protocol_request)
+    with memory.heap:
+        discard(ak.hash_map_set(&this.m_active_requests, requests_request_id(protocol_request), root))
+    return protocol_request
+
+## Ported from Libraries/LibWeb/Loader/ResourceLoader.cpp:495 Web::ResourceLoader::handle_network_response_headers.
+func resource_loader_handle_network_response_headers(this: ResourceLoader*, request: const LoadRequest*, response_headers: const HttpHeaderList*):
+    let page = load_request_page(request) else return
+
+    if load_request_include_credentials(request) == HttpIncludeCredentials.yes:
+        # From https://fetch.spec.whatwg.org/#concept-http-network-fetch:
+        # 15. If includeCredentials is true, then the user agent should parse and store response
+        #     `Set-Cookie` headers given request and response.
+        for header in ak.vector_span_const(http_header_list_headers(response_headers)):
+            let name = ak.byte_string_view(&header.name)
+            if ak.string_view_equals_ignoring_ascii_case(&name, ak.sv("Set-Cookie")):
+                store_response_cookies(page, load_request_url(request) else trap("VERIFY: a load request's URL"), ak.byte_string_view(&header.value))
+
+## The captures of finish_network_request's deferred lambda: `[this, protocol_request]`.
+struct ResourceLoaderFinishNetworkRequest:
+    var this: ResourceLoader*
+    var protocol_request: RequestsRequest*
+
+    ## The deferred invocation: the request is no longer active.
+    static func call(context: void*?):
+        let captures = (ResourceLoaderFinishNetworkRequest*)(context else trap("finish_network_request: no captures"))
+        let this = captures.this
+        var removed: gc.Root[RequestsRequest]? = none
+        with memory.heap:
+            removed = ak.hash_map_take_k(&this.m_active_requests, requests_request_id(captures.protocol_request))
+        var root = removed else trap("VERIFY: did_remove")
+        gc.root_release(&root)
+
+## Ported from Libraries/LibWeb/Loader/ResourceLoader.cpp:512 Web::ResourceLoader::finish_network_request.
+func resource_loader_finish_network_request(this: ResourceLoader*, protocol_request: RequestsRequest*):
+    this.m_pending_loads -= 1
+    if ak.function0_is_set(&this.on_load_counter_change):
+        ak.function0_call(&this.on_load_counter_change)
+
+    let captures = new ResourceLoaderFinishNetworkRequest(this = this, protocol_request = protocol_request) else trap("out of memory")
+    core_deferred_invoke(ak.Function0[unit](call = ResourceLoaderFinishNetworkRequest.call, context = captures))

@@ -1,0 +1,404 @@
+#==============================================================================================
+#
+#   tests_loader_3 - http: through the in-process RequestClient and ResourceLoader on a
+#   loopback server, images through the luce-png/luce-jpeg plugin, BitmapDecodedImageData,
+#   NavigationObserver and preloaded resources
+#
+#   DESCRIPTION:
+#       The http: tests start a server on 127.0.0.1 (luce-std net, its own thread, the C heap)
+#       that answers each connection with a canned HTTP/1.x response chosen by the request's
+#       path: Content-Length, chunked and until-close bodies, gzip and deflate, a 1xx head
+#       before the final one, a redirect, an echo of a POST body and a truncated body. The
+#       image tests decode PNG and JPEG fixtures (tests/libweb) and a small RGBA PNG with
+#       partial alpha (its premultiplied pixels computed as Skia rounds) through the plugin.
+#
+#==============================================================================================
+
+import thread
+
+# mark: A loopback HTTP server ==================================================================
+
+## The server's state, in the C heap: its listener, how many connections it serves, and the head and body of
+## the last request it received.
+struct LoaderTestServer:
+    var listener: net.Listener
+    var port: u16
+    var connections: usize
+    var last_request: u8[4096]
+    var last_request_length: usize
+
+## The canned response to a request for `target`.
+func loader_test_server_response(target: str) -> const u8[]:
+    if target == "/fixed":
+        return b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\nX-Test: yes\r\n\r\nhello"
+    if target == "/chunked?x=1":
+        return b"HTTP/1.1 200 Fine\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"
+    if target == "/gzip":
+        return b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 41\r\n\r\n\x1F\x8B\x08\x00\x00\x00\x00\x00\x02\xFF\xCB\x48\xCD\xC9\xC9\x57\x48\xAF\xCA\x2C\x50\x28\xCF\x2F\xCA\x49\xD1\x51\xC8\x40\x13\x01\x00\xA0\x7D\xCC\x30\x22\x00\x00\x00"
+    if target == "/deflate":
+        return b"HTTP/1.1 200 OK\r\nContent-Encoding: deflate\r\nContent-Length: 27\r\n\r\n\x78\x9C\xCB\x48\xCD\xC9\xC9\x57\x48\x49\x4D\xCB\x49\x2C\x49\x55\x28\xCF\x2F\xCA\x49\x01\x00\x48\xA9\x07\x52"
+    if target == "/eof":
+        return b"HTTP/1.0 200 OK\r\nContent-Type: text/html\r\n\r\nuntil close"
+    if target == "/continue":
+        return b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 404 Not Found\r\nContent-Length: 2\r\n\r\nno"
+    if target == "/redirect":
+        return b"HTTP/1.1 302 Found\r\nLocation: /fixed\r\nContent-Length: 0\r\n\r\n"
+    if target == "/truncated":
+        return b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc"
+    return b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n"
+
+## The value of the Content-Length line of a request head, or zero.
+func loader_test_server_content_length(head: const u8[]) -> usize:
+    let name = "content-length:"
+    var index: usize = 0
+    while index + name.length < head.length:
+        var matches = true
+        for offset in 0..<name.length:
+            var byte = head[index + offset]
+            if byte >= 'A' and byte <= 'Z':
+                byte += 32
+            if byte != name.bytes[offset]:
+                matches = false
+                break
+        if matches:
+            var value: usize = 0
+            var at = index + name.length
+            while at < head.length and head[at] == ' ':
+                at += 1
+            while at < head.length and head[at] >= '0' and head[at] <= '9':
+                value = value * 10 + (usize)(head[at] - '0')
+                at += 1
+            return value
+        index += 1
+    return 0
+
+## The server thread: serves its connections one after another.
+func loader_test_server_main(context: void*?):
+    let server = (LoaderTestServer*)(context else trap("no server"))
+    for _ in 0..<server.connections:
+        var connection = server.listener.accept() catch:
+            return
+        var used: usize = 0
+        var head_end: usize? = none
+        while head_end == none and used < server.last_request.length:
+            let count = connection.read(server.last_request[used..]) catch:
+                break
+            if count == 0:
+                break
+            used += count
+            head_end = net.http_head_end(server.last_request[..<used])
+        if let end = head_end:
+            let body_length = loader_test_server_content_length(server.last_request[..<end])
+            while used < end + body_length and used < server.last_request.length:
+                let count = connection.read(server.last_request[used..]) catch:
+                    break
+                if count == 0:
+                    break
+                used += count
+            server.last_request_length = used
+            # The target: between the first two spaces of the request line.
+            var first: usize = 0
+            while first < end and server.last_request[first] != ' ':
+                first += 1
+            var second = first + 1
+            while second < end and server.last_request[second] != ' ':
+                second += 1
+            let target = (str)server.last_request[first + 1..<second]
+            if target == "/echo":
+                var head: u8[64] = ---
+                let prefix = "HTTP/1.1 200 OK\r\nContent-Length: "
+                memory.copy(head, prefix.bytes, prefix.length)
+                var length = prefix.length
+                let body = server.last_request[end..<used]
+                head[length] = '0' + (u8)(body.length // 10)
+                head[length + 1] = '0' + (u8)(body.length % 10)
+                head[length + 2] = '\r'
+                head[length + 3] = '\n'
+                head[length + 4] = '\r'
+                head[length + 5] = '\n'
+                length += 6
+                discard(connection.write(head[..<length]) catch: recover 0)
+                discard(connection.write(body) catch: recover 0)
+            else:
+                let response = loader_test_server_response(target)
+                discard(connection.write(response) catch: recover 0)
+        connection.shutdown() catch:
+            discard(0)
+        connection.destroy()
+
+## A server on 127.0.0.1 that serves `connections` connections, running on its own thread.
+func loader_test_server_start(connections: usize) -> (LoaderTestServer*, thread.Handle):
+    with memory.heap:
+        let listener = net.Listener.bind(net.SocketAddress.loopback(0)) else trap("the server's listener")
+        let address = listener.address() else trap("the server's address")
+        let server = new LoaderTestServer(listener = listener, port = address.port, connections = connections) else trap("out of memory")
+        let handle = thread.spawn(loader_test_server_main, server, name = "p2d-http-server") else trap("the server's thread")
+        return (server, handle)
+
+## The end of a server: its thread joined, its listener closed.
+func loader_test_server_stop(server: LoaderTestServer*, handle: thread.Handle):
+    var joined = handle
+    joined.join() else trap("the server's thread joins")
+    server.listener.destroy()
+    free(server) in memory.heap
+
+## `http://127.0.0.1:<port><path>`.
+func loader_test_server_url(server: const LoaderTestServer*, path: str) -> ak.ByteString:
+    var builder = ak.string_builder_new()
+    ak.string_builder_append(&builder, "http://127.0.0.1:")
+    loader_test_append_number(&builder, (i64)server.port)
+    ak.string_builder_append(&builder, path)
+    return ak.string_builder_to_byte_string(&builder)
+
+## The last request the server received, as text.
+func loader_test_server_last_request(server: const LoaderTestServer*) -> ak.StringView:
+    return ak.string_view_from_bytes(server.last_request[..<server.last_request_length])
+
+# mark: http: ===================================================================================
+
+test "the in-process RequestClient: http: requests on a loopback server: bodies, encodings, 1xx, redirects, POST, errors":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    var event_loop = LoaderTestEventLoop()
+    loader_test_install_event_loop(&event_loop)
+    defer loader_test_remove_event_loop()
+    let client = in_process_request_client_create(vm_heap(vm))
+    let (server, handle) = loader_test_server_start(9)
+
+    # A Content-Length body; the request's head as sent.
+    let fixed_url = loader_test_server_url(server, "/fixed")
+    let request_headers = http_header_list_create()
+    http_header_list_append(request_headers, http_header_create(ak.sv("Accept"), ak.sv("text/plain")))
+    let (fixed, _) = loader_test_start(client, ak.string_view_text(ak.byte_string_view(&fixed_url)), "GET", request_headers)
+    loader_test_drain(&event_loop)
+    assert(fixed.finishes == 1 and fixed.network_error == none and fixed.status_code == 200)
+    let fixed_reason = fixed.reason_phrase else trap("a reason phrase")
+    assert(ak.string_eq_string_view(&fixed_reason, ak.sv("OK")))
+    assert(fixed.received("hello") and fixed.total_size == 5)
+    let x_test = fixed.header("X-Test") else trap("the X-Test header")
+    assert(loader_test_byte_string_is(x_test, "yes"))
+    let sent = loader_test_server_last_request(server)
+    var expected_head = ak.string_builder_new()
+    ak.string_builder_append(&expected_head, "GET /fixed HTTP/1.1\r\nHost: 127.0.0.1:")
+    loader_test_append_number(&expected_head, (i64)server.port)
+    ak.string_builder_append(&expected_head, "\r\nAccept: text/plain\r\nAccept-Encoding: gzip, deflate\r\nConnection: close\r\n\r\n")
+    assert(ak.string_view_eq_string_view(&sent, ak.string_builder_string_view(&expected_head)))
+
+    # A chunked body (and the query in the request target), a body until the connection closes.
+    let chunked_url = loader_test_server_url(server, "/chunked?x=1")
+    let (chunked, _) = loader_test_start(client, ak.string_view_text(ak.byte_string_view(&chunked_url)))
+    let eof_url = loader_test_server_url(server, "/eof")
+    let (until_close, _) = loader_test_start(client, ak.string_view_text(ak.byte_string_view(&eof_url)))
+    loader_test_drain(&event_loop)
+    assert(chunked.finishes == 1 and chunked.network_error == none and chunked.received("hello world"))
+    let chunked_reason = chunked.reason_phrase else trap("a reason phrase")
+    assert(ak.string_eq_string_view(&chunked_reason, ak.sv("Fine")))
+    assert(until_close.finishes == 1 and until_close.network_error == none and until_close.received("until close"))
+
+    # gzip and deflate bodies, decoded.
+    let gzip_url = loader_test_server_url(server, "/gzip")
+    let (gzip, _) = loader_test_start(client, ak.string_view_text(ak.byte_string_view(&gzip_url)))
+    let deflate_url = loader_test_server_url(server, "/deflate")
+    let (deflate, _) = loader_test_start(client, ak.string_view_text(ak.byte_string_view(&deflate_url)))
+    loader_test_drain(&event_loop)
+    assert(gzip.finishes == 1 and gzip.network_error == none and gzip.received("hello gzip world, hello gzip world") and gzip.total_size == 41)
+    assert(deflate.finishes == 1 and deflate.network_error == none and deflate.received("hello deflate world"))
+
+    # A 100 Continue head before the final one; a redirect is delivered as it is (Fetch follows it).
+    let continue_url = loader_test_server_url(server, "/continue")
+    let (after_continue, _) = loader_test_start(client, ak.string_view_text(ak.byte_string_view(&continue_url)))
+    let redirect_url = loader_test_server_url(server, "/redirect")
+    let (redirect, _) = loader_test_start(client, ak.string_view_text(ak.byte_string_view(&redirect_url)))
+    loader_test_drain(&event_loop)
+    assert(after_continue.status_code == 404 and after_continue.received("no") and after_continue.network_error == none)
+    assert(redirect.status_code == 302 and redirect.finishes == 1 and ak.byte_buffer_size(&redirect.data) == 0)
+    let location = redirect.header("Location") else trap("a Location header")
+    assert(loader_test_byte_string_is(location, "/fixed"))
+
+    # A POST: its body and Content-Length sent, echoed.
+    let echo_url = loader_test_server_url(server, "/echo")
+    let (echo, _) = loader_test_start(client, ak.string_view_text(ak.byte_string_view(&echo_url)), "POST", none, b"posted body")
+    loader_test_drain(&event_loop)
+    assert(echo.finishes == 1 and echo.received("posted body"))
+    let posted = loader_test_server_last_request(server)
+    assert(ak.string_view_find_string_view(&posted, ak.sv("POST /echo HTTP/1.1\r\n")) == 0)
+    assert(ak.string_view_find_string_view(&posted, ak.sv("\r\nContent-Length: 11\r\n")) != none)
+
+    # A body cut short: the bytes that came, then the error.
+    let truncated_url = loader_test_server_url(server, "/truncated")
+    let (truncated, _) = loader_test_start(client, ak.string_view_text(ak.byte_string_view(&truncated_url)))
+    loader_test_drain(&event_loop)
+    assert(truncated.finishes == 1 and truncated.network_error == RequestsNetworkError.incomplete_content and truncated.received("abc"))
+    loader_test_server_stop(server, handle)
+
+    # Nothing listens on the port any more: the connection is refused.
+    let (refused, _) = loader_test_start(client, ak.string_view_text(ak.byte_string_view(&fixed_url)))
+    loader_test_drain(&event_loop)
+    assert(refused.finishes == 1 and refused.network_error == RequestsNetworkError.unable_to_connect and refused.headers == none)
+
+test "ResourceLoader::load: http: through the RequestClient: the page's notifications, the active request until it completes":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    var event_loop = LoaderTestEventLoop()
+    loader_test_install_event_loop(&event_loop)
+    defer loader_test_remove_event_loop()
+    discard(loader_test_initialize_resource_loader(vm))
+    # The VM's heap is the current allocator, as the engine runs: the load's captures are managed, kept by what holds them.
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        let page = loader_test_create_page(vm)
+        let (server, handle) = loader_test_server_start(2)
+
+        let fixed_url = loader_test_server_url(server, "/fixed")
+        let (load, protocol_request) = loader_test_load(vm, ak.string_view_text(ak.byte_string_view(&fixed_url)), page)
+        let request = protocol_request else trap("a network load answers its request")
+        let loader = resource_loader_the()
+        assert(resource_loader_pending_loads(loader) == 1 and ak.hash_map_size(&loader.m_active_requests) == 1)
+        assert(loader_test_network_started == 1 and load.completions == 0)
+        # The request is rooted while it is active: a collection keeps it.
+        let weak = gc.make_weak[RequestsRequest](request)
+        gc.heap_collect_garbage(vm_heap(vm))
+        assert(gc.weak_ptr(&weak) == request)
+        loader_test_drain(&event_loop)
+        assert(load.completions == 1 and load.success and loader_test_received(load, "hello"))
+        assert(load.status_code == 200)
+        let reason = load.reason_phrase else trap("a reason phrase")
+        assert(ak.string_eq_string_view(&reason, ak.sv("OK")))
+        assert(loader_test_network_finished == 1)
+        assert(resource_loader_pending_loads(loader) == 0 and ak.hash_map_size(&loader.m_active_requests) == 0)
+
+        # An error after the headers: on_complete hears the network error's text.
+        let truncated_url = loader_test_server_url(server, "/truncated")
+        let (truncated, _) = loader_test_load(vm, ak.string_view_text(ak.byte_string_view(&truncated_url)), page)
+        loader_test_drain(&event_loop)
+        assert(loader_test_failed_with(truncated, "Request finished with error: Connection was closed before entire response was received"))
+        loader_test_server_stop(server, handle)
+
+# mark: Images ==================================================================================
+
+## A 3x1 RGBA PNG: (200, 100, 50, 128), (10, 20, 30, 255), (255, 255, 255, 0) (written by Pillow).
+let loader_test_rgba_png: u8[78] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
+                                    0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1B, 0xE0, 0x14, 0xB4, 0x00, 0x00, 0x00, 0x15, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x38, 0x91,
+                                    0x62, 0xD4, 0xC0, 0x25, 0x22, 0xF7, 0xFF, 0xFF, 0xFF, 0xFF, 0x0C, 0x00, 0x23, 0xAF, 0x06, 0x17, 0xF4, 0x45, 0xF0, 0x3C, 0x00, 0x00, 0x00,
+                                    0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82]
+
+## The pixel at (x, y) of a decoded image's bitmap (premultiplied BGRA8888, as a u32).
+func loader_test_pixel(bitmap: const gfx.Bitmap*, x: i32, y: i32) -> u32:
+    let row = gfx.bitmap_scanline_const(bitmap, y) else trap("a row")
+    return row[(usize)x]
+
+## Whether the channel of `pixel` at `shift` is within `tolerance` of `expected`.
+func loader_test_channel_near(pixel: u32, shift: u32, expected: u32, tolerance: u32) -> bool:
+    let value = (pixel >> shift) & 0xff
+    return (value - expected if value >= expected else expected - value) <= tolerance
+
+## The bytes of a fixture of tests/libweb.
+func loader_test_fixture(path: str) -> ak.ByteBuffer:
+    var full = ak.string_builder_new()
+    ak.string_builder_append(&full, "tests/libweb/")
+    ak.string_builder_append(&full, path)
+    return core_mapped_file_map(ak.string_builder_string_view(&full)) else trap("the fixture reads")
+
+test "the luce-png/luce-jpeg ImageCodecPlugin: PNG and JPEG decoded to premultiplied BGRA8888 bitmaps":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+
+    # Partial alpha, premultiplied with Skia's rounding.
+    let rgba = luce_image_codec_plugin_decode(loader_test_rgba_png) else trap("the PNG decodes")
+    assert(rgba.frame_count == 1 and not rgba.is_animated and rgba.session_id == 0 and ak.vector_size(&rgba.frames) == 1)
+    let rgba_bitmap = ak.vector_at_const(&rgba.frames, 0).bitmap else trap("a bitmap")
+    assert(gfx.bitmap_width(rgba_bitmap) == 3 and gfx.bitmap_height(rgba_bitmap) == 1)
+    assert(gfx.bitmap_format(rgba_bitmap) == gfx.BitmapFormat.bgra8888 and gfx.bitmap_alpha_type(rgba_bitmap) == gfx.AlphaType.premultiplied)
+    assert(loader_test_pixel(rgba_bitmap, 0, 0) == 0x80643219)
+    assert(loader_test_pixel(rgba_bitmap, 1, 0) == 0xff0a141e)
+    assert(loader_test_pixel(rgba_bitmap, 2, 0) == 0)
+
+    # A palette PNG with tRNS (smiley.png), as Pillow decodes it.
+    let smiley_bytes = loader_test_fixture("Ref/data/smiley.png")
+    let smiley = luce_image_codec_plugin_decode(ak.byte_buffer_bytes_const(&smiley_bytes)) else trap("smiley.png decodes")
+    let smiley_bitmap = ak.vector_at_const(&smiley.frames, 0).bitmap else trap("a bitmap")
+    assert(gfx.bitmap_width(smiley_bitmap) == 50 and gfx.bitmap_height(smiley_bitmap) == 50)
+    assert(loader_test_pixel(smiley_bitmap, 0, 0) == 0xffffa300)
+    assert(loader_test_pixel(smiley_bitmap, 2, 2) == 0xfefe0000)
+    assert(loader_test_pixel(smiley_bitmap, 3, 2) == 0xf0f00000)
+    assert(loader_test_pixel(smiley_bitmap, 25, 25) == 0)
+
+    # A baseline JPEG, within 4 of libjpeg's (Pillow's) samples, opaque.
+    let jpeg_bytes = loader_test_fixture("Text/input/wpt-import/html/canvas/element/manual/imagebitmap/resources/squares_1.jpg")
+    let squares = luce_image_codec_plugin_decode(ak.byte_buffer_bytes_const(&jpeg_bytes)) else trap("squares_1.jpg decodes")
+    let squares_bitmap = ak.vector_at_const(&squares.frames, 0).bitmap else trap("a bitmap")
+    assert(gfx.bitmap_width(squares_bitmap) == 160 and gfx.bitmap_height(squares_bitmap) == 320)
+    let center = loader_test_pixel(squares_bitmap, 80, 160)
+    assert(center >> 24 == 255 and loader_test_channel_near(center, 16, 129, 4) and loader_test_channel_near(center, 8, 255, 4) and loader_test_channel_near(center, 0, 129, 4))
+    let corner = loader_test_pixel(squares_bitmap, 159, 319)
+    assert(loader_test_channel_near(corner, 16, 254, 4) and loader_test_channel_near(corner, 8, 128, 4) and loader_test_channel_near(corner, 0, 129, 4))
+    assert(loader_test_pixel(squares_bitmap, 5, 5) == 0xff000000)
+
+    # What is neither fails.
+    let unsupported: PlatformDecodedImage? = luce_image_codec_plugin_decode(b"GIF89a\x01\x00\x01\x00") catch failure:
+        assert(failure.code == luce_image_codec_unsupported)
+        recover none
+    assert(unsupported == none)
+    let broken: PlatformDecodedImage? = luce_image_codec_plugin_decode(loader_test_rgba_png[..<40]) catch:
+        recover none
+    assert(broken == none)
+
+## What decode_image's handlers heard.
+struct LoaderTestDecodeLog:
+    var resolved: i32
+    var rejected: i32
+    var width: i32
+
+    static func on_resolved(context: void*?, image: PlatformDecodedImage*):
+        let log = (LoaderTestDecodeLog*)(context else trap("no log"))
+        log.resolved += 1
+        log.width = gfx.bitmap_width(ak.vector_at(&image.frames, 0).bitmap else trap("a bitmap"))
+
+    static func on_rejected(context: void*?, error_: ak.AkError*):
+        let log = (LoaderTestDecodeLog*)(context else trap("no log"))
+        log.rejected += 1
+
+test "the luce-png/luce-jpeg ImageCodecPlugin: decode_image settles its promise on the next turn of the event loop":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    var event_loop = LoaderTestEventLoop()
+    loader_test_install_event_loop(&event_loop)
+    defer loader_test_remove_event_loop()
+    platform_s_the = none
+    luce_image_codec_plugin_install()
+    defer platform_s_the = none
+    let log = new LoaderTestDecodeLog() else trap("out of memory")
+    let plugin = platform_image_codec_plugin_the()
+    let handlers_resolved = ak.Function1[PlatformDecodedImage*, unit](call = LoaderTestDecodeLog.on_resolved, context = log)
+    let handlers_rejected = ak.Function1[ak.AkError*, unit](call = LoaderTestDecodeLog.on_rejected, context = log)
+    let good = platform_image_codec_plugin_decode_image(plugin, loader_test_rgba_png, handlers_resolved, handlers_rejected)
+    let bad = platform_image_codec_plugin_decode_image(plugin, b"not an image", handlers_resolved, handlers_rejected)
+    assert(log.resolved == 0 and log.rejected == 0 and not core_promise_is_resolved(good))
+    loader_test_drain(&event_loop)
+    assert(log.resolved == 1 and log.width == 3 and log.rejected == 1)
+    assert(core_promise_is_resolved(good) and core_promise_is_rejected(bad))
+    # The plugin decodes no animations.
+    platform_image_codec_plugin_request_animation_frames(plugin, 1, 0, 4)
+    platform_image_codec_plugin_stop_animation_decode(plugin, 1)
+
+test "BitmapDecodedImageData: its frames, durations, intrinsic size and frame rects":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let realm = web_test_create_realm(vm)
+    let decoded = luce_image_codec_plugin_decode(loader_test_rgba_png) else trap("the PNG decodes")
+    let bitmap = ak.vector_at_const(&decoded.frames, 0).bitmap else trap("a bitmap")
+    var frames: ak.Vector[HtmlBitmapDecodedImageDataFrame]
+    ak.vector_append_t(&frames, HtmlBitmapDecodedImageDataFrame(bitmap = gfx.immutable_bitmap_create_color_space(bitmap, decoded.color_space), duration = 40))
+    ak.vector_append_t(&frames, HtmlBitmapDecodedImageDataFrame(bitmap = gfx.immutable_bitmap_create_color_space(bitmap, decoded.color_space), duration = 60))
+    let data = html_bitmap_decoded_image_data_create(realm, frames, 3, true) else trap("create")
+    assert(is_html_bitmap_decoded_image_data(data))
+    assert(html_decoded_image_data_frame_count(data) == 2 and html_decoded_image_data_loop_count(data) == 3 and html_decoded_image_data_is_animated(data))
+    assert(html_decoded_image_data_frame_duration(data, 1) == 60 and html_decoded_image_data_frame_duration(data, 2) == 0)
+    assert(html_decoded_image_data_bitmap(data, 0, gfx.IntSize()) != none and html_decoded_image_data_bitmap(data, 2, gfx.IntSize()) == none)
+    let width = html_decoded_image_data_intrinsic_width(data) else trap("an intrinsic width")
+    let height = html_decoded_image_data_intrinsic_height(data) else trap("an intrinsic height")
+    assert(width.m_value == gfx.CssPixels.from_int(3).m_value and height.m_value == gfx.CssPixels.from_int(1).m_value)
+    let ratio = html_decoded_image_data_intrinsic_aspect_ratio(data) else trap("an aspect ratio")
+    assert(ratio.m_numerator.m_value == gfx.CssPixels.from_int(3).m_value and ratio.m_denominator.m_value == gfx.CssPixels.from_int(1).m_value)
+    let rect = html_decoded_image_data_frame_rect(data, 0) else trap("a frame rect")
+    assert(rect.m_size.m_width == 3 and rect.m_size.m_height == 1)

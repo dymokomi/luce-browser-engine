@@ -1,0 +1,202 @@
+#==============================================================================================
+#
+#   content_filter - ContentFilter: the URLs a user's block list filters, matched by an
+#   Aho-Corasick automaton (AsciiStringMatcher)
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibWeb/Loader/ContentFilter.cpp (lines 16-181) with the inline
+#       functions of ContentFilter.h (lines 44-45). ContentFilter::the()'s static instance and
+#       its matcher live in the C heap for the process (DESIGN.md §3.3 rule 7): set_patterns
+#       builds the matcher there, whatever allocator is current.
+#
+#       Copyright (c) 2021, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2025, Tim Ledbetter <tim.ledbetter@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: ContentFilter ===========================================================================
+
+## `static ContentFilter filter;` of ContentFilter::the().
+var content_filter_s_filter: ContentFilter*?
+
+## Ported from Libraries/LibWeb/Loader/ContentFilter.cpp:16 Web::ContentFilter::the.
+pub func content_filter_the() -> ContentFilter*:
+    if let filter = content_filter_s_filter:
+        return filter
+    with memory.heap:
+        let filter = new ContentFilter else trap("out of memory")
+        content_filter_construct(filter)
+        content_filter_s_filter = filter
+        return filter
+
+## Ported from Libraries/LibWeb/Loader/ContentFilter.cpp:22 Web::ContentFilter::ContentFilter.
+func content_filter_construct(this: ContentFilter*):
+    content_filter_init_fields(this)
+
+## Ported from Libraries/LibWeb/Loader/ContentFilter.cpp:26 Web::ContentFilter::is_filtered.
+pub func content_filter_is_filtered(this: const ContentFilter*, url: web_url.Url) -> bool:
+    if not content_filter_filtering_enabled(this):
+        return false
+
+    let scheme = web_url.url_scheme(&url)
+    if ak.string_eq_string_view(&scheme, ak.sv("data")):
+        return false
+    let text = web_url.url_to_string(&url)
+    return content_filter_contains(this, ak.string_bytes_as_string_view(&text))
+
+## Ported from Libraries/LibWeb/Loader/ContentFilter.cpp:36 Web::ContentFilter::contains.
+func content_filter_contains(this: const ContentFilter*, text: ak.StringView) -> bool:
+    let matcher = this.m_matcher else return false
+    return ascii_string_matcher_contains(matcher, text)
+
+## Ported from Libraries/LibWeb/Loader/ContentFilter.cpp:43 Web::ContentFilter::set_patterns.
+pub func content_filter_set_patterns(this: ContentFilter*, patterns: const ak.String[]) -> !:
+    # m_matcher = make<AsciiStringMatcher>(patterns), in the C heap with the filter.
+    let saved_atomic_allocator = ak.atomic_allocator
+    ak.atomic_allocator = none
+    defer ak.atomic_allocator = saved_atomic_allocator
+    with memory.heap:
+        let matcher = new AsciiStringMatcher else trap("out of memory")
+        ascii_string_matcher_construct(matcher, patterns)
+        this.m_matcher = matcher
+
+## Ported from Libraries/LibWeb/Loader/ContentFilter.h:44 Web::ContentFilter::filtering_enabled.
+pub func content_filter_filtering_enabled(this: const ContentFilter*) -> bool:
+    return this.m_filtering_enabled
+
+## Ported from Libraries/LibWeb/Loader/ContentFilter.h:45 Web::ContentFilter::set_filtering_enabled.
+pub func content_filter_set_filtering_enabled(this: ContentFilter*, enabled: bool):
+    this.m_filtering_enabled = enabled
+
+# mark: AsciiStringMatcher ======================================================================
+
+## AsciiStringMatcher::AsciiStringMatcher's BuildTimeNode: a node of the trie being built.
+struct AsciiStringMatcherBuildTimeNode:
+    var children: ak.Vector[AsciiStringMatcherTransition]
+    var is_output: bool
+
+## `children.find_if([ch](Transition const& t) { return t.character == ch; })`: the index of the
+## transition on `ch`, if any.
+func ascii_string_matcher_find_child(children: const ak.Vector[AsciiStringMatcherTransition]*, ch: u8) -> usize?:
+    let transitions = ak.vector_span_const(children)
+    for index in 0..<transitions.length:
+        if transitions[index].character == ch:
+            return index
+    return none
+
+## The comparator of AsciiStringMatcher's quick_sort: by character.
+func ascii_string_matcher_transition_less_than(context: void*?, a: const AsciiStringMatcherTransition*, b: const AsciiStringMatcherTransition*) -> bool:
+    return a.character < b.character
+
+## Ported from Libraries/LibWeb/Loader/ContentFilter.cpp:49 Web::AsciiStringMatcher::AsciiStringMatcher.
+pub func ascii_string_matcher_construct(this: AsciiStringMatcher*, patterns: const ak.String[]):
+    var build_time_nodes: ak.Vector[AsciiStringMatcherBuildTimeNode]
+    ak.vector_append_t(&build_time_nodes, AsciiStringMatcherBuildTimeNode())
+
+    for i: u32 in 0..<u32(patterns.length):
+        let pattern = &patterns[(usize)i]
+        var node: u32 = 0
+        let pattern_view = ak.string_bytes_as_string_view(pattern)
+        for ch in ak.string_view_bytes(&pattern_view):
+            assert(ch < 0x80)
+            let children = &ak.vector_at(&build_time_nodes, (usize)node).children
+            if let it = ascii_string_matcher_find_child(children, ch):
+                node = ak.vector_at(children, it).next_state
+            else:
+                let new_node = u32(ak.vector_size(&build_time_nodes))
+                ak.vector_append_t(&build_time_nodes, AsciiStringMatcherBuildTimeNode())
+                ak.vector_append_t(&ak.vector_at(&build_time_nodes, (usize)node).children, AsciiStringMatcherTransition(character = ch, next_state = new_node))
+                node = new_node
+
+        let node_at = ak.vector_at(&build_time_nodes, (usize)node)
+        if not node_at.is_output:
+            node_at.is_output = true
+
+    var failure_links: ak.Vector[u32]
+    ak.vector_resize(&failure_links, ak.vector_size(&build_time_nodes))
+
+    var queue: ak.Queue[u32]
+    for transition in ak.vector_span_const(&ak.vector_at(&build_time_nodes, 0).children):
+        let child = transition.next_state
+        *ak.vector_at(&failure_links, (usize)child) = 0
+        ak.queue_enqueue(&queue, child)
+
+    while not ak.queue_is_empty(&queue):
+        let current = ak.queue_dequeue(&queue)
+        let current_children = ak.vector_at(&build_time_nodes, (usize)current).children
+        for transition in ak.vector_span_const(&current_children):
+            let character = transition.character
+            let child = transition.next_state
+            var failure_link = *ak.vector_at(&failure_links, (usize)current)
+            while failure_link != 0:
+                let failure_children = &ak.vector_at(&build_time_nodes, (usize)failure_link).children
+                if let it = ascii_string_matcher_find_child(failure_children, character):
+                    failure_link = ak.vector_at(failure_children, it).next_state
+                    break
+                failure_link = *ak.vector_at(&failure_links, (usize)failure_link)
+
+            let next_failure_link = failure_link
+            *ak.vector_at(&failure_links, (usize)child) = next_failure_link
+
+            let inherited = ak.vector_at(&build_time_nodes, (usize)next_failure_link).is_output
+            let child_node = ak.vector_at(&build_time_nodes, (usize)child)
+            if inherited and not child_node.is_output:
+                child_node.is_output = true
+
+            ak.queue_enqueue(&queue, child)
+
+    for index in 0..<ak.vector_size(&build_time_nodes):
+        let node = ak.vector_at(&build_time_nodes, index)
+        ak.quick_sort_t_collection_t_less_than(ak.vector_span(&node.children), ak.Function2[const AsciiStringMatcherTransition*, const AsciiStringMatcherTransition*, bool](call = ascii_string_matcher_transition_less_than, context = none))
+
+    ak.vector_resize(&this.m_nodes, ak.vector_size(&build_time_nodes))
+    ak.vector_clear_with_capacity(&this.m_transitions)
+
+    var transition_index: u32 = 0
+    for i: u32 in 0..<u32(ak.vector_size(&build_time_nodes)):
+        let build_time_node = ak.vector_at(&build_time_nodes, (usize)i)
+        let node = ak.vector_at(&this.m_nodes, (usize)i)
+        node.first_transition = transition_index
+        node.transition_count = (u8)ak.vector_size(&build_time_node.children)
+        node.output = build_time_node.is_output
+        ak.vector_extend_2(&this.m_transitions, &build_time_node.children)
+
+        transition_index += u32(ak.vector_size(&build_time_node.children))
+
+## The comparator of AsciiStringMatcher::contains's binary searches.
+func ascii_string_matcher_compare(context: void*?, needle: const u8*, transition: const AsciiStringMatcherTransition*) -> i32:
+    if *needle > transition.character:
+        return -1 if *needle < transition.character else 1
+    return -1 if *needle < transition.character else 0
+
+## AsciiStringMatcher::contains's get_children: the transitions out of `state`.
+func ascii_string_matcher_get_children(this: const AsciiStringMatcher*, state: u32) -> const AsciiStringMatcherTransition[]:
+    let node = ak.vector_at_const(&this.m_nodes, (usize)state)
+    let first = (usize)node.first_transition
+    return ak.vector_span_const(&this.m_transitions)[first..<first + (usize)node.transition_count]
+
+## Ported from Libraries/LibWeb/Loader/ContentFilter.cpp:137 Web::AsciiStringMatcher::contains.
+pub func ascii_string_matcher_contains(this: const AsciiStringMatcher*, text: ak.StringView) -> bool:
+    if ak.vector_is_empty(&this.m_nodes):
+        return false
+
+    let comparator = ak.Function2[const u8*, const AsciiStringMatcherTransition*, i32](call = ascii_string_matcher_compare, context = none)
+    var state: u32 = 0
+    for ch in ak.string_view_bytes(&text):
+        let children = ascii_string_matcher_get_children(this, state)
+
+        var found = ak.binary_search(children, ch, none, comparator)
+
+        if found == none:
+            state = 0
+            let root_children = ascii_string_matcher_get_children(this, 0)
+            found = ak.binary_search(root_children, ch, none, comparator)
+            if found == none:
+                continue
+
+        let transition = found else trap("VERIFY_NOT_REACHED")
+        state = transition.next_state
+        if ak.vector_at_const(&this.m_nodes, (usize)state).output:
+            return true
+    return false

@@ -1,0 +1,175 @@
+#==============================================================================================
+#
+#   in_process_request_client - the engine's RequestClient: file:, data: and http(s): loads in
+#   the engine's process, and a PageClient::request_file for file: loads
+#
+#   DESCRIPTION:
+#       Ladybird loads through its RequestServer process (curl); the port's RequestClient seam
+#       (external/lib_requests/request_client.lucb) is implemented here in process, over our
+#       own libraries (DESIGN.md §7.0): luce-std `files` for file:, Fetch's data: URL
+#       processor for data:, and luce-std `net` with luce-tls for http(s): (in_process_http).
+#       Not a port: new code of the seam, written for the embedders (the browser, web_test,
+#       the tests).
+#
+#       A request runs as a deferred invocation on the current Core event loop, so its
+#       callbacks are set before anything is delivered (RequestServer replies over IPC later
+#       too): the response headers, then the body in chunks, then the completion. An http(s)
+#       request blocks the event loop while it runs (connect, TLS, the whole response): the
+#       event loop seam watches no sockets yet (Core::Notifier), so the network reads happen
+#       inside that one invocation. stop_request stops delivery at the next chunk.
+#
+#       PageClient::request_file is the embedder's (WebContent asks the UI process to open
+#       the file): in_process_request_file is an implementation an embedder's PageClient can
+#       forward to, opening the file with luce-std on the next turn of the event loop.
+#
+#       Copyright (c) 2026 the luce-browser authors.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: The client ==============================================================================
+
+## The in-process RequestClient: the seam's client, and how long an http(s) request may take.
+pub struct InProcessRequestClient:
+    pub var client: RequestsRequestClient  # the seam's client first: a pointer to one is a pointer to the other
+    ## The time an http(s) request may take, from connecting to its last byte.
+    pub var m_timeout_nanoseconds: u64
+
+## The vtable of the in-process client.
+let in_process_request_client_vtable: RequestsRequestClientVTable = RequestsRequestClientVTable(start_request = in_process_request_client_start_request,
+                                                                                                stop_request = in_process_request_client_stop_request,
+                                                                                                ensure_connection = in_process_request_client_ensure_connection)
+
+## A new in-process client whose requests are cells of `heap`, in the C heap for the process (the embedder installs
+## it with ResourceLoader::initialize, DESIGN.md §3.3 rule 7).
+pub func in_process_request_client_create(heap: gc.Heap*) -> InProcessRequestClient*:
+    with memory.heap:
+        let this = new InProcessRequestClient(client = RequestsRequestClient(vtable = &in_process_request_client_vtable, m_heap = heap),
+                                              m_timeout_nanoseconds = 30000000000) else trap("out of memory")
+        requests_request_client_construct(&this.client, &in_process_request_client_vtable, heap)
+        return this
+
+## One request of the in-process client: what start_request was given, and whether it was stopped.
+struct InProcessRequest:
+    var client: InProcessRequestClient*
+    var request: RequestsRequest*
+    var method: ak.ByteString
+    var url: web_url.Url
+    var request_headers: ak.Vector[HttpHeader]
+    var request_body: ak.ByteBuffer
+    var stopped: bool
+    var finished: bool
+
+## The client's start_request: the request runs on the next turn of the event loop.
+func in_process_request_client_start_request(base: RequestsRequestClient*, request: RequestsRequest*, arguments: const RequestsStartRequest*) -> bool:
+    let this = (InProcessRequestClient*)base
+    var request_headers: ak.Vector[HttpHeader]
+    if let headers = arguments.request_headers:
+        request_headers = ak.vector_clone(http_header_list_headers(headers))
+    let body = ak.byte_buffer_copy_span_u8(arguments.request_body) else trap("out of memory")
+    let state = new InProcessRequest(client = this, request = request, method = arguments.method, url = arguments.url, request_headers = request_headers,
+                                     request_body = body, stopped = false, finished = false) else trap("out of memory")
+    request.m_client_data = state
+    core_deferred_invoke(ak.Function0[unit](call = in_process_request_run, context = state))
+    return true
+
+## The client's stop_request: nothing more is delivered to the request.
+func in_process_request_client_stop_request(base: RequestsRequestClient*, request: RequestsRequest*) -> bool:
+    let state = (InProcessRequest*)(request.m_client_data else return false)
+    if state.finished or state.stopped:
+        return false
+    state.stopped = true
+    return true
+
+## The client's ensure_connection: the in-process client keeps no connections, so there is nothing to prepare.
+func in_process_request_client_ensure_connection(base: RequestsRequestClient*, url: web_url.Url, cache_level: RequestServerCacheLevel):
+    return
+
+# mark: Running a request =======================================================================
+
+## The deferred invocation of a request: dispatches on the URL's scheme.
+func in_process_request_run(context: void*?):
+    let state = (InProcessRequest*)(context else trap("in-process request: no state"))
+    if state.stopped:
+        return
+    let scheme = web_url.url_scheme(&state.url)
+    if ak.string_eq_string_view(&scheme, ak.sv("data")):
+        in_process_request_run_data(state)
+    elif ak.string_eq_string_view(&scheme, ak.sv("file")):
+        in_process_request_run_file(state)
+    elif ak.string_eq_string_view(&scheme, ak.sv("http")) or ak.string_eq_string_view(&scheme, ak.sv("https")):
+        in_process_http_run(state)
+    else:
+        in_process_request_finish(state, 0, RequestsRequestTimingInfo(), RequestsNetworkError.malformed_url)
+
+## The response headers, delivered unless the request was stopped.
+func in_process_request_deliver_headers(state: InProcessRequest*, headers: HttpHeaderList*, status_code: u32?, reason_phrase: ak.String?):
+    if not state.stopped:
+        requests_request_did_receive_headers(state.request, headers, status_code, reason_phrase)
+
+## A chunk of the body, delivered unless the request was stopped.
+func in_process_request_deliver_data(state: InProcessRequest*, data: const u8[]):
+    if not state.stopped and data.length != 0:
+        requests_request_did_receive_data(state.request, data)
+
+## The completion, delivered once unless the request was stopped.
+func in_process_request_finish(state: InProcessRequest*, total_size: u64, timing_info: RequestsRequestTimingInfo, network_error: RequestsNetworkError?):
+    if state.finished:
+        return
+    state.finished = true
+    if not state.stopped:
+        requests_request_did_finish(state.request, total_size, timing_info, network_error)
+
+## A data: URL: its MIME type as the Content-Type, its body (Fetch's data: URL processor).
+func in_process_request_run_data(state: InProcessRequest*):
+    let data_url = fetch_process_data_url(state.url) catch:
+        in_process_request_finish(state, 0, RequestsRequestTimingInfo(), RequestsNetworkError.malformed_url)
+        return
+    let mime_type = mime_type_serialized(&data_url.mime_type)
+    var headers: ak.Vector[HttpHeader]
+    ak.vector_append_t(&headers, http_header_create(ak.sv("Content-Type"), ak.string_bytes_as_string_view(&mime_type)))
+    in_process_request_deliver_headers(state, http_header_list_create(headers), 200, ak.string_from_str("OK"))
+    in_process_request_deliver_data(state, ak.byte_buffer_bytes_const(&data_url.body))
+    in_process_request_finish(state, (u64)ak.byte_buffer_size(&data_url.body), RequestsRequestTimingInfo(), none)
+
+## A file: URL: the file's bytes, with the headers ResourceLoader gives a file (its guessed Content-Type).
+func in_process_request_run_file(state: InProcessRequest*):
+    let path = web_url.url_file_path(&state.url)
+    let st = core_system_stat(ak.byte_string_view(&path)) catch:
+        in_process_request_finish(state, 0, RequestsRequestTimingInfo(), RequestsNetworkError.unknown)
+        return
+    if core_system_is_directory(&st):
+        in_process_request_finish(state, 0, RequestsRequestTimingInfo(), RequestsNetworkError.unknown)
+        return
+    let data = core_mapped_file_map(ak.byte_string_view(&path)) catch:
+        in_process_request_finish(state, 0, RequestsRequestTimingInfo(), RequestsNetworkError.unknown)
+        return
+    in_process_request_deliver_headers(state, response_headers_for_file(ak.byte_string_view(&path), st.modified.seconds), 200, ak.string_from_str("OK"))
+    in_process_request_deliver_data(state, ak.byte_buffer_bytes_const(&data))
+    in_process_request_finish(state, (u64)ak.byte_buffer_size(&data), RequestsRequestTimingInfo(), none)
+
+# mark: PageClient::request_file ================================================================
+
+## The captures of in_process_request_file's deferred invocation: the file request.
+struct InProcessRequestFile:
+    var file_request: FileRequest
+
+    ## Opens the file and hands its descriptor (or the error) to the request's callback.
+    static func call(context: void*?):
+        let captures = (InProcessRequestFile*)(context else trap("request_file: no captures"))
+        let path = file_request_path(&captures.file_request)
+        var result = ErrorOrI32.value(value = -1)
+        let file: std_files.File? = std_files.File.open(core_c_path(ak.byte_string_view(&path))) catch:
+            recover none
+        if let opened = file:
+            result = ErrorOrI32.value(value = opened.descriptor() else -1)
+        else:
+            let code = libc.errno()
+            result = ErrorOrI32.ak_error(value = ak.ak_error_from_errno(code if code != 0 else 2))
+        ak.function1_call(&captures.file_request.on_file_request_finish, result)
+
+## An implementation of PageClient::request_file (WebContent's asks the UI process): opens the request's path for
+## reading on the next turn of the event loop and hands the descriptor to its callback, which owns it.
+pub func in_process_request_file(file_request: FileRequest):
+    let captures = new InProcessRequestFile(file_request = file_request) else trap("out of memory")
+    core_deferred_invoke(ak.Function0[unit](call = InProcessRequestFile.call, context = captures))

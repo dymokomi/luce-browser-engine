@@ -1,0 +1,304 @@
+#==============================================================================================
+#
+#   in_process_http - the in-process client's http(s): requests: HTTP/1.1 over luce-std net
+#   and luce-tls
+#
+#   DESCRIPTION:
+#       What RequestServer does with curl for one request, minimally (DESIGN.md §7.0): resolve
+#       and connect (luce-tls's Stream over luce-std net), a TLS 1.3 handshake for https:
+#       against the public roots, one HTTP/1.1 request with `Connection: close` (the request's
+#       method, its headers, Host, Accept-Encoding and the body's Content-Length), then the
+#       response head (net.http_parse_response; 1xx heads are skipped) and its body, fixed,
+#       chunked or until the connection closes (net.HttpBodyDecoder). A gzip or deflate
+#       Content-Encoding is decoded with luce-compress once the body is complete; other bodies
+#       are delivered as they arrive. Redirects are Fetch's (the 3xx response is delivered).
+#       No connection is reused, no proxy is used, and no cache is kept.
+#
+#       luce-std and luce-tls allocate from the current allocator, and this runs with a VM's
+#       heap current: their calls run with the C heap current (they free what they make), and
+#       what they answer is copied into managed memory before it is delivered.
+#
+#       Copyright (c) 2026 the luce-browser authors.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Connecting ==============================================================================
+
+## The network error a failed connect (resolve, then TCP) stands for.
+func in_process_http_connect_error(code: ErrorCode) -> RequestsNetworkError:
+    if code == net.unknown_host or code == net.resolution_temporary:
+        return RequestsNetworkError.unable_to_resolve_host
+    if code == net.timed_out:
+        return RequestsNetworkError.timeout_reached
+    return RequestsNetworkError.unable_to_connect
+
+## Connects `stream` to `host`:`port`, with a TLS handshake when `secure`; answers the error, if any.
+func in_process_http_connect(stream: tls_stream.Stream*, host: str, port: u16, secure: bool, deadline: net.Deadline) -> RequestsNetworkError?:
+    with memory.heap:
+        let connected = tls_stream.Stream.connect(host, port, false, deadline) catch failure:
+            return in_process_http_connect_error(failure.code)
+        *stream = connected
+        if secure:
+            stream.start_tls(host) catch failure:
+                stream.destroy()
+                if failure.code == net.timed_out:
+                    return RequestsNetworkError.timeout_reached
+                return RequestsNetworkError.ssl_handshake_failed
+    return none
+
+## Sends all of `data`.
+func in_process_http_write(stream: tls_stream.Stream*, data: const u8[]) -> !:
+    with memory.heap:
+        discard(try stream.write(data))
+
+## Reads what has arrived into `buffer` (zero at the end of the stream).
+func in_process_http_read(stream: tls_stream.Stream*, buffer: u8[]) -> usize!:
+    with memory.heap:
+        return try stream.read(buffer)
+
+## Closes the connection, ignoring its errors.
+func in_process_http_close(stream: tls_stream.Stream*):
+    with memory.heap:
+        stream.destroy()
+
+# mark: The request =============================================================================
+
+## Whether the request's own headers name `name`.
+func in_process_http_has_header(state: const InProcessRequest*, name: str) -> bool:
+    for header in ak.vector_span_const(&state.request_headers):
+        let header_name = ak.byte_string_view(&header.name)
+        if ak.string_view_equals_ignoring_ascii_case(&header_name, ak.sv(name)):
+            return true
+    return false
+
+## The request's head: its request line, Host, the request's headers, and the headers the client adds.
+func in_process_http_request_head(state: const InProcessRequest*, host: ak.StringView, port: u16, secure: bool) -> ak.ByteString:
+    var builder = ak.string_builder_new()
+    ak.string_builder_append_string_view(&builder, ak.byte_string_view(&state.method))
+    ak.string_builder_append(&builder, " ")
+    let path = web_url.url_serialize_path(&state.url)
+    ak.string_builder_append_string_view(&builder, ak.string_bytes_as_string_view(&path))
+    if let query = web_url.url_query(&state.url):
+        ak.string_builder_append(&builder, "?")
+        ak.string_builder_append_string_view(&builder, ak.string_bytes_as_string_view(&query))
+    ak.string_builder_append(&builder, " HTTP/1.1\r\n")
+
+    if not in_process_http_has_header(state, "Host"):
+        ak.string_builder_append(&builder, "Host: ")
+        ak.string_builder_append_string_view(&builder, host)
+        if port != (u16)(443 if secure else 80):
+            let port_text = ak.string_number_u64((u64)port)
+            ak.string_builder_append(&builder, ":")
+            ak.string_builder_append_string_view(&builder, ak.string_bytes_as_string_view(&port_text))
+        ak.string_builder_append(&builder, "\r\n")
+    for header in ak.vector_span_const(&state.request_headers):
+        let name = ak.byte_string_view(&header.name)
+        if ak.string_view_equals_ignoring_ascii_case(&name, ak.sv("Connection")) or ak.string_view_equals_ignoring_ascii_case(&name, ak.sv("Content-Length")):
+            continue
+        ak.string_builder_append_string_view(&builder, name)
+        ak.string_builder_append(&builder, ": ")
+        ak.string_builder_append_string_view(&builder, ak.byte_string_view(&header.value))
+        ak.string_builder_append(&builder, "\r\n")
+    if not in_process_http_has_header(state, "Accept-Encoding"):
+        ak.string_builder_append(&builder, "Accept-Encoding: gzip, deflate\r\n")
+    let method = ak.byte_string_view(&state.method)
+    if ak.byte_buffer_size(&state.request_body) != 0 or not ak.string_view_eq_string_view(&method, ak.sv("GET")):
+        let length_text = ak.string_number_u64((u64)ak.byte_buffer_size(&state.request_body))
+        ak.string_builder_append(&builder, "Content-Length: ")
+        ak.string_builder_append_string_view(&builder, ak.string_bytes_as_string_view(&length_text))
+        ak.string_builder_append(&builder, "\r\n")
+    ak.string_builder_append(&builder, "Connection: close\r\n\r\n")
+    return ak.string_builder_to_byte_string(&builder)
+
+## Microseconds of the monotonic clock, for the timing info.
+func in_process_http_now_microseconds() -> i64:
+    let now = ak.monotonic_time_now()
+    return ak.monotonic_time_nanoseconds(&now) // 1000
+
+## The host to connect to: the URL's host serialized, an IPv6 address without its brackets.
+func in_process_http_host(url: const web_url.Url*) -> ak.String?:
+    let host = web_url.url_host(url) else return none
+    let serialized = web_url.host_serialize(&host)
+    let view = ak.string_bytes_as_string_view(&serialized)
+    let bytes = ak.string_view_bytes(&view)
+    if bytes.length >= 2 and bytes[0] == '[' and bytes[bytes.length - 1] == ']':
+        return ak.string_from_utf8(ak.string_view_from_bytes(bytes[1..<bytes.length - 1])) else trap("MUST: String::from_utf8")
+    return serialized
+
+## An http(s): request (see the header).
+func in_process_http_run(state: InProcessRequest*):
+    var timing_info = RequestsRequestTimingInfo()
+    let scheme = web_url.url_scheme(&state.url)
+    let secure = ak.string_eq_string_view(&scheme, ak.sv("https"))
+    let maybe_host = in_process_http_host(&state.url)
+    if maybe_host == none:
+        in_process_request_finish(state, 0, timing_info, RequestsNetworkError.malformed_url)
+        return
+    let host_string = maybe_host else trap("VERIFY_NOT_REACHED")
+    let host_view = ak.string_bytes_as_string_view(&host_string)
+    let host = ak.string_view_text(host_view)
+    let port = web_url.url_port_or_default(&state.url)
+
+    let deadline = net.Deadline.after(state.client.m_timeout_nanoseconds) else net.Deadline()
+    timing_info.domain_lookup_start_microseconds = in_process_http_now_microseconds()
+    timing_info.connect_start_microseconds = timing_info.domain_lookup_start_microseconds
+    var stream = tls_stream.Stream()
+    if let connect_error = in_process_http_connect(&stream, host, port, secure, deadline):
+        in_process_request_finish(state, 0, timing_info, connect_error)
+        return
+    timing_info.connect_end_microseconds = in_process_http_now_microseconds()
+    timing_info.domain_lookup_end_microseconds = timing_info.connect_start_microseconds
+    if secure:
+        timing_info.secure_connect_start_microseconds = timing_info.connect_start_microseconds
+    timing_info.http_version_alpn_identifier = RequestsAlpnHttpVersion.http1_1
+
+    let network_error = in_process_http_exchange(state, &stream, host_view, port, secure, &timing_info)
+    in_process_http_close(&stream)
+    timing_info.response_end_microseconds = in_process_http_now_microseconds()
+    in_process_request_finish(state, (u64)timing_info.encoded_body_size, timing_info, network_error)
+
+# mark: The response ============================================================================
+
+## Sends the request and receives the response, delivering its head and body; answers the network error, if any.
+func in_process_http_exchange(state: InProcessRequest*, stream: tls_stream.Stream*, host: ak.StringView, port: u16, secure: bool, timing_info: RequestsRequestTimingInfo*) -> RequestsNetworkError?:
+    timing_info.request_start_microseconds = in_process_http_now_microseconds()
+    let head = in_process_http_request_head(state, host, port, secure)
+    in_process_http_write(stream, ak.byte_string_bytes(&head)) catch failure:
+        return in_process_http_connect_error(failure.code)
+    in_process_http_write(stream, ak.byte_buffer_bytes_const(&state.request_body)) catch failure:
+        return in_process_http_connect_error(failure.code)
+
+    # The response head: read until a final (not 1xx) head is complete.
+    var buffer: u8[16384] = ---
+    var received = ak.ByteBuffer()
+    var head_end: usize = 0
+    var response: net.HttpHead = ---
+    var storage: net.HttpField[100] = ---
+    let method = ak.string_view_text(ak.byte_string_view(&state.method))
+    while true:
+        let available = ak.byte_buffer_bytes_const(&received)
+        if let end = net.http_head_end(available):
+            response = net.http_parse_response(available[..<end], storage, method) catch:
+                return RequestsNetworkError.unknown
+            if response.status >= 100 and response.status < 200 and response.status != 101:
+                # An informational head: drop it and wait for the final one.
+                let rest = ak.byte_buffer_copy_span_u8(available[end..]) else trap("out of memory")
+                received = rest
+                continue
+            head_end = end
+            break
+        let count = in_process_http_read(stream, buffer) catch failure:
+            return in_process_http_connect_error(failure.code)
+        if count == 0:
+            return RequestsNetworkError.incomplete_content
+        ak.byte_buffer_append_span_u8(&received, buffer[..<count])
+        if state.stopped:
+            return none
+    timing_info.response_start_microseconds = in_process_http_now_microseconds()
+
+    # The headers, copied out of the received bytes, and the reason phrase of the status line.
+    var headers: ak.Vector[HttpHeader]
+    for field in response.fields:
+        ak.vector_append_t(&headers, http_header_create(ak.string_view_from_bytes(field.name.bytes), ak.string_view_from_bytes(field.value.bytes)))
+    let head_bytes = ak.byte_buffer_bytes_const(&received)
+    var line_end: usize = 0
+    while line_end < head_end and head_bytes[line_end] != '\r':
+        line_end += 1
+    # "HTTP/1.1 200 OK": the reason phrase starts after the status code.
+    let reason_start: usize = 13 if line_end > 13 else line_end
+    let reason_phrase = ak.string_from_utf8(ak.string_view_from_bytes(head_bytes[reason_start..<line_end])) else ak.String()
+    let encoding = response.field("content-encoding") else ""
+    let decode_gzip = net.http_equal(encoding, "gzip") or net.http_equal(encoding, "x-gzip")
+    let decode_deflate = net.http_equal(encoding, "deflate")
+    let body_kind = response.body_kind
+    let body_length = response.body_length
+    in_process_request_deliver_headers(state, http_header_list_create(headers), (u32)response.status, reason_phrase)
+
+    # The body.
+    var decoder = net.HttpBodyDecoder.create(body_kind, body_length) catch:
+        return RequestsNetworkError.unknown
+    var encoded = ak.ByteBuffer()
+    let first = ak.byte_buffer_copy_span_u8(head_bytes[head_end..]) else trap("out of memory")
+    var pending: const u8[] = ak.byte_buffer_bytes_const(&first)
+    while not decoder.finished():
+        if state.stopped:
+            return none
+        if pending.length == 0:
+            let count = in_process_http_read(stream, buffer) catch failure:
+                return in_process_http_connect_error(failure.code)
+            if count == 0:
+                decoder.finish() catch:
+                    return RequestsNetworkError.incomplete_content
+                break
+            pending = buffer[..<count]
+        let step = decoder.consume(pending) catch:
+            return RequestsNetworkError.incomplete_content
+        timing_info.encoded_body_size += (i64)step.body.length
+        if decode_gzip or decode_deflate:
+            ak.byte_buffer_append_span_u8(&encoded, step.body)
+        else:
+            in_process_request_deliver_data(state, step.body)
+        pending = pending[step.consumed..]
+
+    if decode_gzip or decode_deflate:
+        let decoded = in_process_http_decode(ak.byte_buffer_bytes_const(&encoded), decode_gzip) catch:
+            return RequestsNetworkError.invalid_content_encoding
+        in_process_request_deliver_data(state, ak.byte_buffer_bytes_const(&decoded))
+    return none
+
+# mark: Content-Encoding ========================================================================
+
+## The bytes of a gzip (RFC 1952) or deflate (RFC 9110: zlib, RFC 1950; raw DEFLATE accepted too) body.
+func in_process_http_decode(data: const u8[], gzip: bool) -> ak.ByteBuffer!:
+    if gzip:
+        return try in_process_http_decode_gzip(data)
+    if data.length >= 2 and (data[0] & 15) == 8 and (((u32)data[0] << 8) | (u32)data[1]) % 31 == 0:
+        return try in_process_http_inflate(data[2..])
+    return try in_process_http_inflate(data)
+
+## A gzip member: its header skipped, its DEFLATE data inflated into ISIZE bytes, its CRC-32 checked.
+func in_process_http_decode_gzip(data: const u8[]) -> ak.ByteBuffer!:
+    if data.length < 18 or data[0] != 0x1f or data[1] != 0x8b or data[2] != 8:
+        error(ak.ak_error, "not a gzip stream")
+    let flags = data[3]
+    var at: usize = 10
+    if (flags & 4) != 0:  # FEXTRA
+        if at + 2 > data.length:
+            error(ak.ak_error, "truncated gzip header")
+        at += 2 + ((usize)data[at] | ((usize)data[at + 1] << 8))
+    if (flags & 8) != 0:  # FNAME
+        while at < data.length and data[at] != 0:
+            at += 1
+        at += 1
+    if (flags & 16) != 0:  # FCOMMENT
+        while at < data.length and data[at] != 0:
+            at += 1
+        at += 1
+    if (flags & 2) != 0:  # FHCRC
+        at += 2
+    if at + 8 > data.length:
+        error(ak.ak_error, "truncated gzip stream")
+    let trailer = data[data.length - 8..]
+    let crc = (u32)trailer[0] | ((u32)trailer[1] << 8) | ((u32)trailer[2] << 16) | ((u32)trailer[3] << 24)
+    let size = (usize)trailer[4] | ((usize)trailer[5] << 8) | ((usize)trailer[6] << 16) | ((usize)trailer[7] << 24)
+    var output = try ak.byte_buffer_create_uninitialized(size)
+    with memory.heap:
+        discard(try flate.inflate_raw(data[at..<data.length - 8], ak.byte_buffer_bytes(&output)))
+    if flate.crc32(ak.byte_buffer_bytes_const(&output)) != crc:
+        error(ak.ak_error, "gzip CRC mismatch")
+    return output
+
+## A raw DEFLATE stream of unknown length: inflated into a buffer that doubles until the stream fits.
+func in_process_http_inflate(data: const u8[]) -> ak.ByteBuffer!:
+    var capacity = data.length * 4 + 4096
+    while true:
+        var output = try ak.byte_buffer_create_uninitialized(capacity)
+        var produced: usize = 0
+        with memory.heap:
+            let (_, made) = try flate.inflate_raw_bounded(data, ak.byte_buffer_bytes(&output))
+            produced = made
+        if produced < capacity:
+            ak.byte_buffer_resize(&output, produced)
+            return output
+        capacity *= 2

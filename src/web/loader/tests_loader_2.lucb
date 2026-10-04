@@ -1,0 +1,601 @@
+#==============================================================================================
+#
+#   tests_loader_2 - the LibCore seams, LoadRequest, ResourceLoader's settings and its
+#   in-process loads, and the in-process RequestClient's file: and data: requests
+#
+#   DESCRIPTION:
+#       Ladybird has no unit tests for these; they pin the C++ behaviour: Core::Promise's
+#       handlers (set before or after it settles) and await; Core::Resource over file:// and
+#       resource:// (data/res); the generated directory page; LoadRequest's accessors and
+#       timer; ResourceLoader's initialization, its settings kept in the C heap, and load's
+#       blocked, unsupported, resource:, file: (through PageClient::request_file) and missing
+#       page cases; the RequestClient seam with the in-process client's data: and file:
+#       requests, stopping one, and PageClient::request_file's descriptor.
+#
+#==============================================================================================
+
+# mark: An event loop ===========================================================================
+
+## An event loop for the loader tests: the deferred invocations in order, no timers. It lives in
+## the test's frame, so the scan of the stack keeps its queue (and what the queued captures hold).
+struct LoaderTestEventLoop: CoreEventLoopImplementation:
+    var deferred: ak.Vector[ak.Function0[unit]]
+
+    mutating func pump(mode: CoreEventLoopPumpMode) -> usize:
+        let pending = self.deferred
+        self.deferred = ak.Vector[ak.Function0[unit]]()
+        for index in 0..<ak.vector_size(&pending):
+            var function = *ak.vector_at_const(&pending, index)
+            ak.function0_call(&function)
+        return ak.vector_size(&pending)
+
+    mutating func quit(code: i32):
+        return
+
+    mutating func was_exit_requested() -> bool:
+        return false
+
+    mutating func wake():
+        return
+
+    mutating func deferred_invoke(function: ak.Function0[unit]):
+        ak.vector_append_t(&self.deferred, function)
+
+    mutating func register_timer(timer: CoreTimer*, milliseconds: i32, should_reload: bool) -> isize:
+        trap("LoaderTestEventLoop: no timers")
+
+    mutating func unregister_timer(timer_id: isize):
+        trap("LoaderTestEventLoop: no timers")
+
+## Installs `event_loop` as the process's Core event loop, with an EventLoopPlugin over it.
+func loader_test_install_event_loop(event_loop: LoaderTestEventLoop*):
+    core_event_loop_installed = none
+    core_event_loop_install(event_loop)
+    web_test_install_event_loop_plugin()
+
+## The end of loader_test_install_event_loop.
+func loader_test_remove_event_loop():
+    web_test_remove_event_loop_plugin()
+    core_event_loop_installed = none
+
+## Runs the loop until nothing is queued.
+func loader_test_drain(event_loop: LoaderTestEventLoop*):
+    while not ak.vector_is_empty(&event_loop.deferred):
+        discard(event_loop.pump(CoreEventLoopPumpMode.dont_wait_for_events))
+
+# mark: Core::Promise ===========================================================================
+
+## What a promise's handlers heard.
+struct LoaderTestPromiseLog:
+    var resolved: i32
+    var rejected: i32
+    var value: i32
+    var error_code: i32
+
+    static func on_resolved(context: void*?, value: i32*):
+        let log = (LoaderTestPromiseLog*)(context else trap("no log"))
+        log.resolved += 1
+        log.value = *value
+
+    static func on_rejected(context: void*?, error_: ak.AkError*):
+        let log = (LoaderTestPromiseLog*)(context else trap("no log"))
+        log.rejected += 1
+        log.error_code = ak.ak_error_code(error_)
+
+## The deferred invocation that resolves a promise with 7.
+func loader_test_resolve_later(context: void*?):
+    core_promise_resolve((CorePromise[i32, ak.AkError]*)(context else trap("no promise")), 7)
+
+test "Core::Promise: handlers set before or after it settles hear it once; await pumps the loop":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    var log = LoaderTestPromiseLog()
+    let resolved_handler = ak.Function1[i32*, unit](call = LoaderTestPromiseLog.on_resolved, context = &log)
+    let rejected_handler = ak.Function1[ak.AkError*, unit](call = LoaderTestPromiseLog.on_rejected, context = &log)
+
+    # Handlers first, then the result.
+    let first = core_promise_construct[i32, ak.AkError]()
+    assert(not core_promise_is_resolved(first) and not core_promise_is_rejected(first))
+    discard(core_promise_when_resolved(first, resolved_handler))
+    discard(core_promise_when_rejected(first, rejected_handler))
+    core_promise_resolve(first, 42)
+    assert(log.resolved == 1 and log.value == 42 and log.rejected == 0)
+    assert(core_promise_is_resolved(first) and not core_promise_is_rejected(first))
+
+    # The result first: when_resolved runs the handler at once; when_rejected does not.
+    let second = core_promise_construct[i32, ak.AkError]()
+    core_promise_resolve(second, 5)
+    discard(core_promise_when_rejected(second, rejected_handler))
+    discard(core_promise_when_resolved(second, resolved_handler))
+    assert(log.resolved == 2 and log.value == 5 and log.rejected == 0)
+
+    # A rejection: the rejection handler, before or after.
+    let third = core_promise_construct[i32, ak.AkError]()
+    discard(core_promise_when_rejected(third, rejected_handler))
+    core_promise_reject(third, ak.ak_error_from_errno(2))
+    assert(log.rejected == 1 and log.error_code == 2)
+    assert(core_promise_is_rejected(third) and not core_promise_is_resolved(third))
+    let fourth = core_promise_construct[i32, ak.AkError]()
+    core_promise_reject(fourth, ak.ak_error_from_errno(13))
+    discard(core_promise_when_resolved(fourth, resolved_handler))
+    discard(core_promise_when_rejected(fourth, rejected_handler))
+    assert(log.rejected == 2 and log.error_code == 13 and log.resolved == 2)
+
+    # await pumps the event loop until the promise settles, and answers (and releases) the result.
+    var event_loop = LoaderTestEventLoop()
+    loader_test_install_event_loop(&event_loop)
+    defer loader_test_remove_event_loop()
+    let fifth = core_promise_construct[i32, ak.AkError]()
+    core_deferred_invoke(ak.Function0[unit](call = loader_test_resolve_later, context = fifth))
+    match core_promise_await(fifth):
+        .value(value): assert(value == 7)
+        .error_(_): trap("the promise resolved")
+    assert(not core_promise_is_resolved(fifth))
+    match core_promise_await(fourth):
+        .value(_): trap("the promise was rejected")
+        .error_(failure): assert(ak.ak_error_code(&failure) == 13)
+
+# mark: Core::Resource ==========================================================================
+
+test "Core::Resource: file:// and resource:// files and directories, their URIs, names and data":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    loader_test_install_resources()
+
+    let template_uri = ak.sv("resource://ladybird/templates/error.html")
+    let resource = core_resource_load_from_uri(template_uri) else trap("the error template loads")
+    assert(core_resource_is_file(resource) and not core_resource_is_directory(resource))
+    let uri = core_resource_uri(resource)
+    assert(ak.string_eq_string_view(&uri, template_uri))
+    let filesystem_path = core_resource_filesystem_path(resource)
+    assert(ak.string_eq_string_view(&filesystem_path, ak.sv("data/res/ladybird/templates/error.html")))
+    let file_url = core_resource_file_url(resource)
+    assert(ak.string_eq_string_view(&file_url, ak.sv("file://data/res/ladybird/templates/error.html")))
+    let filename = core_resource_filename(resource)
+    assert(ak.string_eq_string_view(&filename, ak.sv("error.html")))
+    assert(core_resource_modified_time(resource) != none)
+    let data = core_resource_data(resource)
+    assert(data.length == 1750 and data[0] == '<')
+    let clone = core_resource_clone_data(resource)
+    assert(ak.byte_buffer_size(&clone) == 1750)
+
+    # A resource:// directory and its children.
+    let directory = core_resource_load_from_uri(ak.sv("resource://ladybird/templates")) else trap("the templates directory loads")
+    assert(core_resource_is_directory(directory))
+    let children = core_resource_children(directory)
+    assert(ak.vector_size(&children) == 2)
+    assert(ak.string_eq_string_view(ak.vector_at_const(&children, 0), ak.sv("directory.html")))
+    assert(ak.string_eq_string_view(ak.vector_at_const(&children, 1), ak.sv("error.html")))
+
+    # A file:// file by its relative path, through load_from_filesystem (the working directory prepended).
+    let same = core_resource_load_from_filesystem(ak.sv("data/res/ladybird/templates/error.html")) else trap("the template loads from the file system")
+    assert(same.m_scheme == CoreResourceScheme.file and core_resource_data(same).length == 1750)
+    let same_uri = core_resource_uri(same)
+    let same_uri_view = ak.string_bytes_as_string_view(&same_uri)
+    assert(ak.string_view_starts_with_string_view(&same_uri_view, ak.sv("file:///")))
+    assert(ak.string_view_ends_with_string_view(&same_uri_view, ak.sv("/data/res/ladybird/templates/error.html")))
+
+    # Errors: a missing file, an unknown scheme.
+    let missing: CoreResource*? = core_resource_load_from_uri(ak.sv("resource://ladybird/templates/nope.html")) catch:
+        recover none
+    assert(missing == none)
+    let unknown: CoreResource*? = core_resource_load_from_uri(ak.sv("ftp://x/y")) catch failure:
+        assert(failure.code == ak.ak_error)
+        recover none
+    assert(unknown == none)
+
+test "load_file_directory_page: the directory's entries sorted, folders and files, from the directory template":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    loader_test_install_resources()
+    let cwd = core_system_getcwd() else trap("the working directory")
+    var url_text = ak.string_builder_new()
+    ak.string_builder_append(&url_text, "file://")
+    ak.string_builder_append_string_view(&url_text, ak.byte_string_view(&cwd))
+    ak.string_builder_append(&url_text, "/data/res/ladybird")
+    let url = web_url.parser_basic_parse(ak.string_builder_string_view(&url_text)) else trap("the directory's URL")
+    let page = load_file_directory_page(url) else trap("the directory page")
+    let view = ak.string_bytes_as_string_view(&page)
+    assert(ak.string_view_starts_with_string_view(&view, ak.sv("<!DOCTYPE html>"), ak.CaseSensitivity.case_insensitive))
+    assert(ak.string_view_find_string_view(&view, ak.sv("<title>Index of ")) != none)
+    let templates = ak.string_view_find_string_view(&view, ak.sv("<td><span class=\"folder\"></span></td><td><a href=\"file://")) else trap("the templates folder's row")
+    let name = ak.string_view_find_string_view(&view, ak.sv("/data/res/ladybird/templates\">templates</a></td><td>&nbsp;</td><td>-         </td>")) else trap("its link and size")
+    assert(name > templates)
+    assert(ak.string_view_find_string_view(&view, ak.sv("Open Parent Directory")) != none)
+    assert(ak.string_view_find_string_view(&view, ak.sv("%contents%")) == none)
+
+# mark: LoadRequest =============================================================================
+
+test "LoadRequest: GET by default, its setters, and the timer":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let headers = http_header_list_create()
+    var request = load_request_create(headers)
+    let method = load_request_method(&request)
+    let method_view = ak.byte_string_view(&method)
+    assert(ak.string_view_eq_string_view(&method_view, ak.sv("GET")))
+    assert(load_request_url(&request) == none and load_request_page(&request) == none)
+    assert(load_request_cache_mode(&request) == HttpCacheMode.default)
+    assert(load_request_include_credentials(&request) == HttpIncludeCredentials.yes)
+    assert(load_request_initiator_type(&request) == none)
+    assert(load_request_headers(&request) == headers)
+    let zero = load_request_load_time(&request)
+    assert(ak.duration_to_milliseconds(&zero) == 0)
+    load_request_set_url(&request, loader_test_url("https://example.com/"))
+    load_request_set_method(&request, ak.byte_string_from_str("POST"))
+    load_request_set_body(&request, ak.byte_buffer_copy_span_u8(b"abc") else trap("a body"))
+    load_request_set_cache_mode(&request, HttpCacheMode.no_store)
+    load_request_set_include_credentials(&request, HttpIncludeCredentials.no)
+    load_request_set_initiator_type(&request, FetchRequestInitiatorType.img)
+    assert(ak.byte_buffer_size(load_request_body(&request)) == 3)
+    assert(load_request_cache_mode(&request) == HttpCacheMode.no_store and load_request_include_credentials(&request) == HttpIncludeCredentials.no)
+    assert(load_request_initiator_type(&request) == FetchRequestInitiatorType.img)
+    load_request_start_timer(&request)
+    let elapsed = load_request_load_time(&request)
+    assert(ak.duration_to_milliseconds(&elapsed) >= 0 and ak.duration_to_milliseconds(&elapsed) < 1000)
+
+# mark: ResourceLoader ==========================================================================
+
+## Whether `value` is `text`.
+func loader_test_byte_string_is(value: ak.ByteString, text: str) -> bool:
+    let view = ak.byte_string_view(&value)
+    return ak.string_view_equals(&view, text)
+
+## The vtable of the loader tests' PageClient: the test PageClient's (tests_page), whose request_file
+## opens the file in process (in_process_request_file) and which counts the network notifications.
+let loader_test_page_client_vtable: PageClientVTable = PageClientVTable(cell_vtable = JsCellVTable(cell_vtable = gc.CellVTable(class_info = &test_page_client_class, visit_edges = test_page_client_visit_edges)), id = test_page_client_id, page = test_page_client_page, page_const = test_page_client_page, is_connection_open = test_page_client_is_connection_open, zoom_level = test_page_client_one, device_pixel_ratio = test_page_client_one, device_pixels_per_css_pixel = test_page_client_one, preferred_color_scheme = test_page_client_preferred_color_scheme, preferred_contrast = test_page_client_preferred_contrast, preferred_motion = test_page_client_preferred_motion, request_frame = test_document_request_frame, page_did_change_title = test_document_page_did_change_title, display_list_player_type = test_page_client_display_list_player_type, is_headless = test_page_client_is_headless, palette = test_page_client_palette,
+                                                                        request_file = loader_test_page_client_request_file, page_did_start_network_request = loader_test_page_client_started,
+                                                                        page_did_finish_network_request = loader_test_page_client_finished)
+
+## The network notifications the test PageClient heard.
+var loader_test_network_started: i32
+var loader_test_network_finished: i32
+
+## The test PageClient's request_file.
+func loader_test_page_client_request_file(this: PageClient*, file_request: FileRequest):
+    in_process_request_file(file_request)
+
+## The test PageClient's page_did_start_network_request.
+func loader_test_page_client_started(this: PageClient*, request_id: u64, url: web_url.Url, method: ak.ByteString, request_headers: ak.Vector[HttpHeader],
+                                     request_body: const u8[], initiator_type: ak.String?):
+    loader_test_network_started += 1
+
+## The test PageClient's page_did_finish_network_request.
+func loader_test_page_client_finished(this: PageClient*, request_id: u64, body_size: u64, timing_info: RequestsRequestTimingInfo, network_error: RequestsNetworkError?):
+    loader_test_network_finished += 1
+
+## A page whose client is the loader tests' PageClient.
+func loader_test_create_page(vm: Vm*) -> Page*:
+    let page = web_test_create_page(vm)
+    ((gc.Cell*)page_client(page)).vtable = (const gc.CellVTable*)&loader_test_page_client_vtable
+    loader_test_network_started = 0
+    loader_test_network_finished = 0
+    return page
+
+## What a load's callbacks heard (managed memory: the callbacks may run after the test's frame changed).
+struct LoaderTestLoad:
+    var headers: HttpHeaderList*?
+    var status_code: u32?
+    var reason_phrase: ak.String?
+    var data: ak.ByteBuffer
+    var completions: i32
+    var success: bool
+    var error_message: ak.ByteString?
+
+    static func on_headers(context: void*?, headers: const HttpHeaderList*, status_code: u32?, reason_phrase: const (ak.String?)*):
+        let load = (LoaderTestLoad*)(context else trap("no load"))
+        load.headers = http_header_list_create(ak.vector_clone(http_header_list_headers(headers)))
+        load.status_code = status_code
+        load.reason_phrase = *reason_phrase
+
+    static func on_data(context: void*?, data: const u8[]):
+        let load = (LoaderTestLoad*)(context else trap("no load"))
+        ak.byte_buffer_append_span_u8(&load.data, data)
+
+    static func on_complete(context: void*?, success: bool, timing_info: const RequestsRequestTimingInfo*, error_message: ak.StringView?):
+        let load = (LoaderTestLoad*)(context else trap("no load"))
+        load.completions += 1
+        load.success = success
+        if let message = error_message:
+            load.error_message = ak.byte_string_from_string_view(message)
+
+    ## The value of a response header.
+    func header(name: str) -> ak.ByteString?:
+        let headers = self.headers else return none
+        return http_header_list_get(headers, ak.sv(name))
+
+## Starts loading `url` (with `page`, if any) through ResourceLoader::the(), its callbacks recording into a new LoaderTestLoad.
+func loader_test_load(vm: Vm*, url: str, page: Page*?) -> (LoaderTestLoad*, RequestsRequest*?):
+    let load = new LoaderTestLoad(data = ak.ByteBuffer()) else trap("out of memory")
+    let heap = vm_heap(vm)
+    var request = load_request_create(http_header_list_create())
+    load_request_set_url(&request, loader_test_url(url))
+    if let request_page = page:
+        load_request_set_page(&request, request_page)
+    let on_headers = gc.create_function3(heap, ak.Function3[const HttpHeaderList*, u32?, const (ak.String?)*, unit](call = LoaderTestLoad.on_headers, context = load))
+    let on_data = gc.create_function1(heap, ak.Function1[const u8[], unit](call = LoaderTestLoad.on_data, context = load))
+    let on_complete = gc.create_function3(heap, ak.Function3[bool, const RequestsRequestTimingInfo*, ak.StringView?, unit](call = LoaderTestLoad.on_complete, context = load))
+    let protocol_request = resource_loader_load(resource_loader_the(), &request, on_headers, on_data, on_complete)
+    return (load, protocol_request)
+
+## Whether `load` failed with `message`.
+func loader_test_failed_with(load: const LoaderTestLoad*, message: str) -> bool:
+    let error_message = load.error_message else return false
+    let view = ak.byte_string_view(&error_message)
+    return load.completions == 1 and not load.success and ak.string_view_equals(&view, message)
+
+## Whether the bytes `load` received are `text`.
+func loader_test_received(load: const LoaderTestLoad*, text: str) -> bool:
+    let view = ak.string_view_from_bytes(ak.byte_buffer_bytes_const(&load.data))
+    return ak.string_view_equals(&view, text)
+
+## The loader of a test: an in-process client in the VM's heap, ResourceLoader::initialize with it.
+func loader_test_initialize_resource_loader(vm: Vm*) -> InProcessRequestClient*:
+    let client = in_process_request_client_create(vm_heap(vm))
+    resource_loader_initialize(vm_heap(vm), &client.client)
+    return client
+
+test "ResourceLoader: initialize, the defaults of its settings, and the setters' copies in the C heap":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let client = loader_test_initialize_resource_loader(vm)
+    assert(resource_loader_is_initialized())
+    let loader = resource_loader_the()
+    assert(resource_loader_class_name(loader).m_length == 14)
+    assert(*resource_loader_request_client(loader) == &client.client)
+    assert(resource_loader_pending_loads(loader) == 0)
+    let user_agent = resource_loader_user_agent()
+    assert(ak.string_eq_string_view(&user_agent, ak.sv(default_user_agent)))
+    let platform = resource_loader_platform()
+    assert(ak.string_eq_string_view(&platform, ak.sv(default_platform)))
+    assert(ak.vector_size(resource_loader_preferred_languages()) == 1)
+    assert(ak.string_eq_string_view(ak.vector_at_const(resource_loader_preferred_languages(), 0), ak.sv("en-US")))
+    assert(resource_loader_navigator_compatibility_mode() == NavigatorCompatibilityMode.chrome)
+    assert(not resource_loader_enable_global_privacy_control(loader))
+
+    resource_loader_set_user_agent(loader, ak.string_from_str("Test agent, a string longer than a short string"))
+    resource_loader_set_platform(loader, ak.string_from_str("Test platform"))
+    var languages: ak.Vector[ak.String]
+    ak.vector_append_t(&languages, ak.string_from_str("fr-CA, a long language tag"))
+    ak.vector_append_t(&languages, ak.string_from_str("fr"))
+    resource_loader_set_preferred_languages(loader, languages)
+    resource_loader_set_navigator_compatibility_mode(loader, NavigatorCompatibilityMode.gecko)
+    resource_loader_set_enable_global_privacy_control(loader, true)
+    # The values outlive collections of the VM's heap: the loader keeps C-heap copies.
+    gc.heap_collect_garbage(vm_heap(vm))
+    let new_agent = resource_loader_user_agent()
+    assert(ak.string_eq_string_view(&new_agent, ak.sv("Test agent, a string longer than a short string")))
+    let new_platform = resource_loader_platform()
+    assert(ak.string_eq_string_view(&new_platform, ak.sv("Test platform")))
+    assert(ak.vector_size(resource_loader_preferred_languages()) == 2)
+    assert(ak.string_eq_string_view(ak.vector_at_const(resource_loader_preferred_languages(), 0), ak.sv("fr-CA, a long language tag")))
+    assert(resource_loader_navigator_compatibility_mode() == NavigatorCompatibilityMode.gecko)
+    assert(resource_loader_enable_global_privacy_control(loader))
+
+    # The client's death forgets it; set_client installs another.
+    ak.function0_call(&client.client.on_request_server_died)
+    assert(*resource_loader_request_client(loader) == none)
+    resource_loader_set_client(loader, &client.client)
+    assert(*resource_loader_request_client(loader) == &client.client)
+
+test "ResourceLoader::load: blocked ports and filtered URLs, unsupported schemes, file: without a page":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    var event_loop = LoaderTestEventLoop()
+    loader_test_install_event_loop(&event_loop)
+    defer loader_test_remove_event_loop()
+    discard(loader_test_initialize_resource_loader(vm))
+
+    let (blocked, blocked_request) = loader_test_load(vm, "http://example.com:25/", none)
+    assert(blocked_request == none and loader_test_failed_with(blocked, "Request was blocked"))
+
+    let patterns = loader_test_patterns("blocked.test")
+    content_filter_set_patterns(content_filter_the(), ak.vector_span_const(&patterns)) else trap("set_patterns")
+    defer loader_test_reset_globals()
+    let (filtered, filtered_request) = loader_test_load(vm, "https://blocked.test/a.png", none)
+    assert(filtered_request == none and loader_test_failed_with(filtered, "Request was blocked"))
+
+    let (unsupported, unsupported_request) = loader_test_load(vm, "ftp://example.com:2121/file", none)
+    assert(unsupported_request == none and loader_test_failed_with(unsupported, "Protocol not implemented: ftp"))
+
+    let (no_page, no_page_request) = loader_test_load(vm, "file:///tmp/x.html", none)
+    assert(no_page_request == none and loader_test_failed_with(no_page, "INTERNAL ERROR: No Page for file scheme request"))
+    assert(ak.vector_is_empty(&event_loop.deferred))
+
+test "ResourceLoader::load: resource: files and directories, file: through PageClient::request_file":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    var event_loop = LoaderTestEventLoop()
+    loader_test_install_event_loop(&event_loop)
+    defer loader_test_remove_event_loop()
+    discard(loader_test_initialize_resource_loader(vm))
+    loader_test_install_resources()
+
+    # resource: loads answer at once, with the guessed Content-Type and the file's Last-Modified.
+    let (resource, resource_request) = loader_test_load(vm, "resource://ladybird/templates/error.html", none)
+    assert(resource_request == none and resource.completions == 1 and resource.success)
+    assert(resource.status_code == none and resource.reason_phrase == none)
+    let content_type = resource.header("Content-Type") else trap("a Content-Type")
+    assert(loader_test_byte_string_is(content_type, "text/html"))
+    let allow_origin = resource.header("Access-Control-Allow-Origin") else trap("an Access-Control-Allow-Origin")
+    assert(loader_test_byte_string_is(allow_origin, "null"))
+    assert(resource.header("Last-Modified") != none)
+    assert(ak.byte_buffer_size(&resource.data) == 1750)
+    let (missing, _) = loader_test_load(vm, "resource://ladybird/templates/nope.html", none)
+    assert(missing.completions == 1 and not missing.success and missing.error_message != none)
+
+    # file: asks the page's client to open the file, and answers on a later turn of the event loop.
+    let page = loader_test_create_page(vm)
+    let cwd = core_system_getcwd() else trap("the working directory")
+    var file_url = ak.string_builder_new()
+    ak.string_builder_append(&file_url, "file://")
+    ak.string_builder_append_string_view(&file_url, ak.byte_string_view(&cwd))
+    ak.string_builder_append(&file_url, "/data/res/ladybird/templates/directory.html")
+    let file_url_text = ak.string_builder_to_byte_string(&file_url)
+    let (file, file_request) = loader_test_load(vm, ak.string_view_text(ak.byte_string_view(&file_url_text)), page)
+    assert(file_request == none and file.completions == 0)
+    assert(resource_loader_pending_loads(resource_loader_the()) == 1)
+    loader_test_drain(&event_loop)
+    assert(resource_loader_pending_loads(resource_loader_the()) == 0)
+    assert(file.completions == 1 and file.success and ak.byte_buffer_size(&file.data) == 1590)
+    let file_type = file.header("Content-Type") else trap("a Content-Type")
+    assert(loader_test_byte_string_is(file_type, "text/html"))
+
+    # A missing file: the client's error; a directory: its generated page.
+    let (missing_file, _) = loader_test_load(vm, "file:///nonexistent/p2d/missing.html", page)
+    loader_test_drain(&event_loop)
+    assert(loader_test_failed_with(missing_file, "No such file or directory (errno=2)"))
+    var directory_url = ak.string_builder_new()
+    ak.string_builder_append(&directory_url, "file://")
+    ak.string_builder_append_string_view(&directory_url, ak.byte_string_view(&cwd))
+    ak.string_builder_append(&directory_url, "/data/res/ladybird")
+    let directory_url_text = ak.string_builder_to_byte_string(&directory_url)
+    let (directory, _) = loader_test_load(vm, ak.string_view_text(ak.byte_string_view(&directory_url_text)), page)
+    loader_test_drain(&event_loop)
+    assert(directory.completions == 1 and directory.success)
+    let directory_view = ak.string_view_from_bytes(ak.byte_buffer_bytes_const(&directory.data))
+    assert(ak.string_view_find_string_view(&directory_view, ak.sv(">templates</a>")) != none)
+    # (No network request was made, so the page heard of none.)
+    assert(loader_test_network_started == 0 and loader_test_network_finished == 0)
+
+# mark: The in-process RequestClient: data: and file: ==========================================
+
+## What a request of the seam delivered.
+struct LoaderTestSeamLog:
+    var headers: HttpHeaderList*?
+    var status_code: u32?
+    var reason_phrase: ak.String?
+    var data: ak.ByteBuffer
+    var finishes: i32
+    var total_size: u64
+    var network_error: RequestsNetworkError?
+
+    static func on_headers(context: void*?, headers: HttpHeaderList*, status_code: u32?, reason_phrase: ak.String?):
+        let log = (LoaderTestSeamLog*)(context else trap("no log"))
+        log.headers = headers
+        log.status_code = status_code
+        log.reason_phrase = reason_phrase
+
+    static func on_data(context: void*?, data: const u8[]):
+        let log = (LoaderTestSeamLog*)(context else trap("no log"))
+        ak.byte_buffer_append_span_u8(&log.data, data)
+
+    static func on_finish(context: void*?, total_size: u64, timing_info: RequestsRequestTimingInfo, network_error: RequestsNetworkError?):
+        let log = (LoaderTestSeamLog*)(context else trap("no log"))
+        log.finishes += 1
+        log.total_size = total_size
+        log.network_error = network_error
+
+    ## The value of a response header.
+    func header(name: str) -> ak.ByteString?:
+        let headers = self.headers else return none
+        return http_header_list_get(headers, ak.sv(name))
+
+    ## Whether the body received is `text`.
+    func received(text: str) -> bool:
+        let view = ak.string_view_from_bytes(ak.byte_buffer_bytes_const(&self.data))
+        return ak.string_view_equals(&view, text)
+
+## Starts a GET of `url` through `client`, its deliveries recorded in a new log.
+func loader_test_start(client: InProcessRequestClient*, url: str, method: str = "GET", headers: HttpHeaderList*? = none, body: const u8[] = b"") -> (LoaderTestSeamLog*, RequestsRequest*):
+    let log = new LoaderTestSeamLog(data = ak.ByteBuffer()) else trap("out of memory")
+    let request = requests_request_client_start_request(&client.client, ak.byte_string_from_str(method), loader_test_url(url), headers, body) else trap("the request starts")
+    requests_request_set_unbuffered_request_callbacks(request, ak.Function3[HttpHeaderList*, u32?, ak.String?, unit](call = LoaderTestSeamLog.on_headers, context = log),
+                                                      ak.Function1[const u8[], unit](call = LoaderTestSeamLog.on_data, context = log),
+                                                      ak.Function3[u64, RequestsRequestTimingInfo, RequestsNetworkError?, unit](call = LoaderTestSeamLog.on_finish, context = log))
+    return (log, request)
+
+test "the in-process RequestClient: data: and file: requests on the event loop, ids, stopping one":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    var event_loop = LoaderTestEventLoop()
+    loader_test_install_event_loop(&event_loop)
+    defer loader_test_remove_event_loop()
+    let client = in_process_request_client_create(vm_heap(vm))
+
+    let (data_log, data_request) = loader_test_start(client, "data:text/plain;charset=utf-8,hello%20world")
+    let (base64_log, base64_request) = loader_test_start(client, "data:image/png;base64,iVBORw0KGgo=")
+    assert(requests_request_id(data_request) == 0 and requests_request_id(base64_request) == 1)
+    assert(data_request.m_mode == RequestsRequestMode.unbuffered)
+    # Nothing is delivered before the event loop runs the requests.
+    assert(data_log.finishes == 0 and data_log.headers == none)
+    loader_test_drain(&event_loop)
+    assert(data_log.finishes == 1 and data_log.network_error == none and data_log.status_code == 200)
+    assert(data_log.received("hello world") and data_log.total_size == 11)
+    let data_type = data_log.header("Content-Type") else trap("a Content-Type")
+    assert(loader_test_byte_string_is(data_type, "text/plain;charset=utf-8"))
+    assert(base64_log.finishes == 1 and ak.byte_buffer_size(&base64_log.data) == 8)
+
+    # A bad data: URL, a missing file, an unknown scheme: a network error, no headers.
+    let (bad_log, _) = loader_test_start(client, "data:text/html;base64,%%%")
+    let (missing_log, _) = loader_test_start(client, "file:///nonexistent/p2d/missing.html")
+    let (gopher_log, _) = loader_test_start(client, "gopher://example.com/")
+    loader_test_drain(&event_loop)
+    assert(bad_log.finishes == 1 and bad_log.network_error == RequestsNetworkError.malformed_url and bad_log.headers == none)
+    assert(missing_log.finishes == 1 and missing_log.network_error == RequestsNetworkError.unknown)
+    assert(gopher_log.finishes == 1 and gopher_log.network_error == RequestsNetworkError.malformed_url)
+
+    # A file: its bytes and the headers ResourceLoader gives a file.
+    let cwd = core_system_getcwd() else trap("the working directory")
+    var file_url = ak.string_builder_new()
+    ak.string_builder_append(&file_url, "file://")
+    ak.string_builder_append_string_view(&file_url, ak.byte_string_view(&cwd))
+    ak.string_builder_append(&file_url, "/data/res/ladybird/templates/error.html")
+    let file_url_text = ak.string_builder_to_byte_string(&file_url)
+    let (file_log, _) = loader_test_start(client, ak.string_view_text(ak.byte_string_view(&file_url_text)))
+    loader_test_drain(&event_loop)
+    assert(file_log.finishes == 1 and file_log.network_error == none and ak.byte_buffer_size(&file_log.data) == 1750)
+    let file_type = file_log.header("Content-Type") else trap("a Content-Type")
+    assert(loader_test_byte_string_is(file_type, "text/html"))
+
+    # A stopped request delivers nothing more; stopping it again, or a finished one, answers false.
+    let (stopped_log, stopped_request) = loader_test_start(client, "data:,never")
+    assert(requests_request_stop(stopped_request))
+    assert(not requests_request_stop(stopped_request))
+    loader_test_drain(&event_loop)
+    assert(stopped_log.finishes == 0 and stopped_log.headers == none and ak.byte_buffer_size(&stopped_log.data) == 0)
+    assert(not requests_request_stop(data_request))
+
+## What PageClient::request_file's callback heard.
+struct LoaderTestFileResult:
+    var calls: i32
+    var result: ErrorOrI32
+
+    static func call(context: void*?, result: ErrorOrI32):
+        let log = (LoaderTestFileResult*)(context else trap("no log"))
+        log.calls += 1
+        log.result = result
+
+test "in_process_request_file: a descriptor of the open file on the next turn of the event loop, or the error":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    var event_loop = LoaderTestEventLoop()
+    loader_test_install_event_loop(&event_loop)
+    defer loader_test_remove_event_loop()
+
+    let found = new LoaderTestFileResult(result = ErrorOrI32.value(value = -1)) else trap("out of memory")
+    var request = FileRequest(m_path = ak.byte_string_empty())
+    file_request_construct(&request, ak.byte_string_from_str("data/res/ladybird/templates/error.html"), ak.Function1[ErrorOrI32, unit](call = LoaderTestFileResult.call, context = found))
+    let path = file_request_path(&request)
+    assert(loader_test_byte_string_is(path, "data/res/ladybird/templates/error.html"))
+    in_process_request_file(request)
+    assert(found.calls == 0)
+    loader_test_drain(&event_loop)
+    assert(found.calls == 1)
+    match found.result:
+        .value(fd):
+            assert(fd >= 0)
+            let st = core_system_fstat(fd) else trap("fstat")
+            assert(not core_system_is_directory(&st) and st.size == 1750)
+            let bytes = core_file_read_until_eof(fd) else trap("read_until_eof")
+            assert(ak.byte_buffer_size(&bytes) == 1750)
+        .ak_error(_): trap("the file opens")
+
+    let missing = new LoaderTestFileResult(result = ErrorOrI32.value(value = -1)) else trap("out of memory")
+    var missing_request = FileRequest(m_path = ak.byte_string_empty())
+    file_request_construct(&missing_request, ak.byte_string_from_str("/nonexistent/p2d/missing.html"), ak.Function1[ErrorOrI32, unit](call = LoaderTestFileResult.call, context = missing))
+    in_process_request_file(missing_request)
+    loader_test_drain(&event_loop)
+    match missing.result:
+        .value(_): trap("the file is missing")
+        .ak_error(failure): assert(ak.ak_error_code(&failure) == 2)

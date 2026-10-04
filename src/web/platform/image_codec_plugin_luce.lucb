@@ -1,0 +1,154 @@
+#==============================================================================================
+#
+#   image_codec_plugin_luce - the engine's Platform::ImageCodecPlugin: still PNG and JPEG
+#   images decoded by luce-png and luce-jpeg
+#
+#   DESCRIPTION:
+#       Ladybird's WebView::ImageCodecPlugin (Libraries/LibWebView/Plugins/ImageCodecPlugin.cpp)
+#       sends the bytes to its ImageDecoder process, which decodes with LibGfx's decoders over
+#       libpng and libjpeg-turbo. Here the plugin decodes in process with our own decoders
+#       (DESIGN.md §7.0): luce-png and luce-jpeg give 8-bit RGBA, converted at this seam to the
+#       bitmaps gfx and the rasterizer draw, premultiplied BGRA8888 (raster.premultiply_u8,
+#       Skia's rounding). Not a port: new code behind the ported seam.
+#
+#       decode_image answers a promise at once and decodes on the next turn of the event loop,
+#       as the ImageDecoder's reply arrives later: the promise's handlers hear one frame (or
+#       the error). The images are sRGB (an embedded ICC profile or cICP chunk is not read),
+#       and still: animated GIF, WebP and APNG need their own luce packages, so
+#       request_animation_frames and stop_animation_decode have nothing to do.
+#
+#       Copyright (c) 2026 the luce-browser authors.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: The plugin ==============================================================================
+
+## The image codec plugin over luce-png and luce-jpeg.
+pub struct LuceImageCodecPlugin: IsPlatformImageCodecPlugin:
+    pub var plugin: PlatformImageCodecPlugin  # the seam's plugin first: a pointer to one is a pointer to the other
+
+    func platform_image_codec_plugin() -> PlatformImageCodecPlugin*: return (PlatformImageCodecPlugin*)&self
+
+## The plugin's vtable.
+let luce_image_codec_plugin_vtable: PlatformImageCodecPluginVTable = PlatformImageCodecPluginVTable(class_info = &platform_image_codec_plugin_class,
+                                                                                                    decode_image = luce_image_codec_plugin_decode_image,
+                                                                                                    request_animation_frames = luce_image_codec_plugin_request_animation_frames,
+                                                                                                    stop_animation_decode = luce_image_codec_plugin_stop_animation_decode)
+
+## Makes the plugin in the C heap for the process and installs it (WebContent's main: ImageCodecPlugin::install).
+pub func luce_image_codec_plugin_install():
+    with memory.heap:
+        let plugin = new LuceImageCodecPlugin(plugin = PlatformImageCodecPlugin(vtable = &luce_image_codec_plugin_vtable)) else trap("out of memory")
+        platform_image_codec_plugin_install(plugin.platform_image_codec_plugin())
+
+## The captures of decode_image's deferred decode: the bytes (copied, as the IPC message copies them) and the promise.
+struct LuceImageCodecPluginDecode:
+    var bytes: ak.ByteBuffer
+    var promise: CorePromise[PlatformDecodedImage, ak.AkError]*
+
+    ## The deferred decode: resolves the promise with the decoded image, or rejects it.
+    static func call(context: void*?):
+        let captures = (LuceImageCodecPluginDecode*)(context else trap("decode_image: no captures"))
+        let image = luce_image_codec_plugin_decode(ak.byte_buffer_bytes_const(&captures.bytes)) catch failure:
+            core_promise_reject(captures.promise, ak.ak_error_from_failure(failure))
+            return
+        core_promise_resolve(captures.promise, image)
+
+## ImageCodecPlugin::decode_image: a promise whose handlers are `on_resolved` and `on_rejected`, settled on the
+## next turn of the event loop.
+func luce_image_codec_plugin_decode_image(this: PlatformImageCodecPlugin*, bytes: const u8[], on_resolved: ak.Function1[PlatformDecodedImage*, unit],
+                                          on_rejected: ak.Function1[ak.AkError*, unit]) -> CorePromise[PlatformDecodedImage, ak.AkError]*:
+    let promise = core_promise_construct[PlatformDecodedImage, ak.AkError]()
+    if ak.function1_is_set(&on_resolved):
+        promise.on_resolution = on_resolved
+    if ak.function1_is_set(&on_rejected):
+        promise.on_rejection = on_rejected
+
+    let copy = ak.byte_buffer_copy_span_u8(bytes) else trap("out of memory")
+    let captures = new LuceImageCodecPluginDecode(bytes = copy, promise = promise) else trap("out of memory")
+    core_deferred_invoke(ak.Function0[unit](call = LuceImageCodecPluginDecode.call, context = captures))
+    return promise
+
+## ImageCodecPlugin::request_animation_frames: the plugin decodes no animations.
+func luce_image_codec_plugin_request_animation_frames(this: PlatformImageCodecPlugin*, session_id: i64, start_frame_index: u32, count: u32):
+    return
+
+## ImageCodecPlugin::stop_animation_decode: the plugin decodes no animations.
+func luce_image_codec_plugin_stop_animation_decode(this: PlatformImageCodecPlugin*, session_id: i64):
+    return
+
+# mark: Decoding ================================================================================
+
+## The image could not be decoded.
+pub let luce_image_codec_unsupported: ErrorCode = ErrorCode.package(5)
+
+## PNG's signature.
+let luce_image_codec_png_signature: u8[8] = [0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A]
+
+## Whether `bytes` start with `signature`.
+func luce_image_codec_starts_with(bytes: const u8[], signature: const u8[]) -> bool:
+    if bytes.length < signature.length:
+        return false
+    for index in 0..<signature.length:
+        if bytes[index] != signature[index]:
+            return false
+    return true
+
+## The decoded image of a PNG or JPEG file: one frame, a premultiplied BGRA8888 bitmap.
+pub func luce_image_codec_plugin_decode(bytes: const u8[]) -> PlatformDecodedImage!:
+    var width: usize = 0
+    var height: usize = 0
+    var pixels: u8[]
+    if luce_image_codec_starts_with(bytes, luce_image_codec_png_signature):
+        let found = try png_codec.info(bytes)
+        width = found.width
+        height = found.height
+        try luce_image_codec_check_size(width, height)
+        pixels = try alloc u8[width * height * 4] in memory.heap
+        with memory.heap:
+            png_codec.decode_rgba8(bytes, pixels) catch failure:
+                free(pixels)
+                error(failure.code, failure.message)
+    elif luce_image_codec_starts_with(bytes, [0xFF, 0xD8, 0xFF]):
+        let found = try jpeg_codec.info(bytes)
+        width = found.width
+        height = found.height
+        try luce_image_codec_check_size(width, height)
+        pixels = try alloc u8[width * height * 4] in memory.heap
+        with memory.heap:
+            jpeg_codec.decode_rgba8(bytes, pixels) catch failure:
+                free(pixels)
+                error(failure.code, failure.message)
+    else:
+        error(luce_image_codec_unsupported, "Unsupported image format")
+    defer free(pixels) in memory.heap
+
+    let bitmap = try luce_image_codec_bitmap(pixels, width, height)
+    var color_space: gfx.ColorSpace = ---
+    gfx.color_space_construct(&color_space)
+    var image = PlatformDecodedImage(color_space = color_space)
+    image.frame_count = 1
+    ak.vector_append_t(&image.frames, PlatformFrame(bitmap = bitmap, duration = 0))
+    ak.vector_append_t(&image.all_durations, 0)
+    return image
+
+## Fails for a picture with no pixels or too many (above 2^14 on a side, as Gfx::Bitmap's size check).
+func luce_image_codec_check_size(width: usize, height: usize) -> !:
+    if width == 0 or height == 0 or width > 16384 or height > 16384:
+        error(luce_image_codec_unsupported, "the image's size is out of range")
+
+## A premultiplied BGRA8888 bitmap of the 8-bit RGBA `pixels`.
+func luce_image_codec_bitmap(pixels: const u8[], width: usize, height: usize) -> gfx.Bitmap*!:
+    let size = gfx.IntSize(m_width = (i32)width, m_height = (i32)height)
+    let bitmap = try gfx.bitmap_create_alpha_type(gfx.BitmapFormat.bgra8888, gfx.AlphaType.premultiplied, size)
+    for y in 0..<height:
+        let row = gfx.bitmap_scanline(bitmap, (i32)y) else trap("VERIFY: bitmap data")
+        let source = pixels[y * width * 4..]
+        for x in 0..<width:
+            let alpha = source[x * 4 + 3]
+            let red = (u32)raster.premultiply_u8(source[x * 4], alpha)
+            let green = (u32)raster.premultiply_u8(source[x * 4 + 1], alpha)
+            let blue = (u32)raster.premultiply_u8(source[x * 4 + 2], alpha)
+            row[x] = ((u32)alpha << 24) | (red << 16) | (green << 8) | blue
+    return bitmap
