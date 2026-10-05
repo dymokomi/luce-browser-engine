@@ -1,0 +1,357 @@
+#==============================================================================================
+#
+#   fetching_1 - Fetch::Fetching: the HTTP cache partitions, fetch, and populating a request
+#   from its client
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibWeb/Fetch/Fetching/Fetching.cpp (lines 75-381): HTTPCache (one
+#       HTTP::MemoryCache per network partition key, for the process), determining the HTTP
+#       cache partition, selecting a response from and storing one in the memory cache (off
+#       unless enabled), the fetch algorithm (Fetching.h's entry point) and populate request
+#       from client. Main fetch is in fetching_2, fetch response handover in fetching_3,
+#       scheme fetch in fetching_4, HTTP fetch and HTTP-redirect fetch in fetching_5,
+#       HTTP-network-or-cache fetch in fetching_6, the network fetch through the
+#       ResourceLoader, CORS-preflight fetch and the Fetch metadata headers in fetching_7.
+#
+#       Copyright (c) 2022-2023, Linus Groh <linusg@serenityos.org>
+#       Copyright (c) 2023, Luke Wilde <lukew@serenityos.org>
+#       Copyright (c) 2023, Sam Atkins <atkinssj@serenityos.org>
+#       Copyright (c) 2024, Jamie Mansfield <jmansfield@cadixdev.org>
+#       Copyright (c) 2025, Shannon Booth <shannon@serenityos.org>
+#       Copyright (c) 2025, Kenneth Myhra <kennethmyhra@serenityos.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: The HTTP cache ==========================================================================
+
+## HTTPCache::the()'s `static HTTPCache s_cache`: for the process, so its map and what it keeps live in the C heap
+## (DESIGN.md §3.3 rule 7).
+var fetch_http_cache_s_cache: FetchHttpCache
+
+## A copy of `value` in the C heap, for a key of the HTTP cache. Runs with the C heap current and ak's atomic
+## allocator unset (fetch_http_cache_get).
+func fetch_http_cache_kept_string(value: ak.String) -> ak.String:
+    return ak.string_from_utf8(ak.string_bytes_as_string_view(&value)) else trap("MUST: String::from_utf8")
+
+## A copy of `value` in the C heap, as fetch_http_cache_kept_string.
+func fetch_http_cache_kept_optional_string(value: ak.String?) -> ak.String?:
+    if let string = value:
+        return fetch_http_cache_kept_string(string)
+    return none
+
+## A copy of a network partition key whose strings live in the C heap, for HTTPCache's map: the key's origin
+## (an opaque origin holds no strings).
+func fetch_http_cache_kept_key(key: const FetchNetworkPartitionKey*) -> FetchNetworkPartitionKey:
+    match key.top_level_origin.m_state:
+        .origin_opaque_data(_):
+            return *key
+        .origin_tuple(tuple):
+            let host_value: ak.HostVariantType = match tuple.host.m_value:
+                .string(string) => .string(fetch_http_cache_kept_string(string))
+                _ => tuple.host.m_value
+            let origin = web_url.origin_tuple(fetch_http_cache_kept_optional_string(tuple.scheme), web_url.Host(m_value = host_value), tuple.port, fetch_http_cache_kept_optional_string(tuple.domain))
+            return FetchNetworkPartitionKey(top_level_origin = origin, second_key = key.second_key)
+
+## Ported from Libraries/LibWeb/Fetch/Fetching/Fetching.cpp:89 Web::Fetch::Fetching::HTTPCache::get.
+pub func fetch_http_cache_get(this: FetchHttpCache*, key: const FetchNetworkPartitionKey*) -> HttpMemoryCache*:
+    # return *m_cache.ensure(key, [] { return HTTP::MemoryCache::create(); }); the entry and its key in the C heap.
+    if let cache = ak.hash_map_get_k(&this.m_cache, *key):
+        return *cache
+    let saved_atomic_allocator = ak.atomic_allocator
+    ak.atomic_allocator = none
+    defer ak.atomic_allocator = saved_atomic_allocator
+    with memory.heap:
+        let kept_key = fetch_http_cache_kept_key(key)
+        let cache = http_memory_cache_create()
+        ak.hash_map_set(&this.m_cache, kept_key, cache)
+        return cache
+
+## Ported from Libraries/LibWeb/Fetch/Fetching/Fetching.cpp:96 Web::Fetch::Fetching::HTTPCache::the.
+pub func fetch_http_cache_the() -> FetchHttpCache*:
+    return &fetch_http_cache_s_cache
+
+## Ported from Libraries/LibWeb/Fetch/Fetching/Fetching.cpp:102 Web::Fetch::Fetching::HTTPCache::clear_cache.
+pub func fetch_http_cache_clear_cache(this: FetchHttpCache*):
+    # (The map's storage is in the C heap; the keys' strings and the caches are never freed, as the C++
+    #  process-wide objects.)
+    let saved_atomic_allocator = ak.atomic_allocator
+    ak.atomic_allocator = none
+    defer ak.atomic_allocator = saved_atomic_allocator
+    with memory.heap:
+        ak.hash_map_clear(&this.m_cache)
+
+## Ported from Libraries/LibWeb/Fetch/Fetching/Fetching.cpp:112 Web::Fetch::Fetching::determine_the_http_cache_partition.
+# https://fetch.spec.whatwg.org/#determine-the-http-cache-partition
+func fetch_fetching_determine_the_http_cache_partition(request: FetchRequest*) -> HttpMemoryCache*?:
+    # 1. Let key be the result of determining the network partition key given request.
+    # 2. If key is null, then return null.
+    let key = fetch_determine_the_network_partition_key_fetch_request(request) else return none
+
+    # 3. Return the unique HTTP cache associated with key. [HTTP-CACHING]
+    return fetch_http_cache_get(fetch_http_cache_the(), &key)
+
+## Ported from Libraries/LibWeb/Fetch/Fetching/Fetching.cpp:125 Web::Fetch::Fetching::select_response_from_cache.
+func fetch_fetching_select_response_from_cache(realm: Realm*, http_cache: HttpMemoryCache*, request: FetchRequest*) -> FetchResponse*?:
+    if not fetch_fetching_g_http_memory_cache_enabled:
+        return none
+
+    let method = fetch_request_method(request)
+    let cache_entry = http_memory_cache_open_entry(http_cache, fetch_request_current_url(request), ak.byte_string_view(&method), fetch_request_header_list(request), fetch_request_cache_mode(request)) else return none
+
+    let response = fetch_infrastructure_response_create(realm_vm(realm))
+    ak.vector_append_t(fetch_response_url_list(response), fetch_request_current_url(request))
+    fetch_response_set_method(response, method)
+
+    fetch_response_set_status(response, (u16)cache_entry.status_code)
+    fetch_response_set_status_message(response, cache_entry.reason_phrase)
+    fetch_response_set_header_list(response, cache_entry.response_headers)
+
+    let body_with_type = fetch_safely_extract_body_bytes(realm, ak.byte_buffer_bytes_const(&cache_entry.response_body))
+    fetch_response_set_body(response, body_with_type.body)
+
+    return response
+
+## Ported from Libraries/LibWeb/Fetch/Fetching/Fetching.cpp:148 Web::Fetch::Fetching::store_response_in_cache.
+func fetch_fetching_store_response_in_cache(http_cache: HttpMemoryCache*, request: FetchRequest*, response: FetchResponse*):
+    if not fetch_fetching_g_http_memory_cache_enabled:
+        return
+    if fetch_request_cache_mode(request) == HttpCacheMode.no_store:
+        return
+
+    let method = fetch_request_method(request)
+    http_memory_cache_create_entry(http_cache, fetch_request_current_url(request), ak.byte_string_view(&method), fetch_request_header_list(request), fetch_request_request_time(request), (u32)fetch_response_status(response), fetch_response_status_message(response), fetch_response_header_list(response))
+
+# mark: Fetch ===================================================================================
+
+## The captures of fetch's onPreloadedResponseAvailable, `[fetch_params](GC::Ref<Response> response)`.
+struct FetchFetchingFetchOnPreloadedResponseAvailable:
+    var fetch_params: FetchParams*
+
+    ## Sets fetchParams’s preloaded response candidate to response.
+    static func call(context: void*?, response: FetchResponse*):
+        let captures = (FetchFetchingFetchOnPreloadedResponseAvailable*)(context else trap("fetch: no captures"))
+        fetch_params_set_preloaded_response_candidate(captures.fetch_params, .fetch_response(response))
+
+## Ported from Libraries/LibWeb/Fetch/Fetching/Fetching.cpp:159 Web::Fetch::Fetching::fetch.
+# https://fetch.spec.whatwg.org/#concept-fetch
+pub func fetch_fetching_fetch(realm: Realm*, request: FetchRequest*, algorithms: const FetchAlgorithms*, use_parallel_queue: FetchUseParallelQueue = FetchUseParallelQueue.no) -> FetchController*:
+    if fetch_web_fetch_debug:
+        ak.dbgln(f"Fetch: Running 'fetch' with: request @ {(void*)request}")
+
+    let vm = realm_vm(realm)
+
+    # 1. Assert: request’s mode is "navigate" or processEarlyHintsResponse is null.
+    let process_early_hints_response = fetch_algorithms_process_early_hints_response((FetchAlgorithms*)algorithms)
+    assert(fetch_request_mode(request) == FetchRequestMode.navigate or not ak.function1_is_set(&process_early_hints_response))
+
+    # 2. Let taskDestination be null.
+    var task_destination: FetchTaskDestination = .empty
+
+    # 3. Let crossOriginIsolatedCapability be false.
+    var cross_origin_isolated_capability = HtmlCanUseCrossOriginIsolatedApIs.no
+
+    # 4. Populate request from client given request.
+    fetch_fetching_populate_request_from_client(realm, request)
+
+    # 5. If request’s client is non-null, then:
+    if let client = fetch_request_client(request):
+        # 1. Set taskDestination to request’s client’s global object.
+        task_destination = .js_object(html_environment_settings_object_global_object(client))
+
+        # 2. Set crossOriginIsolatedCapability to request’s client’s cross-origin isolated capability.
+        cross_origin_isolated_capability = html_environment_settings_object_cross_origin_isolated_capability(client)
+
+    # 6. If useParallelQueue is true, then set taskDestination to the result of starting a new parallel queue.
+    if use_parallel_queue == FetchUseParallelQueue.yes:
+        task_destination = .html_parallel_queue(html_parallel_queue_create())
+
+    # 7. Let timingInfo be a new fetch timing info whose start time and post-redirect start time are the coarsened
+    #    shared current time given crossOriginIsolatedCapability, and render-blocking is set to request’s
+    #    render-blocking.
+    let timing_info = fetch_timing_info_create(vm)
+    let now = high_resolution_time_coarsened_shared_current_time(cross_origin_isolated_capability)
+    fetch_timing_info_set_start_time(timing_info, now)
+    fetch_timing_info_set_post_redirect_start_time(timing_info, now)
+    fetch_timing_info_set_render_blocking(timing_info, fetch_request_render_blocking(request))
+
+    # 8. Let fetchParams be a new fetch params whose request is request, timing info is timingInfo, process request
+    #    body chunk length is processRequestBodyChunkLength, process request end-of-body is processRequestEndOfBody,
+    #    process early hints response is processEarlyHintsResponse, process response is processResponse, process
+    #    response consume body is processResponseConsumeBody, process response end-of-body is processResponseEndOfBody,
+    #    task destination is taskDestination, and cross-origin isolated capability is crossOriginIsolatedCapability.
+    let fetch_params = fetch_params_create(vm, request, timing_info)
+    fetch_params_set_algorithms(fetch_params, (FetchAlgorithms*)algorithms)
+    fetch_params_set_task_destination(fetch_params, task_destination)
+    fetch_params_set_cross_origin_isolated_capability(fetch_params, cross_origin_isolated_capability)
+
+    # 9. If request’s body is a byte sequence, then set request’s body to request’s body as a body.
+    match fetch_request_body_const(request):
+        .byte_buffer(buffer):
+            fetch_request_set_body(request, .fetch_body(fetch_byte_sequence_as_body(realm, ak.byte_buffer_bytes_const(&buffer))))
+        _: _ = 0
+
+    # 10. If all of the following conditions are true:
+    let url = fetch_request_url(request)
+    let scheme = web_url.url_scheme(&url)
+    let mode = fetch_request_mode(request)
+    let method = fetch_request_method(request)
+    if (fetch_is_http_or_https_scheme(ak.string_bytes_as_string_view(&scheme)) and (mode == FetchRequestMode.same_origin or mode == FetchRequestMode.cors or mode == FetchRequestMode.no_cors) and fetch_fetching_client_global_is_window(request) and ak.byte_string_equals_ignoring_ascii_case(&method, ak.sv("GET")) and (not fetch_request_unsafe_request(request) or http_header_list_is_empty(fetch_request_header_list(request)))):
+        # - request’s URL’s scheme is an HTTP(S) scheme
+        # - request’s mode is "same-origin", "cors", or "no-cors"
+        # - request’s client is not null, and request’s client’s global object is a Window object
+        # - request’s method is `GET`
+        # - request’s unsafe-request flag is not set or request’s header list is empty
+        let client = fetch_request_client(request) else trap("VERIFY: the request's client")
+
+        # 1. Assert: request’s origin is same origin with request’s client’s origin.
+        match fetch_request_origin(request):
+            .origin(origin): assert(web_url.origin_is_same_origin(&origin, html_environment_settings_object_origin(client)))
+            _: trap("VERIFY: request.origin().has<URL::Origin>()")
+
+        # 2. Let onPreloadedResponseAvailable be an algorithm that runs the following step given a response
+        #    response: set fetchParams’s preloaded response candidate to response.
+        let captures = new FetchFetchingFetchOnPreloadedResponseAvailable(fetch_params = fetch_params) else trap("out of memory")
+        let on_preloaded_response_available = gc.create_function1(realm_heap(realm), ak.Function1[FetchResponse*, unit](call = FetchFetchingFetchOnPreloadedResponseAvailable.call, context = captures))
+
+        # 3. Let foundPreloadedResource be the result of invoking consume a preloaded resource for request’s
+        #    window, given request’s URL, request’s destination, request’s mode, request’s credentials mode,
+        #    request’s integrity metadata, and onPreloadedResponseAvailable.
+        let window = as_html_window((gc.Cell*)html_environment_settings_object_global_object(client))
+        let found_preloaded_resource = html_consume_a_preloaded_resource(
+            window,
+            fetch_request_url(request),
+            fetch_request_destination(request),
+            fetch_request_mode(request),
+            fetch_request_credentials_mode(request),
+            fetch_request_integrity_metadata(request),
+            on_preloaded_response_available)
+
+        # 4. If foundPreloadedResource is true and fetchParams’s preloaded response candidate is null, then set
+        #    fetchParams’s preloaded response candidate to "pending".
+        if found_preloaded_resource and fetch_params_preloaded_response_candidate_const(fetch_params) == .empty:
+            fetch_params_set_preloaded_response_candidate(fetch_params, .fetch_params_preloaded_response_candidate_pending_tag(FetchParamsPreloadedResponseCandidatePendingTag()))
+
+    # 11. If request’s header list does not contain `Accept`, then:
+    if not http_header_list_contains(fetch_request_header_list(request), ak.sv("Accept")):
+        # 1. Let value be `*/*`.
+        var value = ak.sv("*/*")
+
+        # 2. If request’s initiator is "prefetch", then set value to the document `Accept` header value.
+        if fetch_request_initiator(request) == FetchRequestInitiator.prefetch:
+            value = ak.sv(fetch_fetching_document_accept_header_value)
+
+        # 3. Otherwise, the user agent should set value to the first matching statement, if any, switching on request’s destination:
+        elif let destination = fetch_request_destination(request):
+            match destination:
+                # -> "document"
+                # -> "frame"
+                # -> "iframe"
+                .document, .frame, .i_frame:
+                    # the document `Accept` header value
+                    value = ak.sv(fetch_fetching_document_accept_header_value)
+                # -> "image"
+                .image:
+                    # `image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5`
+                    # AD-HOC: The spec default omits AVIF and WebP, which causes CDNs that perform format negotiation to
+                    #         potentially fall back to non alpha-preserving formats.
+                    #         Spec issue: https://github.com/whatwg/fetch/issues/1740
+                    value = ak.sv("image/avif,image/webp,image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5")
+                # -> "json"
+                .json:
+                    # `application/json,*/*;q=0.5`
+                    value = ak.sv("application/json,*/*;q=0.5")
+                # -> "style"
+                .style:
+                    # `text/css,*/*;q=0.1`
+                    value = ak.sv("text/css,*/*;q=0.1")
+                _: _ = 0
+
+        # 4. Append (`Accept`, value) to request’s header list.
+        let header = http_header_isomorphic_encode(ak.sv("Accept"), value)
+        http_header_list_append(fetch_request_header_list(request), header)
+
+    # 12. If request’s header list does not contain `Accept-Language`, then user agents should append
+    #     (`Accept-Language, an appropriate header value) to request’s header list.
+    if not http_header_list_contains(fetch_request_header_list(request), ak.sv("Accept-Language")):
+        var accept_language = ak.string_builder_new()
+        ak.string_builder_join_string(&accept_language, ak.sv(","), ak.vector_span_const(resource_loader_preferred_languages()))
+
+        let header = http_header_isomorphic_encode(ak.sv("Accept-Language"), ak.string_builder_string_view(&accept_language))
+        http_header_list_append(fetch_request_header_list(request), header)
+
+    # 13. If request’s internal priority is null, then use request’s priority, initiator, destination, and
+    #     render-blocking in an implementation-defined manner to set request’s internal priority to an
+    #     implementation-defined object.
+    # NOTE: The user-agent-defined object could encompass stream weight and dependency for HTTP/2, and equivalent
+    #       information used to prioritize dispatch and processing of HTTP/1 fetches.
+
+    # 14. If request is a subresource request, then:
+    if fetch_request_is_subresource_request(request):
+        # 1. Let record be a new fetch record whose request is request and controller is fetchParams’s controller.
+        let record = fetch_record_create_fetch_controller(vm, request, fetch_params_controller(fetch_params))
+
+        # 2. Append record to request’s client’s fetch group’s fetch records.
+        let client = fetch_request_client(request) else trap("VERIFY: a subresource request's client")
+        ak.intrusive_list_append(html_environment_settings_object_fetch_group(client), record, memory.offset_of(FetchRecord, m_list_node))
+
+    # 15. Run main fetch given fetchParams.
+    _ = fetch_fetching_main_fetch(realm, fetch_params)
+
+    # 16. Return fetchParams’s controller.
+    return fetch_params_controller(fetch_params)
+
+## `request.client() && is<HTML::Window>(request.client()->global_object())`, a condition of fetch's step 10.
+func fetch_fetching_client_global_is_window(request: FetchRequest*) -> bool:
+    let client = fetch_request_client(request) else return false
+    return is_html_window((gc.Cell*)html_environment_settings_object_global_object(client))
+
+## Ported from Libraries/LibWeb/Fetch/Fetching/Fetching.cpp:159 Web::Fetch::Fetching::fetch with UseParallelQueue::Yes
+## (region r28's entry point for perform_navigation_params_fetch).
+pub func fetch_fetching_fetch_use_parallel_queue(realm: Realm*, request: FetchRequest*, algorithms: const FetchAlgorithms*) -> FetchController*:
+    return fetch_fetching_fetch(realm, request, algorithms, FetchUseParallelQueue.yes)
+
+## Ported from Libraries/LibWeb/Fetch/Fetching/Fetching.cpp:336 Web::Fetch::Fetching::populate_request_from_client.
+# https://fetch.spec.whatwg.org/#populate-request-from-client
+pub func fetch_fetching_populate_request_from_client(realm: Realm*, request: FetchRequest*):
+    let heap = realm_heap(realm)
+
+    # 1. If request’s traversable for user prompts is "client":
+    match fetch_request_traversable_for_user_prompts(request):
+        .fetch_request_traversable_for_user_prompts(traversable_for_user_prompts) if traversable_for_user_prompts == FetchRequestTraversableForUserPrompts.client:
+            # 1. Set request’s traversable for user prompts to "no-traversable".
+            fetch_request_set_traversable_for_user_prompts(request, .fetch_request_traversable_for_user_prompts(FetchRequestTraversableForUserPrompts.no_traversable))
+
+            # 2. If request’s client is non-null:
+            if let client = fetch_request_client(request):
+                # 1. Let global be request’s client’s global object.
+                let global = html_environment_settings_object_global_object(client)
+
+                # 2. If global is a Window object and global’s navigable is not null, then set request’s traversable for
+                #    user prompts to global’s navigable’s traversable navigable.
+                if let window = as_if_html_window((gc.Cell*)global):
+                    if let navigable = html_window_navigable(window):
+                        fetch_request_set_traversable_for_user_prompts(request, .html_traversable_navigable(html_navigable_traversable_navigable(navigable)))
+        _: _ = 0
+
+    # 2. If request’s origin is "client":
+    match fetch_request_origin(request):
+        .fetch_request_origin(origin) if origin == FetchRequestOrigin.client:
+            # 1. Assert: request’s client is non-null.
+            let client = fetch_request_client(request) else trap("VERIFY: request.client()")
+
+            # 2. Set request’s origin to request’s client’s origin.
+            fetch_request_set_origin(request, .origin(html_environment_settings_object_origin(client)))
+        _: _ = 0
+
+    # 3. If request’s policy container is "client":
+    match fetch_request_policy_container(request):
+        .fetch_request_policy_container(policy_container) if policy_container == FetchRequestPolicyContainer.client:
+            # 1. If request’s client is non-null, then set request’s policy container to a clone of request’s client’s
+            #    policy container.
+            if let client = fetch_request_client(request):
+                fetch_request_set_policy_container(request, .html_policy_container(html_policy_container_clone(html_environment_settings_object_policy_container(client), heap)))
+            # 2. Otherwise, set request’s policy container to a new policy container.
+            else:
+                fetch_request_set_policy_container(request, .html_policy_container(heap_allocate_html_policy_container(heap)))
+        _: _ = 0

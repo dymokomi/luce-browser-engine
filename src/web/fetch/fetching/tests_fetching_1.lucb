@@ -1,0 +1,394 @@
+#==============================================================================================
+#
+#   tests_fetching_1 - Fetch/Fetching's checks pinned to the reference build; PendingResponse,
+#   RefCountedFlag, the HTTP cache partitions, Mixed Content, and the Error and
+#   TransformStream stand-ins
+#
+#   DESCRIPTION:
+#       The runner of tests_fetching_cases (the CORS check, the TAO check and the Fetch metadata
+#       headers over 507 cases, printed as the reference build's oracle prints them), and the
+#       parts of region p2c the scenarios of tests_fetching_2 and _3 do not single out:
+#       PendingResponse's callback (set before or after the response, run on a later turn,
+#       the request forgetting it), RefCountedFlag, HTTPCache's caches per network partition
+#       key (its keys copied to the C heap, DESIGN.md §3.3 rule 7), the memory cache off by
+#       default, Mixed Content's checks for a non-Window settings object, the TypeError
+#       stand-in, the TransformStream stand-in piping a byte stream through an identity
+#       transform, and what the region's cells keep alive through a collection.
+#
+#==============================================================================================
+
+# mark: The oracle's cases ======================================================================
+
+## The oracle's `credentials_of`.
+func fetching_test_credentials(argument: ak.StringView) -> FetchRequestCredentialsMode:
+    if ak.string_view_equals(&argument, "omit"):
+        return FetchRequestCredentialsMode.omit
+    if ak.string_view_equals(&argument, "same-origin"):
+        return FetchRequestCredentialsMode.same_origin
+    return FetchRequestCredentialsMode.include
+
+## Runs one case and appends its result as the oracle prints it.
+func fetching_test_run_case(builder: ak.StringBuilder*, vm: Vm*, test_case: const FetchHttpCase*):
+    let vector = fetch_http_test_arguments(test_case)
+    let a = ak.vector_span_const(&vector)
+    let op = test_case.op
+    if op == "cors_check":
+        let request = fetch_request_create(vm)
+        fetch_request_set_credentials_mode(request, fetching_test_credentials(a[0]))
+        fetch_request_set_origin(request, fetch_http_test_origin(a[1]))
+        let response = fetch_infrastructure_test_response_with_headers(vm, a, 2)
+        ak.string_builder_append(builder, "success" if fetch_fetching_cors_check(request, response) else "failure")
+    elif op == "tao_check":
+        let request = fetch_request_create(vm)
+        fetch_request_set_timing_allow_failed(request, ak.string_view_equals(&a[0], "true"))
+        fetch_request_set_mode(request, fetch_http_test_mode(a[1]))
+        fetch_request_set_origin(request, fetch_http_test_origin(a[2]))
+        fetch_request_set_url(request, fetch_http_test_url(a[3]))
+        fetch_request_set_response_tainting(request, fetch_http_test_tainting(a[4]))
+        let response = fetch_infrastructure_test_response_with_headers(vm, a, 5)
+        ak.string_builder_append(builder, "success" if fetch_fetching_tao_check(request, response) else "failure")
+    elif op == "fetch_metadata":
+        let request = fetch_request_create(vm)
+        fetch_request_set_origin(request, fetch_http_test_origin(a[0]))
+        fetch_request_set_mode(request, fetch_http_test_mode(a[1]))
+        fetch_request_set_destination(request, fetch_infrastructure_test_destination(a[2]))
+        fetch_request_set_user_activation(request, ak.string_view_equals(&a[3], "true"))
+        fetch_request_set_url_list(request, fetch_http_test_url_list(a, 4))
+        fetch_fetching_append_fetch_metadata_headers_for_request(request)
+        fetch_http_test_headers(builder, http_header_list_headers(fetch_request_header_list(request)))
+    else:
+        trap("unknown op")
+
+test "Fetch/Fetching's CORS and TAO checks and Fetch metadata headers give the reference build's results":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let allocator: memory.Allocator = vm_heap(vm)
+    var failures = 0
+    with allocator:
+        for test_case in &fetch_fetching_cases:
+            var builder = ak.string_builder_new()
+            fetching_test_run_case(&builder, vm, test_case)
+            let result = ak.string_builder_string_view(&builder)
+            if not ak.string_view_eq_string_view(&result, ak.string_view_from_bytes(test_case.expected)):
+                var arguments = ak.string_builder_new()
+                fetch_http_test_escape(&arguments, ak.string_view_from_bytes(test_case.arguments))
+                print(f"{test_case.op} {ak.string_view_text(ak.string_builder_string_view(&arguments))}:\n  expected {(str)test_case.expected}\n  got      {ak.string_view_text(result)}")
+                failures += 1
+    assert(failures == 0)
+
+# mark: PendingResponse and RefCountedFlag ======================================================
+
+## What a PendingResponse callback heard.
+struct FetchingTestCallbackLog:
+    var calls: i32
+    var response: FetchResponse*?
+
+    ## The callback.
+    static func call(context: void*?, response: FetchResponse*):
+        let log = (FetchingTestCallbackLog*)(context else trap("no log"))
+        log.calls += 1
+        log.response = response
+
+## Whether a request still lists `pending_response`.
+func fetching_test_is_pending(request: FetchRequest*, pending_response: FetchPendingResponse*) -> bool:
+    for pending in ak.vector_span(&request.m_pending_responses):
+        if pending == pending_response:
+            return true
+    return false
+
+test "PendingResponse: the callback runs on a later turn once both are known; the request lists it until then":
+    var event_loop = FetchingTestEventLoop()
+    fetching_test_begin(&event_loop)
+    defer fetching_test_end()
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    _ = web_test_install_agent(vm)
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        let request = fetch_request_create(vm)
+        let response = fetch_infrastructure_response_create(vm)
+
+        # The callback first: resolve runs it on the next turn.
+        let pending = fetch_pending_response_create(vm, request)
+        assert(not fetch_pending_response_is_resolved(pending) and fetching_test_is_pending(request, pending))
+        let log = new FetchingTestCallbackLog() else trap("out of memory")
+        fetch_pending_response_when_loaded(pending, ak.Function1[FetchResponse*, unit](call = FetchingTestCallbackLog.call, context = log))
+        assert(log.calls == 0)
+        fetch_pending_response_resolve(pending, response)
+        assert(fetch_pending_response_is_resolved(pending) and log.calls == 0)
+        fetching_test_run(&event_loop)
+        assert(log.calls == 1 and log.response == response)
+        assert(not fetching_test_is_pending(request, pending))
+
+        # The response first (created resolved): when_loaded runs it on the next turn.
+        let resolved = fetch_pending_response_create_fetch_response(vm, request, response)
+        assert(fetch_pending_response_is_resolved(resolved) and fetching_test_is_pending(request, resolved))
+        let second = new FetchingTestCallbackLog() else trap("out of memory")
+        fetch_pending_response_when_loaded(resolved, ak.Function1[FetchResponse*, unit](call = FetchingTestCallbackLog.call, context = second))
+        assert(second.calls == 0)
+        fetching_test_run(&event_loop)
+        assert(second.calls == 1 and second.response == response and not fetching_test_is_pending(request, resolved))
+
+        # RefCountedFlag holds its value.
+        let flag = fetch_ref_counted_flag_create(false)
+        assert(not fetch_ref_counted_flag_value(flag))
+        fetch_ref_counted_flag_set_value(flag, true)
+        assert(fetch_ref_counted_flag_value(flag))
+        assert(fetch_ref_counted_flag_value(fetch_ref_counted_flag_create(true)))
+
+# mark: HTTP cache partitions ===================================================================
+
+## A network partition key of the origin of `url`.
+func fetching_test_partition_key(url: str) -> FetchNetworkPartitionKey:
+    let parsed = web_url.parser_basic_parse(ak.sv(url)) else trap("the test URL parses")
+    return FetchNetworkPartitionKey(top_level_origin = web_url.url_origin(&parsed), second_key = none)
+
+test "HTTPCache: one memory cache per network partition key, its keys in the C heap; the memory cache is off":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        fetch_fetching_clear_http_memory_cache()
+        let cache = fetch_http_cache_the()
+        assert(cache == fetch_http_cache_the() and ak.hash_map_is_empty(&cache.m_cache))
+
+        # Keys hash and compare as their top-level origins (Traits<NetworkPartitionKey>).
+        var traits = FetchNetworkPartitionKeyTraits()
+        let first_key = fetching_test_partition_key("https://a-long-host-name.test/one")
+        let same_key = fetching_test_partition_key("https://a-long-host-name.test:443/two")
+        let other_key = fetching_test_partition_key("https://b.test/")
+        assert(traits.equals(&first_key, &same_key) and not traits.equals(&first_key, &other_key))
+        assert(traits.hash_of(&first_key) == web_url.origin_traits_hash(&first_key.top_level_origin))
+
+        # The same key gives the same cache; the stored key survives a collection of the VM's heap.
+        let first = fetch_http_cache_get(cache, &first_key)
+        gc.heap_collect_garbage(vm_heap(vm))
+        assert(fetch_http_cache_get(cache, &same_key) == first)
+        assert(fetch_http_cache_get(cache, &other_key) != first)
+        assert(ak.hash_map_size(&cache.m_cache) == 2)
+        let opaque_key = FetchNetworkPartitionKey(top_level_origin = web_url.origin_create_opaque(), second_key = none)
+        let opaque = fetch_http_cache_get(cache, &opaque_key)
+        assert(fetch_http_cache_get(cache, &opaque_key) == opaque and ak.hash_map_size(&cache.m_cache) == 3)
+
+        # The memory cache is off unless enabled: finalizing an entry with nothing pending does nothing.
+        assert(not fetch_fetching_http_memory_cache_enabled())
+        http_memory_cache_finalize_entry(first, web_url.about_blank(), ak.sv("GET"), http_header_list_create(), 200, http_header_list_create(), ak.ByteBuffer())
+        fetch_fetching_set_http_memory_cache_enabled(true)
+        assert(fetch_fetching_http_memory_cache_enabled())
+        fetch_fetching_set_http_memory_cache_enabled(false)
+
+        fetch_fetching_clear_http_memory_cache()
+        assert(ak.hash_map_is_empty(&cache.m_cache))
+
+# mark: Mixed Content ===========================================================================
+
+test "Mixed Content: a non-Window settings object with an opaque origin does not restrict mixed content":
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        let settings = web_test_settings_of(realm)
+        assert(mixed_content_does_settings_prohibit_mixed_security_contexts(settings) == MixedContentProhibitsMixedSecurityContexts.does_not_restrict_mixed_security_contexts)
+
+        # An image over http is neither upgraded nor blocked; nor is its response.
+        let request = fetch_request_create(vm)
+        fetch_request_set_url(request, web_url.parser_basic_parse(ak.sv("http://example.com/a.png")) else trap("the URL parses"))
+        fetch_request_set_client(request, settings)
+        fetch_request_set_destination(request, FetchRequestDestination.image)
+        mixed_content_upgrade_a_mixed_content_request_to_a_potentially_trustworthy_url_if_appropriate(request)
+        let url = fetch_request_url(request)
+        let scheme = web_url.url_scheme(&url)
+        assert(ak.string_eq_string_view(&scheme, ak.sv("http")))
+        assert(mixed_content_should_fetching_request_be_blocked_as_mixed_content(request) == FetchRequestOrResponseBlocking.allowed)
+        let response = fetch_infrastructure_response_create(vm)
+        assert(mixed_content_should_response_to_request_be_blocked_as_mixed_content(request, response) == FetchRequestOrResponseBlocking.allowed)
+
+        # A potentially trustworthy URL or an IP address host returns before the settings object is asked.
+        let local = fetch_request_create(vm)
+        fetch_request_set_url(local, web_url.parser_basic_parse(ak.sv("http://192.168.0.1/a.png")) else trap("the URL parses"))
+        fetch_request_set_destination(local, FetchRequestDestination.image)
+        mixed_content_upgrade_a_mixed_content_request_to_a_potentially_trustworthy_url_if_appropriate(local)
+        let local_url = fetch_request_url(local)
+        let local_scheme = web_url.url_scheme(&local_url)
+        assert(ak.string_eq_string_view(&local_scheme, ak.sv("http")))
+
+# mark: The Error and TransformStream stand-ins =================================================
+
+test "the TypeError stand-in: an error object of its realm with its message, as a JS value":
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        let value = js_type_error_create(realm, ak.string_from_str("Load failed: nope"))
+        assert(js_value_is_object(value))
+        let cell = (gc.Cell*)js_value_as_object(value)
+        assert(is_js_error(cell) and is_js_type_error(cell))
+        let error_ = as_if_js_error(cell) else trap("an error")
+        assert(error_.m_realm == realm)
+        let name = js_error_name(error_)
+        assert(ak.string_view_equals(&name, "TypeError"))
+        let message = js_error_message(error_) else trap("a message")
+        assert(ak.utf16_string_base_eq_string_view(&message.utf16_string_base, ak.sv("Load failed: nope")))
+
+        let plain = js_error_create(realm)
+        assert(is_js_error(plain) and not is_js_type_error(plain) and js_error_message(plain) == none)
+        let plain_name = js_error_name(plain)
+        assert(ak.string_view_equals(&plain_name, "Error"))
+        let with_message = js_error_create_message(realm, ak.utf16_string_from_str("m"))
+        assert(js_error_message(with_message) != none)
+
+        # The error is kept by the value that holds it, and collected without it.
+        var root = gc.root_create[JsError](error_)
+        gc.heap_collect_garbage(vm_heap(vm))
+        assert(gc.root_ptr(&root) == error_)
+        gc.root_release(&root)
+
+## The identity transform algorithm of the TransformStream test: enqueue the chunk in the transform stream (as fetch
+## response handover's), counting the chunks.
+struct FetchingTestTransform:
+    var realm: Realm*
+    var transform_stream: StreamsTransformStream*?
+    var chunks: i32
+    var flushes: i32
+
+    ## The transform algorithm.
+    static func transform(context: void*?, chunk: JsValue) -> JsPromiseCapability*:
+        let captures = (FetchingTestTransform*)(context else trap("no captures"))
+        captures.chunks += 1
+        let stream = captures.transform_stream else trap("no stream")
+        streams_transform_stream_default_controller_enqueue(streams_transform_stream_controller(stream), chunk) else trap("enqueue")
+        return idl_create_resolved_promise(captures.realm, js_undefined())
+
+    ## The flush algorithm.
+    static func flush(context: void*?) -> JsPromiseCapability*:
+        let captures = (FetchingTestTransform*)(context else trap("no captures"))
+        captures.flushes += 1
+        return idl_create_resolved_promise(captures.realm, js_undefined())
+
+## Whether a ByteBuffer holds exactly `text`.
+func fetching_test_bytes_are(bytes: const ak.ByteBuffer*, text: str) -> bool:
+    let span = ak.byte_buffer_bytes_const(bytes)
+    return span.length == text.length and ak.compare_bytes(span, text.bytes) == 0
+
+## A transform stream of `realm` set up with the test's identity transform and flush algorithms.
+func fetching_test_transform_stream(vm: Vm*, realm: Realm*, captures: FetchingTestTransform*) -> StreamsTransformStream*:
+    let stream = realm_create_streams_transform_stream(realm, realm)
+    captures.transform_stream = stream
+    let transform = gc.create_function1(vm_heap(vm), ak.Function1[JsValue, JsPromiseCapability*](call = FetchingTestTransform.transform, context = captures))
+    let flush = gc.create_function0(vm_heap(vm), ak.Function0[JsPromiseCapability*](call = FetchingTestTransform.flush, context = captures))
+    streams_transform_stream_set_up(stream, transform, flush)
+    return stream
+
+test "the TransformStream stand-in: a byte stream piped through an identity transform, its end flushed, its error":
+    var event_loop = FetchingTestEventLoop()
+    fetching_test_begin(&event_loop)
+    defer fetching_test_end()
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        var settings = test_promise_enter(realm)
+
+        # Chunks before and after the pipe arrive in order on the readable side; the source's end flushes, then
+        # closes the readable side.
+        let source = test_streams_byte_stream(realm)
+        test_streams_enqueue(source, "ab")
+        let captures = new FetchingTestTransform(realm = realm) else trap("out of memory")
+        let transform = fetching_test_transform_stream(vm, realm, captures)
+        let readable = streams_readable_stream_piped_through(source, transform)
+        assert(readable == streams_transform_stream_readable(transform) and streams_readable_stream_is_locked(source))
+        test_streams_enqueue(source, "cd")
+        let reader = streams_readable_stream_get_a_reader(readable) else trap("get_a_reader")
+        var read_all = TestStreamsReadAll(error_ = js_undefined())
+        test_streams_read_all_bytes(vm, reader, &read_all)
+        assert(captures.chunks == 2 and captures.flushes == 0 and read_all.successes == 0)
+        streams_readable_stream_close(source)
+        # (Leaving the execution context performs a microtask checkpoint.)
+        test_promise_leave(settings)
+        settings = test_promise_enter(realm)
+        assert(captures.flushes == 1 and not streams_readable_stream_is_readable(readable))
+        assert(read_all.successes == 1 and fetching_test_bytes_are(&read_all.bytes, "abcd"))
+
+        # An errored source errors the readable side; the flush algorithm does not run.
+        let failing = test_streams_byte_stream(realm)
+        let failing_captures = new FetchingTestTransform(realm = realm) else trap("out of memory")
+        let failing_transform = fetching_test_transform_stream(vm, realm, failing_captures)
+        let failing_readable = streams_readable_stream_piped_through(failing, failing_transform)
+        let error_ = js_type_error_create(realm, ak.string_from_str("Load failed: test"))
+        streams_readable_stream_error(failing, error_)
+        test_promise_leave(settings)
+        assert(streams_readable_stream_is_errored(failing_readable) and failing_captures.flushes == 0)
+
+# mark: Collections =============================================================================
+
+## Weak references to the cells a collection must keep through region p2c's cells.
+struct FetchingTestKept:
+    var request: gc.Weak[FetchRequest]
+    var callback: gc.Weak[gc.Function1[FetchResponse*, unit]]
+    var response: gc.Weak[FetchResponse]
+    var fetch_params: gc.Weak[FetchParams]
+    var stream: gc.Weak[StreamsReadableStream]
+    var transform_readable: gc.Weak[StreamsReadableStream]
+    var transform_controller: gc.Weak[StreamsTransformStreamDefaultController]
+
+## Makes the cells, rooted only through a pending response, a data receiver and a transform stream.
+noinline func make_fetching_test_kept(vm: Vm*, realm: Realm*, pending_root: gc.Root[FetchPendingResponse]*, receiver_root: gc.Root[FetchFetchedDataReceiver]*, transform_root: gc.Root[StreamsTransformStream]*) -> FetchingTestKept:
+    let request = fetch_request_create(vm)
+    let pending = fetch_pending_response_create(vm, request)
+    let log = new FetchingTestCallbackLog() else trap("out of memory")
+    fetch_pending_response_when_loaded(pending, ak.Function1[FetchResponse*, unit](call = FetchingTestCallbackLog.call, context = log))
+    let response = fetch_infrastructure_response_create(vm)
+    pending.m_response = response
+    *pending_root = gc.root_create(pending)
+
+    let fetch_params = fetch_params_create(vm, fetch_request_create(vm), fetch_timing_info_create(vm))
+    let settings = test_promise_enter(realm)
+    let stream = test_streams_byte_stream(realm)
+    let receiver = realm_create_fetch_fetched_data_receiver(realm, fetch_params, stream, none)
+    *receiver_root = gc.root_create(receiver)
+
+    let captures = new FetchingTestTransform(realm = realm) else trap("out of memory")
+    let transform = fetching_test_transform_stream(vm, realm, captures)
+    *transform_root = gc.root_create(transform)
+    test_promise_leave(settings)
+
+    return FetchingTestKept(
+        request = gc.make_weak[FetchRequest](request),
+        callback = gc.make_weak[gc.Function1[FetchResponse*, unit]](pending.m_callback else trap("a callback")),
+        response = gc.make_weak[FetchResponse](response),
+        fetch_params = gc.make_weak[FetchParams](fetch_params),
+        stream = gc.make_weak[StreamsReadableStream](stream),
+        transform_readable = gc.make_weak[StreamsReadableStream](streams_transform_stream_readable(transform)),
+        transform_controller = gc.make_weak[StreamsTransformStreamDefaultController](streams_transform_stream_controller(transform)),
+    )
+
+noinline func run_fetching_test_visit_edges():
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    var pending = gc.root_create[FetchPendingResponse](none)
+    var receiver = gc.root_create[FetchFetchedDataReceiver](none)
+    var transform = gc.root_create[StreamsTransformStream](none)
+    let kept = make_fetching_test_kept(vm, realm, &pending, &receiver, &transform)
+    web_test_clobber_stack()
+    gc.heap_collect_garbage(vm_heap(vm))
+    assert(web_test_alive(&kept.request))
+    assert(web_test_alive(&kept.callback))
+    assert(web_test_alive(&kept.response))
+    assert(web_test_alive(&kept.fetch_params))
+    assert(web_test_alive(&kept.stream))
+    assert(web_test_alive(&kept.transform_readable))
+    assert(web_test_alive(&kept.transform_controller))
+
+    gc.root_release(&pending)
+    gc.root_release(&receiver)
+    gc.root_release(&transform)
+    web_test_clobber_stack()
+    gc.heap_collect_garbage(vm_heap(vm))
+    assert(not web_test_alive(&kept.callback))
+    assert(not web_test_alive(&kept.transform_controller))
+    web_test_destroy_vm(vm)
+
+test "what pending responses, fetched data receivers and transform streams keep alive":
+    var event_loop = FetchingTestEventLoop()
+    fetching_test_begin(&event_loop)
+    defer fetching_test_end()
+    run_fetching_test_visit_edges()

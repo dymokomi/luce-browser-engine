@@ -1,0 +1,584 @@
+#==============================================================================================
+#
+#   fetching_7 - Fetch::Fetching: the network fetch through the ResourceLoader, CORS-preflight
+#   fetch, the Fetch metadata headers and the memory cache switch
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibWeb/Fetch/Fetching/Fetching.cpp (lines 2072-2545): the debug log
+#       of a load (WEB_FETCH_DEBUG), Ladybird's non-standard drop-in for HTTP-network fetch
+#       (it also serves file:, resource: and about: URLs through the ResourceLoader: a
+#       ReadableStream with byte reading support fed by a FetchedDataReceiver), CORS-preflight
+#       fetch, setting the Sec-Fetch-Dest, -Mode, -Site and -User headers, and enabling and
+#       clearing the HTTP memory cache. Each C++ lambda is a capture struct with a static
+#       function (DESIGN.md §2.7).
+#
+#       Copyright (c) 2022-2023, Linus Groh <linusg@serenityos.org>
+#       Copyright (c) 2023, Luke Wilde <lukew@serenityos.org>
+#       Copyright (c) 2023, Sam Atkins <atkinssj@serenityos.org>
+#       Copyright (c) 2024, Jamie Mansfield <jmansfield@cadixdev.org>
+#       Copyright (c) 2025, Shannon Booth <shannon@serenityos.org>
+#       Copyright (c) 2025, Kenneth Myhra <kennethmyhra@serenityos.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: The debug log ===========================================================================
+
+## Ported from Libraries/LibWeb/Fetch/Fetching/Fetching.cpp:2073 Web::Fetch::Fetching::log_load_request (WEB_FETCH_DEBUG).
+func fetch_fetching_log_load_request(load_request: const LoadRequest*):
+    ak.dbgln("Fetch: Invoking ResourceLoader")
+    let method = load_request_method(load_request)
+    let url = load_request_url(load_request) else trap("VERIFY: a load request's URL")
+    let serialized_url = web_url.url_serialize(&url)
+    ak.dbgln(f"> {ak.string_view_text(ak.byte_string_view(&method))} {ak.string_view_text(ak.string_bytes_as_string_view(&serialized_url))} HTTP/1.1")
+    for header in ak.vector_span_const(http_header_list_headers(load_request_headers(load_request))):
+        ak.dbgln(f"> {ak.string_view_text(ak.byte_string_view(&header.name))}: {ak.string_view_text(ak.byte_string_view(&header.value))}")
+    ak.dbgln(">")
+    let body = ak.string_view_from_bytes(ak.byte_buffer_bytes_const(load_request_body(load_request)))
+    let lines = ak.string_view_split_view_u8(&body, '\n', ak.SplitBehavior.keep_empty)
+    for line in ak.vector_span_const(&lines):
+        ak.dbgln(f"> {ak.string_view_text(line)}")
+
+## Ported from Libraries/LibWeb/Fetch/Fetching/Fetching.cpp:2084 Web::Fetch::Fetching::log_response (WEB_FETCH_DEBUG).
+func fetch_fetching_log_response(status_code: u32?, headers: const HttpHeaderList*, data: const u8[]):
+    ak.dbgln(f"< HTTP/1.1 {status_code else 0}")
+    for header in ak.vector_span_const(http_header_list_headers(headers)):
+        ak.dbgln(f"< {ak.string_view_text(ak.byte_string_view(&header.name))}: {ak.string_view_text(ak.byte_string_view(&header.value))}")
+    ak.dbgln("<")
+    let body = ak.string_view_from_bytes(data)
+    let lines = ak.string_view_split_view_u8(&body, '\n', ak.SplitBehavior.keep_empty)
+    for line in ak.vector_span_const(&lines):
+        ak.dbgln(f"< {ak.string_view_text(line)}")
+
+# mark: The network fetch's algorithms ==========================================================
+
+## The captures of the network fetch's pullAlgorithm, `[&realm]()`.
+struct FetchFetchingNetworkFetchPull:
+    var realm: Realm*
+
+    ## The pull algorithm: the bytes are pushed into the stream as they arrive.
+    static func call(context: void*?) -> JsPromiseCapability*:
+        let captures = (FetchFetchingNetworkFetchPull*)(context else trap("network fetch: no captures"))
+        # 1. Let promise be a new promise.
+        # 2. Run the following steps in parallel:
+        # NOTE: This is handled by FetchedDataReceiver, which pushes bytes into the controller as they arrive.
+
+        # 3. Return promise.
+        return idl_create_resolved_promise(captures.realm, js_undefined())
+
+## The captures of the network fetch's cancelAlgorithm, `[&realm, &fetch_params](JS::Value reason)`.
+struct FetchFetchingNetworkFetchCancel:
+    var realm: Realm*
+    var fetch_params: FetchParams*
+
+    ## Aborts fetchParams’s controller with reason, given reason.
+    static func call(context: void*?, reason: JsValue) -> JsPromiseCapability*:
+        let captures = (FetchFetchingNetworkFetchCancel*)(context else trap("network fetch: no captures"))
+        fetch_controller_abort(fetch_params_controller(captures.fetch_params), captures.realm, reason)
+        return idl_create_resolved_promise(captures.realm, js_undefined())
+
+## The captures of on_headers_received, `[&vm, pending_response, stream, request, fetched_data_receiver](HeaderList
+## const& response_headers, Optional<u32> status_code, Optional<String> const& reason_phrase)`.
+struct FetchFetchingNetworkFetchHeadersReceived:
+    var vm: Vm*
+    var pending_response: FetchPendingResponse*
+    var stream: StreamsReadableStream*
+    var request: FetchRequest*
+    var fetched_data_receiver: FetchFetchedDataReceiver*
+
+    ## The response's head: a new response whose body's stream is the stream.
+    static func call(context: void*?, response_headers: const HttpHeaderList*, status_code: u32?, reason_phrase: const (ak.String?)*):
+        let captures = (FetchFetchingNetworkFetchHeadersReceived*)(context else trap("network fetch: no captures"))
+        if fetch_pending_response_is_resolved(captures.pending_response):
+            # RequestServer will send us the response headers twice, the second time being for HTTP trailers. This
+            # fetch algorithm is not interested in trailers, so just drop them here.
+            return
+
+        let response = fetch_infrastructure_response_create(captures.vm)
+        fetch_response_set_status(response, (u16)(status_code else 200))
+
+        if let phrase = *reason_phrase:
+            fetch_response_set_status_message(response, ak.string_to_byte_string(&phrase))
+
+        if fetch_web_fetch_debug:
+            let url = fetch_request_url(captures.request)
+            let serialized_url = web_url.url_serialize(&url)
+            let state = "complete" if fetch_is_ok_status(fetch_response_status(response)) else "failed"
+            ak.dbgln(f"Fetch: ResourceLoader load for '{ak.string_view_text(ak.string_bytes_as_string_view(&serialized_url))}' {state}: (status {fetch_response_status(response)})")
+            fetch_fetching_log_response(status_code, response_headers, b"")
+
+        for header in ak.vector_span_const(http_header_list_headers(response_headers)):
+            http_header_list_append(fetch_response_header_list(response), HttpHeader(name = header.name, value = header.value))
+
+        fetch_fetched_data_receiver_set_response(captures.fetched_data_receiver, response)
+
+        # 14. Set response’s body to a new body whose stream is stream.
+        let body = fetch_body_create(captures.vm, captures.stream)
+        fetch_response_set_body(response, body)
+        fetch_fetched_data_receiver_set_body(captures.fetched_data_receiver, body)
+
+        # 17. Return response.
+        # NOTE: Typically response’s body’s stream is still being enqueued to after returning.
+        fetch_pending_response_resolve(captures.pending_response, response)
+
+## The captures of on_data_received, `[fetched_data_receiver](ReadonlyBytes bytes)`.
+struct FetchFetchingNetworkFetchDataReceived:
+    var fetched_data_receiver: FetchFetchedDataReceiver*
+
+    ## Bytes of the response's body as they arrive.
+    static func call(context: void*?, bytes: const u8[]):
+        let captures = (FetchFetchingNetworkFetchDataReceived*)(context else trap("network fetch: no captures"))
+        fetch_fetched_data_receiver_handle_network_bytes(captures.fetched_data_receiver, bytes, FetchFetchedDataReceiverNetworkState.ongoing)
+
+## The captures of on_complete, `[&vm, &realm, pending_response, stream, fetched_data_receiver](bool success,
+## Requests::RequestTimingInfo const&, Optional<StringView> error_message)`.
+struct FetchFetchingNetworkFetchComplete:
+    var vm: Vm*
+    var realm: Realm*
+    var pending_response: FetchPendingResponse*
+    var stream: StreamsReadableStream*
+    var fetched_data_receiver: FetchFetchedDataReceiver*
+
+    ## The end of the load: the stream closes, or errors and the response (if none yet) is a network error.
+    static func call(context: void*?, success: bool, timing_info: const RequestsRequestTimingInfo*, error_message: ak.StringView?):
+        let captures = (FetchFetchingNetworkFetchComplete*)(context else trap("network fetch: no captures"))
+        # FIXME: Implement on_complete timing info for unbuffered requests
+        var execution_context: HtmlTemporaryExecutionContext = ---
+        html_temporary_execution_context_construct_realm(&execution_context, captures.realm, HtmlTemporaryExecutionContextCallbacksEnabled.yes)
+        defer html_temporary_execution_context_destruct(&execution_context)
+
+        if success:
+            fetch_fetched_data_receiver_handle_network_bytes(captures.fetched_data_receiver, b"", FetchFetchedDataReceiverNetworkState.complete)
+        else:
+            # 16.1.2.2. Otherwise, if stream is readable, error stream with a TypeError.
+            var message = ak.string_builder_new()
+            ak.string_builder_append(&message, "Load failed: ")
+            ak.string_builder_append_string_view(&message, error_message else ak.sv("Unknown error"))
+            let error_ = ak.string_from_string_builder(&message) else trap("MUST: String::formatted")
+
+            if streams_readable_stream_is_readable(captures.stream):
+                streams_readable_stream_error(captures.stream, js_type_error_create(captures.realm, error_))
+
+            if not fetch_pending_response_is_resolved(captures.pending_response):
+                fetch_pending_response_resolve(captures.pending_response, fetch_response_network_error(captures.vm, error_))
+
+# mark: The network fetch =======================================================================
+
+## Ported from Libraries/LibWeb/Fetch/Fetching/Fetching.cpp:2098 Web::Fetch::Fetching::nonstandard_resource_loader_file_or_http_network_fetch.
+# https://fetch.spec.whatwg.org/#concept-http-network-fetch
+# Drop-in replacement for 'HTTP-network fetch', but obviously non-standard :^)
+# It also handles file:// URLs since those can also go through ResourceLoader.
+pub func fetch_fetching_nonstandard_resource_loader_file_or_http_network_fetch(realm: Realm*, fetch_params: FetchParams*, include_credentials: HttpIncludeCredentials = HttpIncludeCredentials.no, is_new_connection_fetch: FetchIsNewConnectionFetch = FetchIsNewConnectionFetch.no, http_cache: HttpMemoryCache*? = none) -> FetchPendingResponse*:
+    if fetch_web_fetch_debug:
+        ak.dbgln(f"Fetch: Running 'non-standard HTTP-network fetch' with: fetch_params @ {(void*)fetch_params}")
+
+    let fetch_timing_info = fetch_params_timing_info(fetch_params)
+    let cross_origin_isolated_capability = fetch_params_cross_origin_isolated_capability(fetch_params)
+
+    let vm = realm_vm(realm)
+
+    _ = include_credentials
+    _ = is_new_connection_fetch
+    _ = fetch_timing_info
+    _ = cross_origin_isolated_capability
+
+    let request = fetch_params_request(fetch_params)
+
+    let page = bind_principal_host_defined_page(realm)
+
+    var load_request = load_request_create(fetch_request_header_list(request))
+    load_request_set_url(&load_request, fetch_request_current_url(request))
+    load_request_set_page(&load_request, page)
+    load_request_set_method(&load_request, fetch_request_method(request))
+    load_request_set_cache_mode(&load_request, fetch_request_cache_mode(request))
+    load_request_set_include_credentials(&load_request, include_credentials)
+    load_request_set_initiator_type(&load_request, fetch_request_initiator_type(request))
+
+    match fetch_request_body_const(request):
+        .fetch_body(body):
+            match fetch_body_source(body):
+                .byte_buffer(byte_buffer):
+                    load_request_set_body(&load_request, ak.byte_buffer_clone(&byte_buffer))
+                .file_api_blob(blob_handle):
+                    load_request_set_body(&load_request, ak.byte_buffer_copy_span_u8(file_api_blob_raw_bytes(blob_handle)) else trap("MUST: ByteBuffer::copy"))
+                .empty: _ = 0
+        _: _ = 0
+
+    let pending_response = fetch_pending_response_create(vm, request)
+
+    if fetch_web_fetch_debug:
+        ak.dbgln("Fetch: Invoking ResourceLoader")
+        fetch_fetching_log_load_request(&load_request)
+
+    var execution_context: HtmlTemporaryExecutionContext = ---
+    html_temporary_execution_context_construct_realm(&execution_context, realm, HtmlTemporaryExecutionContextCallbacksEnabled.yes)
+    defer html_temporary_execution_context_destruct(&execution_context)
+
+    # 10. Let stream be a new ReadableStream.
+    let stream = realm_create_streams_readable_stream(realm, realm)
+
+    # 9. Let buffer be an empty byte sequence.
+    let fetched_data_receiver = realm_create_fetch_fetched_data_receiver(realm, fetch_params, stream, http_cache)
+
+    # 11. Let pullAlgorithm be the following steps:
+    let pull_captures = new FetchFetchingNetworkFetchPull(realm = realm) else trap("out of memory")
+    let pull_algorithm = gc.create_function0(realm_heap(realm), ak.Function0[JsPromiseCapability*](call = FetchFetchingNetworkFetchPull.call, context = pull_captures))
+
+    # 12. Let cancelAlgorithm be an algorithm that aborts fetchParams’s controller with reason, given reason.
+    let cancel_captures = new FetchFetchingNetworkFetchCancel(realm = realm, fetch_params = fetch_params) else trap("out of memory")
+    let cancel_algorithm = gc.create_function1(realm_heap(realm), ak.Function1[JsValue, JsPromiseCapability*](call = FetchFetchingNetworkFetchCancel.call, context = cancel_captures))
+
+    # 13. Set up stream with byte reading support with pullAlgorithm set to pullAlgorithm, cancelAlgorithm set to cancelAlgorithm.
+    streams_readable_stream_set_up_with_byte_reading_support(stream, pull_algorithm, cancel_algorithm)
+
+    let headers_captures = new FetchFetchingNetworkFetchHeadersReceived(vm = vm, pending_response = pending_response, stream = stream, request = request, fetched_data_receiver = fetched_data_receiver) else trap("out of memory")
+    let on_headers_received = gc.create_function3(vm_heap(vm), ak.Function3[const HttpHeaderList*, u32?, const (ak.String?)*, unit](call = FetchFetchingNetworkFetchHeadersReceived.call, context = headers_captures))
+
+    # 16. Run these steps in parallel:
+    #     FIXME: 1. Run these steps, but abort when fetchParams is canceled:
+    let data_captures = new FetchFetchingNetworkFetchDataReceived(fetched_data_receiver = fetched_data_receiver) else trap("out of memory")
+    let on_data_received = gc.create_function1(vm_heap(vm), ak.Function1[const u8[], unit](call = FetchFetchingNetworkFetchDataReceived.call, context = data_captures))
+
+    let complete_captures = new FetchFetchingNetworkFetchComplete(vm = vm, realm = realm, pending_response = pending_response, stream = stream, fetched_data_receiver = fetched_data_receiver) else trap("out of memory")
+    let on_complete = gc.create_function3(vm_heap(vm), ak.Function3[bool, const RequestsRequestTimingInfo*, ak.StringView?, unit](call = FetchFetchingNetworkFetchComplete.call, context = complete_captures))
+
+    let network_request = resource_loader_load(resource_loader_the(), &load_request, on_headers_received, on_data_received, on_complete)
+    fetch_controller_set_pending_request(fetch_params_controller(fetch_params), network_request)
+
+    return pending_response
+
+# mark: CORS-preflight fetch ====================================================================
+
+## The captures of the load callback of the preflight's response, `[&vm, &request,
+## returned_pending_response](GC::Ref<Response> response)`.
+struct FetchFetchingCorsPreflightFetchResponse:
+    var vm: Vm*
+    var request: FetchRequest*
+    var returned_pending_response: FetchPendingResponse*
+
+    ## Steps 7 and 8 of CORS-preflight fetch.
+    static func call(context: void*?, response: FetchResponse*):
+        let captures = (FetchFetchingCorsPreflightFetchResponse*)(context else trap("cors_preflight_fetch: no captures"))
+        fetch_fetching_cors_preflight_fetch_response(captures, response)
+
+## `extract_header_list_values(...).visit([](Vector<ByteString>& values) { return move(values); }, [](auto) ->
+## Vector<ByteString> { return {}; })`: the values, an empty list for null (or failure).
+func fetch_fetching_extracted_values_or_empty(values_or_failure: EmptyOrVectorOrHttpHeaderListExtractHeaderParseFailure) -> ak.Vector[ak.ByteString]:
+    match values_or_failure:
+        .vector_byte_string(values): return values
+        _: return ak.Vector[ak.ByteString]()
+
+## Whether an extraction of header list values is failure.
+func fetch_fetching_extracted_values_are_failure(values_or_failure: const EmptyOrVectorOrHttpHeaderListExtractHeaderParseFailure*) -> bool:
+    match *values_or_failure:
+        .http_header_list_extract_header_parse_failure(_): return true
+        _: return false
+
+## `TRY_OR_IGNORE(String::formatted(<prefix>{}<suffix>, value))`: the message, or none when the formatted text is not
+## valid UTF-8 (C++ then returns without resolving).
+func fetch_fetching_preflight_message(prefix: str, value: ak.StringView, suffix: str) -> ak.String?:
+    var builder = ak.string_builder_new()
+    ak.string_builder_append(&builder, prefix)
+    ak.string_builder_append_string_view(&builder, value)
+    ak.string_builder_append(&builder, suffix)
+    return ak.string_from_string_builder(&builder) catch: recover none
+
+## The body of the load callback of the preflight's response (steps 7 and 8).
+func fetch_fetching_cors_preflight_fetch_response(captures: FetchFetchingCorsPreflightFetchResponse*, response: FetchResponse*):
+    let vm = captures.vm
+    let request = captures.request
+    let returned_pending_response = captures.returned_pending_response
+    if fetch_web_fetch_debug:
+        ak.dbgln("Fetch: Running 'CORS-preflight fetch' preflight_response load callback")
+
+    # 7. If a CORS check for request and response returns success and response’s status is an ok status, then:
+    # NOTE: The CORS check is done on request rather than preflight to ensure the correct credentials mode is used.
+    if fetch_fetching_cors_check(request, response) and fetch_is_ok_status(fetch_response_status(response)):
+        # 1. Let methods be the result of extracting header list values given `Access-Control-Allow-Methods` and response’s header list.
+        let methods_or_failure = http_header_list_extract_header_list_values(fetch_response_header_list(response), ak.sv("Access-Control-Allow-Methods"))
+
+        # 2. Let headerNames be the result of extracting header list values given `Access-Control-Allow-Headers` and
+        #    response’s header list.
+        let header_names_or_failure = http_header_list_extract_header_list_values(fetch_response_header_list(response), ak.sv("Access-Control-Allow-Headers"))
+
+        # 3. If either methods or headerNames is failure, return a network error.
+        if fetch_fetching_extracted_values_are_failure(&methods_or_failure):
+            fetch_pending_response_resolve(returned_pending_response, fetch_response_network_error(vm, ak.string_from_str("The Access-Control-Allow-Methods in the CORS-preflight response is syntactically invalid")))
+            return
+        if fetch_fetching_extracted_values_are_failure(&header_names_or_failure):
+            fetch_pending_response_resolve(returned_pending_response, fetch_response_network_error(vm, ak.string_from_str("The Access-Control-Allow-Headers in the CORS-preflight response is syntactically invalid")))
+            return
+
+        # NOTE: We treat "methods_or_failure" being `Empty` as empty Vector here.
+        var methods = fetch_fetching_extracted_values_or_empty(methods_or_failure)
+
+        # NOTE: We treat "header_names_or_failure" being `Empty` as empty Vector here.
+        let header_names = fetch_fetching_extracted_values_or_empty(header_names_or_failure)
+
+        # 4. If methods is null and request’s use-CORS-preflight flag is set, then set methods to a new list containing request’s method.
+        # NOTE: This ensures that a CORS-preflight fetch that happened due to request’s use-CORS-preflight flag being set is cached.
+        let method = fetch_request_method(request)
+        if ak.vector_is_empty(&methods) and fetch_request_use_cors_preflight(request):
+            var request_method_list: ak.Vector[ak.ByteString]
+            ak.vector_append_t(&request_method_list, method)
+            methods = request_method_list
+
+        # 5. If request’s method is not in methods, request’s method is not a CORS-safelisted method, and request’s credentials mode
+        #    is "include" or methods does not contain `*`, then return a network error.
+        if not fetch_fetching_byte_strings_contain(&methods, ak.byte_string_view(&method)) and not http_is_cors_safelisted_method(ak.byte_string_view(&method)):
+            if fetch_request_credentials_mode(request) == FetchRequestCredentialsMode.include:
+                let message = fetch_fetching_preflight_message("Non-CORS-safelisted method '", ak.byte_string_view(&method), "' not found in the CORS-preflight response's Access-Control-Allow-Methods header (the header may be missing). '*' is not allowed as the main request includes credentials.") else return
+                fetch_pending_response_resolve(returned_pending_response, fetch_response_network_error(vm, message))
+                return
+
+            if not fetch_fetching_byte_strings_contain(&methods, ak.sv("*")):
+                let message = fetch_fetching_preflight_message("Non-CORS-safelisted method '", ak.byte_string_view(&method), "' not found in the CORS-preflight response's Access-Control-Allow-Methods header and there was no '*' entry. The header may be missing.") else return
+                fetch_pending_response_resolve(returned_pending_response, fetch_response_network_error(vm, message))
+                return
+
+        # 6. If one of request’s header list’s names is a CORS non-wildcard request-header name and is not a byte-case-insensitive match
+        #    for an item in headerNames, then return a network error.
+        for header in ak.vector_span_const(http_header_list_headers(fetch_request_header_list(request))):
+            if fetch_is_cors_non_wildcard_request_header_name(ak.byte_string_view(&header.name)):
+                var is_in_header_names = false
+
+                for allowed_header_name in ak.vector_span_const(&header_names):
+                    if ak.byte_string_equals_ignoring_ascii_case(&allowed_header_name, ak.byte_string_view(&header.name)):
+                        is_in_header_names = true
+                        break
+
+                if not is_in_header_names:
+                    let message = fetch_fetching_preflight_message("Main request contains the header '", ak.byte_string_view(&header.name), "' that is not specified in the CORS-preflight response's Access-Control-Allow-Headers header (the header may be missing). '*' does not capture this header.") else return
+                    fetch_pending_response_resolve(returned_pending_response, fetch_response_network_error(vm, message))
+                    return
+
+        # 7. For each unsafeName of the CORS-unsafe request-header names with request’s header list, if unsafeName is not a
+        #    byte-case-insensitive match for an item in headerNames and request’s credentials mode is "include" or headerNames
+        #    does not contain `*`, return a network error.
+        let unsafe_names = fetch_get_cors_unsafe_header_names(fetch_request_header_list(request))
+        for unsafe_name in ak.vector_span_const(&unsafe_names):
+            var is_in_header_names = false
+
+            for header_name in ak.vector_span_const(&header_names):
+                if ak.byte_string_equals_ignoring_ascii_case(&unsafe_name, ak.byte_string_view(&header_name)):
+                    is_in_header_names = true
+                    break
+
+            if not is_in_header_names:
+                if fetch_request_credentials_mode(request) == FetchRequestCredentialsMode.include:
+                    let message = fetch_fetching_preflight_message("CORS-unsafe request-header '", ak.byte_string_view(&unsafe_name), "' not found in the CORS-preflight response's Access-Control-Allow-Headers header (the header may be missing). '*' is not allowed as the main request includes credentials.") else return
+                    fetch_pending_response_resolve(returned_pending_response, fetch_response_network_error(vm, message))
+                    return
+
+                if not fetch_fetching_byte_strings_contain(&header_names, ak.sv("*")):
+                    let message = fetch_fetching_preflight_message("CORS-unsafe request-header '", ak.byte_string_view(&unsafe_name), "' not found in the CORS-preflight response's Access-Control-Allow-Headers header and there was no '*' entry. The header may be missing.") else return
+                    fetch_pending_response_resolve(returned_pending_response, fetch_response_network_error(vm, message))
+                    return
+
+        # FIXME: 8. Let max-age be the result of extracting header list values given `Access-Control-Max-Age` and response’s header list.
+        # FIXME: 9. If max-age is failure or null, then set max-age to 5.
+        # FIXME: 10. If max-age is greater than an imposed limit on max-age, then set max-age to the imposed limit.
+
+        # 11. If the user agent does not provide for a cache, then return response.
+        # NOTE: Since we don't currently have a cache, this is always true.
+        fetch_pending_response_resolve(returned_pending_response, response)
+        return
+
+        # FIXME: 12. For each method in methods for which there is a method cache entry match using request, set matching entry’s max-age
+        #            to max-age.
+        # FIXME: 13. For each method in methods for which there is no method cache entry match using request, create a new cache entry
+        #            with request, max-age, method, and null.
+        # FIXME: 14. For each headerName in headerNames for which there is a header-name cache entry match using request, set matching
+        #            entry’s max-age to max-age.
+        # FIXME: 15. For each headerName in headerNames for which there is no header-name cache entry match using request, create a
+        #            new cache entry with request, max-age, null, and headerName.
+        # FIXME: 16. Return response.
+
+    # 8. Otherwise, return a network error.
+    fetch_pending_response_resolve(returned_pending_response, fetch_response_network_error(vm, ak.string_from_str("CORS-preflight check failed")))
+
+## Ported from Libraries/LibWeb/Fetch/Fetching/Fetching.cpp:2238 Web::Fetch::Fetching::cors_preflight_fetch.
+# https://fetch.spec.whatwg.org/#cors-preflight-fetch-0
+pub func fetch_fetching_cors_preflight_fetch(realm: Realm*, request: FetchRequest*) -> FetchPendingResponse*:
+    if fetch_web_fetch_debug:
+        ak.dbgln(f"Fetch: Running 'CORS-preflight fetch' with request @ {(void*)request}")
+
+    let vm = realm_vm(realm)
+
+    # 1. Let preflight be a new request whose method is `OPTIONS`, URL list is a clone of request’s URL list, initiator is
+    #    request’s initiator, destination is request’s destination, origin is request’s origin, referrer is request’s referrer,
+    #    referrer policy is request’s referrer policy, mode is "cors", and response tainting is "cors".
+    let preflight = fetch_request_create(vm)
+    fetch_request_set_method(preflight, ak.byte_string_from_str("OPTIONS"))
+    fetch_request_set_url_list(preflight, ak.vector_clone(fetch_request_url_list(request)))
+    fetch_request_set_initiator(preflight, fetch_request_initiator(request))
+    fetch_request_set_destination(preflight, fetch_request_destination(request))
+    fetch_request_set_origin(preflight, fetch_request_origin(request))
+    fetch_request_set_referrer(preflight, fetch_request_referrer(request))
+    fetch_request_set_referrer_policy(preflight, fetch_request_referrer_policy(request))
+    fetch_request_set_mode(preflight, FetchRequestMode.cors)
+    fetch_request_set_response_tainting(preflight, FetchRequestResponseTainting.cors)
+
+    # 2. Append (`Accept`, `*/*`) to preflight’s header list.
+    http_header_list_append(fetch_request_header_list(preflight), http_header_create(ak.sv("Accept"), ak.sv("*/*")))
+
+    # 3. Append (`Access-Control-Request-Method`, request’s method) to preflight’s header list.
+    let method = fetch_request_method(request)
+    let temp_header = http_header_isomorphic_encode(ak.sv("Access-Control-Request-Method"), ak.byte_string_view(&method))
+    http_header_list_append(fetch_request_header_list(preflight), temp_header)
+
+    # 4. Let headers be the CORS-unsafe request-header names with request’s header list.
+    let headers = fetch_get_cors_unsafe_header_names(fetch_request_header_list(request))
+
+    # 5. If headers is not empty, then:
+    if not ak.vector_is_empty(&headers):
+        # 1. Let value be the items in headers separated from each other by `,`.
+        # NOTE: This intentionally does not use combine, as 0x20 following 0x2C is not the way this was implemented,
+        #       for better or worse.
+        var value = ak.string_builder_new()
+        for (index, header_name) in ak.vector_span_const(&headers).indexed():
+            if index > 0:
+                ak.string_builder_append(&value, ",")
+            ak.string_builder_append_string_view(&value, ak.byte_string_view(&header_name))
+
+        # 2. Append (`Access-Control-Request-Headers`, value) to preflight’s header list.
+        http_header_list_append(fetch_request_header_list(preflight), http_header_create(ak.sv("Access-Control-Request-Headers"), ak.string_builder_string_view(&value)))
+
+    # 6. Let response be the result of running HTTP-network-or-cache fetch given a new fetch params whose request is preflight.
+    # FIXME: The spec doesn't say anything about timing_info here, but FetchParams requires a non-null FetchTimingInfo object.
+    let timing_info = fetch_timing_info_create(vm)
+    let fetch_params = fetch_params_create(vm, preflight, timing_info)
+
+    let returned_pending_response = fetch_pending_response_create(vm, request)
+
+    let preflight_response = fetch_fetching_http_network_or_cache_fetch(realm, fetch_params)
+
+    let captures = new FetchFetchingCorsPreflightFetchResponse(vm = vm, request = request, returned_pending_response = returned_pending_response) else trap("out of memory")
+    fetch_pending_response_when_loaded(preflight_response, ak.Function1[FetchResponse*, unit](call = FetchFetchingCorsPreflightFetchResponse.call, context = captures))
+
+    return returned_pending_response
+
+# mark: Fetch metadata headers ==================================================================
+
+## Ported from Libraries/LibWeb/Fetch/Fetching/Fetching.cpp:2415 Web::Fetch::Fetching::set_sec_fetch_dest_header.
+# https://w3c.github.io/webappsec-fetch-metadata/#abstract-opdef-set-dest
+pub func fetch_fetching_set_sec_fetch_dest_header(request: FetchRequest*):
+    # 1. Assert: r’s url is a potentially trustworthy URL.
+    assert(secure_contexts_is_url_potentially_trustworthy(fetch_request_url(request)) == SecureContextsTrustworthiness.potentially_trustworthy)
+
+    # 2. Let header be a Structured Header whose value is a token.
+    # FIXME: This is handled below, as Serenity doesn't have APIs for RFC 8941.
+
+    # 3. If r’s destination is the empty string, set header’s value to the string "empty". Otherwise, set header’s value to r’s destination.
+    var value = ak.sv("empty")
+    if let destination = fetch_request_destination(request):
+        value = fetch_request_destination_to_string(destination)
+
+    # 4. Set a structured field value `Sec-Fetch-Dest`/header in r’s header list.
+    http_header_list_append(fetch_request_header_list(request), http_header_create(ak.sv("Sec-Fetch-Dest"), value))
+
+## Ported from Libraries/LibWeb/Fetch/Fetching/Fetching.cpp:2433 Web::Fetch::Fetching::set_sec_fetch_mode_header.
+# https://w3c.github.io/webappsec-fetch-metadata/#abstract-opdef-set-dest
+pub func fetch_fetching_set_sec_fetch_mode_header(request: FetchRequest*):
+    # 1. Assert: r’s url is a potentially trustworthy URL.
+    assert(secure_contexts_is_url_potentially_trustworthy(fetch_request_url(request)) == SecureContextsTrustworthiness.potentially_trustworthy)
+
+    # 2. Let header be a Structured Header whose value is a token.
+    # FIXME: This is handled below, as Serenity doesn't have APIs for RFC 8941.
+
+    # 3. Set header’s value to r’s mode.
+    let value = fetch_request_mode_to_string(fetch_request_mode(request))
+
+    # 4. Set a structured field value `Sec-Fetch-Mode`/header in r’s header list.
+    http_header_list_append(fetch_request_header_list(request), http_header_create(ak.sv("Sec-Fetch-Mode"), value))
+
+## Ported from Libraries/LibWeb/Fetch/Fetching/Fetching.cpp:2449 Web::Fetch::Fetching::set_sec_fetch_site_header.
+# https://w3c.github.io/webappsec-fetch-metadata/#abstract-opdef-set-site
+pub func fetch_fetching_set_sec_fetch_site_header(request: FetchRequest*):
+    # 1. Assert: r’s url is a potentially trustworthy URL.
+    assert(secure_contexts_is_url_potentially_trustworthy(fetch_request_url(request)) == SecureContextsTrustworthiness.potentially_trustworthy)
+
+    # 2. Let header be a Structured Header whose value is a token.
+    # FIXME: This is handled below, as Serenity doesn't have APIs for RFC 8941.
+
+    # 3. Set header’s value to same-origin.
+    var value = ak.sv("same-origin")
+
+    # FIXME: 4. If r is a navigation request that was explicitly caused by a user’s interaction with the user agent (by typing an address
+    #           into the user agent directly, for example, or by clicking a bookmark, etc.), then set header’s value to none.
+
+    # 5. If header’s value is not none, then for each url in r’s url list:
+    if not ak.string_view_equals_ignoring_ascii_case(&value, ak.sv("none")):
+        let request_origin = fetch_fetching_request_origin(request) else trap("VERIFY: request.origin().has<URL::Origin>()")
+
+        for url in ak.vector_span_const(fetch_request_url_list(request)):
+            # 1. If url is same origin with r’s origin, continue.
+            let url_origin = web_url.url_origin(&url)
+            if web_url.origin_is_same_origin(&url_origin, request_origin):
+                continue
+
+            # 2. Set header’s value to cross-site.
+            value = ak.sv("cross-site")
+
+            # 3. If r’s origin is not same site with url’s origin, then break.
+            if not web_url.origin_is_same_site(&request_origin, url_origin):
+                break
+
+            # 4. Set header’s value to same-site.
+            value = ak.sv("same-site")
+
+    # 6. Set a structured field value `Sec-Fetch-Site`/header in r’s header list.
+    http_header_list_append(fetch_request_header_list(request), http_header_create(ak.sv("Sec-Fetch-Site"), value))
+
+## Ported from Libraries/LibWeb/Fetch/Fetching/Fetching.cpp:2490 Web::Fetch::Fetching::set_sec_fetch_user_header.
+# https://w3c.github.io/webappsec-fetch-metadata/#abstract-opdef-set-user
+pub func fetch_fetching_set_sec_fetch_user_header(request: FetchRequest*):
+    # 1. Assert: r’s url is a potentially trustworthy URL.
+    assert(secure_contexts_is_url_potentially_trustworthy(fetch_request_url(request)) == SecureContextsTrustworthiness.potentially_trustworthy)
+
+    # 2. If r is not a navigation request, or if r’s user-activation is false, return.
+    if not fetch_request_is_navigation_request(request) or not fetch_request_user_activation(request):
+        return
+
+    # 3. Let header be a Structured Header whose value is a token.
+    # FIXME: This is handled below, as Serenity doesn't have APIs for RFC 8941.
+
+    # 4. Set header’s value to true.
+    # NOTE: See https://datatracker.ietf.org/doc/html/rfc8941#name-booleans for boolean format in RFC 8941.
+    let value = ak.sv("?1")
+
+    # 5. Set a structured field value `Sec-Fetch-User`/header in r’s header list.
+    http_header_list_append(fetch_request_header_list(request), http_header_create(ak.sv("Sec-Fetch-User"), value))
+
+## Ported from Libraries/LibWeb/Fetch/Fetching/Fetching.cpp:2511 Web::Fetch::Fetching::append_fetch_metadata_headers_for_request.
+# https://w3c.github.io/webappsec-fetch-metadata/#abstract-opdef-append-the-fetch-metadata-headers-for-a-request
+pub func fetch_fetching_append_fetch_metadata_headers_for_request(request: FetchRequest*):
+    # 1. If r’s url is not an potentially trustworthy URL, return.
+    if secure_contexts_is_url_potentially_trustworthy(fetch_request_url(request)) != SecureContextsTrustworthiness.potentially_trustworthy:
+        return
+
+    # 2. Set the Sec-Fetch-Dest header for r.
+    fetch_fetching_set_sec_fetch_dest_header(request)
+
+    # 3. Set the Sec-Fetch-Mode header for r.
+    fetch_fetching_set_sec_fetch_mode_header(request)
+
+    # 4. Set the Sec-Fetch-Site header for r.
+    fetch_fetching_set_sec_fetch_site_header(request)
+
+    # 5. Set the Sec-Fetch-User header for r.
+    fetch_fetching_set_sec_fetch_user_header(request)
+
+# mark: The HTTP memory cache switch ============================================================
+
+## Ported from Libraries/LibWeb/Fetch/Fetching/Fetching.cpp:2530 Web::Fetch::Fetching::set_http_memory_cache_enabled.
+pub func fetch_fetching_set_http_memory_cache_enabled(enabled: bool):
+    fetch_fetching_g_http_memory_cache_enabled = enabled
+
+## Ported from Libraries/LibWeb/Fetch/Fetching/Fetching.cpp:2535 Web::Fetch::Fetching::http_memory_cache_enabled.
+pub func fetch_fetching_http_memory_cache_enabled() -> bool:
+    return fetch_fetching_g_http_memory_cache_enabled
+
+## Ported from Libraries/LibWeb/Fetch/Fetching/Fetching.cpp:2540 Web::Fetch::Fetching::clear_http_memory_cache.
+pub func fetch_fetching_clear_http_memory_cache():
+    fetch_http_cache_clear_cache(fetch_http_cache_the())

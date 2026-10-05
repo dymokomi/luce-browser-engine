@@ -1,0 +1,313 @@
+#==============================================================================================
+#
+#   tests_fetching_3 - fetches over HTTP on a loopback server: no-cors and CORS responses, the
+#   CORS-preflight fetch, redirects, network errors, the request's headers
+#
+#   DESCRIPTION:
+#       Region p2c's HTTP scenarios: a server on 127.0.0.1 (luce-std net, its own thread, the C
+#       heap) answers each request with the canned response its route names ("METHOD path") and
+#       records every request head it received; the fetches run as tests_fetching_2's, from a
+#       test page whose about:blank document has an opaque origin (so CORS answers `null` or
+#       `*`). They cover HTTP fetch, HTTP-network-or-cache fetch (the headers it adds, the cache
+#       partition), the network fetch through the ResourceLoader, the CORS and TAO checks, the
+#       CORS-preflight fetch, HTTP-redirect fetch by redirect mode, and failed connections.
+#
+#==============================================================================================
+
+# mark: A loopback server with routes ===========================================================
+
+## A route of the server: the request line's method and target, and the canned response.
+struct FetchingTestRoute:
+    var key: str
+    var response: const u8[]
+
+## The routes of the HTTP scenarios.
+let fetching_test_routes: FetchingTestRoute[12] = [
+    FetchingTestRoute(key = "GET /image", response = b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 6\r\nX-Hidden: no\r\n\r\npixels"),
+    FetchingTestRoute(key = "GET /cors", response = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 4\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Expose-Headers: X-Exposed\r\nX-Exposed: yes\r\nX-Hidden: no\r\nTiming-Allow-Origin: *\r\n\r\ncors"),
+    FetchingTestRoute(key = "GET /no-cors-headers", response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nno"),
+    FetchingTestRoute(key = "OPTIONS /put", response = b"HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: null\r\nAccess-Control-Allow-Methods: PUT\r\nAccess-Control-Allow-Headers: X-Custom\r\n\r\n"),
+    FetchingTestRoute(key = "PUT /put", response = b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: null\r\nContent-Length: 3\r\n\r\nput"),
+    FetchingTestRoute(key = "OPTIONS /put-refused", response = b"HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: null\r\n\r\n"),
+    FetchingTestRoute(key = "GET /redirect", response = b"HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\n\r\n"),
+    FetchingTestRoute(key = "GET /final", response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfinal"),
+    FetchingTestRoute(key = "GET /cors-redirect", response = b"HTTP/1.1 302 Found\r\nLocation: /final\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 0\r\n\r\n"),
+    FetchingTestRoute(key = "GET /redirect-to-data", response = b"HTTP/1.1 302 Found\r\nLocation: data:,x\r\nContent-Length: 0\r\n\r\n"),
+    FetchingTestRoute(key = "GET /not-found", response = b"HTTP/1.1 404 Not Found\r\nContent-Length: 4\r\n\r\nnope"),
+    FetchingTestRoute(key = "GET /quit", response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"),
+]
+
+## The server's state, in the C heap: its listener, and the heads of the requests it received.
+struct FetchingTestServer:
+    var listener: net.Listener
+    var port: u16
+    var request_count: usize
+    var requests: u8[16][2048]
+    var request_lengths: usize[16]
+
+## The canned response of a request line's `method target`, or a 500.
+func fetching_test_server_response(key: const u8[]) -> const u8[]:
+    for route in fetching_test_routes:
+        if key.length == route.key.length and ak.compare_bytes(key, route.key.bytes) == 0:
+            return route.response
+    return b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n"
+
+## The server thread: serves connections until `GET /quit`.
+func fetching_test_server_main(context: void*?):
+    let server = (FetchingTestServer*)(context else trap("no server"))
+    var quit = false
+    while not quit:
+        var connection = server.listener.accept() catch:
+            return
+        var buffer: u8[4096] = ---
+        var used: usize = 0
+        var head_end: usize? = none
+        while head_end == none and used < buffer.length:
+            let count = connection.read(buffer[used..]) catch:
+                break
+            if count == 0:
+                break
+            used += count
+            head_end = net.http_head_end(buffer[..<used])
+        if let end = head_end:
+            let body_length = loader_test_server_content_length(buffer[..<end])
+            while used < end + body_length and used < buffer.length:
+                let count = connection.read(buffer[used..]) catch:
+                    break
+                if count == 0:
+                    break
+                used += count
+            if server.request_count < 16:
+                let length = end if end < 2048 else 2048
+                memory.copy(server.requests[server.request_count], buffer, length)
+                server.request_lengths[server.request_count] = length
+                server.request_count += 1
+            # The key: the request line up to the second space.
+            var first: usize = 0
+            while first < end and buffer[first] != ' ':
+                first += 1
+            var second = first + 1
+            while second < end and buffer[second] != ' ':
+                second += 1
+            let key = buffer[..<second]
+            if key.length == 9 and ak.compare_bytes(key, b"GET /quit") == 0:
+                quit = true
+            _ = connection.write(fetching_test_server_response(key)) catch: recover 0
+        connection.shutdown() catch:
+            _ = 0
+        connection.destroy()
+
+## A server on 127.0.0.1 running on its own thread.
+func fetching_test_server_start() -> (FetchingTestServer*, thread.Handle):
+    with memory.heap:
+        let listener = net.Listener.bind(net.SocketAddress.loopback(0)) else trap("the server's listener")
+        let address = listener.address() else trap("the server's address")
+        let server = new FetchingTestServer(listener = listener, port = address.port) else trap("out of memory")
+        let handle = thread.spawn(fetching_test_server_main, server, name = "p2c-http-server") else trap("the server's thread")
+        return (server, handle)
+
+## The end of a server: `GET /quit` sent, its thread joined, its listener closed.
+func fetching_test_server_stop(server: FetchingTestServer*, handle: thread.Handle):
+    with memory.heap:
+        var connection = net.Connection.connect(net.SocketAddress.loopback(server.port)) else trap("the server accepts")
+        _ = connection.write(b"GET /quit HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n") catch: recover 0
+        var reply: u8[256] = ---
+        _ = connection.read(reply) catch: recover 0
+        connection.destroy()
+    var joined = handle
+    joined.join() else trap("the server's thread joins")
+    server.listener.destroy()
+    free(server) in memory.heap
+
+## `http://127.0.0.1:<port><path>`.
+func fetching_test_server_url(server: const FetchingTestServer*, path: str) -> ak.ByteString:
+    var builder = ak.string_builder_new()
+    ak.string_builder_append(&builder, "http://127.0.0.1:")
+    loader_test_append_number(&builder, (i64)server.port)
+    ak.string_builder_append(&builder, path)
+    return ak.string_builder_to_byte_string(&builder)
+
+## The head of the `index`th request the server received.
+func fetching_test_server_request(server: const FetchingTestServer*, index: usize) -> ak.StringView:
+    assert(index < server.request_count)
+    return ak.string_view_from_bytes(server.requests[index][..<server.request_lengths[index]])
+
+## Whether the `index`th request's head has the line `line` (`Name: value`, or the request line).
+func fetching_test_server_request_has(server: const FetchingTestServer*, index: usize, line: str) -> bool:
+    let head = fetching_test_server_request(server, index)
+    var needle = ak.string_builder_new()
+    ak.string_builder_append(&needle, line)
+    ak.string_builder_append(&needle, "\r\n")
+    return ak.string_view_find_string_view(&head, ak.string_builder_string_view(&needle)) != none
+
+## A request of the page's client for `path` on the server.
+func fetching_test_server_request_for(page: const FetchingTestPage*, server: const FetchingTestServer*, path: str, destination: FetchRequestDestination?, mode: FetchRequestMode) -> FetchRequest*:
+    let url = fetching_test_server_url(server, path)
+    return fetching_test_request(page, ak.string_view_text(ak.byte_string_view(&url)), destination, mode)
+
+# mark: HTTP scenarios ==========================================================================
+
+test "fetch over HTTP: no-cors (opaque) and CORS responses, their headers, the request's headers, the CORS check":
+    var event_loop = FetchingTestEventLoop()
+    fetching_test_begin(&event_loop)
+    defer fetching_test_end()
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    _ = web_test_install_agent(vm)
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        let page = fetching_test_page(vm, &event_loop)
+        let (server, handle) = fetching_test_server_start()
+
+        # An image from another origin, no-cors: an opaque filtered response (no status, headers or body), its
+        # internal response's bytes read for process response consume body.
+        let image = fetching_test_server_request_for(&page, server, "/image", FetchRequestDestination.image, FetchRequestMode.no_cors)
+        let (image_log, _) = fetching_test_fetch(&page, image)
+        fetching_test_run(&event_loop)
+        assert(image_log.responses == 1 and image_log.consumed == 1 and image_log.ends_of_body == 1)
+        let opaque = image_log.the_response()
+        assert(fetch_response_type(opaque) == FetchResponseType.opaque and fetch_response_status(opaque) == 0)
+        assert(http_header_list_is_empty(fetch_response_header_list(opaque)) and fetch_response_body(opaque) == none)
+        assert(image_log.received("pixels"))
+        let internal = fetch_filtered_response_internal_response(opaque)
+        assert(fetch_response_status(internal) == 200 and fetching_test_header_is(fetch_response_header_list(internal), "X-Hidden", "no"))
+        assert(fetch_request_redirect_count(image) == 0)
+
+        # The head sent: the default Accept for images, Accept-Language, the Fetch metadata headers (127.0.0.1 is
+        # potentially trustworthy), the default User-Agent.
+        assert(server.request_count == 1)
+        assert(fetching_test_server_request_has(server, 0, "GET /image HTTP/1.1"))
+        assert(fetching_test_server_request_has(server, 0, "Accept: image/avif,image/webp,image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5"))
+        assert(fetching_test_server_request_has(server, 0, "Accept-Language: en-US"))
+        assert(fetching_test_server_request_has(server, 0, "Sec-Fetch-Dest: image"))
+        assert(fetching_test_server_request_has(server, 0, "Sec-Fetch-Mode: no-cors"))
+        assert(fetching_test_server_request_has(server, 0, "Sec-Fetch-Site: cross-site"))
+        let user_agent = fetch_default_user_agent_value()
+        var user_agent_line = ak.string_builder_new()
+        ak.string_builder_append(&user_agent_line, "User-Agent: ")
+        ak.string_builder_append_string_view(&user_agent_line, ak.byte_string_view(&user_agent))
+        assert(fetching_test_server_request_has(server, 0, ak.string_view_text(ak.string_builder_string_view(&user_agent_line))))
+
+        # A CORS request whose response allows any origin: a CORS filtered response exposing the safelisted and the
+        # exposed headers only; the TAO check passes.
+        let cors = fetching_test_server_request_for(&page, server, "/cors", none, FetchRequestMode.cors)
+        let (cors_log, _) = fetching_test_fetch(&page, cors)
+        fetching_test_run(&event_loop)
+        let cors_response = cors_log.the_response()
+        assert(fetch_response_type(cors_response) == FetchResponseType.cors and fetch_response_status(cors_response) == 200)
+        assert(fetching_test_header_is(fetch_response_header_list(cors_response), "X-Exposed", "yes"))
+        assert(fetching_test_header_is(fetch_response_header_list(cors_response), "Content-Type", "text/plain"))
+        assert(http_header_list_get(fetch_response_header_list(cors_response), ak.sv("X-Hidden")) == none)
+        assert(cors_log.received("cors") and not fetch_request_timing_allow_failed(cors))
+        assert(fetch_request_response_tainting(cors) == FetchRequestResponseTainting.cors)
+        assert(fetching_test_server_request_has(server, 1, "Origin: null"))
+        assert(fetching_test_server_request_has(server, 1, "Sec-Fetch-Mode: cors"))
+
+        # Without Access-Control-Allow-Origin, the CORS check fails: a network error.
+        let refused = fetching_test_server_request_for(&page, server, "/no-cors-headers", none, FetchRequestMode.cors)
+        let (refused_log, _) = fetching_test_fetch(&page, refused)
+        fetching_test_run(&event_loop)
+        assert(fetching_test_network_error_is(refused_log.the_response(), "Request with 'cors' response tainting failed CORS check"))
+        assert(refused_log.consumed == 1 and refused_log.consumed_null)
+
+        # A 404 is a response (no network error).
+        let not_found = fetching_test_server_request_for(&page, server, "/not-found", FetchRequestDestination.image, FetchRequestMode.no_cors)
+        let (not_found_log, _) = fetching_test_fetch(&page, not_found)
+        fetching_test_run(&event_loop)
+        assert(fetch_response_status(fetch_filtered_response_internal_response(not_found_log.the_response())) == 404 and not_found_log.received("nope"))
+
+        # The HTTP cache partition of the page's network partition key exists (the memory cache itself is off).
+        assert(not fetch_fetching_http_memory_cache_enabled())
+        assert(ak.hash_map_size(&fetch_http_cache_the().m_cache) >= 1)
+        fetching_test_server_stop(server, handle)
+
+        # Nothing listens any more: a network error, the stream errored with a TypeError.
+        let gone = fetching_test_server_request_for(&page, server, "/image", FetchRequestDestination.image, FetchRequestMode.no_cors)
+        let (gone_log, _) = fetching_test_fetch(&page, gone)
+        fetching_test_run(&event_loop)
+        let gone_response = gone_log.the_response()
+        assert(fetch_response_is_network_error(gone_response))
+        let gone_message = fetch_response_network_error_message(gone_response) else trap("a message")
+        assert(ak.string_starts_with_bytes(&gone_message, ak.sv("Load failed: ")))
+    fetch_fetching_clear_http_memory_cache()
+
+test "fetch over HTTP: the CORS-preflight fetch, then the main request; a preflight that refuses the method":
+    var event_loop = FetchingTestEventLoop()
+    fetching_test_begin(&event_loop)
+    defer fetching_test_end()
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    _ = web_test_install_agent(vm)
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        let page = fetching_test_page(vm, &event_loop)
+        let (server, handle) = fetching_test_server_start()
+
+        # A CORS PUT with a custom header (an unsafe request): an OPTIONS preflight naming them, then the PUT.
+        let put = fetching_test_server_request_for(&page, server, "/put", none, FetchRequestMode.cors)
+        fetch_request_set_method(put, ak.byte_string_from_str("PUT"))
+        fetch_request_set_unsafe_request(put, true)
+        http_header_list_append(fetch_request_header_list(put), http_header_create(ak.sv("X-Custom"), ak.sv("1")))
+        let (put_log, _) = fetching_test_fetch(&page, put)
+        fetching_test_run(&event_loop)
+        assert(put_log.responses == 1 and put_log.received("put"))
+        assert(fetch_response_type(put_log.the_response()) == FetchResponseType.cors)
+        assert(server.request_count == 2)
+        assert(fetching_test_server_request_has(server, 0, "OPTIONS /put HTTP/1.1"))
+        assert(fetching_test_server_request_has(server, 0, "Accept: */*"))
+        assert(fetching_test_server_request_has(server, 0, "Access-Control-Request-Method: PUT"))
+        assert(fetching_test_server_request_has(server, 0, "Access-Control-Request-Headers: x-custom"))
+        assert(fetching_test_server_request_has(server, 1, "PUT /put HTTP/1.1"))
+        assert(fetching_test_server_request_has(server, 1, "X-Custom: 1"))
+        assert(fetching_test_server_request_has(server, 1, "Content-Length: 0"))
+
+        # A preflight whose response allows no method: a network error, and no main request.
+        let refused = fetching_test_server_request_for(&page, server, "/put-refused", none, FetchRequestMode.cors)
+        fetch_request_set_method(refused, ak.byte_string_from_str("PUT"))
+        fetch_request_set_unsafe_request(refused, true)
+        let (refused_log, _) = fetching_test_fetch(&page, refused)
+        fetching_test_run(&event_loop)
+        assert(fetching_test_network_error_is(refused_log.the_response(), "Non-CORS-safelisted method 'PUT' not found in the CORS-preflight response's Access-Control-Allow-Methods header and there was no '*' entry. The header may be missing."))
+        assert(server.request_count == 3)
+        fetching_test_server_stop(server, handle)
+    fetch_fetching_clear_http_memory_cache()
+
+test "fetch over HTTP: redirects followed, refused in error mode, to a scheme that is not HTTP(S)":
+    var event_loop = FetchingTestEventLoop()
+    fetching_test_begin(&event_loop)
+    defer fetching_test_end()
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    _ = web_test_install_agent(vm)
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        let page = fetching_test_page(vm, &event_loop)
+        let (server, handle) = fetching_test_server_start()
+
+        # Followed: the final response, whose URL list has both URLs; the request counted the redirect.
+        let followed = fetching_test_server_request_for(&page, server, "/redirect", FetchRequestDestination.image, FetchRequestMode.no_cors)
+        let (followed_log, _) = fetching_test_fetch(&page, followed)
+        fetching_test_run(&event_loop)
+        assert(followed_log.responses == 1 and followed_log.received("final"))
+        assert(fetch_request_redirect_count(followed) == 1)
+        let internal = fetch_filtered_response_internal_response(followed_log.the_response())
+        assert(ak.vector_size(fetch_response_url_list(internal)) == 2)
+        let final_url = fetch_response_url(internal) else trap("a URL")
+        let serialized = web_url.url_serialize(&final_url)
+        assert(ak.string_ends_with_bytes(&serialized, ak.sv("/final")))
+        assert(server.request_count == 2 and fetching_test_server_request_has(server, 1, "GET /final HTTP/1.1"))
+
+        # Redirect mode "error" (CORS, the redirect passing the CORS check): a network error.
+        let error_mode = fetching_test_server_request_for(&page, server, "/cors-redirect", none, FetchRequestMode.cors)
+        fetch_request_set_redirect_mode(error_mode, FetchRequestRedirectMode.error_)
+        let (error_log, _) = fetching_test_fetch(&page, error_mode)
+        fetching_test_run(&event_loop)
+        assert(fetching_test_network_error_is(error_log.the_response(), "Request with 'error' redirect mode received redirect response"))
+
+        # A redirect to data: is refused.
+        let to_data = fetching_test_server_request_for(&page, server, "/redirect-to-data", FetchRequestDestination.image, FetchRequestMode.no_cors)
+        let (to_data_log, _) = fetching_test_fetch(&page, to_data)
+        fetching_test_run(&event_loop)
+        assert(fetching_test_network_error_is(to_data_log.the_response(), "Request redirect URL must have HTTP or HTTPS scheme"))
+        fetching_test_server_stop(server, handle)
+    fetch_fetching_clear_http_memory_cache()

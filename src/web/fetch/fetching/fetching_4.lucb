@@ -1,0 +1,303 @@
+#==============================================================================================
+#
+#   fetching_4 - Fetch::Fetching: scheme fetch
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibWeb/Fetch/Fetching/Fetching.cpp (lines 932-1193): scheme fetch,
+#       for about:blank, blob: (FileAPI's blob URL store is phase 3: its calls trap), data:,
+#       file: and resource: (Ladybird's ad-hoc network fetch through the ResourceLoader, for
+#       subresources of file: and resource: pages) and HTTP(S) (HTTP fetch, fetching_5).
+#
+#       Copyright (c) 2022-2023, Linus Groh <linusg@serenityos.org>
+#       Copyright (c) 2023, Luke Wilde <lukew@serenityos.org>
+#       Copyright (c) 2023, Sam Atkins <atkinssj@serenityos.org>
+#       Copyright (c) 2024, Jamie Mansfield <jmansfield@cadixdev.org>
+#       Copyright (c) 2025, Shannon Booth <shannon@serenityos.org>
+#       Copyright (c) 2025, Kenneth Myhra <kennethmyhra@serenityos.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+## A network error as a resolved pending response: `PendingResponse::create(vm, request,
+## Infrastructure::Response::network_error(vm, message))`.
+func fetch_fetching_pending_network_error(vm: Vm*, request: FetchRequest*, message: str) -> FetchPendingResponse*:
+    return fetch_pending_response_create_fetch_response(vm, request, fetch_response_network_error(vm, ak.string_from_str(message)))
+
+## `request->current_url().paths().size() == 1 && request->current_url().paths()[0] == "blank"sv`.
+func fetch_fetching_url_path_is_blank(url: const web_url.Url*) -> bool:
+    let paths = web_url.url_paths(url)
+    if ak.vector_size(&paths) != 1:
+        return false
+    let first = *ak.vector_at_const(&paths, 0)
+    return ak.string_eq_string_view(&first, ak.sv("blank"))
+
+## `origin->is_opaque() || origin->scheme() == "file"sv || origin->scheme() == "resource"sv` of the file: and resource:
+## steps.
+func fetch_fetching_origin_may_load_local_files(origin: const web_url.Origin*) -> bool:
+    if web_url.origin_is_opaque(origin):
+        return true
+    let scheme = web_url.origin_scheme(origin) else return false
+    return ak.string_eq_string_view(&scheme, ak.sv("file")) or ak.string_eq_string_view(&scheme, ak.sv("resource"))
+
+## `request->origin().get_pointer<URL::Origin>()`: the request's origin when it is an origin.
+func fetch_fetching_request_origin(request: FetchRequest*) -> web_url.Origin?:
+    match fetch_request_origin(request):
+        .origin(value): return value
+        _: return none
+
+## Ported from Libraries/LibWeb/Fetch/Fetching/Fetching.cpp:933 Web::Fetch::Fetching::scheme_fetch.
+# https://fetch.spec.whatwg.org/#concept-scheme-fetch
+pub func fetch_fetching_scheme_fetch(realm: Realm*, fetch_params: FetchParams*) -> FetchPendingResponse*:
+    if fetch_web_fetch_debug:
+        ak.dbgln(f"Fetch: Running 'scheme fetch' with: fetch_params @ {(void*)fetch_params}")
+
+    let vm = realm_vm(realm)
+
+    # 1. If fetchParams is canceled, then return the appropriate network error for fetchParams.
+    if fetch_params_is_canceled(fetch_params):
+        return fetch_pending_response_create_fetch_response(vm, fetch_params_request(fetch_params), fetch_response_appropriate_network_error(vm, fetch_params))
+
+    # 2. Let request be fetchParams’s request.
+    let request = fetch_params_request(fetch_params)
+
+    # 3. Switch on request’s current URL’s scheme and run the associated steps:
+    let current_url = fetch_request_current_url(request)
+    let scheme = web_url.url_scheme(&current_url)
+    # -> "about"
+    if ak.string_eq_string_view(&scheme, ak.sv("about")):
+        # If request’s current URL’s path is the string "blank", then return a new response whose status message is
+        # `OK`, header list is « (`Content-Type`, `text/html;charset=utf-8`) », and body is the empty byte sequence as
+        # a body.
+        # NOTE: URLs such as "about:config" are handled during navigation and result in a network error in the context
+        #       of fetching.
+        if fetch_fetching_url_path_is_blank(&current_url):
+            let response = fetch_infrastructure_response_create(vm)
+            fetch_response_set_status_message(response, ak.byte_string_from_str("OK"))
+            http_header_list_append(fetch_response_header_list(response), http_header_create(ak.sv("Content-Type"), ak.sv("text/html;charset=utf-8")))
+            fetch_response_set_body(response, fetch_byte_sequence_as_body(realm, "".bytes))
+
+            return fetch_pending_response_create_fetch_response(vm, request, response)
+
+        # FIXME: This is actually wrong, see note above.
+        return fetch_fetching_nonstandard_resource_loader_file_or_http_network_fetch(realm, fetch_params)
+    # -> "blob"
+    elif ak.string_eq_string_view(&scheme, ak.sv("blob")):
+        return fetch_fetching_scheme_fetch_blob(realm, request)
+    # -> "data"
+    elif ak.string_eq_string_view(&scheme, ak.sv("data")):
+        # 1. Let dataURLStruct be the result of running the data: URL processor on request’s current URL.
+        # 2. If dataURLStruct is failure, then return a network error.
+        let data_url_struct = fetch_process_data_url(current_url) catch:
+            return fetch_fetching_pending_network_error(vm, request, "Failed to process 'data:' URL")
+
+        # 3. Let mimeType be dataURLStruct’s MIME type, serialized.
+        let mime_type = mime_type_serialized(&data_url_struct.mime_type)
+
+        # 4. Return a new response whose status message is `OK`, header list is « (`Content-Type`, mimeType) », and
+        #    body is dataURLStruct’s body as a body.
+        let response = fetch_infrastructure_response_create(vm)
+        fetch_response_set_status_message(response, ak.byte_string_from_str("OK"))
+
+        let header = http_header_isomorphic_encode(ak.sv("Content-Type"), ak.string_bytes_as_string_view(&mime_type))
+        http_header_list_append(fetch_response_header_list(response), header)
+
+        fetch_response_set_body(response, fetch_byte_sequence_as_body(realm, ak.byte_buffer_bytes_const(&data_url_struct.body)))
+        return fetch_pending_response_create_fetch_response(vm, request, response)
+    # -> "file"
+    # AD-HOC: "resource"
+    elif ak.string_eq_string_view(&scheme, ak.sv("file")) or ak.string_eq_string_view(&scheme, ak.sv("resource")):
+        # For now, unfortunate as it is, file: URLs are left as an exercise for the reader.
+        # When in doubt, return a network error.
+
+        let error_ = fetch_fetching_pending_network_error(vm, request, "Request with 'file:' or 'resource:' URL blocked")
+
+        let origin = fetch_fetching_request_origin(request) else return error_
+
+        if not fetch_fetching_origin_may_load_local_files(&origin):
+            return error_
+
+        # Allow file:// pages to load subresources (scripts, styles, fonts, etc.) from other file:// URLs,
+        # but block the fetch() API and other requests without a destination from reading arbitrary files.
+        # Requests made via fetch() have an empty destination, so we use that to distinguish between
+        # subresource loads initiated by the browser (which have a destination) and programmatic fetches
+        # (which do not). This prevents data exfiltration via fetch() from file:// pages.
+        if fetch_request_destination(request) == none:
+            return error_
+
+        return fetch_fetching_nonstandard_resource_loader_file_or_http_network_fetch(realm, fetch_params)
+    # -> HTTP(S) scheme
+    elif fetch_is_http_or_https_scheme(ak.string_bytes_as_string_view(&scheme)):
+        # Return the result of running HTTP fetch given fetchParams.
+        return fetch_fetching_http_fetch(realm, fetch_params)
+
+    # 4. Return a network error.
+    let message = "Request has invalid 'about:' URL, only 'about:blank' can be fetched" if ak.string_eq_string_view(&scheme, ak.sv("about")) else "Request URL has invalid scheme, must be one of 'about', 'blob', 'data', 'file', 'http', or 'https'"
+    return fetch_fetching_pending_network_error(vm, request, message)
+
+## The "blob" steps of scheme fetch (Fetching.cpp:967-1133). FileAPI's blobs and blob URL store are phase 3: the
+## steps trap in their closure stubs.
+func fetch_fetching_scheme_fetch_blob(realm: Realm*, request: FetchRequest*) -> FetchPendingResponse*:
+    let vm = realm_vm(realm)
+    let current_url = fetch_request_current_url(request)
+
+    # 1. Let blobURLEntry be request’s current URL’s blob URL entry.
+    let blob_url_entry = web_url.url_blob_url_entry(&current_url)
+
+    # 2. If request’s method is not `GET` or blobURLEntry is null, then return a network error. [FILEAPI]
+    let method = fetch_request_method(request)
+    if not ak.byte_string_eq_string_view(&method, ak.sv("GET")) or blob_url_entry == none:
+        return fetch_fetching_pending_network_error(vm, request, "Request has an invalid 'blob:' URL")
+
+    # 3. Let requestEnvironment be the result of determining the environment given request.
+    let request_environment = fetch_fetching_determine_the_environment(request)
+
+    # 4. Let isTopLevelSelfFetch be false.
+    var is_top_level_self_fetch = false
+
+    # 5. If request’s client is non-null:
+    if let client = fetch_request_client(request):
+        # 1. Let global be request’s client’s global object.
+        let global_window = as_if_html_window((gc.Cell*)html_environment_settings_object_global_object(client))
+
+        # 2. If all of the following conditions are true:
+        if let window = global_window:
+            # global is a Window object;
+            if let navigable = html_window_navigable(window):
+                # global’s navigable is not null;
+                # global’s navigable’s parent is null; and
+                # requestEnvironment’s creation URL equals request’s current URL,
+                let environment = request_environment else trap("VERIFY: requestEnvironment")
+                if html_navigable_parent(navigable) == none and web_url.url_eq(&environment.creation_url, current_url):
+                    # then set isTopLevelSelfFetch to true.
+                    is_top_level_self_fetch = true
+
+    # 6. Let stringOrEnvironment be the result of these steps:
+    var string_or_environment: FileApiEnvironmentOrTopLevelSelfFetch = .top_level_navigation
+    # 1. If request’s destination is "document", then return "top-level-navigation".
+    if fetch_request_destination(request) == FetchRequestDestination.document:
+        string_or_environment = .top_level_navigation
+    # 2. If isTopLevelSelfFetch is true, then return "top-level-self-fetch".
+    elif is_top_level_self_fetch:
+        string_or_environment = .top_level_self_fetch
+    # 3. Return requestEnvironment.
+    else:
+        string_or_environment = .environment(request_environment else trap("VERIFY: requestEnvironment"))
+
+    # 7. Let blob be the result of obtaining a blob object given blobURLEntry and navigationOrEnvironment.
+    let maybe_blob_object = file_api_obtain_a_blob_object(blob_url_entry else trap("unreachable"), string_or_environment)
+
+    # 8. If blob is not a Blob object, then return a network error.
+    let blob_url_entry_object = maybe_blob_object else return fetch_fetching_pending_network_error(vm, request, "Failed to obtain a Blob object from 'blob:' URL")
+
+    let blob_object: web_url.BlobUrlEntryBlob? = match blob_url_entry_object:
+        .blob_url_entry_blob(value) => value
+        _ => none
+    let blob_data = blob_object else return fetch_fetching_pending_network_error(vm, request, "Failed to obtain a Blob object from 'blob:' URL")
+    let blob = file_api_blob_create(realm, blob_data.data, blob_data.type_)
+
+    # 9. Let response be a new response.
+    let response = fetch_infrastructure_response_create(vm)
+
+    # 10. Let fullLength be blob’s size.
+    let full_length = file_api_blob_size(blob)
+
+    # 11. Let serializedFullLength be fullLength, serialized and isomorphic encoded.
+    let serialized_full_length = ak.string_number_u64(full_length)
+
+    # 12. Let type be blob’s type.
+    let type_ = file_api_blob_type(blob)
+
+    # 13. If request’s header list does not contain `Range`:
+    if not http_header_list_contains(fetch_request_header_list(request), ak.sv("Range")):
+        # 1. Let bodyWithType be the result of safely extracting blob.
+        let body_with_type = fetch_safely_extract_body_bytes(realm, file_api_blob_raw_bytes(blob))
+
+        # 2. Set response’s status message to `OK`.
+        fetch_response_set_status_message(response, ak.byte_string_from_str("OK"))
+
+        # 3. Set response’s body to bodyWithType’s body.
+        fetch_response_set_body(response, body_with_type.body)
+
+        # 4. Set response’s header list to « (`Content-Length`, serializedFullLength), (`Content-Type`, type) ».
+        let content_length_header = http_header_isomorphic_encode(ak.sv("Content-Length"), ak.string_bytes_as_string_view(&serialized_full_length))
+        http_header_list_append(fetch_response_header_list(response), content_length_header)
+
+        let content_type_header = http_header_isomorphic_encode(ak.sv("Content-Type"), ak.string_bytes_as_string_view(&type_))
+        http_header_list_append(fetch_response_header_list(response), content_type_header)
+    # 14. Otherwise:
+    else:
+        # 1. Set response’s range-requested flag.
+        fetch_response_set_range_requested(response, true)
+
+        # 2. Let rangeHeader be the result of getting `Range` from request’s header list.
+        let range_header = http_header_list_get(fetch_request_header_list(request), ak.sv("Range")) else ak.byte_string_empty()
+
+        # 3. Let rangeValue be the result of parsing a single range header value given rangeHeader and true.
+        let maybe_range_value = http_parse_single_range_header_value(ak.byte_string_view(&range_header), true)
+
+        # 4. If rangeValue is failure, then return a network error.
+        # 5. Let (rangeStart, rangeEnd) be rangeValue.
+        let range_value = maybe_range_value else return fetch_fetching_pending_network_error(vm, request, "Failed to parse single range header value")
+        var range_start = range_value.start
+        var range_end = range_value.end
+
+        # 6. If rangeStart is null:
+        if range_start == none:
+            let end = range_end else trap("VERIFY: range_end.has_value()")
+
+            # 1. Set rangeStart to fullLength − rangeEnd.
+            let start = full_length - end
+            range_start = start
+
+            # 2. Set rangeEnd to rangeStart + rangeEnd − 1.
+            range_end = start + end - 1
+        # 7. Otherwise:
+        else:
+            # 1. If rangeStart is greater than or equal to fullLength, then return a network error.
+            if (range_start else trap("unreachable")) >= full_length:
+                return fetch_fetching_pending_network_error(vm, request, "rangeStart is greater than or equal to fullLength")
+
+            # 2. If rangeEnd is null or rangeEnd is greater than or equal to fullLength, then set rangeEnd to fullLength − 1.
+            if range_end == none or (range_end else trap("unreachable")) >= full_length:
+                range_end = full_length - 1
+
+        let start = range_start else trap("unreachable")
+        let end = range_end else trap("unreachable")
+
+        # 8. Let slicedBlob be the result of invoking slice blob given blob, rangeStart, rangeEnd + 1, and type.
+        let sliced_blob = file_api_blob_slice(blob, (i64)start, (i64)(end + 1), type_) else trap("MUST: Blob::slice")
+
+        # 9. Let slicedBodyWithType be the result of safely extracting slicedBlob.
+        let sliced_body_with_type = fetch_safely_extract_body_bytes(realm, file_api_blob_raw_bytes(sliced_blob))
+
+        # 10. Set response’s body to slicedBodyWithType’s body.
+        fetch_response_set_body(response, sliced_body_with_type.body)
+
+        # 11. Let serializedSlicedLength be slicedBlob’s size, serialized and isomorphic encoded.
+        let serialized_sliced_length = ak.string_number_u64(file_api_blob_size(sliced_blob))
+
+        # 12. Let contentRange be the result of invoking build a content range given rangeStart, rangeEnd, and fullLength.
+        let content_range = http_build_content_range(start, end, full_length)
+
+        # 13. Set response’s status to 206.
+        fetch_response_set_status(response, 206)
+
+        # 14. Set response’s status message to `Partial Content`.
+        fetch_response_set_status_message(response, ak.byte_string_from_str("Partial Content"))
+
+        # 15. Set response’s header list to «
+
+        # (`Content-Length`, serializedSlicedLength),
+        let content_length_header = http_header_isomorphic_encode(ak.sv("Content-Length"), ak.string_bytes_as_string_view(&serialized_sliced_length))
+        http_header_list_append(fetch_response_header_list(response), content_length_header)
+
+        # (`Content-Type`, type),
+        let content_type_header = http_header_isomorphic_encode(ak.sv("Content-Type"), ak.string_bytes_as_string_view(&type_))
+        http_header_list_append(fetch_response_header_list(response), content_type_header)
+
+        # (`Content-Range`, contentRange) ».
+        let content_range_header = http_header_isomorphic_encode(ak.sv("Content-Range"), ak.byte_string_view(&content_range))
+        http_header_list_append(fetch_response_header_list(response), content_range_header)
+
+    # 15. Return response.
+    return fetch_pending_response_create_fetch_response(vm, request, response)

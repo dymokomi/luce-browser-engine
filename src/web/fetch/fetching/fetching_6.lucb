@@ -1,0 +1,585 @@
+#==============================================================================================
+#
+#   fetching_6 - Fetch::Fetching: HTTP-network-or-cache fetch
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibWeb/Fetch/Fetching/Fetching.cpp (lines 1559-2070):
+#       HTTP-network-or-cache fetch: the HTTP request (a clone of the request unless no
+#       traversable prompts and redirects error), credentials, Content-Length and the keepalive
+#       limit, Referer, Origin, the Fetch metadata headers, User-Agent, the cache-mode headers,
+#       Sec-GPC, Authorization from the URL's credentials, the HTTP cache partition and the
+#       memory cache (off unless enabled), then the network fetch through the ResourceLoader
+#       and the 401, 407 and 421 retries. Each C++ lambda is a capture struct with a static
+#       function (DESIGN.md §2.7).
+#
+#       Copyright (c) 2022-2023, Linus Groh <linusg@serenityos.org>
+#       Copyright (c) 2023, Luke Wilde <lukew@serenityos.org>
+#       Copyright (c) 2023, Sam Atkins <atkinssj@serenityos.org>
+#       Copyright (c) 2024, Jamie Mansfield <jmansfield@cadixdev.org>
+#       Copyright (c) 2025, Shannon Booth <shannon@serenityos.org>
+#       Copyright (c) 2025, Kenneth Myhra <kennethmyhra@serenityos.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: The response's callbacks ================================================================
+
+## The captures of the load callback of the forward response, `[&realm, &vm, &fetch_params, request, response,
+## stored_response, http_request, returned_pending_response, is_authentication_fetch, is_new_connection_fetch,
+## include_credentials, response_was_null = !response, http_cache](GC::Ref<Response> resolved_forward_response)
+## mutable`.
+struct FetchFetchingHttpNetworkOrCacheFetchForwardResponse:
+    var realm: Realm*
+    var fetch_params: FetchParams*
+    var request: FetchRequest*
+    var response: FetchResponse*?
+    var stored_response: FetchResponse*?
+    var http_request: FetchRequest*
+    var returned_pending_response: FetchPendingResponse*
+    var is_authentication_fetch: FetchIsAuthenticationFetch
+    var is_new_connection_fetch: FetchIsNewConnectionFetch
+    var include_credentials: HttpIncludeCredentials
+    var response_was_null: bool
+    var http_cache: HttpMemoryCache*?
+
+    ## Steps 10.3 to 14 of HTTP-network-or-cache fetch.
+    static func call(context: void*?, resolved_forward_response: FetchResponse*):
+        let captures = (FetchFetchingHttpNetworkOrCacheFetchForwardResponse*)(context else trap("http_network_or_cache_fetch: no captures"))
+        fetch_fetching_http_network_or_cache_fetch_forward_response(captures, resolved_forward_response)
+
+## The captures of the load callback of the response after the 401 handling, `[&realm, &vm, &fetch_params, request,
+## returned_pending_response, is_authentication_fetch, is_new_connection_fetch](GC::Ref<Response> response)`.
+struct FetchFetchingHttpNetworkOrCacheFetchInnerResponse:
+    var realm: Realm*
+    var fetch_params: FetchParams*
+    var request: FetchRequest*
+    var returned_pending_response: FetchPendingResponse*
+    var is_authentication_fetch: FetchIsAuthenticationFetch
+    var is_new_connection_fetch: FetchIsNewConnectionFetch
+
+    ## Steps 15 and 16 of HTTP-network-or-cache fetch.
+    static func call(context: void*?, response: FetchResponse*):
+        let captures = (FetchFetchingHttpNetworkOrCacheFetchInnerResponse*)(context else trap("http_network_or_cache_fetch: no captures"))
+        fetch_fetching_http_network_or_cache_fetch_inner_response(captures, response)
+
+## The captures of the load callback of the final response, `[returned_pending_response,
+## is_authentication_fetch](GC::Ref<Response> response)`.
+struct FetchFetchingHttpNetworkOrCacheFetchFinalResponse:
+    var returned_pending_response: FetchPendingResponse*
+    var is_authentication_fetch: FetchIsAuthenticationFetch
+
+    ## Step 17 of HTTP-network-or-cache fetch, then its response.
+    static func call(context: void*?, response: FetchResponse*):
+        let captures = (FetchFetchingHttpNetworkOrCacheFetchFinalResponse*)(context else trap("http_network_or_cache_fetch: no captures"))
+
+        # 17. If isAuthenticationFetch is true, then create an authentication entry for request and the given
+        #     realm.
+        if captures.is_authentication_fetch == FetchIsAuthenticationFetch.yes:
+            # FIXME: "create an authentication entry for request and the given realm"
+            _ = 0
+
+        fetch_pending_response_resolve(captures.returned_pending_response, response)
+
+## `www_authenticate_has_credential_based_scheme`: whether the response's `WWW-Authenticate` names a scheme a
+## username/password prompt can handle (Basic or Digest).
+func fetch_fetching_www_authenticate_has_credential_based_scheme(response: FetchResponse*) -> bool:
+    let www_authenticate = http_header_list_get(fetch_response_header_list(response), ak.sv("WWW-Authenticate")) else return false
+    # The value is a comma-separated list of challenges. Each challenge starts with a scheme name.
+    # We check if any of the schemes are ones we can handle with a username/password prompt.
+    let value = www_authenticate
+    let view = ak.byte_string_view(&value)
+    let challenges = ak.string_view_split_view_u8(&view, ',')
+    for challenge in ak.vector_span_const(&challenges):
+        let trimmed = ak.string_view_trim_whitespace(&challenge)
+        let space_index = ak.string_view_find_u8(&trimmed, ' ')
+        var scheme = trimmed
+        if let index = space_index:
+            scheme = ak.string_view_substring_view_usize(&trimmed, 0, index)
+        if ak.string_view_equals_ignoring_ascii_case(&scheme, ak.sv("Basic")) or ak.string_view_equals_ignoring_ascii_case(&scheme, ak.sv("Digest")):
+            return true
+    return false
+
+## The body of the load callback of the forward response (steps 10.3 to 14).
+func fetch_fetching_http_network_or_cache_fetch_forward_response(captures: FetchFetchingHttpNetworkOrCacheFetchForwardResponse*, resolved_forward_response: FetchResponse*):
+    let realm = captures.realm
+    let vm = realm_vm(realm)
+    let fetch_params = captures.fetch_params
+    let request = captures.request
+    let http_request = captures.http_request
+    if fetch_web_fetch_debug:
+        ak.dbgln("Fetch: Running 'HTTP-network-or-cache fetch' pending_forward_response load callback")
+    if captures.response_was_null:
+        let forward_response = resolved_forward_response
+
+        # NOTE: TRACE is omitted as it is a forbidden method in Fetch.
+        let http_method = fetch_request_method(http_request)
+        let method_is_unsafe = not (ak.byte_string_eq_string_view(&http_method, ak.sv("GET")) or ak.byte_string_eq_string_view(&http_method, ak.sv("HEAD")) or ak.byte_string_eq_string_view(&http_method, ak.sv("OPTIONS")))
+
+        # 3. If httpRequest’s method is unsafe and forwardResponse’s status is in the range 200 to 399, inclusive,
+        #    invalidate appropriate stored responses in httpCache, as per the "Invalidation" chapter of HTTP
+        #    Caching, and set storedResponse to null.
+        if method_is_unsafe and fetch_response_status(forward_response) >= 200 and fetch_response_status(forward_response) <= 399:
+            # FIXME: "invalidate appropriate stored responses in httpCache, as per the "Invalidation" chapter of HTTP Caching"
+            captures.stored_response = none
+
+        # 4. If the revalidatingFlag is set and forwardResponse’s status is 304, then:
+        #     1. Update storedResponse’s header list using forwardResponse’s header list, as per the "Freshening
+        #        Stored Responses upon Validation" chapter of HTTP Caching.
+        #     2. Set response to storedResponse.
+        #     3. Set response’s cache state to "validated".
+        # NB: We only cache fresh responses in WebContent. Revalidation is handled by RequestServer.
+
+        # 5. If response is null, then:
+        if captures.response == none:
+            # 1. Set response to forwardResponse.
+            captures.response = forward_response
+
+            # 2. Store httpRequest and forwardResponse in httpCache, as per the "Storing Responses in Caches" chapter of HTTP Caching.
+            # NOTE: If forwardResponse is a network error, this effectively caches the network error, which is
+            #       sometimes known as "negative caching".
+            # NOTE: The associated body info is stored in the cache alongside the response.
+            if let http_cache = captures.http_cache:
+                fetch_fetching_store_response_in_cache(http_cache, http_request, forward_response)
+
+    let response = captures.response else trap("VERIFY: HTTP-network-or-cache fetch's response")
+
+    # 11. Set response’s URL list to a clone of httpRequest’s URL list.
+    fetch_response_set_url_list(response, ak.vector_clone(fetch_request_url_list(http_request)))
+
+    # 12. If httpRequest’s header list contains `Range`, then set response’s range-requested flag.
+    if http_header_list_contains(fetch_request_header_list(http_request), ak.sv("Range")):
+        fetch_response_set_range_requested(response, true)
+
+    # 13. Set response’s request-includes-credentials to includeCredentials.
+    fetch_response_set_request_includes_credentials(response, captures.include_credentials == HttpIncludeCredentials.yes)
+
+    var inner_pending_response = fetch_pending_response_create_fetch_response(vm, request, response)
+
+    # 14. If response’s status is 401, httpRequest’s response tainting is not "cors", includeCredentials is true,
+    #     and request’s traversable for user prompts is a traversable navigable:
+    # AD-HOC: Only enter the 401 handling path if the server is requesting an authentication
+    #         scheme we can handle with a username/password prompt (Basic or Digest).
+    #         Other schemes like PrivateToken (RFC 9577) are not user-prompt-based and should
+    #         not trigger credential prompting or request retries.
+    let traversable_is_a_traversable_navigable = match fetch_request_traversable_for_user_prompts(request):
+        .html_traversable_navigable(_) => true
+        _ => false
+    if (fetch_response_status(response) == 401 and fetch_request_response_tainting(http_request) != FetchRequestResponseTainting.cors and captures.include_credentials == HttpIncludeCredentials.yes and traversable_is_a_traversable_navigable and fetch_fetching_www_authenticate_has_credential_based_scheme(response)):
+        # 1. Needs testing: multiple `WWW-Authenticate` headers, missing, parsing issues.
+        # (Red box in the spec, no-op)
+
+        # 2. If request’s body is non-null, then:
+        if not fetch_request_body_is_empty(request):
+            # 1. If request’s body’s source is null, then return a network error.
+            if fetch_fetching_body_source_is_null(fetch_fetching_request_body(request)):
+                fetch_pending_response_resolve(captures.returned_pending_response, fetch_response_network_error(vm, ak.string_from_str("Request has body but no body source")))
+                return
+
+            # 2. Set request’s body to the body of the result of safely extracting request’s body’s source.
+            let source = fetch_body_source(fetch_fetching_request_body(request))
+            # NOTE: BodyInitOrReadableBytes is a superset of Body::SourceType
+            fetch_request_set_body(request, .fetch_body(fetch_fetching_body_of_source(realm, source)))
+
+        # 3. If request’s use-URL-credentials flag is unset or isAuthenticationFetch is true, then:
+        if not fetch_request_use_url_credentials(request) or captures.is_authentication_fetch == FetchIsAuthenticationFetch.yes:
+            # 1. If fetchParams is canceled, then return the appropriate network error for fetchParams.
+            if fetch_params_is_canceled(fetch_params):
+                fetch_pending_response_resolve(captures.returned_pending_response, fetch_response_appropriate_network_error(vm, fetch_params))
+                return
+
+            # FIXME: 2. Let username and password be the result of prompting the end user for a username and password,
+            #           respectively, in request’s window.
+            ak.dbgln("Fetch: Username/password prompt is not implemented, using empty strings. This request will probably fail.")
+            let username = ak.byte_string_empty()
+            let password = ak.byte_string_empty()
+
+            # 3. Set the username given request’s current URL and username.
+            web_url.url_set_username(ak.vector_last(fetch_request_url_list(request)), ak.byte_string_view(&username))
+
+            # 4. Set the password given request’s current URL and password.
+            web_url.url_set_password(ak.vector_last(fetch_request_url_list(request)), ak.byte_string_view(&password))
+
+        # 4. Set response to the result of running HTTP-network-or-cache fetch given fetchParams and true.
+        inner_pending_response = fetch_fetching_http_network_or_cache_fetch(realm, fetch_params, FetchIsAuthenticationFetch.yes)
+
+    let inner_captures = new FetchFetchingHttpNetworkOrCacheFetchInnerResponse(realm = realm, fetch_params = fetch_params, request = request, returned_pending_response = captures.returned_pending_response, is_authentication_fetch = captures.is_authentication_fetch, is_new_connection_fetch = captures.is_new_connection_fetch) else trap("out of memory")
+    fetch_pending_response_when_loaded(inner_pending_response, ak.Function1[FetchResponse*, unit](call = FetchFetchingHttpNetworkOrCacheFetchInnerResponse.call, context = inner_captures))
+
+## The body of the load callback of the response after the 401 handling (steps 15 and 16).
+func fetch_fetching_http_network_or_cache_fetch_inner_response(captures: FetchFetchingHttpNetworkOrCacheFetchInnerResponse*, response: FetchResponse*):
+    let realm = captures.realm
+    let vm = realm_vm(realm)
+    let fetch_params = captures.fetch_params
+    let request = captures.request
+    if fetch_web_fetch_debug:
+        ak.dbgln("Fetch: Running 'HTTP network-or-cache fetch' inner_pending_response load callback")
+    # 15. If response’s status is 407, then:
+    if fetch_response_status(response) == 407:
+        # 1. If request’s traversable for user prompts is "no-traversable", then return a network error.
+        match fetch_request_traversable_for_user_prompts(request):
+            .fetch_request_traversable_for_user_prompts(traversable) if traversable == FetchRequestTraversableForUserPrompts.no_traversable:
+                fetch_pending_response_resolve(captures.returned_pending_response, fetch_response_network_error(vm, ak.string_from_str("Request requires proxy authentication but has 'no-window' set")))
+                return
+            _: _ = 0
+
+        # 2. Needs testing: multiple `Proxy-Authenticate` headers, missing, parsing issues.
+        # (Red box in the spec, no-op)
+
+        # 3. If fetchParams is canceled, then return the appropriate network error for fetchParams.
+        if fetch_params_is_canceled(fetch_params):
+            fetch_pending_response_resolve(captures.returned_pending_response, fetch_response_appropriate_network_error(vm, fetch_params))
+            return
+
+        # FIXME: 4. Prompt the end user as appropriate in request’s window and store the result as a
+        #           proxy-authentication entry.
+        # NOTE: Remaining details surrounding proxy authentication are defined by HTTP.
+
+        # FIXME: 5. Set response to the result of running HTTP-network-or-cache fetch given fetchParams.
+        # (Doing this without step 4 would potentially lead to an infinite request cycle.)
+
+    var inner_pending_response = fetch_pending_response_create_fetch_response(vm, request, response)
+
+    # 16. If all of the following are true
+    if (fetch_response_status(response) == 421 and captures.is_new_connection_fetch == FetchIsNewConnectionFetch.no and (fetch_request_body_is_empty(request) or not fetch_fetching_body_source_is_null(fetch_fetching_request_body(request)))):
+        # - response’s status is 421
+        # - isNewConnectionFetch is false
+        # - request’s body is null, or request’s body is non-null and request’s body’s source is non-null
+        # then:
+        # 1. If fetchParams is canceled, then return the appropriate network error for fetchParams.
+        if fetch_params_is_canceled(fetch_params):
+            fetch_pending_response_resolve(captures.returned_pending_response, fetch_response_appropriate_network_error(vm, fetch_params))
+            return
+        # 2. Set response to the result of running HTTP-network-or-cache fetch given fetchParams,
+        #    isAuthenticationFetch, and true.
+        inner_pending_response = fetch_fetching_http_network_or_cache_fetch(realm, fetch_params, captures.is_authentication_fetch, FetchIsNewConnectionFetch.yes)
+
+    let final_captures = new FetchFetchingHttpNetworkOrCacheFetchFinalResponse(returned_pending_response = captures.returned_pending_response, is_authentication_fetch = captures.is_authentication_fetch) else trap("out of memory")
+    fetch_pending_response_when_loaded(inner_pending_response, ak.Function1[FetchResponse*, unit](call = FetchFetchingHttpNetworkOrCacheFetchFinalResponse.call, context = final_captures))
+
+# mark: HTTP-network-or-cache fetch =============================================================
+
+## The length a fetch record's in-flight request counts toward the keepalive limit:
+## `in_flight_request->body().visit(...)`.
+func fetch_fetching_in_flight_body_length(request: FetchRequest*) -> u64:
+    match fetch_request_body_const(request):
+        .empty: return 0
+        .byte_buffer(buffer): return (u64)ak.byte_buffer_size(&buffer)
+        .fetch_body(body): return fetch_body_length(body) else 0
+
+## `request->traversable_for_user_prompts()` is "no-traversable".
+func fetch_fetching_has_no_traversable_for_user_prompts(request: FetchRequest*) -> bool:
+    match fetch_request_traversable_for_user_prompts(request):
+        .fetch_request_traversable_for_user_prompts(traversable): return traversable == FetchRequestTraversableForUserPrompts.no_traversable
+        _: return false
+
+## Ported from Libraries/LibWeb/Fetch/Fetching/Fetching.cpp:1560 Web::Fetch::Fetching::http_network_or_cache_fetch.
+# https://fetch.spec.whatwg.org/#concept-http-network-or-cache-fetch
+pub func fetch_fetching_http_network_or_cache_fetch(realm: Realm*, fetch_params: FetchParams*, is_authentication_fetch: FetchIsAuthenticationFetch = FetchIsAuthenticationFetch.no, is_new_connection_fetch: FetchIsNewConnectionFetch = FetchIsNewConnectionFetch.no) -> FetchPendingResponse*:
+    if fetch_web_fetch_debug:
+        let authentication = "Yes" if is_authentication_fetch == FetchIsAuthenticationFetch.yes else "No"
+        let new_connection = "Yes" if is_new_connection_fetch == FetchIsNewConnectionFetch.yes else "No"
+        ak.dbgln(f"Fetch: Running 'HTTP-network-or-cache fetch' with: fetch_params @ {(void*)fetch_params}, is_authentication_fetch = {authentication}, is_new_connection_fetch = {new_connection}")
+
+    let vm = realm_vm(realm)
+
+    # 1. Let request be fetchParams’s request.
+    let request = fetch_params_request(fetch_params)
+
+    # 2. Let httpFetchParams be null.
+    var http_fetch_params: FetchParams*? = none
+
+    # 3. Let httpRequest be null.
+    var http_request: FetchRequest*? = none
+
+    # 4. Let response be null.
+    var response: FetchResponse*? = none
+
+    # 5. Let storedResponse be null.
+    var stored_response: FetchResponse*? = none
+
+    # 6. Let httpCache be null.
+    var http_cache: HttpMemoryCache*? = none
+
+    # 7. Let the revalidatingFlag be unset.
+
+    var include_credentials = HttpIncludeCredentials.no
+
+    # 8. Run these steps, but abort when fetchParams is canceled:
+    # NOTE: There's an 'if aborted' check after this anyway, so not doing this is fine and only incurs a small delay.
+    #       For now, support for aborting fetch requests is limited anyway as ResourceLoader doesn't support it.
+    # (C++'s ScopeGuard sets `aborted` when the block ends: after step 8.25 below.)
+    var aborted = false
+
+    # 1. If request’s traversable for user prompts is "no-traversable" and request’s redirect mode is "error",
+    #    then set httpFetchParams to fetchParams and httpRequest to request.
+    if fetch_fetching_has_no_traversable_for_user_prompts(request) and fetch_request_redirect_mode(request) == FetchRequestRedirectMode.error_:
+        http_fetch_params = fetch_params
+        http_request = request
+    # 2. Otherwise:
+    else:
+        # 1. Set httpRequest to a clone of request.
+        # NOTE: Implementations are encouraged to avoid teeing request’s body’s stream when request’s body’s
+        #       source is null as only a single body is needed in that case. E.g., when request’s body’s source
+        #       is null, redirects and authentication will end up failing the fetch.
+        let cloned_request = fetch_request_clone(request, realm)
+        http_request = cloned_request
+
+        # 2. Set httpFetchParams to a copy of fetchParams.
+        let new_http_fetch_params = fetch_params_copy(fetch_params)
+        # 3. Set httpFetchParams’s request to httpRequest.
+        fetch_params_set_request(new_http_fetch_params, cloned_request)
+        http_fetch_params = new_http_fetch_params
+
+    let the_http_request = http_request else trap("VERIFY: httpRequest")
+    let http_header_list = fetch_request_header_list(the_http_request)
+
+    # 3. Let includeCredentials be true if one of
+    if (fetch_request_credentials_mode(request) == FetchRequestCredentialsMode.include or (fetch_request_credentials_mode(request) == FetchRequestCredentialsMode.same_origin and fetch_request_response_tainting(request) == FetchRequestResponseTainting.basic)):
+        # - request’s credentials mode is "include"
+        # - request’s credentials mode is "same-origin" and request’s response tainting is "basic"
+        # is true; otherwise false.
+        include_credentials = HttpIncludeCredentials.yes
+    else:
+        include_credentials = HttpIncludeCredentials.no
+
+    # 4. If Cross-Origin-Embedder-Policy allows credentials with request returns false, then set
+    #    includeCredentials to false.
+    if not fetch_request_cross_origin_embedder_policy_allows_credentials(request):
+        include_credentials = HttpIncludeCredentials.no
+
+    # 5. Let contentLength be httpRequest’s body’s length, if httpRequest’s body is non-null; otherwise null.
+    let content_length: u64? = match fetch_request_body_const(the_http_request):
+        .fetch_body(body) => fetch_body_length(body)
+        _ => none
+
+    # 6. Let contentLengthHeaderValue be null.
+    var content_length_header_value: ak.ByteString? = none
+
+    # 7. If httpRequest’s body is null and httpRequest’s method is `POST` or `PUT`, then set
+    #    contentLengthHeaderValue to `0`.
+    let http_method = fetch_request_method(the_http_request)
+    if fetch_request_body_is_empty(the_http_request) and (ak.byte_string_eq_string_view(&http_method, ak.sv("POST")) or ak.byte_string_eq_string_view(&http_method, ak.sv("PUT"))):
+        content_length_header_value = ak.byte_string_from_str("0")
+
+    # 8. If contentLength is non-null, then set contentLengthHeaderValue to contentLength, serialized and
+    #    isomorphic encoded.
+    if let length = content_length:
+        content_length_header_value = ak.byte_string_number_u64(length)
+
+    # 9. If contentLengthHeaderValue is non-null, then append (`Content-Length`, contentLengthHeaderValue) to
+    #    httpRequest’s header list.
+    if let value = content_length_header_value:
+        http_header_list_append(http_header_list, http_header_create(ak.sv("Content-Length"), ak.byte_string_view(&value)))
+
+    # 10. If contentLength is non-null and httpRequest’s keepalive is true, then:
+    if content_length != none and fetch_request_keepalive(the_http_request):
+        # 1. Let inflightKeepaliveBytes be 0.
+        var inflight_keep_alive_bytes: u64 = 0
+
+        # 2. Let group be httpRequest’s client’s fetch group.
+        let group = html_environment_settings_object_fetch_group(fetch_request_client(the_http_request) else trap("VERIFY: httpRequest's client"))
+
+        # 3. Let inflightRecords be the set of fetch records in group whose request’s keepalive is true and done flag is unset.
+        var in_flight_records: ak.Vector[FetchRecord*]
+        var record = ak.intrusive_list_first(group)
+        while let fetch_record = record:
+            if fetch_request_keepalive(fetch_record_request(fetch_record)) and not fetch_request_done(fetch_record_request(fetch_record)):
+                ak.vector_append_t(&in_flight_records, fetch_record)
+            record = ak.intrusive_list_next[FetchRecord, FetchRecord*?](fetch_record, memory.offset_of(FetchRecord, m_list_node))
+
+        # 4. For each fetchRecord of inflightRecords:
+        for fetch_record in ak.vector_span_const(&in_flight_records):
+            # 1. Let inflightRequest be fetchRecord’s request.
+            let in_flight_request = fetch_record_request(fetch_record)
+
+            # 2. Increment inflightKeepaliveBytes by inflightRequest’s body’s length.
+            inflight_keep_alive_bytes += fetch_fetching_in_flight_body_length(in_flight_request)
+
+        # 5. If the sum of contentLength and inflightKeepaliveBytes is greater than 64 kibibytes, then return a network error.
+        if ((content_length else 0) + inflight_keep_alive_bytes) > fetch_fetching_keepalive_maximum_size:
+            return fetch_fetching_pending_network_error(vm, request, "Keepalive request exceeded maximum allowed size of 64 KiB")
+
+        # NOTE: The above limit ensures that requests that are allowed to outlive the environment settings object
+        #       and contain a body, have a bounded size and are not allowed to stay alive indefinitely.
+
+    # 11. If httpRequest’s referrer is a URL, then:
+    match fetch_request_referrer(the_http_request):
+        .url(referrer_url):
+            # 1. Let referrerValue be httpRequest’s referrer, serialized and isomorphic encoded.
+            let serialized_referrer = web_url.url_serialize(&referrer_url)
+            let referrer_value = text_codec.isomorphic_encode(ak.string_bytes_as_string_view(&serialized_referrer))
+
+            # 2. Append (`Referer`, referrerValue) to httpRequest’s header list.
+            http_header_list_append(http_header_list, http_header_create(ak.sv("Referer"), ak.byte_string_view(&referrer_value)))
+        _: _ = 0
+
+    # 12. Append a request `Origin` header for httpRequest.
+    fetch_request_add_origin_header(the_http_request)
+
+    # 13. Append the Fetch metadata headers for httpRequest.
+    fetch_fetching_append_fetch_metadata_headers_for_request(the_http_request)
+
+    # 14. FIXME: If httpRequest’s initiator is "prefetch", then set a structured field value
+    #     given (`Sec-Purpose`, the token prefetch) in httpRequest’s header list.
+
+    # 15. If httpRequest’s header list does not contain `User-Agent`, then user agents should append
+    #     (`User-Agent`, default `User-Agent` value) to httpRequest’s header list.
+    if not http_header_list_contains(http_header_list, ak.sv("User-Agent")):
+        let user_agent = fetch_default_user_agent_value()
+        http_header_list_append(http_header_list, http_header_create(ak.sv("User-Agent"), ak.byte_string_view(&user_agent)))
+
+    # 16. If httpRequest’s cache mode is "default" and httpRequest’s header list contains `If-Modified-Since`,
+    #     `If-None-Match`, `If-Unmodified-Since`, `If-Match`, or `If-Range`, then set httpRequest’s cache mode to
+    #     "no-store".
+    if (fetch_request_cache_mode(the_http_request) == HttpCacheMode.default and (http_header_list_contains(http_header_list, ak.sv("If-Modified-Since")) or http_header_list_contains(http_header_list, ak.sv("If-None-Match")) or http_header_list_contains(http_header_list, ak.sv("If-Unmodified-Since")) or http_header_list_contains(http_header_list, ak.sv("If-Match")) or http_header_list_contains(http_header_list, ak.sv("If-Range")))):
+        fetch_request_set_cache_mode(the_http_request, HttpCacheMode.no_store)
+
+    # 17. If httpRequest’s cache mode is "no-cache", httpRequest’s prevent no-cache cache-control header
+    #     modification flag is unset, and httpRequest’s header list does not contain `Cache-Control`, then append
+    #     (`Cache-Control`, `max-age=0`) to httpRequest’s header list.
+    if (fetch_request_cache_mode(the_http_request) == HttpCacheMode.no_cache and not fetch_request_prevent_no_cache_cache_control_header_modification(the_http_request) and not http_header_list_contains(http_header_list, ak.sv("Cache-Control"))):
+        http_header_list_append(http_header_list, http_header_create(ak.sv("Cache-Control"), ak.sv("max-age=0")))
+
+    # 18. If httpRequest’s cache mode is "no-store" or "reload", then:
+    if (fetch_request_cache_mode(the_http_request) == HttpCacheMode.no_store or fetch_request_cache_mode(the_http_request) == HttpCacheMode.reload):
+        # 1. If httpRequest’s header list does not contain `Pragma`, then append (`Pragma`, `no-cache`) to
+        #    httpRequest’s header list.
+        if not http_header_list_contains(http_header_list, ak.sv("Pragma")):
+            http_header_list_append(http_header_list, http_header_create(ak.sv("Pragma"), ak.sv("no-cache")))
+
+        # 2. If httpRequest’s header list does not contain `Cache-Control`, then append
+        #    (`Cache-Control`, `no-cache`) to httpRequest’s header list.
+        if not http_header_list_contains(http_header_list, ak.sv("Cache-Control")):
+            http_header_list_append(http_header_list, http_header_create(ak.sv("Cache-Control"), ak.sv("no-cache")))
+
+    # 19. If httpRequest’s header list contains `Range`, then append (`Accept-Encoding`, `identity`) to
+    #     httpRequest’s header list.
+    # NOTE: This avoids a failure when handling content codings with a part of an encoded response.
+    #       Additionally, many servers mistakenly ignore `Range` headers if a non-identity encoding is accepted.
+    if http_header_list_contains(http_header_list, ak.sv("Range")):
+        http_header_list_append(http_header_list, http_header_create(ak.sv("Accept-Encoding"), ak.sv("identity")))
+
+    # 20. Modify httpRequest’s header list per HTTP. Do not append a given header if httpRequest’s header list
+    #     contains that header’s name.
+    # NOTE: It would be great if we could make this more normative somehow. At this point headers such as
+    #       `Accept-Encoding`, `Connection`, `DNT`, and `Host`, are to be appended if necessary.
+    #     `Accept`, `Accept-Charset`, and `Accept-Language` must not be included at this point.
+    # NOTE: `Accept` and `Accept-Language` are already included (unless fetch() is used, which does not include
+    #       the latter by default), and `Accept-Charset` is a waste of bytes. See HTTP header layer division for
+    #       more details.
+    #
+    # https://w3c.github.io/gpc/#the-sec-gpc-header-field-for-http-requests
+    if resource_loader_enable_global_privacy_control(resource_loader_the()) and not http_header_list_contains(http_header_list, ak.sv("Sec-GPC")):
+        http_header_list_append(http_header_list, http_header_create(ak.sv("Sec-GPC"), ak.sv("1")))
+
+    # 21. If includeCredentials is true, then:
+    if include_credentials == HttpIncludeCredentials.yes:
+        # 1. If the user agent is not configured to block cookies for httpRequest (see section 7 of [COOKIES]),
+        #    then:
+        #     1. Let cookies be the result of running the "cookie-string" algorithm (see section 5.4 of [COOKIES])
+        #        with the user agent’s cookie store and httpRequest’s current URL.
+        #     2. If cookies is not the empty string, then append (`Cookie`, cookies) to httpRequest’s header list.
+        # NB: HTTP cookies are attached by RequestServer.
+
+        # 2. If httpRequest’s header list does not contain `Authorization`, then:
+        if not http_header_list_contains(http_header_list, ak.sv("Authorization")):
+            # 1. Let authorizationValue be null.
+            var authorization_value: ak.String? = none
+
+            # 2. If there’s an authentication entry for httpRequest and either httpRequest’s use-URL-credentials
+            #    flag is unset or httpRequest’s current URL does not include credentials, then set
+            #    authorizationValue to authentication entry.
+            # FIXME: "If there’s an authentication entry for httpRequest" (C++ tests `false && ...`: never),
+            #        "set authorizationValue to authentication entry."
+            # 3. Otherwise, if httpRequest’s current URL does include credentials and isAuthenticationFetch is
+            #    true, set authorizationValue to httpRequest’s current URL, converted to an `Authorization` value.
+            let http_current_url = fetch_request_current_url(the_http_request)
+            if web_url.url_includes_credentials(&http_current_url) and is_authentication_fetch == FetchIsAuthenticationFetch.yes:
+                let url_username = web_url.url_username(&http_current_url)
+                let url_password = web_url.url_password(&http_current_url)
+                let decoded_username = web_url.percent_decode(ak.string_bytes_as_string_view(&url_username))
+                let decoded_password = web_url.percent_decode(ak.string_bytes_as_string_view(&url_password))
+                var payload = ak.string_builder_new()
+                ak.string_builder_append_string_view(&payload, ak.byte_string_view(&decoded_username))
+                ak.string_builder_append(&payload, ":")
+                ak.string_builder_append_string_view(&payload, ak.byte_string_view(&decoded_password))
+                let payload_view = ak.string_builder_string_view(&payload)
+                authorization_value = ak.encode_base64(ak.string_view_bytes(&payload_view)) else trap("MUST: encode_base64")
+
+            # 4. If authorizationValue is non-null, then append (`Authorization`, authorizationValue) to
+            #    httpRequest’s header list.
+            if let value = authorization_value:
+                let header = http_header_isomorphic_encode(ak.sv("Authorization"), ak.string_bytes_as_string_view(&value))
+                http_header_list_append(http_header_list, header)
+
+    # FIXME: 22. If there’s a proxy-authentication entry, use it as appropriate.
+    # NOTE: This intentionally does not depend on httpRequest’s credentials mode.
+
+    # 23. Set httpCache to the result of determining the HTTP cache partition, given httpRequest.
+    http_cache = fetch_fetching_determine_the_http_cache_partition(the_http_request)
+
+    # 24. If httpCache is null, then set httpRequest’s cache mode to "no-store".
+    if http_cache == none:
+        fetch_request_set_cache_mode(the_http_request, HttpCacheMode.no_store)
+
+    # 25. If httpRequest’s cache mode is neither "no-store" nor "reload", then:
+    if (fetch_request_cache_mode(the_http_request) != HttpCacheMode.no_store and fetch_request_cache_mode(the_http_request) != HttpCacheMode.reload):
+        # 1. Set storedResponse to the result of selecting a response from the httpCache, possibly needing
+        #    validation, as per the "Constructing Responses from Caches" chapter of HTTP Caching [HTTP-CACHING],
+        #    if any.
+        # NOTE: As mandated by HTTP, this still takes the `Vary` header into account.
+        stored_response = fetch_fetching_select_response_from_cache(realm, http_cache else trap("VERIFY: httpCache"), the_http_request)
+
+        # 2. If storedResponse is non-null, then:
+        if let cached_response = stored_response:
+            # 1. If cache mode is "default", storedResponse is a stale-while-revalidate response, and httpRequest’s
+            #    client is non-null, then:
+            # 2. Otherwise:
+            #     1. If storedResponse is a stale response, then set the revalidatingFlag.
+            #     2. If the revalidatingFlag is set and httpRequest’s cache mode is neither "force-cache" nor
+            #        "only-if-cached", then:
+            #         1. If storedResponse’s header list contains `ETag`, then append (`If-None-Match`, `ETag`'s value)
+            #            to httpRequest’s header list.
+            #         2. If storedResponse’s header list contains `Last-Modified`, then append (`If-Modified-Since`,
+            #            `Last-Modified`'s value) to httpRequest’s header list.
+            #     3. Otherwise, set response to storedResponse and set response’s cache state to "local".
+
+            # NB: We only cache fresh responses in WebContent. Revalidation is handled by RequestServer.
+            response = cached_response
+            fetch_response_set_cache_state(cached_response, FetchResponseCacheState.local_)
+
+    # (The end of step 8's block: C++'s ScopeGuard.)
+    if fetch_params_is_canceled(fetch_params):
+        aborted = true
+
+    # 9. If aborted, then return the appropriate network error for fetchParams.
+    if aborted:
+        return fetch_pending_response_create_fetch_response(vm, request, fetch_response_appropriate_network_error(vm, fetch_params))
+
+    var pending_forward_response: FetchPendingResponse*? = none
+    let the_http_fetch_params = http_fetch_params else trap("VERIFY: httpFetchParams")
+
+    # 10. If response is null, then:
+    if response == none:
+        # 1. If httpRequest’s cache mode is "only-if-cached", then return a network error.
+        # NB: We skip this step in order to allow the disk cache in RequestServer to handle this request. If a disk
+        #     cache entry does not exist, it will return a network error itself.
+
+        # 2. Let forwardResponse be the result of running HTTP-network fetch given httpFetchParams, includeCredentials,
+        #    and isNewConnectionFetch.
+        pending_forward_response = fetch_fetching_nonstandard_resource_loader_file_or_http_network_fetch(realm, the_http_fetch_params, include_credentials, is_new_connection_fetch, http_cache)
+    else:
+        pending_forward_response = fetch_pending_response_create_fetch_response(vm, request, fetch_infrastructure_response_create(vm))
+
+    # AD-HOC: If the controller is already in the non-spec Stopped state, we should cancel the network request immediately.
+    if fetch_controller_state(fetch_params_controller(the_http_fetch_params)) == FetchControllerState.stopped:
+        fetch_controller_stop_fetch(fetch_params_controller(the_http_fetch_params))
+
+    let returned_pending_response = fetch_pending_response_create(vm, request)
+
+    let forward_captures = new FetchFetchingHttpNetworkOrCacheFetchForwardResponse(realm = realm, fetch_params = fetch_params, request = request, response = response, stored_response = stored_response, http_request = the_http_request, returned_pending_response = returned_pending_response, is_authentication_fetch = is_authentication_fetch, is_new_connection_fetch = is_new_connection_fetch, include_credentials = include_credentials, response_was_null = response == none, http_cache = http_cache) else trap("out of memory")
+    fetch_pending_response_when_loaded(pending_forward_response else trap("VERIFY: the forward response"), ak.Function1[FetchResponse*, unit](call = FetchFetchingHttpNetworkOrCacheFetchForwardResponse.call, context = forward_captures))
+
+    # 18. Return response.
+    # NOTE: Typically response’s body’s stream is still being enqueued to after returning.
+    return returned_pending_response

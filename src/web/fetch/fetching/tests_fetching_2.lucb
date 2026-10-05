@@ -1,0 +1,385 @@
+#==============================================================================================
+#
+#   tests_fetching_2 - fetches end to end in a test page: about:blank, data:, file:, a
+#   cancelled fetch, blocked requests, integrity metadata, the network error's TypeError
+#
+#   DESCRIPTION:
+#       Region p2c's scenarios of Fetch::Fetching with a Window client (a test page's about:blank
+#       document, tests_html_browsing's), the ResourceLoader over the in-process client
+#       (tests_loader_2's, whose PageClient opens file: URLs in process) and a test event loop: fetch, main fetch, scheme fetch, the network fetch, the TransformStream
+#       stand-in of fetch response handover, and the process response, process response end of
+#       body and process response consume body algorithms the callers give. Ladybird has no unit
+#       tests of Fetching; the expected values are the C++ algorithms' (the HTTP scenarios are in
+#       tests_fetching_3, the checks pinned to the reference build in tests_fetching_1).
+#
+#==============================================================================================
+
+# mark: A test page and its fetches =============================================================
+
+## The event loop of the fetching tests: the deferred invocations in order, as the loader tests' (LoaderTestEventLoop),
+## and timers registered but never fired (the page's cursor blink and frame timers). It lives in the test's frame,
+## so the scan of the stack keeps its queue.
+struct FetchingTestEventLoop: CoreEventLoopImplementation:
+    var deferred: ak.Vector[ak.Function0[unit]]
+    var next_timer_id: isize
+
+    func pump(mode: CoreEventLoopPumpMode) -> usize:
+        let pending = self.deferred
+        self.deferred = ak.Vector[ak.Function0[unit]]()
+        for index in 0..<ak.vector_size(&pending):
+            var function = *ak.vector_at_const(&pending, index)
+            ak.function0_call(&function)
+        return ak.vector_size(&pending)
+
+    func quit(code: i32):
+        return
+
+    func was_exit_requested() -> bool:
+        return false
+
+    func wake():
+        return
+
+    func deferred_invoke(function: ak.Function0[unit]):
+        ak.vector_append_t(&self.deferred, function)
+
+    func register_timer(timer: CoreTimer*, milliseconds: i32, should_reload: bool) -> isize:
+        self.next_timer_id += 1
+        return self.next_timer_id
+
+    func unregister_timer(timer_id: isize):
+        return
+
+## A test page's window document, its realm and settings object, and the event loop of the test.
+struct FetchingTestPage:
+    var vm: Vm*
+    var page: Page*
+    var document: DomDocument*
+    var realm: Realm*
+    var settings: HtmlEnvironmentSettingsObject*
+    var event_loop: FetchingTestEventLoop*
+
+## What a fetch's algorithms heard (managed memory: the algorithms run in later tasks).
+struct FetchingTestLog:
+    var responses: i32
+    var response: FetchResponse*?
+    var ends_of_body: i32
+    var consumed: i32
+    var consumed_null: bool
+    var consumed_failure: bool
+    var bytes: ak.ByteBuffer
+
+    ## process response.
+    static func process_response(context: void*?, response: FetchResponse*):
+        let log = (FetchingTestLog*)(context else trap("no log"))
+        log.responses += 1
+        log.response = response
+
+    ## process response end-of-body.
+    static func process_response_end_of_body(context: void*?, response: FetchResponse*):
+        let log = (FetchingTestLog*)(context else trap("no log"))
+        log.ends_of_body += 1
+
+    ## process response consume body.
+    static func process_response_consume_body(context: void*?, response: FetchResponse*, body: FetchAlgorithmsBodyBytes):
+        let log = (FetchingTestLog*)(context else trap("no log"))
+        log.consumed += 1
+        if log.response == none:
+            log.response = response
+        match body:
+            .empty: log.consumed_null = true
+            .fetch_algorithms_consume_body_failure_tag(_): log.consumed_failure = true
+            .byte_buffer(bytes): ak.byte_buffer_append_span_u8(&log.bytes, ak.byte_buffer_bytes_const(&bytes))
+
+    ## Whether the consumed bytes are `text`.
+    func received(text: str) -> bool:
+        let bytes = ak.byte_buffer_bytes_const(&self.bytes)
+        return bytes.length == text.length and ak.compare_bytes(bytes, text.bytes) == 0
+
+    ## The response the algorithms were given.
+    func the_response() -> FetchResponse*:
+        return self.response else trap("no response")
+
+## A test page (call with the VM's heap current): an agent, the loader tests' event loop and PageClient, the
+## ResourceLoader over the in-process client, a top-level traversable whose about:blank document is the client.
+func fetching_test_page(vm: Vm*, event_loop: FetchingTestEventLoop*) -> FetchingTestPage:
+    _ = loader_test_initialize_resource_loader(vm)
+    let (page, traversable) = test_browsing_page_with_traversable(vm)
+    ((gc.Cell*)page_client(page)).vtable = (const gc.CellVTable*)&loader_test_page_client_vtable
+    let document = html_navigable_active_document(traversable.html_navigable()) else trap("no document")
+    let realm = dom_document_realm(document)
+    let settings = html_principal_realm_settings_object(realm)
+    fetching_test_run(event_loop)
+    return FetchingTestPage(vm = vm, page = page, document = document, realm = realm, settings = settings, event_loop = event_loop)
+
+## Runs the event loop until nothing is left: the deferred invocations, then the HTML tasks with a microtask
+## checkpoint after each, again until both are empty.
+func fetching_test_run(event_loop: FetchingTestEventLoop*):
+    while true:
+        let deferred = not ak.vector_is_empty(&event_loop.deferred)
+        while not ak.vector_is_empty(&event_loop.deferred):
+            _ = event_loop.pump(CoreEventLoopPumpMode.dont_wait_for_events)
+        let tasks = fetch_test_run_tasks()
+        if not deferred and tasks == 0:
+            break
+
+## A new request of the page's client for `url`, with `destination` and `mode`.
+func fetching_test_request(page: const FetchingTestPage*, url: str, destination: FetchRequestDestination? = none, mode: FetchRequestMode = FetchRequestMode.no_cors) -> FetchRequest*:
+    let request = fetch_request_create(page.vm)
+    fetch_request_set_url(request, web_url.parser_basic_parse(ak.sv(url)) else trap("the test URL parses"))
+    fetch_request_set_client(request, page.settings)
+    fetch_request_set_destination(request, destination)
+    fetch_request_set_mode(request, mode)
+    return request
+
+## Fetches `request` with a new log's process response, process response end-of-body and process response consume
+## body; answers the log and the controller.
+func fetching_test_fetch(page: const FetchingTestPage*, request: FetchRequest*) -> (FetchingTestLog*, FetchController*):
+    let log = new FetchingTestLog() else trap("out of memory")
+    let algorithms = fetch_algorithms_create(page.vm, FetchAlgorithmsInput(
+        process_response = ak.Function1[FetchResponse*, unit](call = FetchingTestLog.process_response, context = log),
+        process_response_end_of_body = ak.Function1[FetchResponse*, unit](call = FetchingTestLog.process_response_end_of_body, context = log),
+        process_response_consume_body = ak.Function2[FetchResponse*, FetchAlgorithmsBodyBytes, unit](call = FetchingTestLog.process_response_consume_body, context = log)))
+    let controller = fetch_fetching_fetch(page.realm, request, algorithms)
+    return (log, controller)
+
+## Whether a String is `text`.
+func fetching_test_is(string: ak.String, text: str) -> bool:
+    return ak.string_eq_string_view(&string, ak.sv(text))
+
+## Whether a header of a header list is `text`.
+func fetching_test_header_is(list: const HttpHeaderList*, name: str, text: str) -> bool:
+    let value = http_header_list_get(list, ak.sv(name)) else return false
+    return ak.byte_string_eq_string_view(&value, ak.sv(text))
+
+## Whether a response is a network error with `message`.
+func fetching_test_network_error_is(response: FetchResponse*, message: str) -> bool:
+    if not fetch_response_is_network_error(response):
+        return false
+    let error_message = fetch_response_network_error_message(response) else return false
+    return fetching_test_is(error_message, message)
+
+## The `file://` URL of `path` under the working directory.
+func fetching_test_file_url(path: str) -> ak.ByteString:
+    let cwd = core_system_getcwd() else trap("the working directory")
+    var url = ak.string_builder_new()
+    ak.string_builder_append(&url, "file://")
+    ak.string_builder_append_string_view(&url, ak.byte_string_view(&cwd))
+    ak.string_builder_append(&url, "/")
+    ak.string_builder_append(&url, path)
+    return ak.string_builder_to_byte_string(&url)
+
+## The first steps of every scenario: the test event loop installed (before the VM, which is destroyed with it
+## installed), with an EventLoopPlugin over it.
+func fetching_test_begin(event_loop: FetchingTestEventLoop*):
+    web_initialize_strings()
+    core_event_loop_installed = none
+    core_event_loop_install(event_loop)
+    web_test_install_event_loop_plugin()
+
+## The end of fetching_test_begin.
+func fetching_test_end():
+    web_test_remove_event_loop_plugin()
+    core_event_loop_installed = none
+
+# mark: Scheme fetch ============================================================================
+
+test "fetch: about:blank and data: URLs give basic responses whose bodies are read to the end":
+    var event_loop = FetchingTestEventLoop()
+    fetching_test_begin(&event_loop)
+    defer fetching_test_end()
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    _ = web_test_install_agent(vm)
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        let page = fetching_test_page(vm, &event_loop)
+
+        # data: is fetched as "basic" whatever the mode; the response is a basic filtered response of the data URL's
+        # MIME type and body, and the request gets the default headers.
+        let request = fetching_test_request(&page, "data:text/plain;charset=utf-8,hello%20world", FetchRequestDestination.image)
+        let (log, controller) = fetching_test_fetch(&page, request)
+        assert(fetch_controller_state(controller) == FetchControllerState.ongoing)
+        assert(log.responses == 0)
+        fetching_test_run(&event_loop)
+        assert(log.responses == 1 and log.consumed == 1 and log.ends_of_body == 1)
+        let response = log.the_response()
+        assert(fetch_response_type(response) == FetchResponseType.basic)
+        assert(fetch_response_status(response) == 200)
+        assert(fetching_test_header_is(fetch_response_header_list(response), "Content-Type", "text/plain;charset=utf-8"))
+        assert(log.received("hello world"))
+        assert(fetch_request_done(request))
+        assert(fetch_request_response_tainting(request) == FetchRequestResponseTainting.basic)
+        assert(fetching_test_header_is(fetch_request_header_list(request), "Accept", "image/avif,image/webp,image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5"))
+        assert(fetching_test_header_is(fetch_request_header_list(request), "Accept-Language", "en-US"))
+        let response_url = fetch_response_url(response) else trap("a response URL")
+        assert(fetching_test_is(web_url.url_serialize(&response_url), "data:text/plain;charset=utf-8,hello%20world"))
+
+        # A style request accepts CSS; a request without a destination anything.
+        let style = fetching_test_request(&page, "data:text/css,p{}", FetchRequestDestination.style)
+        let (style_log, _) = fetching_test_fetch(&page, style)
+        let plain = fetching_test_request(&page, "data:,x")
+        let (plain_log, _) = fetching_test_fetch(&page, plain)
+        fetching_test_run(&event_loop)
+        assert(fetching_test_header_is(fetch_request_header_list(style), "Accept", "text/css,*/*;q=0.1"))
+        assert(fetching_test_header_is(fetch_request_header_list(plain), "Accept", "*/*"))
+        assert(style_log.received("p{}") and plain_log.received("x"))
+
+        # A data: URL that does not process is a network error, whose body is null.
+        let broken = fetching_test_request(&page, "data:text/plain;base64,%%%")
+        let (broken_log, _) = fetching_test_fetch(&page, broken)
+        fetching_test_run(&event_loop)
+        assert(broken_log.responses == 1 and broken_log.consumed == 1 and broken_log.consumed_null)
+        assert(fetching_test_network_error_is(broken_log.the_response(), "Failed to process 'data:' URL"))
+
+        # about:blank: an empty text/html body (a no-cors fetch from an opaque origin: an opaque response).
+        let blank = fetching_test_request(&page, "about:blank", FetchRequestDestination.document, FetchRequestMode.navigate)
+        let (blank_log, _) = fetching_test_fetch(&page, blank)
+        fetching_test_run(&event_loop)
+        assert(blank_log.responses == 1 and blank_log.consumed == 1 and blank_log.received(""))
+        assert(fetch_response_type(blank_log.the_response()) == FetchResponseType.basic)
+        assert(fetching_test_header_is(fetch_response_header_list(blank_log.the_response()), "Content-Type", "text/html;charset=utf-8"))
+        let blank_message = fetch_response_status_message(blank_log.the_response())
+        assert(ak.byte_string_eq_string_view(&blank_message, ak.sv("OK")))
+
+        # blob: URLs reach FileAPI's blob URL store (phase 3), whose stub traps: scheme fetch's blob steps stop there.
+        assert(test_page_still_unported("stub_closure.lucb", "Web::FileAPI::obtain_a_blob_object"))
+
+        # An unknown scheme is a network error. (Other about: URLs go to the ResourceLoader, whose about: pages are
+        # resources the repository does not carry: its MUST traps, region p2d's note.)
+        let unknown = fetching_test_request(&page, "gopher://example.com/", FetchRequestDestination.image, FetchRequestMode.navigate)
+        let (unknown_log, _) = fetching_test_fetch(&page, unknown)
+        fetching_test_run(&event_loop)
+        assert(fetching_test_network_error_is(unknown_log.the_response(), "Request URL has invalid scheme, must be one of 'about', 'blob', 'data', 'file', 'http', or 'https'"))
+
+test "fetch: file: subresources through the ResourceLoader, missing files, and file: without a destination":
+    var event_loop = FetchingTestEventLoop()
+    fetching_test_begin(&event_loop)
+    defer fetching_test_end()
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    _ = web_test_install_agent(vm)
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        let page = fetching_test_page(vm, &event_loop)
+
+        # An image of a file: URL from the opaque-origin page: no-cors, so an opaque filtered response whose internal
+        # response holds the file's bytes, with the type the file name names.
+        let url = fetching_test_file_url("data/res/ladybird/templates/error.html")
+        let request = fetching_test_request(&page, ak.string_view_text(ak.byte_string_view(&url)), FetchRequestDestination.image)
+        let (log, _) = fetching_test_fetch(&page, request)
+        fetching_test_run(&event_loop)
+        assert(log.responses == 1 and log.consumed == 1 and log.ends_of_body == 1)
+        let response = log.the_response()
+        assert(fetch_response_type(response) == FetchResponseType.opaque)
+        assert(fetch_response_status(response) == 0 and fetch_response_body(response) == none)
+        let internal = fetch_filtered_response_internal_response(response)
+        assert(fetch_response_status(internal) == 200)
+        assert(fetching_test_header_is(fetch_response_header_list(internal), "Content-Type", "text/html"))
+        assert(ak.byte_buffer_size(&log.bytes) == 1750)
+        assert(fetch_request_response_tainting(request) == FetchRequestResponseTainting.opaque)
+
+        # A missing file: the network error of the failed load (its stream errored with the TypeError stand-in).
+        let missing = fetching_test_request(&page, "file:///nonexistent/p2c/missing.png", FetchRequestDestination.image)
+        let (missing_log, _) = fetching_test_fetch(&page, missing)
+        fetching_test_run(&event_loop)
+        assert(missing_log.responses == 1)
+        assert(fetching_test_network_error_is(missing_log.the_response(), "Load failed: No such file or directory (errno=2)"))
+        assert(missing_log.consumed == 1 and missing_log.consumed_null)
+
+        # A file: request without a destination (fetch()'s) is blocked.
+        let programmatic = fetching_test_request(&page, ak.string_view_text(ak.byte_string_view(&url)))
+        let (programmatic_log, _) = fetching_test_fetch(&page, programmatic)
+        fetching_test_run(&event_loop)
+        assert(fetching_test_network_error_is(programmatic_log.the_response(), "Request with 'file:' or 'resource:' URL blocked"))
+
+        # The same-origin mode refuses another origin; CORS refuses a URL that is not HTTP(S).
+        let same_origin = fetching_test_request(&page, ak.string_view_text(ak.byte_string_view(&url)), FetchRequestDestination.image, FetchRequestMode.same_origin)
+        let (same_origin_log, _) = fetching_test_fetch(&page, same_origin)
+        let cors = fetching_test_request(&page, ak.string_view_text(ak.byte_string_view(&url)), FetchRequestDestination.font, FetchRequestMode.cors)
+        let (cors_log, _) = fetching_test_fetch(&page, cors)
+        fetching_test_run(&event_loop)
+        assert(fetching_test_network_error_is(same_origin_log.the_response(), "Request with 'same-origin' mode must have same URL and request origin"))
+        assert(fetching_test_network_error_is(cors_log.the_response(), "Request with 'cors' mode must have URL with HTTP or HTTPS scheme"))
+
+test "fetch: a terminated fetch, bad ports, local-URLs-only, redirect modes of no-cors, and integrity metadata":
+    var event_loop = FetchingTestEventLoop()
+    fetching_test_begin(&event_loop)
+    defer fetching_test_end()
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    _ = web_test_install_agent(vm)
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        let page = fetching_test_page(vm, &event_loop)
+
+        # Terminated before main fetch runs in parallel: scheme fetch answers the appropriate network error.
+        let request = fetching_test_request(&page, "data:,x")
+        let (log, controller) = fetching_test_fetch(&page, request)
+        fetch_controller_terminate(controller)
+        fetching_test_run(&event_loop)
+        assert(log.responses == 1)
+        assert(fetch_response_is_network_error(log.the_response()) and not fetch_response_is_aborted_network_error(log.the_response()))
+
+        # A bad port, a non-local URL with local-URLs-only: "Request was blocked" and its own error.
+        let bad_port = fetching_test_request(&page, "http://127.0.0.1:25/x", FetchRequestDestination.image)
+        let (bad_port_log, _) = fetching_test_fetch(&page, bad_port)
+        let local_only = fetching_test_request(&page, "http://127.0.0.1:1/x", FetchRequestDestination.image)
+        fetch_request_set_local_urls_only(local_only, true)
+        let (local_only_log, _) = fetching_test_fetch(&page, local_only)
+        fetching_test_run(&event_loop)
+        assert(fetching_test_network_error_is(bad_port_log.the_response(), "Request was blocked"))
+        # (Step 7's block replaces step 3's error: port 1 is a bad port too.)
+        assert(fetching_test_network_error_is(local_only_log.the_response(), "Request was blocked"))
+        let local_only_2 = fetching_test_request(&page, "http://127.0.0.1:8081/x", FetchRequestDestination.image)
+        fetch_request_set_local_urls_only(local_only_2, true)
+        let (local_only_2_log, _) = fetching_test_fetch(&page, local_only_2)
+        fetching_test_run(&event_loop)
+        assert(fetching_test_network_error_is(local_only_2_log.the_response(), "Request with 'local-URLs-only' flag must have a local URL"))
+
+        # no-cors needs redirect mode "follow".
+        let manual = fetching_test_request(&page, "http://127.0.0.1:8081/x", FetchRequestDestination.image)
+        fetch_request_set_redirect_mode(manual, FetchRequestRedirectMode.manual)
+        let (manual_log, _) = fetching_test_fetch(&page, manual)
+        fetching_test_run(&event_loop)
+        assert(fetching_test_network_error_is(manual_log.the_response(), "Request with 'no-cors' mode must have redirect mode set to 'follow'"))
+
+        # Integrity metadata: matching bytes become the body; others a network error.
+        let good = fetching_test_request(&page, "data:,hello")
+        fetch_request_set_integrity_metadata(good, ak.string_from_str("sha256-LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ="))
+        let (good_log, _) = fetching_test_fetch(&page, good)
+        let bad = fetching_test_request(&page, "data:,hello")
+        fetch_request_set_integrity_metadata(bad, ak.string_from_str("sha256-AAAAul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ="))
+        let (bad_log, _) = fetching_test_fetch(&page, bad)
+        fetching_test_run(&event_loop)
+        assert(good_log.responses == 1 and good_log.received("hello") and not fetch_response_is_network_error(good_log.the_response()))
+        assert(bad_log.responses == 1 and fetching_test_network_error_is(bad_log.the_response(), "Response body could not be processed"))
+
+test "fetch: a request the client's Content Security Policy blocks is a network error":
+    var event_loop = FetchingTestEventLoop()
+    fetching_test_begin(&event_loop)
+    defer fetching_test_end()
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    _ = web_test_install_agent(vm)
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        let page = fetching_test_page(vm, &event_loop)
+
+        # img-src 'none' on the page's policy container (the request's is a clone of it, populated from the client):
+        # an image is blocked, a style sheet is not.
+        let policy = content_security_policy_policy_parse_a_serialized_csp(vm_heap(vm), ByteStringOrString.byte_string(ak.byte_string_from_str("img-src 'none'")), ContentSecurityPolicyPolicySource.header, ContentSecurityPolicyPolicyDisposition.enforce)
+        content_security_policy_policy_set_self_origin(policy, dom_document_origin(page.document))
+        let policy_container = html_environment_settings_object_policy_container(page.settings)
+        ak.vector_append_t(&policy_container.csp_list.m_policies, policy)
+        let image = fetching_test_request(&page, "data:image/png,x", FetchRequestDestination.image)
+        let (image_log, _) = fetching_test_fetch(&page, image)
+        let style = fetching_test_request(&page, "data:text/css,p{}", FetchRequestDestination.style)
+        let (style_log, _) = fetching_test_fetch(&page, style)
+        fetching_test_run(&event_loop)
+        assert(fetching_test_network_error_is(image_log.the_response(), "Request was blocked"))
+        assert(image_log.consumed == 1 and image_log.consumed_null)
+        assert(not fetch_response_is_network_error(style_log.the_response()) and style_log.received("p{}"))
+        match fetch_request_policy_container(image):
+            .html_policy_container(container): assert(container != policy_container and ak.vector_size(&container.csp_list.m_policies) == 1)
+            _: trap("the request's policy container was populated from its client")

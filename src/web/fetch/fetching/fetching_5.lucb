@@ -1,0 +1,458 @@
+#==============================================================================================
+#
+#   fetching_5 - Fetch::Fetching: HTTP fetch and HTTP-redirect fetch
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibWeb/Fetch/Fetching/Fetching.cpp (lines 1195-1557): HTTP fetch
+#       (service workers: FIXMEs as in C++; the CORS-preflight fetch when one is needed, then
+#       HTTP-network-or-cache fetch; the CORS and TAO checks; redirects by redirect mode) and
+#       HTTP-redirect fetch. Each C++ lambda is a capture struct with a static function
+#       (DESIGN.md §2.7).
+#
+#       Copyright (c) 2022-2023, Linus Groh <linusg@serenityos.org>
+#       Copyright (c) 2023, Luke Wilde <lukew@serenityos.org>
+#       Copyright (c) 2023, Sam Atkins <atkinssj@serenityos.org>
+#       Copyright (c) 2024, Jamie Mansfield <jmansfield@cadixdev.org>
+#       Copyright (c) 2025, Shannon Booth <shannon@serenityos.org>
+#       Copyright (c) 2025, Kenneth Myhra <kennethmyhra@serenityos.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: HTTP fetch's callbacks ==================================================================
+
+## The captures of HTTP fetch's fetch_main_content, `[request, realm = GC::Ref { realm }, fetch_params = GC::Ref
+## { fetch_params }]() -> GC::Ref<PendingResponse>`.
+struct FetchFetchingHttpFetchMainContent:
+    var request: FetchRequest*
+    var realm: Realm*
+    var fetch_params: FetchParams*
+
+    ## Steps 4.2 and 4.3 of HTTP fetch.
+    static func call(context: void*?) -> FetchPendingResponse*:
+        let captures = (FetchFetchingHttpFetchMainContent*)(context else trap("http_fetch: no captures"))
+
+        # 2. If request’s redirect mode is "follow", then set request’s service-workers mode to "none".
+        # NOTE: Redirects coming from the network (as opposed to from a service worker) are not to be exposed to a
+        #       service worker.
+        if fetch_request_redirect_mode(captures.request) == FetchRequestRedirectMode.follow:
+            fetch_request_set_service_workers_mode(captures.request, FetchRequestServiceWorkersMode.none_)
+
+        # 3. Set response and internalResponse to the result of running HTTP-network-or-cache fetch given fetchParams.
+        return fetch_fetching_http_network_or_cache_fetch(captures.realm, captures.fetch_params)
+
+## The captures of the load callback of the CORS-preflight response, `[returned_pending_response,
+## pending_actual_response, fetch_main_content](GC::Ref<Response> preflight_response)`.
+struct FetchFetchingHttpFetchPreflightResponse:
+    var returned_pending_response: FetchPendingResponse*
+    var pending_actual_response: FetchPendingResponse*
+    var fetch_main_content: gc.Function0[FetchPendingResponse*]*
+
+    ## Step 4.1.2 of HTTP fetch, then the main content's fetch.
+    static func call(context: void*?, preflight_response: FetchResponse*):
+        let captures = (FetchFetchingHttpFetchPreflightResponse*)(context else trap("http_fetch: no captures"))
+        if fetch_web_fetch_debug:
+            ak.dbgln("Fetch: Running 'HTTP fetch' pending_preflight_response load callback")
+
+        # 2. If preflightResponse is a network error, then return preflightResponse.
+        if fetch_response_is_network_error(preflight_response):
+            fetch_pending_response_resolve(captures.returned_pending_response, preflight_response)
+            return
+
+        let pending_main_content_response = ak.function0_call(&captures.fetch_main_content.function)
+        let main_content = new FetchFetchingHttpFetchMainContentResponse(pending_actual_response = captures.pending_actual_response) else trap("out of memory")
+        fetch_pending_response_when_loaded(pending_main_content_response, ak.Function1[FetchResponse*, unit](call = FetchFetchingHttpFetchMainContentResponse.call, context = main_content))
+
+## The captures of the load callback of the main content's response, `[pending_actual_response](GC::Ref<Response>
+## main_content_response)`.
+struct FetchFetchingHttpFetchMainContentResponse:
+    var pending_actual_response: FetchPendingResponse*
+
+    ## Resolves the actual response with the main content's.
+    static func call(context: void*?, main_content_response: FetchResponse*):
+        let captures = (FetchFetchingHttpFetchMainContentResponse*)(context else trap("http_fetch: no captures"))
+        if fetch_web_fetch_debug:
+            ak.dbgln("Fetch: Running 'HTTP fetch' pending_main_content_response load callback")
+        fetch_pending_response_resolve(captures.pending_actual_response, main_content_response)
+
+## The captures of fetchParams’s controller’s next manual redirect steps, `[&realm, &fetch_params, response]`.
+struct FetchFetchingHttpFetchNextManualRedirect:
+    var realm: Realm*
+    var fetch_params: FetchParams*
+    var response: FetchResponse*
+
+    ## Runs HTTP-redirect fetch given fetchParams and response.
+    static func call(context: void*?):
+        let captures = (FetchFetchingHttpFetchNextManualRedirect*)(context else trap("http_fetch: no captures"))
+        _ = fetch_fetching_http_redirect_fetch(captures.realm, captures.fetch_params, captures.response)
+
+## The captures of the load callback of the redirect's response, `[returned_pending_response](GC::Ref<Response>
+## response)`.
+struct FetchFetchingHttpFetchInnerResponse:
+    var returned_pending_response: FetchPendingResponse*
+
+    ## Resolves HTTP fetch's response with the redirect's.
+    static func call(context: void*?, response: FetchResponse*):
+        let captures = (FetchFetchingHttpFetchInnerResponse*)(context else trap("http_fetch: no captures"))
+        if fetch_web_fetch_debug:
+            ak.dbgln("Fetch: Running 'HTTP fetch' inner_pending_response load callback")
+        fetch_pending_response_resolve(captures.returned_pending_response, response)
+
+## The captures of the load callback of the actual response, `[&realm, &vm, &fetch_params, request, response,
+## internal_response, returned_pending_response, response_was_null = !response](GC::Ref<Response>
+## resolved_actual_response) mutable`.
+struct FetchFetchingHttpFetchActualResponse:
+    var realm: Realm*
+    var fetch_params: FetchParams*
+    var request: FetchRequest*
+    var response: FetchResponse*?
+    var internal_response: FetchResponse*?
+    var returned_pending_response: FetchPendingResponse*
+    var response_was_null: bool
+
+    ## Steps 4.4 to 7 of HTTP fetch.
+    static func call(context: void*?, resolved_actual_response: FetchResponse*):
+        let captures = (FetchFetchingHttpFetchActualResponse*)(context else trap("http_fetch: no captures"))
+        fetch_fetching_http_fetch_actual_response(captures, resolved_actual_response)
+
+## The body of the load callback of HTTP fetch's actual response.
+func fetch_fetching_http_fetch_actual_response(captures: FetchFetchingHttpFetchActualResponse*, resolved_actual_response: FetchResponse*):
+    let realm = captures.realm
+    let vm = realm_vm(realm)
+    let fetch_params = captures.fetch_params
+    let request = captures.request
+    if fetch_web_fetch_debug:
+        ak.dbgln("Fetch: Running 'HTTP fetch' pending_actual_response load callback")
+    if captures.response_was_null:
+        captures.response = resolved_actual_response
+        captures.internal_response = resolved_actual_response
+        # 4. If request’s response tainting is "cors" and a CORS check for request and response returns failure,
+        #    then return a network error.
+        # NOTE: As the CORS check is not to be applied to responses whose status is 304 or 407, or responses from
+        #       a service worker for that matter, it is applied here.
+        if (fetch_request_response_tainting(request) == FetchRequestResponseTainting.cors and not fetch_fetching_cors_check(request, resolved_actual_response)):
+            fetch_pending_response_resolve(captures.returned_pending_response, fetch_response_network_error(vm, ak.string_from_str("Request with 'cors' response tainting failed CORS check")))
+            return
+
+        # 5. If the TAO check for request and response returns failure, then set request’s timing allow failed flag.
+        if not fetch_fetching_tao_check(request, resolved_actual_response):
+            fetch_request_set_timing_allow_failed(request, true)
+
+    let response = captures.response else trap("VERIFY: HTTP fetch's response")
+    let internal_response = captures.internal_response else trap("VERIFY: HTTP fetch's internal response")
+
+    # 5. If either request’s response tainting or response’s type is "opaque", and the cross-origin resource
+    #    policy check with request’s origin, request’s client, request’s destination, and internalResponse returns
+    #    blocked, then return a network error.
+    # NOTE: The cross-origin resource policy check runs for responses coming from the network and responses coming
+    #       from the service worker. This is different from the CORS check, as request’s client and the service
+    #       worker can have different embedder policies.
+    # FIXME: "and the cross-origin resource policy check with request’s origin, request’s client, request’s
+    #        destination, and actualResponse returns blocked" (C++ ends the condition with `&& false`: never blocked).
+
+    var inner_pending_response: FetchPendingResponse*? = none
+
+    # 6. If internalResponse’s status is a redirect status:
+    if fetch_is_redirect_status(fetch_response_status(internal_response)):
+        # FIXME: 1. If internalResponse’s status is not 303, request’s body is non-null, and the connection uses HTTP/2,
+        #           then user agents may, and are even encouraged to, transmit an RST_STREAM frame.
+        # NOTE: 303 is excluded as certain communities ascribe special status to it.
+
+        # 2. Switch on request’s redirect mode:
+        match fetch_request_redirect_mode(request):
+            # -> "error"
+            .error_:
+                # 1. Set response to a network error.
+                captures.response = fetch_response_network_error(vm, ak.string_from_str("Request with 'error' redirect mode received redirect response"))
+            # -> "manual"
+            .manual:
+                # 1. If request’s mode is "navigate", then set fetchParams’s controller’s next manual redirect steps
+                #    to run HTTP-redirect fetch given fetchParams and response.
+                if fetch_request_mode(request) == FetchRequestMode.navigate:
+                    let steps = new FetchFetchingHttpFetchNextManualRedirect(realm = realm, fetch_params = fetch_params, response = response) else trap("out of memory")
+                    fetch_controller_set_next_manual_redirect_steps(fetch_params_controller(fetch_params), ak.Function0[unit](call = FetchFetchingHttpFetchNextManualRedirect.call, context = steps))
+                # 2. Otherwise, set response to an opaque-redirect filtered response whose internal response is
+                #    internalResponse.
+                else:
+                    captures.response = fetch_opaque_redirect_filtered_response_create(vm, internal_response).fetch_response()
+            # -> "follow"
+            .follow:
+                # 1. Set response to the result of running HTTP-redirect fetch given fetchParams and response.
+                inner_pending_response = fetch_fetching_http_redirect_fetch(realm, fetch_params, response)
+            _: trap("VERIFY_NOT_REACHED")
+
+    if let inner = inner_pending_response:
+        let inner_captures = new FetchFetchingHttpFetchInnerResponse(returned_pending_response = captures.returned_pending_response) else trap("out of memory")
+        fetch_pending_response_when_loaded(inner, ak.Function1[FetchResponse*, unit](call = FetchFetchingHttpFetchInnerResponse.call, context = inner_captures))
+    else:
+        fetch_pending_response_resolve(captures.returned_pending_response, captures.response else trap("VERIFY: HTTP fetch's response"))
+
+# mark: HTTP fetch ==============================================================================
+
+## Ported from Libraries/LibWeb/Fetch/Fetching/Fetching.cpp:1196 Web::Fetch::Fetching::http_fetch.
+# https://fetch.spec.whatwg.org/#concept-http-fetch
+pub func fetch_fetching_http_fetch(realm: Realm*, fetch_params: FetchParams*, make_cors_preflight: FetchMakeCorsPreflight = FetchMakeCorsPreflight.no) -> FetchPendingResponse*:
+    if fetch_web_fetch_debug:
+        let make = "Yes" if make_cors_preflight == FetchMakeCorsPreflight.yes else "No"
+        ak.dbgln(f"Fetch: Running 'HTTP fetch' with: fetch_params @ {(void*)fetch_params}, make_cors_preflight = {make}")
+
+    let vm = realm_vm(realm)
+
+    # 1. Let request be fetchParams’s request.
+    let request = fetch_params_request(fetch_params)
+
+    # 2. Let response and internalResponse be null.
+    var response: FetchResponse*? = none
+    var internal_response: FetchResponse*? = none
+
+    # 3. If request’s service-workers mode is "all", then:
+    if fetch_request_service_workers_mode(request) == FetchRequestServiceWorkersMode.all:
+        # 1. Let requestForServiceWorker be a clone of request.
+        let request_for_service_worker = fetch_request_clone(request, realm)
+
+        # 2. If requestForServiceWorker’s body is non-null, then:
+        if not fetch_request_body_is_empty(request_for_service_worker):
+            # FIXME: 1. Let transformStream be a new TransformStream.
+            # FIXME: 2. Let transformAlgorithm given chunk be these steps:
+            # FIXME: 3. Set up transformStream with transformAlgorithm set to transformAlgorithm.
+            # FIXME: 4. Set requestForServiceWorker’s body’s stream to the result of requestForServiceWorker’s body’s stream
+            #           piped through transformStream.
+            _ = 0
+
+        # 3. Let serviceWorkerStartTime be the coarsened shared current time given fetchParams’s cross-origin isolated
+        #    capability.
+        let service_worker_start_time = high_resolution_time_coarsened_shared_current_time(fetch_params_cross_origin_isolated_capability(fetch_params))
+
+        # FIXME: 4. Set response to the result of invoking handle fetch for requestForServiceWorker, with fetchParams’s
+        #           controller and fetchParams’s cross-origin isolated capability.
+
+        # 5. If response is non-null, then:
+        if let service_worker_response = response:
+            # 1. Set fetchParams’s timing info’s final service worker start time to serviceWorkerStartTime.
+            fetch_timing_info_set_final_service_worker_start_time(fetch_params_timing_info(fetch_params), service_worker_start_time)
+
+            # 2. If request’s body is non-null, then cancel request’s body with undefined.
+            if not fetch_request_body_is_empty(request):
+                # FIXME: Implement cancelling streams
+                _ = 0
+
+            # 3. Set internalResponse to response, if response is not a filtered response; otherwise to response’s
+            #    internal response.
+            internal_response = service_worker_response if not is_fetch_filtered_response(service_worker_response) else fetch_filtered_response_internal_response(service_worker_response)
+
+            # 4. If one of the following is true
+            let type_ = fetch_response_type(service_worker_response)
+            if (type_ == FetchResponseType.error_ or (fetch_request_mode(request) == FetchRequestMode.same_origin and type_ == FetchResponseType.cors) or (fetch_request_mode(request) != FetchRequestMode.no_cors and type_ == FetchResponseType.opaque) or (fetch_request_redirect_mode(request) != FetchRequestRedirectMode.manual and type_ == FetchResponseType.opaque_redirect) or (fetch_request_redirect_mode(request) != FetchRequestRedirectMode.follow and ak.vector_size(fetch_response_url_list(service_worker_response)) > 1)):
+                # - response’s type is "error"
+                # - request’s mode is "same-origin" and response’s type is "cors"
+                # - request’s mode is not "no-cors" and response’s type is "opaque"
+                # - request’s redirect mode is not "manual" and response’s type is "opaqueredirect"
+                # - request’s redirect mode is not "follow" and response’s URL list has more than one item.
+                # then return a network error.
+                return fetch_fetching_pending_network_error(vm, request, "Invalid request/response state combination")
+
+    var pending_actual_response: FetchPendingResponse*? = none
+
+    let returned_pending_response = fetch_pending_response_create(vm, request)
+
+    # 4. If response is null, then:
+    if response == none:
+        # 1. If makeCORSPreflight is true and one of these conditions is true:
+        # NOTE: This step checks the CORS-preflight cache and if there is no suitable entry it performs a
+        #       CORS-preflight fetch which, if successful, populates the cache. The purpose of the CORS-preflight
+        #       fetch is to ensure the fetched resource is familiar with the CORS protocol. The cache is there to
+        #       minimize the number of CORS-preflight fetches.
+        var pending_preflight_response: FetchPendingResponse*? = none
+        let method = fetch_request_method(request)
+        if make_cors_preflight == FetchMakeCorsPreflight.yes and ((not http_is_cors_safelisted_method(ak.byte_string_view(&method)) or fetch_request_use_cors_preflight(request)) or not fetch_fetching_byte_strings_are_empty(fetch_get_cors_unsafe_header_names(fetch_request_header_list(request)))):
+            # - There is no method cache entry match for request’s method using request, and either request’s
+            #   method is not a CORS-safelisted method or request’s use-CORS-preflight flag is set.
+            #   FIXME: We currently have no cache, so there will always be no method cache entry.
+            # - There is at least one item in the CORS-unsafe request-header names with request’s header list for
+            #   which there is no header-name cache entry match using request.
+            #   FIXME: We currently have no cache, so there will always be no header-name cache entry.
+            # 1. Let preflightResponse be the result of running CORS-preflight fetch given request.
+            pending_preflight_response = fetch_fetching_cors_preflight_fetch(realm, request)
+
+            # NOTE: Step 2 is performed in pending_preflight_response's load callback below.
+
+        let main_content = new FetchFetchingHttpFetchMainContent(request = request, realm = realm, fetch_params = fetch_params) else trap("out of memory")
+        let fetch_main_content = gc.create_function0(realm_heap(realm), ak.Function0[FetchPendingResponse*](call = FetchFetchingHttpFetchMainContent.call, context = main_content))
+
+        if let preflight = pending_preflight_response:
+            let actual = fetch_pending_response_create(vm, request)
+            pending_actual_response = actual
+            let preflight_captures = new FetchFetchingHttpFetchPreflightResponse(returned_pending_response = returned_pending_response, pending_actual_response = actual, fetch_main_content = fetch_main_content) else trap("out of memory")
+            fetch_pending_response_when_loaded(preflight, ak.Function1[FetchResponse*, unit](call = FetchFetchingHttpFetchPreflightResponse.call, context = preflight_captures))
+        else:
+            pending_actual_response = ak.function0_call(&fetch_main_content.function)
+    else:
+        pending_actual_response = fetch_pending_response_create_fetch_response(vm, request, fetch_infrastructure_response_create(vm))
+
+    let actual_captures = new FetchFetchingHttpFetchActualResponse(realm = realm, fetch_params = fetch_params, request = request, response = response, internal_response = internal_response, returned_pending_response = returned_pending_response, response_was_null = response == none) else trap("out of memory")
+    fetch_pending_response_when_loaded(pending_actual_response else trap("VERIFY: the actual response"), ak.Function1[FetchResponse*, unit](call = FetchFetchingHttpFetchActualResponse.call, context = actual_captures))
+
+    # 7. Return response.
+    # NOTE: Typically internalResponse’s body’s stream is still being enqueued to after returning.
+    return returned_pending_response
+
+# mark: HTTP-redirect fetch =====================================================================
+
+## `safely_extract_body(realm, converted_source)` of a body's source (a byte sequence or a Blob;
+## BodyInitOrReadableBytes is a superset of Body::SourceType): its body.
+func fetch_fetching_body_of_source(realm: Realm*, source: FetchBodySourceTypeInternal) -> FetchBody*:
+    match source:
+        .byte_buffer(buffer):
+            let body_with_type = fetch_safely_extract_body_bytes(realm, ak.byte_buffer_bytes_const(&buffer))
+            return body_with_type.body
+        .file_api_blob(blob):
+            let body_with_type = fetch_safely_extract_body_blob(realm, blob)
+            return body_with_type.body
+        .empty: trap("VERIFY: source.get<GC::Ref<FileAPI::Blob>>() of an empty source")
+
+## `request->body().get<GC::Ref<Infrastructure::Body>>()`: the request's body when it is a Body.
+func fetch_fetching_request_body(request: FetchRequest*) -> FetchBody*:
+    match fetch_request_body_const(request):
+        .fetch_body(body): return body
+        _: trap("VERIFY: request->body().get<GC::Ref<Infrastructure::Body>>()")
+
+## `body->source().has<Empty>()`: whether a body's source is null.
+func fetch_fetching_body_source_is_null(body: FetchBody*) -> bool:
+    match fetch_body_source(body):
+        .empty: return true
+        _: return false
+
+## Ported from Libraries/LibWeb/Fetch/Fetching/Fetching.cpp:1415 Web::Fetch::Fetching::http_redirect_fetch.
+# https://fetch.spec.whatwg.org/#concept-http-redirect-fetch
+pub func fetch_fetching_http_redirect_fetch(realm: Realm*, fetch_params: FetchParams*, response: FetchResponse*) -> FetchPendingResponse*?:
+    if fetch_web_fetch_debug:
+        ak.dbgln(f"Fetch: Running 'HTTP-redirect fetch' with: fetch_params @ {(void*)fetch_params}, response = {(void*)response}")
+
+    let vm = realm_vm(realm)
+
+    # 1. Let request be fetchParams’s request.
+    let request = fetch_params_request(fetch_params)
+
+    # 2. Let internalResponse be response, if response is not a filtered response; otherwise response’s internal
+    #    response.
+    let internal_response = response if not is_fetch_filtered_response(response) else fetch_filtered_response_internal_response(response)
+
+    # 3. Let locationURL be internalResponse’s location URL given request’s current URL’s fragment.
+    let current_url = fetch_request_current_url(request)
+    var location_url_is_failure = false
+    let location_url_or_none = fetch_response_location_url(internal_response, web_url.url_fragment(&current_url)) catch:
+        location_url_is_failure = true
+        recover none
+
+    # 4. If locationURL is null, then return response.
+    if not location_url_is_failure and location_url_or_none == none:
+        return fetch_pending_response_create_fetch_response(vm, request, response)
+
+    # 5. If locationURL is failure, then return a network error.
+    if location_url_is_failure:
+        return fetch_fetching_pending_network_error(vm, request, "Request redirect URL is invalid")
+
+    let location_url = location_url_or_none else trap("unreachable")
+
+    # 6. If locationURL’s scheme is not an HTTP(S) scheme, then return a network error.
+    let location_scheme = web_url.url_scheme(&location_url)
+    if not fetch_is_http_or_https_scheme(ak.string_bytes_as_string_view(&location_scheme)):
+        return fetch_fetching_pending_network_error(vm, request, "Request redirect URL must have HTTP or HTTPS scheme")
+
+    # 7. If request’s redirect count is 20, then return a network error.
+    if fetch_request_redirect_count(request) == 20:
+        return fetch_fetching_pending_network_error(vm, request, "Request has reached maximum redirect count of 20")
+
+    # 8. Increase request’s redirect count by 1.
+    fetch_request_set_redirect_count(request, fetch_request_redirect_count(request) + 1)
+
+    # 9. If request’s mode is "cors", locationURL includes credentials, and request’s origin is not same origin with
+    #    locationURL’s origin, then return a network error.
+    if fetch_request_mode(request) == FetchRequestMode.cors and web_url.url_includes_credentials(&location_url):
+        if let request_origin = fetch_fetching_request_origin(request):
+            if not web_url.origin_is_same_origin(&request_origin, web_url.url_origin(&location_url)):
+                return fetch_fetching_pending_network_error(vm, request, "Request with 'cors' mode and different URL and request origin must not include credentials in redirect URL")
+
+    # 10. If request’s response tainting is "cors" and locationURL includes credentials, then return a network error.
+    # NOTE: This catches a cross-origin resource redirecting to a same-origin URL.
+    if fetch_request_response_tainting(request) == FetchRequestResponseTainting.cors and web_url.url_includes_credentials(&location_url):
+        return fetch_fetching_pending_network_error(vm, request, "Request with 'cors' response tainting must not include credentials in redirect URL")
+
+    # 11. If internalResponse’s status is not 303, request’s body is non-null, and request’s body’s source is null, then
+    #     return a network error.
+    if (fetch_response_status(internal_response) != 303 and not fetch_request_body_is_empty(request) and fetch_fetching_body_source_is_null(fetch_fetching_request_body(request))):
+        return fetch_fetching_pending_network_error(vm, request, "Request has body but no body source")
+
+    # 12. If one of the following is true
+    let method = fetch_request_method(request)
+    let status = fetch_response_status(internal_response)
+    if (((status == 301 or status == 302) and ak.byte_string_eq_string_view(&method, ak.sv("POST"))) or (status == 303 and not (ak.byte_string_eq_string_view(&method, ak.sv("GET")) or ak.byte_string_eq_string_view(&method, ak.sv("HEAD"))))):
+        # - internalResponse’s status is 301 or 302 and request’s method is `POST`
+        # - internalResponse’s status is 303 and request’s method is not `GET` or `HEAD`
+        # then:
+        # 1. Set request’s method to `GET` and request’s body to null.
+        fetch_request_set_method(request, ak.byte_string_from_str("GET"))
+        fetch_request_set_body(request, .empty)
+
+        let request_body_header_names: str[4] = [
+            "Content-Encoding",
+            "Content-Language",
+            "Content-Location",
+            "Content-Type",
+        ]
+        # 2. For each headerName of request-body-header name, delete headerName from request’s header list.
+        for header_name in request_body_header_names:
+            http_header_list_delete(fetch_request_header_list(request), ak.sv(header_name))
+
+    # 13. If request’s current URL’s origin is not same origin with locationURL’s origin, then for each headerName of
+    #     CORS non-wildcard request-header name, delete headerName from request’s header list.
+    # NOTE: I.e., the moment another origin is seen after the initial request, the `Authorization` header is removed.
+    let current_origin = web_url.url_origin(&current_url)
+    if not web_url.origin_is_same_origin(&current_origin, web_url.url_origin(&location_url)):
+        let cors_non_wildcard_request_header_names: str[1] = [
+            "Authorization",
+        ]
+        for header_name in cors_non_wildcard_request_header_names:
+            http_header_list_delete(fetch_request_header_list(request), ak.sv(header_name))
+
+    # 14. If request’s body is non-null, then set request’s body to the body of the result of safely extracting
+    #     request’s body’s source.
+    # NOTE: request’s body’s source’s nullity has already been checked.
+    if not fetch_request_body_is_empty(request):
+        let source = fetch_body_source(fetch_fetching_request_body(request))
+        # NOTE: BodyInitOrReadableBytes is a superset of Body::SourceType
+        fetch_request_set_body(request, .fetch_body(fetch_fetching_body_of_source(realm, source)))
+
+    # 15. Let timingInfo be fetchParams’s timing info.
+    let timing_info = fetch_params_timing_info(fetch_params)
+
+    # 16. Set timingInfo’s redirect end time and post-redirect start time to the coarsened shared current time given
+    #     fetchParams’s cross-origin isolated capability.
+    let now = high_resolution_time_coarsened_shared_current_time(fetch_params_cross_origin_isolated_capability(fetch_params))
+    fetch_timing_info_set_redirect_end_time(timing_info, now)
+    fetch_timing_info_set_post_redirect_start_time(timing_info, now)
+
+    # 17. If timingInfo’s redirect start time is 0, then set timingInfo’s redirect start time to timingInfo’s start
+    #     time.
+    if fetch_timing_info_redirect_start_time(timing_info) == 0.0:
+        fetch_timing_info_set_redirect_start_time(timing_info, fetch_timing_info_start_time(timing_info))
+
+    # 18. Append locationURL to request’s URL list.
+    ak.vector_append_t(fetch_request_url_list(request), location_url)
+
+    # 19. Invoke set request’s referrer policy on redirect on request and internalResponse.
+    referrer_policy_set_request_referrer_policy_on_redirect(request, internal_response)
+
+    # 20. Let recursive be true.
+    var recursive = FetchRecursive.yes
+
+    # 21. If request’s redirect mode is "manual", then:
+    if fetch_request_redirect_mode(request) == FetchRequestRedirectMode.manual:
+        # 1. Assert: request’s mode is "navigate".
+        assert(fetch_request_mode(request) == FetchRequestMode.navigate)
+
+        # 2. Set recursive to false.
+        recursive = FetchRecursive.no
+
+    # 22. Return the result of running main fetch given fetchParams and recursive.
+    return fetch_fetching_main_fetch(realm, fetch_params, recursive)

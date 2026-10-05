@@ -1,0 +1,452 @@
+#==============================================================================================
+#
+#   fetching_2 - Fetch::Fetching: main fetch
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibWeb/Fetch/Fetching/Fetching.cpp (lines 383-725): main fetch, its
+#       get_response steps (the first matching statement of step 12) and the steps that run
+#       in parallel (a deferred invocation) once the response is known: CORS-exposed header
+#       names, the filtered response, the blocking checks on the response, integrity
+#       metadata, and fetch response handover. Each C++ lambda is a capture struct with a
+#       static function (DESIGN.md §2.7).
+#
+#       Copyright (c) 2022-2023, Linus Groh <linusg@serenityos.org>
+#       Copyright (c) 2023, Luke Wilde <lukew@serenityos.org>
+#       Copyright (c) 2023, Sam Atkins <atkinssj@serenityos.org>
+#       Copyright (c) 2024, Jamie Mansfield <jmansfield@cadixdev.org>
+#       Copyright (c) 2025, Shannon Booth <shannon@serenityos.org>
+#       Copyright (c) 2025, Kenneth Myhra <kennethmyhra@serenityos.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Main fetch's response steps =============================================================
+
+## The captures of the goal of get_response's spin_until, `[&] { ... }`.
+struct FetchFetchingMainFetchPreloadedResponseCandidateReady:
+    var fetch_params: FetchParams*
+
+    ## Whether fetchParams’s preloaded response candidate is not "pending".
+    static func call(context: void*?) -> bool:
+        let captures = (FetchFetchingMainFetchPreloadedResponseCandidateReady*)(context else trap("main_fetch: no captures"))
+        match fetch_params_preloaded_response_candidate_const(captures.fetch_params):
+            .fetch_params_preloaded_response_candidate_pending_tag(_): return false
+            _: return true
+
+## The captures of the load callback of the CORS-with-preflight response, `[returned_pending_response]`.
+struct FetchFetchingMainFetchCorsWithPreflightResponse:
+    var returned_pending_response: FetchPendingResponse*
+
+    ## Steps 3 and 4 of "request’s use-CORS-preflight flag is set".
+    static func call(context: void*?, cors_with_preflight_response: FetchResponse*):
+        let captures = (FetchFetchingMainFetchCorsWithPreflightResponse*)(context else trap("main_fetch: no captures"))
+        if fetch_web_fetch_debug:
+            ak.dbgln("Fetch: Running 'main fetch' cors_with_preflight_response load callback")
+        # 3. If corsWithPreflightResponse is a network error, then clear cache entries using request.
+        if fetch_response_is_network_error(cors_with_preflight_response):
+            # FIXME: Clear cache entries
+            _ = 0
+
+        # 4. Return corsWithPreflightResponse.
+        fetch_pending_response_resolve(captures.returned_pending_response, cors_with_preflight_response)
+
+## The captures of main fetch's get_response, `[&realm, &vm, &fetch_params, request]() -> GC::Ref<PendingResponse>`.
+struct FetchFetchingMainFetchGetResponse:
+    var realm: Realm*
+    var fetch_params: FetchParams*
+    var request: FetchRequest*
+
+    ## The steps corresponding to the first matching statement of main fetch's step 12.
+    static func call(context: void*?) -> FetchPendingResponse*:
+        let captures = (FetchFetchingMainFetchGetResponse*)(context else trap("main_fetch: no captures"))
+        return fetch_fetching_main_fetch_get_response(captures.realm, captures.fetch_params, captures.request)
+
+## The body of main fetch's get_response lambda.
+func fetch_fetching_main_fetch_get_response(realm: Realm*, fetch_params: FetchParams*, request: FetchRequest*) -> FetchPendingResponse*:
+    let vm = realm_vm(realm)
+    if fetch_web_fetch_debug:
+        ak.dbgln("Fetch: Running 'main fetch' get_response() function")
+    let origin = fetch_fetching_request_origin(request)
+
+    # -> fetchParams’s preloaded response candidate is not null
+    if fetch_params_preloaded_response_candidate_const(fetch_params) != .empty:
+        # 1. Wait until fetchParams’s preloaded response candidate is not "pending".
+        let goal = new FetchFetchingMainFetchPreloadedResponseCandidateReady(fetch_params = fetch_params) else trap("out of memory")
+        html_event_loop_spin_until(html_main_thread_event_loop(), gc.create_function0(vm_heap(vm), ak.Function0[bool](call = FetchFetchingMainFetchPreloadedResponseCandidateReady.call, context = goal)))
+
+        # 2. Assert: fetchParams’s preloaded response candidate is a response.
+        # 3. Return fetchParams’s preloaded response candidate.
+        match fetch_params_preloaded_response_candidate_const(fetch_params):
+            .fetch_response(preloaded_response):
+                return fetch_pending_response_create_fetch_response(vm, request, preloaded_response)
+            _: trap("VERIFY: the preloaded response candidate is a response")
+
+    # -> request’s current URL’s origin is same origin with request’s origin, and request’s response tainting is "basic"
+    # -> request’s current URL’s scheme is "data"
+    # -> request’s mode is "navigate" or "websocket"
+    # AD-HOC: Treat file:// font loads from file:// pages as same-origin.
+    #         Fonts require CORS mode per spec, but file:// origins are opaque in our implementation,
+    #         so the standard same-origin check always fails. Other browsers (Chromium, WebKit, Firefox)
+    #         all allow loading fonts from file:// URLs on file:// pages.
+    let current_url = fetch_request_current_url(request)
+    let current_scheme = web_url.url_scheme(&current_url)
+    let is_file_to_file_font_load = (fetch_fetching_is_opaque_file_origin(origin) and ak.string_eq_string_view(&current_scheme, ak.sv("file")) and fetch_request_destination(request) == FetchRequestDestination.font)
+
+    if ((fetch_fetching_is_same_origin_with(web_url.url_origin(&current_url), origin) and fetch_request_response_tainting(request) == FetchRequestResponseTainting.basic) or is_file_to_file_font_load or ak.string_eq_string_view(&current_scheme, ak.sv("data")) or (fetch_request_mode(request) == FetchRequestMode.navigate or fetch_request_mode(request) == FetchRequestMode.web_socket)):
+        # 1. Set request’s response tainting to "basic".
+        fetch_request_set_response_tainting(request, FetchRequestResponseTainting.basic)
+
+        # 2. Return the result of running scheme fetch given fetchParams.
+        return fetch_fetching_scheme_fetch(realm, fetch_params)
+
+        # NOTE: HTML assigns any documents and workers created from URLs whose scheme is "data" a unique
+        #       opaque origin. Service workers can only be created from URLs whose scheme is an HTTP(S) scheme.
+
+    # -> request’s mode is "same-origin"
+    if fetch_request_mode(request) == FetchRequestMode.same_origin:
+        # Return a network error.
+        return fetch_pending_response_create_fetch_response(vm, request, fetch_response_network_error(vm, ak.string_from_str("Request with 'same-origin' mode must have same URL and request origin")))
+
+    # -> request’s mode is "no-cors"
+    if fetch_request_mode(request) == FetchRequestMode.no_cors:
+        # 1. If request’s redirect mode is not "follow", then return a network error.
+        if fetch_request_redirect_mode(request) != FetchRequestRedirectMode.follow:
+            return fetch_pending_response_create_fetch_response(vm, request, fetch_response_network_error(vm, ak.string_from_str("Request with 'no-cors' mode must have redirect mode set to 'follow'")))
+
+        # 2. Set request’s response tainting to "opaque".
+        fetch_request_set_response_tainting(request, FetchRequestResponseTainting.opaque)
+
+        # 3. Return the result of running scheme fetch given fetchParams.
+        return fetch_fetching_scheme_fetch(realm, fetch_params)
+
+    # -> request’s current URL’s scheme is not an HTTP(S) scheme
+    # AD-HOC: We allow CORS requests for resource:// URLs from opaque origins to enable requesting JS modules from internal pages.
+    if (not fetch_is_http_or_https_scheme(ak.string_bytes_as_string_view(&current_scheme)) and not (fetch_fetching_is_opaque(origin) and ak.string_eq_string_view(&current_scheme, ak.sv("resource")))):
+        # NOTE: At this point all other request modes have been handled. Ensure we're not lying in the error message :^)
+        assert(fetch_request_mode(request) == FetchRequestMode.cors)
+
+        # Return a network error.
+        return fetch_pending_response_create_fetch_response(vm, request, fetch_response_network_error(vm, ak.string_from_str("Request with 'cors' mode must have URL with HTTP or HTTPS scheme")))
+
+    # -> request’s use-CORS-preflight flag is set
+    # -> request’s unsafe-request flag is set and either request’s method is not a CORS-safelisted method or
+    #    CORS-unsafe request-header names with request’s header list is not empty
+    let method = fetch_request_method(request)
+    if (fetch_request_use_cors_preflight(request) or (fetch_request_unsafe_request(request) and (not http_is_cors_safelisted_method(ak.byte_string_view(&method)) or not fetch_fetching_byte_strings_are_empty(fetch_get_cors_unsafe_header_names(fetch_request_header_list(request)))))):
+        # 1. Set request’s response tainting to "cors".
+        fetch_request_set_response_tainting(request, FetchRequestResponseTainting.cors)
+
+        let returned_pending_response = fetch_pending_response_create(vm, request)
+
+        # 2. Let corsWithPreflightResponse be the result of running HTTP fetch given fetchParams and true.
+        let cors_with_preflight_response = fetch_fetching_http_fetch(realm, fetch_params, FetchMakeCorsPreflight.yes)
+        let captures = new FetchFetchingMainFetchCorsWithPreflightResponse(returned_pending_response = returned_pending_response) else trap("out of memory")
+        fetch_pending_response_when_loaded(cors_with_preflight_response, ak.Function1[FetchResponse*, unit](call = FetchFetchingMainFetchCorsWithPreflightResponse.call, context = captures))
+
+        return returned_pending_response
+
+    # -> Otherwise
+    #     1. Set request’s response tainting to "cors".
+    fetch_request_set_response_tainting(request, FetchRequestResponseTainting.cors)
+
+    #     2. Return the result of running HTTP fetch given fetchParams.
+    return fetch_fetching_http_fetch(realm, fetch_params)
+
+## `origin && origin->is_opaque_file_origin()`.
+func fetch_fetching_is_opaque_file_origin(origin: web_url.Origin?) -> bool:
+    if let value = origin:
+        return web_url.origin_is_opaque_file_origin(&value)
+    return false
+
+## `origin && origin->is_opaque()`.
+func fetch_fetching_is_opaque(origin: web_url.Origin?) -> bool:
+    if let value = origin:
+        return web_url.origin_is_opaque(&value)
+    return false
+
+## `origin && url_origin.is_same_origin(*origin)`.
+func fetch_fetching_is_same_origin_with(url_origin: web_url.Origin, origin: web_url.Origin?) -> bool:
+    if let value = origin:
+        return web_url.origin_is_same_origin(&url_origin, value)
+    return false
+
+## `names.is_empty()` of a list of header names.
+func fetch_fetching_byte_strings_are_empty(names: ak.Vector[ak.ByteString]) -> bool:
+    return ak.vector_is_empty(&names)
+
+# mark: Main fetch ==============================================================================
+
+## Ported from Libraries/LibWeb/Fetch/Fetching/Fetching.cpp:384 Web::Fetch::Fetching::main_fetch.
+# https://fetch.spec.whatwg.org/#concept-main-fetch
+pub func fetch_fetching_main_fetch(realm: Realm*, fetch_params: FetchParams*, recursive: FetchRecursive = FetchRecursive.no) -> FetchPendingResponse*?:
+    if fetch_web_fetch_debug:
+        ak.dbgln(f"Fetch: Running 'main fetch' with: fetch_params @ {(void*)fetch_params}")
+
+    let vm = realm_vm(realm)
+
+    # 1. Let request be fetchParams’s request.
+    let request = fetch_params_request(fetch_params)
+
+    # 2. Let response be null.
+    var response: FetchResponse*? = none
+
+    # 3. If request’s local-URLs-only flag is set and request’s current URL is not local, then set response to a
+    #    network error.
+    if fetch_request_local_urls_only(request) and not fetch_is_local_url(fetch_request_current_url(request)):
+        response = fetch_response_network_error(vm, ak.string_from_str("Request with 'local-URLs-only' flag must have a local URL"))
+
+    # 4. Run report Content Security Policy violations for request.
+    content_security_policy_report_content_security_policy_violations_for_request(realm, request)
+
+    # FIXME: 5. Upgrade request to a potentially trustworthy URL, if appropriate.
+
+    # 6. Upgrade a mixed content request to a potentially trustworthy URL, if appropriate.
+    mixed_content_upgrade_a_mixed_content_request_to_a_potentially_trustworthy_url_if_appropriate(request)
+
+    # 7. If should request be blocked due to a bad port, should fetching request be blocked as mixed content, should
+    #    request be blocked by Content Security Policy, or should request be blocked by Integrity Policy Policy
+    #    returns blocked, then set response to a network error.
+    if (fetch_block_bad_port(request) == FetchRequestOrResponseBlocking.blocked or mixed_content_should_fetching_request_be_blocked_as_mixed_content(request) == FetchRequestOrResponseBlocking.blocked or content_security_policy_should_request_be_blocked_by_content_security_policy(realm, request) == ContentSecurityPolicyResult.blocked or content_security_policy_should_request_be_blocked_by_integrity_policy(request) == ContentSecurityPolicyResult.blocked):
+        response = fetch_response_network_error(vm, ak.string_from_str("Request was blocked"))
+
+    # 8. If request’s referrer policy is the empty string, then set request’s referrer policy to request’s policy
+    #    container’s referrer policy.
+    if fetch_request_referrer_policy(request) == ReferrerPolicyReferrerPolicy.empty_string:
+        match fetch_request_policy_container(request):
+            .html_policy_container(policy_container):
+                fetch_request_set_referrer_policy(request, policy_container.referrer_policy)
+            _: trap("VERIFY: request->policy_container().has<GC::Ref<HTML::PolicyContainer>>()")
+
+    # 9. If request’s referrer is not "no-referrer", then set request’s referrer to the result of invoking determine
+    #    request’s referrer.
+    # NOTE: As stated in Referrer Policy, user agents can provide the end user with options to override request’s
+    #       referrer to "no-referrer" or have it expose less sensitive information.
+    let referrer_is_no_referrer = match fetch_request_referrer(request):
+        .fetch_request_referrer(referrer) => referrer == FetchRequestReferrer.no_referrer
+        _ => false
+    if not referrer_is_no_referrer:
+        if let determined_referrer = referrer_policy_determine_requests_referrer(request):
+            fetch_request_set_referrer(request, .url(determined_referrer))
+        else:
+            fetch_request_set_referrer(request, .fetch_request_referrer(FetchRequestReferrer.no_referrer))
+
+    # 10. Set request’s current URL’s scheme to "https" if all of the following conditions are true:
+    # - request’s current URL’s scheme is "http"
+    # - request’s current URL’s host is a domain
+    # FIXME: - Matching request’s current URL’s host per Known HSTS Host Domain Name Matching results in either a
+    #          superdomain match with an asserted includeSubDomains directive or a congruent match (with or without an
+    #          asserted includeSubDomains directive) [HSTS]; or DNS resolution for the request finds a matching HTTPS RR
+    #          per section 9.5 of [SVCB].
+    # (C++ ends the conditions with `&& false`: the scheme is never upgraded.)
+
+    let get_response_captures = new FetchFetchingMainFetchGetResponse(realm = realm, fetch_params = fetch_params, request = request) else trap("out of memory")
+    let get_response = gc.create_function0(vm_heap(vm), ak.Function0[FetchPendingResponse*](call = FetchFetchingMainFetchGetResponse.call, context = get_response_captures))
+
+    if recursive == FetchRecursive.yes:
+        # 12. If response is null, then set response to the result of running the steps corresponding to the first
+        #     matching statement:
+        let pending_response = fetch_fetching_main_fetch_recursive_response(vm, request, response, get_response)
+
+        # 13. If recursive is true, then return response.
+        return pending_response
+
+    # 11. If recursive is false, then run the remaining steps in parallel.
+    let in_parallel = new FetchFetchingMainFetchInParallel(realm = realm, fetch_params = fetch_params, request = request, response = response, get_response = get_response) else trap("out of memory")
+    platform_event_loop_plugin_deferred_invoke(platform_event_loop_plugin_the(), gc.create_function0(realm_heap(realm), ak.Function0[unit](call = FetchFetchingMainFetchInParallel.call, context = in_parallel)))
+
+    return none
+
+## `!response ? get_response->function()() : PendingResponse::create(vm, request, *response)` of a recursive main fetch.
+func fetch_fetching_main_fetch_recursive_response(vm: Vm*, request: FetchRequest*, response: FetchResponse*?, get_response: gc.Function0[FetchPendingResponse*]*) -> FetchPendingResponse*:
+    if let known_response = response:
+        return fetch_pending_response_create_fetch_response(vm, request, known_response)
+    return ak.function0_call(&get_response.function)
+
+## The captures of main fetch's in-parallel steps, `[&realm, &vm, &fetch_params, request, response, get_response]`.
+struct FetchFetchingMainFetchInParallel:
+    var realm: Realm*
+    var fetch_params: FetchParams*
+    var request: FetchRequest*
+    var response: FetchResponse*?
+    var get_response: gc.Function0[FetchPendingResponse*]*
+
+    ## Steps 12 and on of a main fetch that is not recursive.
+    static func call(context: void*?):
+        let captures = (FetchFetchingMainFetchInParallel*)(context else trap("main_fetch: no captures"))
+        let vm = realm_vm(captures.realm)
+
+        # 12. If response is null, then set response to the result of running the steps corresponding to the first
+        #     matching statement:
+        var pending_response = fetch_pending_response_create_fetch_response(vm, captures.request, fetch_infrastructure_response_create(vm))
+        if captures.response == none:
+            pending_response = ak.function0_call(&captures.get_response.function)
+        let process_response = new FetchFetchingMainFetchProcessResponse(realm = captures.realm, fetch_params = captures.fetch_params, request = captures.request, response = captures.response, response_was_null = captures.response == none) else trap("out of memory")
+        fetch_pending_response_when_loaded(pending_response, ak.Function1[FetchResponse*, unit](call = FetchFetchingMainFetchProcessResponse.call, context = process_response))
+
+## The captures of the load callback of main fetch's pending response, `[&realm, &vm, &fetch_params, request,
+## response, response_was_null = !response](GC::Ref<Response> resolved_response) mutable`.
+struct FetchFetchingMainFetchProcessResponse:
+    var realm: Realm*
+    var fetch_params: FetchParams*
+    var request: FetchRequest*
+    var response: FetchResponse*?
+    var response_was_null: bool
+
+    ## Steps 14 to 23 of main fetch.
+    static func call(context: void*?, resolved_response: FetchResponse*):
+        let captures = (FetchFetchingMainFetchProcessResponse*)(context else trap("main_fetch: no captures"))
+        if fetch_web_fetch_debug:
+            ak.dbgln("Fetch: Running 'main fetch' pending_response load callback")
+        if captures.response_was_null:
+            captures.response = resolved_response
+        fetch_fetching_main_fetch_process_response(captures)
+
+## The body of the load callback of main fetch's pending response (steps 14 to 23).
+func fetch_fetching_main_fetch_process_response(captures: FetchFetchingMainFetchProcessResponse*):
+    let realm = captures.realm
+    let vm = realm_vm(realm)
+    let fetch_params = captures.fetch_params
+    let request = captures.request
+    var response = captures.response else trap("VERIFY: main fetch's response")
+
+    # 14. If response is not a network error and response is not a filtered response, then:
+    if not fetch_response_is_network_error(response) and not is_fetch_filtered_response(response):
+        # 1. If request’s response tainting is "cors", then:
+        if fetch_request_response_tainting(request) == FetchRequestResponseTainting.cors:
+            # 1. Let headerNames be the result of extracting header list values given
+            #    `Access-Control-Expose-Headers` and response’s header list.
+            let header_names_or_failure = http_header_list_extract_header_list_values(fetch_response_header_list(response), ak.sv("Access-Control-Expose-Headers"))
+
+            match header_names_or_failure:
+                .vector_byte_string(header_names):
+                    # 2. If request’s credentials mode is not "include" and headerNames contains `*`, then set
+                    #    response’s CORS-exposed header-name list to all unique header names in response’s header
+                    #    list.
+                    if fetch_request_credentials_mode(request) != FetchRequestCredentialsMode.include and fetch_fetching_byte_strings_contain(&header_names, ak.sv("*")):
+                        let unique_header_names = http_header_list_unique_names(fetch_response_header_list(response))
+                        fetch_response_set_cors_exposed_header_name_list(response, unique_header_names)
+                    # 3. Otherwise, if headerNames is not null or failure, then set response’s CORS-exposed
+                    #    header-name list to headerNames.
+                    elif not ak.vector_is_empty(&header_names):
+                        fetch_response_set_cors_exposed_header_name_list(response, header_names)
+                _: _ = 0
+
+        # 2. Set response to the following filtered response with response as its internal response, depending
+        #    on request’s response tainting:
+        response = match fetch_request_response_tainting(request):
+            # -> "basic"
+            # basic filtered response
+            .basic => fetch_basic_filtered_response_create(vm, response).fetch_response()
+            # -> "cors"
+            # CORS filtered response
+            .cors => fetch_cors_filtered_response_create(vm, response).fetch_response()
+            # -> "opaque"
+            # opaque filtered response
+            .opaque => fetch_opaque_filtered_response_create(vm, response).fetch_response()
+            _ => trap("VERIFY_NOT_REACHED")
+
+    # 15. Let internalResponse be response, if response is a network error, and response’s internal response
+    #     otherwise.
+    var internal_response = response if fetch_response_is_network_error(response) else fetch_filtered_response_internal_response(response)
+
+    # 16. If internalResponse’s URL list is empty, then set it to a clone of request’s URL list.
+    # NOTE: A response’s URL list can be empty (for example, when the response represents an about URL).
+    if ak.vector_is_empty(fetch_response_url_list(internal_response)):
+        fetch_response_set_url_list(internal_response, ak.vector_clone(fetch_request_url_list(request)))
+
+    # 17. Set internalResponse’s redirect taint to request’s redirect-taint.
+    fetch_response_set_redirect_taint(internal_response, fetch_request_redirect_taint(request))
+
+    # 18. If request’s timing allow failed flag is unset, then set internalResponse’s timing allow passed flag.
+    if not fetch_request_timing_allow_failed(request):
+        fetch_response_set_timing_allow_passed(internal_response, true)
+
+    # 19. If response is not a network error and any of the following returns blocked
+    if not fetch_response_is_network_error(response) and (mixed_content_should_response_to_request_be_blocked_as_mixed_content(request, internal_response) == FetchRequestOrResponseBlocking.blocked or content_security_policy_should_response_to_request_be_blocked_by_content_security_policy(realm, internal_response, request) == ContentSecurityPolicyResult.blocked or fetch_should_response_to_request_be_blocked_due_to_its_mime_type(internal_response, request) == FetchRequestOrResponseBlocking.blocked or fetch_should_response_to_request_be_blocked_due_to_nosniff(internal_response, request) == FetchRequestOrResponseBlocking.blocked):
+        # - should internalResponse to request be blocked as mixed content
+        # - should internalResponse to request be blocked by Content Security Policy
+        # - should internalResponse to request be blocked due to its MIME type
+        # - should internalResponse to request be blocked due to nosniff
+        # then set response and internalResponse to a network error.
+        internal_response = fetch_response_network_error(vm, ak.string_from_str("Response was blocked"))
+        response = internal_response
+
+    # 20. If response’s type is "opaque", internalResponse’s status is 206, internalResponse’s range-requested
+    #     flag is set, and request’s header list does not contain `Range`, then set response and
+    #     internalResponse to a network error.
+    # NOTE: Traditionally, APIs accept a ranged response even if a range was not requested. This prevents a
+    #       partial response from an earlier ranged request being provided to an API that did not make a range
+    #       request.
+    if (fetch_response_type(response) == FetchResponseType.opaque and fetch_response_status(internal_response) == 206 and fetch_response_range_requested(internal_response) and not http_header_list_contains(fetch_request_header_list(request), ak.sv("Range"))):
+        internal_response = fetch_response_network_error(vm, ak.string_from_str("Response has status 206 and 'range-requested' flag set, but request has no 'Range' header"))
+        response = internal_response
+
+    # 21. If response is not a network error and either request’s method is `HEAD` or `CONNECT`, or
+    #     internalResponse’s status is a null body status, set internalResponse’s body to null and disregard
+    #     any enqueuing toward it (if any).
+    # NOTE: This standardizes the error handling for servers that violate HTTP.
+    let method = fetch_request_method(request)
+    if not fetch_response_is_network_error(response) and (ak.byte_string_eq_string_view(&method, ak.sv("HEAD")) or ak.byte_string_eq_string_view(&method, ak.sv("CONNECT")) or fetch_is_null_body_status(fetch_response_status(internal_response))):
+        fetch_response_set_body(internal_response, none)
+
+    # 22. If request’s integrity metadata is not the empty string, then:
+    let integrity_metadata = fetch_request_integrity_metadata(request)
+    if not ak.string_is_empty(&integrity_metadata):
+        # 1. Let processBodyError be this step: run fetch response handover given fetchParams and a network
+        #    error.
+        let error_captures = new FetchFetchingMainFetchProcessBodyError(realm = realm, fetch_params = fetch_params) else trap("out of memory")
+        let process_body_error = gc.create_function1(vm_heap(vm), ak.Function1[JsValue, unit](call = FetchFetchingMainFetchProcessBodyError.call, context = error_captures))
+
+        # 2. If response’s body is null, then run processBodyError and abort these steps.
+        if fetch_response_body(response) == none:
+            # (C++ passes an empty JS::Value; the steps do not read it.)
+            ak.function1_call(&process_body_error.function, js_undefined())
+            return
+
+        # 3. Let processBody given bytes be these steps:
+        let body_captures = new FetchFetchingMainFetchProcessBody(realm = realm, request = request, response = response, fetch_params = fetch_params, process_body_error = process_body_error) else trap("out of memory")
+        let process_body = gc.create_function1(vm_heap(vm), ak.Function1[ak.ByteBuffer, unit](call = FetchFetchingMainFetchProcessBody.call, context = body_captures))
+
+        # 4. Fully read response’s body given processBody and processBodyError.
+        let body = fetch_response_body(response) else trap("VERIFY: the response's body")
+        fetch_body_fully_read(body, realm, process_body, process_body_error, fetch_params_task_destination_const(fetch_params))
+    # 23. Otherwise, run fetch response handover given fetchParams and response.
+    else:
+        fetch_fetching_fetch_response_handover(realm, fetch_params, response)
+
+## The captures of main fetch's processBodyError, `[&realm, &vm, &fetch_params](JS::Value)`.
+struct FetchFetchingMainFetchProcessBodyError:
+    var realm: Realm*
+    var fetch_params: FetchParams*
+
+    ## Runs fetch response handover given fetchParams and a network error.
+    static func call(context: void*?, value: JsValue):
+        let captures = (FetchFetchingMainFetchProcessBodyError*)(context else trap("main_fetch: no captures"))
+        let vm = realm_vm(captures.realm)
+        fetch_fetching_fetch_response_handover(captures.realm, captures.fetch_params, fetch_response_network_error(vm, ak.string_from_str("Response body could not be processed")))
+
+## The captures of main fetch's processBody, `[&realm, request, response, &fetch_params,
+## process_body_error](ByteBuffer bytes)`.
+struct FetchFetchingMainFetchProcessBody:
+    var realm: Realm*
+    var request: FetchRequest*
+    var response: FetchResponse*
+    var fetch_params: FetchParams*
+    var process_body_error: gc.Function1[JsValue, unit]*
+
+    ## processBody given bytes.
+    static func call(context: void*?, bytes: ak.ByteBuffer):
+        let captures = (FetchFetchingMainFetchProcessBody*)(context else trap("main_fetch: no captures"))
+
+        # 1. If bytes do not match request’s integrity metadata, then run processBodyError and abort these steps.
+        let integrity_metadata = fetch_request_integrity_metadata(captures.request)
+        let bytes_match = sri_do_bytes_match_metadata_list(&bytes, ak.string_bytes_as_string_view(&integrity_metadata)) else return
+        if not bytes_match:
+            ak.function1_call(&captures.process_body_error.function, js_undefined())
+            return
+
+        # 2. Set response’s body to bytes as a body.
+        fetch_response_set_body(captures.response, fetch_byte_sequence_as_body(captures.realm, ak.byte_buffer_bytes_const(&bytes)))
+
+        # 3. Run fetch response handover given fetchParams and response.
+        fetch_fetching_fetch_response_handover(captures.realm, captures.fetch_params, captures.response)

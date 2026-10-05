@@ -1,0 +1,169 @@
+#==============================================================================================
+#
+#   transform_stream - the TransformStream stand-in: setting one up, enqueuing into its
+#   readable side, and piping a readable stream through it
+#
+#   DESCRIPTION:
+#       A stand-in for Streams::TransformStream (DESIGN.md §3.6), written by region p2c for
+#       fetch response handover, which pipes a response body's stream through an identity
+#       transform stream whose flush algorithm is processResponseEndOfBody (Fetching.cpp:876).
+#       Ladybird's TransformStream has a WritableStream side, and piped_through runs
+#       ReadableStreamPipeTo into it (TransformStream.cpp, TransformStreamOperations.cpp,
+#       ReadableStreamPipeTo.cpp, WritableStream*: phase 4). The stand-in keeps the shape of
+#       set_up (TransformStream.cpp:113: the transform, flush and cancel algorithms on the
+#       controller) and replaces the writable side and the pipe by a read loop over the source:
+#       each chunk runs the transform algorithm, the end of the source runs the flush
+#       algorithm and closes the readable side, an error errors it. The readable side is a
+#       readable byte stream (the stand-in's streams carry Uint8Array chunks; C++'s is a
+#       default stream, whose controller is phase 4). Backpressure, the writable side's
+#       queue, aborting and canceling through the pipe, and the pipe's AbortSignal are not
+#       modelled; JS-facing parts stay phase 4.
+#
+#       Copyright (c) 2023-2024, the Ladybird developers.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: TransformStream =========================================================================
+
+## TransformStream::TransformStream(realm).
+func streams_transform_stream_construct(this: StreamsTransformStream*, realm: Realm*):
+    bind_platform_object_construct_realm(this.bind_platform_object(), realm)
+
+## TransformStream::initialize (override).
+func streams_transform_stream_initialize_impl(base: JsCell*, realm: Realm*):
+    web_set_prototype_for_interface(base, realm, BindInterfaceName.transform_stream)
+    js_cell_initialize_impl(base, realm)
+
+## TransformStream::visit_edges (override).
+func streams_transform_stream_visit_edges_impl(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (StreamsTransformStream*)base
+    bind_platform_object_visit_edges_impl(base, visitor)
+    gc.cell_visitor_visit_t(visitor, this.m_controller)
+    gc.cell_visitor_visit_t(visitor, this.m_readable)
+
+## `transform_stream.realm()` (Bindings::PlatformObject::realm).
+func streams_transform_stream_realm(this: StreamsTransformStream*) -> Realm*:
+    return bind_platform_object_realm(this.bind_platform_object())
+
+## TransformStream::readable: [[readable]].
+pub func streams_transform_stream_readable(this: StreamsTransformStream*) -> StreamsReadableStream*:
+    return this.m_readable else trap("VERIFY: the transform stream is set up")
+
+## TransformStream::controller: [[controller]].
+pub func streams_transform_stream_controller(this: StreamsTransformStream*) -> StreamsTransformStreamDefaultController*:
+    return this.m_controller else trap("VERIFY: the transform stream is set up")
+
+## TransformStream::set_up (TransformStream.cpp:113), as the stand-in has it: the controller holds the algorithms
+## (C++'s wrappers turn a null result into a promise resolved with undefined; the stand-in's callers return a
+## promise), the readable side is a readable byte stream.
+## https://streams.spec.whatwg.org/#transformstream-set-up
+pub func streams_transform_stream_set_up(this: StreamsTransformStream*, transform_algorithm: gc.Function1[JsValue, JsPromiseCapability*]*, flush_algorithm: gc.Function0[JsPromiseCapability*]*? = none, cancel_algorithm: gc.Function1[JsValue, JsPromiseCapability*]*? = none):
+    let realm = streams_transform_stream_realm(this)
+
+    # 8. Let startPromise be a promise resolved with undefined.
+    # 9. Perform ! InitializeTransformStream(stream, startPromise, writableHighWaterMark, writableSizeAlgorithm,
+    #    readableHighWaterMark, readableSizeAlgorithm).
+    let readable = realm_create_streams_readable_stream(realm, realm)
+    streams_readable_stream_set_up_with_byte_reading_support(readable)
+    this.m_readable = readable
+
+    # 10. Let controller be a new TransformStreamDefaultController.
+    let controller = realm_create_streams_transform_stream_default_controller(realm, realm)
+
+    # 11. Perform ! SetUpTransformStreamDefaultController(stream, controller, transformAlgorithmWrapper,
+    #     flushAlgorithmWrapper, cancelAlgorithmWrapper).
+    controller.m_stream = this
+    controller.m_transform_algorithm = transform_algorithm
+    controller.m_flush_algorithm = flush_algorithm
+    controller.m_cancel_algorithm = cancel_algorithm
+    this.m_controller = controller
+
+# mark: TransformStreamDefaultController ========================================================
+
+## TransformStreamDefaultController::initialize (override).
+func streams_transform_stream_default_controller_initialize_impl(base: JsCell*, realm: Realm*):
+    web_set_prototype_for_interface(base, realm, BindInterfaceName.transform_stream_default_controller)
+    js_cell_initialize_impl(base, realm)
+
+## TransformStreamDefaultController::visit_edges (override).
+func streams_transform_stream_default_controller_visit_edges_impl(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (StreamsTransformStreamDefaultController*)base
+    bind_platform_object_visit_edges_impl(base, visitor)
+    gc.cell_visitor_visit_t(visitor, this.m_cancel_algorithm)
+    gc.cell_visitor_visit_t(visitor, this.m_flush_algorithm)
+    gc.cell_visitor_visit_t(visitor, this.m_transform_algorithm)
+    gc.cell_visitor_visit_t(visitor, this.m_stream)
+
+## TransformStreamDefaultControllerEnqueue (TransformStreamOperations.cpp), as the stand-in has it: the chunk goes
+## to the readable side's controller.
+## https://streams.spec.whatwg.org/#transform-stream-default-controller-enqueue
+pub func streams_transform_stream_default_controller_enqueue(controller: StreamsTransformStreamDefaultController*, chunk: JsValue) -> !:
+    # 1. Let stream be controller.[[stream]].
+    let stream = controller.m_stream else trap("VERIFY: the controller has a stream")
+
+    # 2. Let readableController be stream.[[readable]].[[controller]].
+    let readable = streams_transform_stream_readable(stream)
+
+    # 3. If ! ReadableStreamDefaultControllerCanCloseOrEnqueue(readableController) is false, throw a TypeError exception.
+    # 4. Let enqueueResult be ReadableStreamDefaultControllerEnqueue(readableController, chunk).
+    # 5. If enqueueResult is an abrupt completion, ... throw stream.[[readable]].[[storedError]].
+    try streams_readable_byte_stream_controller_enqueue_2(streams_readable_stream_byte_controller(readable), chunk)
+
+# mark: Piping through ==========================================================================
+
+## The read request of the pipe: allocated in the reader's heap.
+func heap_allocate_streams_pipe_through_read_request(heap: gc.Heap*, reader: StreamsReadableStreamDefaultReader*, transform: StreamsTransformStream*) -> StreamsPipeThroughReadRequest*:
+    let this = (StreamsPipeThroughReadRequest*)web_heap_allocate_cell(heap, &streams_pipe_through_read_request_class)
+    this.m_reader = reader
+    this.m_transform = transform
+    return this
+
+## The pipe's read request: visit_edges.
+func streams_pipe_through_read_request_visit_edges_impl(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (StreamsPipeThroughReadRequest*)base
+    gc.cell_visit_edges_impl(base, visitor)
+    gc.cell_visitor_visit_t_2(visitor, this.m_reader)
+    gc.cell_visitor_visit_t_2(visitor, this.m_transform)
+
+## The pipe's chunk steps: the transform algorithm given the chunk (TransformStreamDefaultSinkWriteAlgorithm), then
+## the next read.
+func streams_pipe_through_read_request_on_chunk_impl(base: StreamsReadRequest*, chunk: JsValue):
+    let this = (StreamsPipeThroughReadRequest*)base
+    let controller = streams_transform_stream_controller(this.m_transform)
+    let transform_algorithm = controller.m_transform_algorithm else trap("VERIFY: the transform algorithm")
+    _ = ak.function1_call(&transform_algorithm.function, chunk)
+    streams_readable_stream_default_reader_read_2(this.m_reader, this.streams_read_request())
+
+## The pipe's close steps: the flush algorithm (TransformStreamDefaultSinkCloseAlgorithm), then the readable side
+## closes.
+func streams_pipe_through_read_request_on_close_impl(base: StreamsReadRequest*):
+    let this = (StreamsPipeThroughReadRequest*)base
+    let controller = streams_transform_stream_controller(this.m_transform)
+    if let flush_algorithm = controller.m_flush_algorithm:
+        _ = ak.function0_call(&flush_algorithm.function)
+    let readable = streams_transform_stream_readable(this.m_transform)
+    if streams_readable_stream_is_readable(readable):
+        streams_readable_stream_close(readable)
+
+## The pipe's error steps: the readable side errors with the source's error.
+func streams_pipe_through_read_request_on_error_impl(base: StreamsReadRequest*, error_: JsValue):
+    let this = (StreamsPipeThroughReadRequest*)base
+    let readable = streams_transform_stream_readable(this.m_transform)
+    if streams_readable_stream_is_readable(readable):
+        streams_readable_stream_error(readable, error_)
+
+## ReadableStream::piped_through (ReadableStream.cpp:437), as the stand-in has it: the source is read chunk by chunk
+## into the transform stream (ReadableStreamPipeTo's role), and the transform stream's readable side is returned.
+## https://streams.spec.whatwg.org/#readablestream-pipe-through
+pub func streams_readable_stream_piped_through(this: StreamsReadableStream*, transform: StreamsTransformStream*, prevent_close: bool = false, prevent_abort: bool = false, prevent_cancel: bool = false, signal: DomAbortSignal*? = none) -> StreamsReadableStream*:
+    # 1. Assert: ! IsReadableStreamLocked(readable) is false.
+    assert(not streams_readable_stream_is_locked(this))
+
+    # 4. Let promise be ! ReadableStreamPipeTo(readable, transform.[[writable]], preventClose, preventAbort, preventCancel, signalArg).
+    let reader = streams_acquire_readable_stream_default_reader(this) else trap("MUST: AcquireReadableStreamDefaultReader")
+    let read_request = heap_allocate_streams_pipe_through_read_request(gc.cell_heap(reader.cell()), reader, transform)
+    streams_readable_stream_default_reader_read_2(reader, read_request.streams_read_request())
+
+    # 6. Return transform.[[readable]].
+    return streams_transform_stream_readable(transform)
