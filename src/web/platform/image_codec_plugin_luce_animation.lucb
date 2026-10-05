@@ -1,0 +1,252 @@
+#==============================================================================================
+#
+#   image_codec_plugin_luce_animation - the engine's WebP and animated PNG decoding, and the
+#   animations its streaming sessions play (GIF, WebP, APNG)
+#
+#   DESCRIPTION:
+#       What Ladybird's ImageDecoder process makes of a WebP (LibGfx/ImageFormats/
+#       WebPLoader.cpp over libwebp) and of an animated PNG (PNGLoader.cpp over libpng with
+#       the APNG patch), done in process over our own decoders (DESIGN.md §7.0): luce-webp
+#       (a port of libwebp 1.6.0) and luce-png's Animation. Not a port: new code behind the
+#       ported seam, platform/image_codec_plugin_luce.
+#
+#       A WebP is read as decode_webp_header reads it: the features, for an animation the
+#       animation decoder and its frames, then the chunks as WebPMux reads them for the ICC
+#       profile (a file the mux refuses is refused). A still WebP decodes with libwebp's
+#       defaults (WebPDecodeBGRAInto); one without alpha is drawn opaque, as Ladybird's
+#       BGRx8888 bitmap draws it. An animation's frames are WebPAnimDecoder's canvases, with
+#       the demuxer's durations as written and the ANIM chunk's loop count. Its color space
+#       comes from its ICC profile (ColorSpace::load_from_icc_bytes), else sRGB.
+#
+#       An animated PNG is read as read_frames reads it: every frame decoded and composited
+#       at once (here rendered once to find where it fails), each frame's duration
+#       numerator * 1000 / denominator ms (1 ms for a numerator of 0), the loop count acTL's
+#       plays. When a frame fails, or the file ends before the frames acTL counts, the image
+#       is a still one of its first frame (a transparent canvas if none was read), as
+#       PNGImageDecoderPlugin::create falls back. Its color space is the PNG's (cICP, iCCP).
+#
+#       An animation of more than one frame is streamed as a GIF's is (the plugin's
+#       sessions): a `LuceImageCodecAnimation` holds the GIF's, WebP's or APNG's decoder and
+#       renders the frames the session asks for.
+#
+#       Copyright (c) 2026 the luce-browser authors.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: The animations ==========================================================================
+
+## An animation the plugin plays: a GIF's, a WebP's or an APNG's decoder (one of the three spans
+## holds it), in the C heap, over bytes that outlive it.
+struct LuceImageCodecAnimation:
+    var gif: gif_codec.Animation[]
+    var webp: webp_codec.Animation[]
+    var png: png_codec.Animation[]
+    var width: usize
+    var height: usize
+    ## A WebP without alpha, drawn opaque.
+    var opaque: bool
+    var frame_count: usize
+    ## How many times browsers play it (PlatformDecodedImage.loop_count).
+    var loop_count: u32
+
+    ## Frame `index` composited into `pixels`, `width * height` straight RGBA pixels.
+    func render(index: usize, pixels: u8[]) -> !:
+        if self.gif.length > 0:
+            try self.gif[0].render(index, pixels)
+        elif self.webp.length > 0:
+            try self.webp[0].render(index, pixels)
+            if self.opaque:
+                luce_image_codec_make_opaque(pixels[..<self.width * self.height * 4])
+        else:
+            try self.png[0].render(index, pixels)
+
+    ## How long frame `index` is shown, in ms, as Ladybird's decoders time it.
+    func duration(index: usize) -> u32:
+        if self.gif.length > 0:
+            return self.gif[0].frames()[index].duration
+        if self.webp.length > 0:
+            return self.webp[0].frames()[index].duration
+        return luce_image_codec_apng_duration(self.png[0].frames()[index])
+
+    ## Frees the decoder.
+    func release():
+        if self.gif.length > 0:
+            self.gif[0].release()
+            free(self.gif) in memory.heap
+        if self.webp.length > 0:
+            self.webp[0].release()
+            free(self.webp) in memory.heap
+        if self.png.length > 0:
+            self.png[0].release()
+            free(self.png) in memory.heap
+
+## The animation of the GIF, WebP or PNG in `bytes` (which must outlive it), in the C heap, its
+## canvas checked.
+func luce_image_codec_animation_open(kind: LuceImageCodecFormat, bytes: const u8[]) -> LuceImageCodecAnimation!:
+    var animation = LuceImageCodecAnimation()
+    match kind:
+        .gif:
+            var opened = try luce_image_codec_gif_open(bytes)
+            errdefer opened.release()
+            animation.gif = try new gif_codec.Animation[1] --- in memory.heap
+            animation.gif[0] = opened
+            animation.width = opened.info.width
+            animation.height = opened.info.height
+            animation.frame_count = opened.frames().length
+            animation.loop_count = opened.info.plays()
+        .webp:
+            var opened = try webp_codec.Animation.open(bytes)
+            errdefer opened.release()
+            try luce_image_codec_check_size(opened.info.width, opened.info.height)
+            animation.webp = try new webp_codec.Animation[1] --- in memory.heap
+            animation.webp[0] = opened
+            animation.width = opened.info.width
+            animation.height = opened.info.height
+            animation.opaque = not opened.info.alpha
+            animation.frame_count = opened.frames().length
+            animation.loop_count = opened.info.loop_count
+        _:
+            var opened = try png_codec.Animation.open(bytes)
+            errdefer opened.release()
+            try luce_image_codec_check_size(opened.info.width, opened.info.height)
+            animation.png = try new png_codec.Animation[1] --- in memory.heap
+            animation.png[0] = opened
+            animation.width = opened.info.width
+            animation.height = opened.info.height
+            animation.frame_count = opened.frames().length
+            animation.loop_count = opened.info.loop_count
+    return animation
+
+## Frame `index` of an animation, composited, rendered through `pixels` (a canvas of RGBA), as a
+## premultiplied BGRA8888 bitmap.
+func luce_image_codec_animation_frame(animation: LuceImageCodecAnimation*, index: usize, pixels: u8[]) -> gfx.Bitmap*!:
+    try animation.render(index, pixels)
+    return try luce_image_codec_bitmap(pixels, animation.width, animation.height)
+
+## Every frame of an animation, decoded (decode_image_to_bitmaps_and_durations_with_decoder).
+func luce_image_codec_animation_decode_all(animation: LuceImageCodecAnimation*, color_space: gfx.ColorSpace) -> PlatformDecodedImage!:
+    var image = PlatformDecodedImage(color_space = color_space)
+    image.is_animated = true
+    image.loop_count = animation.loop_count
+    image.frame_count = (u32)animation.frame_count
+    let pixels = try new u8[animation.width * animation.height * 4] --- in memory.heap
+    defer free(pixels) in memory.heap
+    for index in 0..<animation.frame_count:
+        let bitmap = try luce_image_codec_animation_frame(animation, index, pixels)
+        ak.vector_append_t(&image.frames, PlatformFrame(bitmap = bitmap, duration = (usize)animation.duration(index)))
+        ak.vector_append_t(&image.all_durations, animation.duration(index))
+    return image
+
+## Sets every pixel's alpha of the RGBA `pixels` to 255.
+func luce_image_codec_make_opaque(pixels: u8[]):
+    for at in 0..<pixels.length // 4:
+        pixels[at * 4 + 3] = 255
+
+# mark: WebP ====================================================================================
+
+## A WebP's color space: its ICC profile, else sRGB.
+func luce_image_codec_webp_color_space(profile: const u8[]?) -> gfx.ColorSpace:
+    let bytes = profile else return luce_image_codec_srgb()
+    return luce_image_codec_icc_color_space(bytes)
+
+## Whether the WebP in `bytes` is an animation of more than one frame (the plugin streams it).
+## Fails as decode_webp_header fails.
+func luce_image_codec_webp_streams(bytes: const u8[]) -> bool!:
+    let found = try webp_codec.features(bytes)
+    if not found.animated:
+        return false
+    let counted = try webp_codec.info(bytes)
+    return counted.frame_count > 1
+
+## A WebP's image: a still picture, or every frame of an animation; with its color space. Fails
+## where Ladybird's decode_webp_header or the frame decoding fails.
+func luce_image_codec_decode_webp(bytes: const u8[]) -> PlatformDecodedImage!:
+    let found = try webp_codec.features(bytes)
+    try luce_image_codec_check_size(found.width, found.height)
+    var animation: LuceImageCodecAnimation? = none
+    if found.animated:
+        animation = try luce_image_codec_animation_open(LuceImageCodecFormat.webp, bytes)
+    defer:
+        if let opened = animation:
+            var held = opened
+            held.release()
+    let color_space = luce_image_codec_webp_color_space(try webp_codec.icc_profile(bytes))
+    if let opened = animation:
+        var playing = opened
+        return try luce_image_codec_animation_decode_all(&playing, color_space)
+    let pixels = try new u8[found.width * found.height * 4] --- in memory.heap
+    defer free(pixels) in memory.heap
+    with memory.heap:
+        try webp_codec.decode_rgba8(bytes, pixels)
+    if not found.alpha:
+        luce_image_codec_make_opaque(pixels)
+    var image = luce_image_codec_still(try luce_image_codec_bitmap(pixels, found.width, found.height), 0, 0)
+    image.color_space = color_space
+    return image
+
+# mark: Animated PNG ============================================================================
+
+## How long Ladybird's PNG loader shows an APNG frame: its delay in ms, 1 for a numerator of 0.
+func luce_image_codec_apng_duration(frame: png_codec.Frame) -> u32:
+    return 1 if frame.delay_numerator == 0 else frame.duration
+
+## How many frames of an APNG Ladybird's read_frames reads before it fails: every frame rendered
+## once through `pixels`, the first kept in `first` (when there is one). All of them when none
+## fails and the file holds every frame acTL counts; else fewer, and the image falls back.
+func luce_image_codec_apng_frames_read(animation: png_codec.Animation*, pixels: u8[], first: u8[]) -> (usize, bool):
+    let count = animation.frames().length
+    for index in 0..<count:
+        animation.render(index, pixels) catch:
+            return (index, false)
+        if index == 0:
+            memory.copy(first, pixels, pixels.length)
+    return (count, animation.complete)
+
+## Whether the PNG in `bytes` is an animated PNG whose frames all decode, more than one (the
+## plugin streams it).
+func luce_image_codec_apng_streams(bytes: const u8[]) -> bool:
+    let found = png_codec.info(bytes) else return false
+    if not found.animated:
+        return false
+    var animation = png_codec.Animation.open(bytes) else return false
+    defer animation.release()
+    let size = found.width * found.height * 4
+    let pixels = (new u8[size] --- in memory.heap) else return false
+    defer free(pixels) in memory.heap
+    let first = (new u8[size] in memory.heap) else return false
+    defer free(first) in memory.heap
+    let (read, whole) = luce_image_codec_apng_frames_read(&animation, pixels, first)
+    return whole and read > 1
+
+## An animated PNG's image (read_frames): every frame composited, or the still image it falls back
+## to; with the PNG's color space.
+func luce_image_codec_decode_apng(bytes: const u8[]) -> PlatformDecodedImage!:
+    var animation = try png_codec.Animation.open(bytes)
+    defer animation.release()
+    let width = animation.info.width
+    let height = animation.info.height
+    try luce_image_codec_check_size(width, height)
+    let pixels = try new u8[width * height * 4] --- in memory.heap
+    defer free(pixels) in memory.heap
+    let first = try new u8[width * height * 4] in memory.heap
+    defer free(first) in memory.heap
+    let color_space = luce_image_codec_png_color_space(bytes)
+    let (read, whole) = luce_image_codec_apng_frames_read(&animation, pixels, first)
+    if not whole:
+        # PNGImageDecoderPlugin::create's fallback: the first frame read, else a transparent
+        # canvas, as a still image.
+        let duration = luce_image_codec_apng_duration(animation.frames()[0]) if read > 0 else 0
+        var image = luce_image_codec_still(try luce_image_codec_bitmap(first, width, height), duration, animation.info.loop_count)
+        image.color_space = color_space
+        return image
+    var image = PlatformDecodedImage(color_space = color_space)
+    image.is_animated = read > 1
+    image.loop_count = animation.info.loop_count
+    image.frame_count = (u32)read
+    for index in 0..<read:
+        try animation.render(index, pixels)
+        let duration = luce_image_codec_apng_duration(animation.frames()[index])
+        ak.vector_append_t(&image.frames, PlatformFrame(bitmap = try luce_image_codec_bitmap(pixels, width, height), duration = (usize)duration))
+        ak.vector_append_t(&image.all_durations, duration)
+    return image

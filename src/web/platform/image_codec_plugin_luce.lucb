@@ -1,7 +1,7 @@
 #==============================================================================================
 #
 #   image_codec_plugin_luce - the engine's Platform::ImageCodecPlugin: images decoded in
-#   process by our luce packages, animated GIFs streamed frame by frame
+#   process by our luce packages, animations (GIF, WebP, APNG) streamed frame by frame
 #
 #   DESCRIPTION:
 #       Ladybird's WebView::ImageCodecPlugin (Libraries/LibWebView/Plugins/ImageCodecPlugin.cpp)
@@ -13,10 +13,10 @@
 #
 #       decode_image answers a promise at once and decodes on the next turn of the event loop,
 #       as the ImageDecoder's reply arrives later. A still image resolves with its one frame.
-#       An animated GIF starts a streaming session, as ConnectionFromClient does for an
-#       animated image of more than one frame: the promise hears every frame's duration, the
-#       loop count, the session id and the first STREAMING_BATCH_SIZE composited frames, and
-#       the plugin keeps the GIF (a copy of its bytes, in the C heap) for
+#       An animated GIF, WebP or PNG of more than one frame starts a streaming session, as
+#       ConnectionFromClient does for an animated image: the promise hears every frame's
+#       duration, the loop count, the session id and the first STREAMING_BATCH_SIZE composited
+#       frames, and the plugin keeps the image (a copy of its bytes, in the C heap) for
 #       request_animation_frames, which decodes the frames AnimatedDecodedImageData asks for
 #       on a later turn and hands them to on_animation_frames_decoded (or reports
 #       on_animation_decode_failed). stop_animation_decode ends the session and cancels a
@@ -41,9 +41,9 @@ pub struct LuceImageCodecPlugin: IsPlatformImageCodecPlugin:
 ## An animated image whose frames the plugin decodes on request (ConnectionFromClient::AnimationSession),
 ## all in the C heap.
 struct LuceImageCodecAnimationSession:
-    ## A copy of the GIF, which the animation reads.
+    ## A copy of the image, which the animation reads.
     var encoded_data: u8[]
-    var animation: gif_codec.Animation
+    var animation: LuceImageCodecAnimation
     ## The canvas each frame is rendered through, RGBA.
     var pixels: u8[]
     var frame_count: u32
@@ -96,38 +96,50 @@ func luce_image_codec_plugin_decode_image(this: PlatformImageCodecPlugin*, bytes
     core_deferred_invoke(ak.Function0[unit](call = LuceImageCodecPluginDecode.call, context = captures))
     return promise
 
-## decode_image_to_details with the job's completion: an animated GIF of more than one frame starts a
-## streaming session and answers its first frames; anything else decodes whole.
+## decode_image_to_details with the job's completion: an animated GIF, WebP or PNG of more than one
+## frame starts a streaming session and answers its first frames; anything else decodes whole.
 func luce_image_codec_plugin_decode_details(this: LuceImageCodecPlugin*, bytes: const u8[]) -> PlatformDecodedImage!:
-    if luce_image_codec_sniff(bytes) == LuceImageCodecFormat.gif:
-        let found = try gif_codec.info(bytes)
-        if found.animated():
-            return try luce_image_codec_plugin_start_session(this, bytes)
+    let kind = luce_image_codec_sniff(bytes)
+    if try luce_image_codec_plugin_streams(kind, bytes):
+        return try luce_image_codec_plugin_start_session(this, kind, bytes)
     return try luce_image_codec_plugin_decode(bytes)
+
+## Whether the image in `bytes`, of `kind`, is an animation of more than one frame: one the plugin
+## streams.
+func luce_image_codec_plugin_streams(kind: LuceImageCodecFormat, bytes: const u8[]) -> bool!:
+    match kind:
+        .gif:
+            let found = try gif_codec.info(bytes)
+            return found.animated()
+        .webp:
+            return try luce_image_codec_webp_streams(bytes)
+        .png:
+            return luce_image_codec_apng_streams(bytes)
+        _:
+            return false
 
 # mark: Streaming animations ====================================================================
 
-## Opens a streaming session on the animated GIF in `bytes`: every frame's duration (no pixels decoded
-## for them), the loop count, and the first STREAMING_BATCH_SIZE frames composited; the session keeps a
-## copy of the GIF for the frames requested later.
-func luce_image_codec_plugin_start_session(this: LuceImageCodecPlugin*, bytes: const u8[]) -> PlatformDecodedImage!:
-    let session = try luce_image_codec_animation_session_create(bytes)
+## Opens a streaming session on the animated image in `bytes`, of `kind`: every frame's duration (no
+## pixels decoded for them), the loop count, the color space, and the first STREAMING_BATCH_SIZE frames
+## composited; the session keeps a copy of the image for the frames requested later.
+func luce_image_codec_plugin_start_session(this: LuceImageCodecPlugin*, kind: LuceImageCodecFormat, bytes: const u8[]) -> PlatformDecodedImage!:
+    let session = try luce_image_codec_animation_session_create(kind, bytes)
     errdefer luce_image_codec_animation_session_destroy(session)
 
-    let frames = session.animation.frames()
-    var image = PlatformDecodedImage(color_space = luce_image_codec_srgb())
+    var image = PlatformDecodedImage(color_space = try luce_image_codec_animation_color_space(kind, bytes))
     image.is_animated = true
-    image.loop_count = session.animation.info.plays()
+    image.loop_count = session.animation.loop_count
     image.frame_count = session.frame_count
     # Collect all durations cheaply (no pixel decode).
-    for frame in frames:
-        ak.vector_append_t(&image.all_durations, frame.duration)
+    for index in 0..<(usize)session.frame_count:
+        ak.vector_append_t(&image.all_durations, session.animation.duration(index))
 
     # Decode only the first batch of frames.
     let batch_size = ak.min(luce_image_codec_streaming_batch_size, session.frame_count)
     for index in 0..<(usize)batch_size:
-        let bitmap = try luce_image_codec_gif_frame(&session.animation, index, session.pixels)
-        ak.vector_append_t(&image.frames, PlatformFrame(bitmap = bitmap, duration = (usize)frames[index].duration))
+        let bitmap = try luce_image_codec_animation_frame(&session.animation, index, session.pixels)
+        ak.vector_append_t(&image.frames, PlatformFrame(bitmap = bitmap, duration = (usize)session.animation.duration(index)))
 
     # Keep the decoder for future frame requests.
     image.session_id = this.m_next_session_id
@@ -136,16 +148,27 @@ func luce_image_codec_plugin_start_session(this: LuceImageCodecPlugin*, bytes: c
         _ = ak.hash_map_set(&this.m_animation_sessions, image.session_id, session)
     return image
 
-## A session over a C-heap copy of the GIF in `bytes`.
-func luce_image_codec_animation_session_create(bytes: const u8[]) -> LuceImageCodecAnimationSession*!:
+## The color space of an animated image of `kind`: a WebP's ICC profile (a file whose chunks WebPMux
+## refuses fails), a PNG's cICP or iCCP, else sRGB.
+func luce_image_codec_animation_color_space(kind: LuceImageCodecFormat, bytes: const u8[]) -> gfx.ColorSpace!:
+    match kind:
+        .webp:
+            return luce_image_codec_webp_color_space(try webp_codec.icc_profile(bytes))
+        .png:
+            return luce_image_codec_png_color_space(bytes)
+        _:
+            return luce_image_codec_srgb()
+
+## A session over a C-heap copy of the animated image in `bytes`, of `kind`.
+func luce_image_codec_animation_session_create(kind: LuceImageCodecFormat, bytes: const u8[]) -> LuceImageCodecAnimationSession*!:
     let encoded_data = try new u8[bytes.length] --- in memory.heap
     errdefer free(encoded_data) in memory.heap
     memory.copy(encoded_data, bytes, bytes.length)
-    var animation = try luce_image_codec_gif_open(encoded_data)
+    var animation = try luce_image_codec_animation_open(kind, encoded_data)
     errdefer animation.release()
-    let pixels = try new u8[animation.info.width * animation.info.height * 4] --- in memory.heap
+    let pixels = try new u8[animation.width * animation.height * 4] --- in memory.heap
     errdefer free(pixels) in memory.heap
-    let session = try new LuceImageCodecAnimationSession(encoded_data = encoded_data, animation = animation, pixels = pixels, frame_count = (u32)animation.frames().length) in memory.heap
+    let session = try new LuceImageCodecAnimationSession(encoded_data = encoded_data, animation = animation, pixels = pixels, frame_count = (u32)animation.frame_count) in memory.heap
     return session
 
 ## Frees a session and what it holds.
@@ -177,7 +200,7 @@ struct LuceImageCodecPluginFrameRequest:
         var bitmaps: ak.Vector[gfx.Bitmap*]
         ak.vector_ensure_capacity(&bitmaps, (usize)(captures.end_index - captures.start_frame_index))
         for index in (usize)captures.start_frame_index..<(usize)captures.end_index:
-            let bitmap = luce_image_codec_gif_frame(&session.animation, index, session.pixels) catch:
+            let bitmap = luce_image_codec_animation_frame(&session.animation, index, session.pixels) catch:
                 if ak.function1_is_set(&plugin.plugin.on_animation_decode_failed):
                     ak.function1_call(&plugin.plugin.on_animation_decode_failed, captures.session_id)
                 return
