@@ -395,7 +395,7 @@ let html_div_element_vtable = HtmlElementVTable(
 
 pub let html_div_element_class = ClassInfo(name = "HTMLDivElement",
     first_id = (u16)ClassId.html_div_element, last_id = (u16)ClassId.html_div_element,
-    size = sizeof(HtmlDivElement), vtable = (const JsCellVTable*)&html_div_element_vtable,
+    size = memory.size_of(HtmlDivElement), vtable = (const JsCellVTable*)&html_div_element_vtable,
     mixins = &html_div_element_mixins)
 ```
 
@@ -652,12 +652,12 @@ int`, `CSSPixels < float`) are spelled with an explicit conversion of the other 
 pub struct CssPixels:                                  # PixelUnits.h
     pub var m_value: i32                               # fixed point, 6 fractional bits
 
-    static func from_raw(value: i32) -> CssPixels: return CssPixels(m_value = value)
-    static func from_int(value: i64) -> CssPixels:    # template<Signed I> CSSPixels(I)
+    func from_raw(value: i32) -> CssPixels: return CssPixels(m_value = value)
+    func from_int(value: i64) -> CssPixels:    # template<Signed I> CSSPixels(I)
         if value > (i64)css_pixels_max_integer_value: return CssPixels(m_value = i32_max)
         if value < (i64)css_pixels_min_integer_value: return CssPixels(m_value = i32_min)
         return CssPixels(m_value = (i32)value << css_pixels_fractional_bits)
-    static func nearest_value_for(value: f64) -> CssPixels: ...
+    func nearest_value_for(value: f64) -> CssPixels: ...
 
     func add(other: CssPixels) -> CssPixels:
         return CssPixels.from_raw(ak.saturating_add(self.m_value, other.m_value))
