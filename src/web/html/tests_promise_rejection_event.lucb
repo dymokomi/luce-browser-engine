@@ -1,0 +1,113 @@
+#==============================================================================================
+#
+#   tests_promise_rejection_event - PromiseRejectionEvent and the unhandledrejection event that
+#   notifying about rejected promises fires
+#
+#   DESCRIPTION:
+#       Ladybird tests these through Tests/LibWeb/Text (script), so these pin the C++ region p2r
+#       ports: PromiseRejectionEvent::create makes a trusted Event with the init's promise and
+#       reason; a promise rejected with no handler is reported at the next microtask checkpoint
+#       by a global task that fires a cancelable unhandledrejection at the window, adds the
+#       promise to the outstanding rejected promises weak set unless a listener handled it, and
+#       reports a rejection nobody canceled to the console. The helpers are web_idl/tests_promise's,
+#       tests_toggle_event's, tests_html_browsing's and dom/tests_events'.
+#
+#==============================================================================================
+
+# mark: Helpers =================================================================================
+
+## What a recording unhandledrejection listener saw.
+struct TestRejectionSeen:
+    var calls: i32
+    var cancelable: bool
+    var promise: JsObject*?
+    var reason: JsValue
+    var cancel: bool
+
+## A native listener recording the PromiseRejectionEvent it gets, and canceling it when asked.
+func test_rejection_listener_call(context: void*?, vm: Vm*) -> JsValue!:
+    let seen = (TestRejectionSeen*)(context else trap("no captures"))
+    let event = as_html_promise_rejection_event((gc.Cell*)js_value_as_object(vm_argument(vm, 0)))
+    seen.calls += 1
+    seen.cancelable = dom_event_cancelable(event.dom_event())
+    seen.promise = html_promise_rejection_event_promise(event)
+    seen.reason = html_promise_rejection_event_reason(event)
+    if seen.cancel:
+        dom_event_prevent_default(event.dom_event())
+    return js_undefined()
+
+## An IDLEventListener over a native function recording into `seen`.
+func test_rejection_listener(realm: Realm*, seen: TestRejectionSeen*) -> DomIdlEventListener*:
+    let function = js_native_function_create(realm, JsNativeFunctionBehaviour(call = test_rejection_listener_call, context = seen), 1, ak.utf16_fly_string_new(), realm)
+    let callback = realm_create_idl_callback_type_realm(realm, (JsObject*)function, realm, IdlOperationReturnsPromise.no)
+    return dom_idl_event_listener_create(realm, callback)
+
+## Runs the queued tasks of the main thread event loop, oldest first.
+func test_rejection_run_tasks():
+    let queue = html_event_loop_task_queue(html_main_thread_event_loop())
+    while let task = html_task_queue_take_first_runnable(queue):
+        html_task_execute(task)
+
+# mark: Tests ===================================================================================
+
+test "PromiseRejectionEvent::create: a trusted Event with the init's promise and reason":
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    let settings = test_promise_enter(realm)
+    let promise = idl_create_promise(realm)
+    var init = html_promise_rejection_event_init_default()
+    assert(init.promise == none and js_value_is_undefined(init.reason))
+    init.promise = js_promise_capability_promise(promise)
+    init.reason = js_value_from_f64(7.0)
+    let event = html_promise_rejection_event_create(realm, html_event_names_rejectionhandled, init)
+    assert(is_dom_event(event) and is_html_promise_rejection_event(event) and not is_html_before_unload_event(event))
+    assert(dom_event_is_trusted(event.dom_event()) and not dom_event_cancelable(event.dom_event()))
+    assert(test_fly_is(dom_event_type(event.dom_event()), "rejectionhandled"))
+    assert(html_promise_rejection_event_promise(event) == js_promise_capability_promise(promise))
+    assert(test_promise_is_number(html_promise_rejection_event_reason(event), 7.0))
+    test_promise_leave(settings)
+
+test "notify about rejected promises: unhandledrejection at the window; unhandled ones stay outstanding":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    _ = web_test_install_agent(vm)
+    web_test_install_event_loop_plugin()
+    defer web_test_remove_event_loop_plugin()
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        let (test_page, traversable) = test_browsing_page_with_traversable(vm)
+        _ = test_page
+        let document = html_navigable_active_document(traversable.html_navigable()) else trap("no document")
+        let window = dom_document_window(document) else trap("no window")
+        let realm = dom_document_realm(document)
+        test_rejection_run_tasks()
+        var seen = TestRejectionSeen(reason = js_undefined(), cancel = true)
+        dom_event_target_add_event_listener(window.dom_event_target(), html_event_names_unhandledrejection, test_rejection_listener(realm, &seen), test_add_options())
+        let mixin = &window.universal_global_scope_mixin
+
+        # A rejection a listener cancels: the event is fired, the promise stays not handled and outstanding.
+        var settings = test_promise_enter(realm)
+        let canceled = idl_create_rejected_promise(realm, js_value_from_f64(3.0))
+        test_promise_leave(settings)
+        assert(seen.calls == 0)
+        test_rejection_run_tasks()
+        assert(seen.calls == 1 and seen.cancelable and seen.promise == js_promise_capability_promise(canceled))
+        assert(test_promise_is_number(seen.reason, 3.0))
+        assert(ak.vector_size(&mixin.m_outstanding_rejected_promises_weak_set) == 1)
+
+        # A promise handled before the task runs is skipped.
+        settings = test_promise_enter(realm)
+        let late = idl_create_rejected_promise(realm, js_value_from_f64(4.0))
+        test_promise_leave(settings)
+        idl_mark_promise_as_handled(late)
+        test_rejection_run_tasks()
+        assert(seen.calls == 1)
+
+        # A rejection with a DOMException nobody cancels is reported to the console.
+        seen.cancel = false
+        settings = test_promise_enter(realm)
+        let exception = idl_dom_exception_create_fly_string(realm, ak.fly_string_from_str("NetworkError"), ak.utf16_string_from_str("Failed to load font"))
+        _ = idl_create_rejected_promise(realm, js_value_from_object((JsObject*)exception))
+        test_promise_leave(settings)
+        test_rejection_run_tasks()
+        assert(seen.calls == 2 and ak.vector_size(&mixin.m_outstanding_rejected_promises_weak_set) == 2)
