@@ -1655,7 +1655,8 @@ virtuals over a CPU rasterizer that needs: paths (fill nonzero/even-odd, stroke 
 dashes), anti-aliasing, linear/radial/conic gradients with color stops and interpolation spaces,
 image drawing with nearest/bilinear/bicubic sampling and repeats, clip stacks (rect, rounded rect,
 path), layers with opacity and all CSS blend modes, box and text shadows (Gaussian blur),
-backdrop and CSS filters, 3D-free transforms, and glyph runs.
+backdrop and CSS filters, transforms with perspective (an SkM44 per canvas state, paths cut at
+w = 0 and projected as SkPath::transform does), and glyph runs.
 
 Decided: the rasterizer is the `raster` module of **luce-browser-render**, a faithful Luce port
 of **tiny-skia**'s algorithms (Rust, BSD-3: itself a port of Skia's CPU raster pipeline), so
