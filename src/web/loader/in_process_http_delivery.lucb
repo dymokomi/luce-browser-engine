@@ -1,0 +1,116 @@
+#==============================================================================================
+#
+#   in_process_http_delivery - what the in-process client's http(s) requests deliver: the
+#   headers, the body chunks and the end, each on a later turn of the event loop, and the
+#   timing info
+#
+#   DESCRIPTION:
+#       RequestServer sends WebContent a request's headers, its body and its end as separate
+#       messages that LibRequests handles on WebContent's event loop. The connections here
+#       read on the event loop too, from their notifiers; what they read is copied into
+#       managed memory and delivered by a deferred invocation of its own, in order, so the
+#       request's callbacks (ResourceLoader's, Fetch's) never run inside a connection's step
+#       and may start or stop requests freely. A stopped request is delivered nothing more.
+#
+#       The timing info is RequestServer's (Request::acquire_timing_info) over curl's
+#       cumulative times, measured from the request's start: when the request was handed a
+#       connection (queue), resolved, connected, secured (zero without TLS), began to be sent
+#       (pretransfer), received its first byte (starttransfer) and ended (total). A reused
+#       connection takes no time to resolve, connect or secure.
+#
+#       Not a port: new code of the RequestClient seam (DESIGN.md §7.1).
+#
+#       Copyright (c) 2026 the luce-browser authors.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Deliveries ==============================================================================
+
+## What a delivery hands the request.
+enum InProcessHttpDeliveryKind:
+    headers
+    data
+    finish
+
+## One delivery (managed memory, kept by the event loop's queue until it runs).
+struct InProcessHttpDelivery:
+    var state: InProcessRequest*
+    var kind: InProcessHttpDeliveryKind
+    var headers: HttpHeaderList*?
+    var status_code: u32
+    var reason_phrase: ak.String
+    var data: ak.ByteBuffer
+    var total_size: u64
+    var timing_info: RequestsRequestTimingInfo
+    var network_error: RequestsNetworkError?
+
+    ## Delivers to the request, unless it was stopped.
+    static func run(context: void*?):
+        let delivery = (InProcessHttpDelivery*)(context else trap("in-process http: no delivery"))
+        let state = delivery.state
+        match delivery.kind:
+            .headers:
+                let headers = delivery.headers else trap("in-process http: no headers")
+                in_process_request_deliver_headers(state, headers, delivery.status_code, delivery.reason_phrase)
+            .data:
+                in_process_request_deliver_data(state, ak.byte_buffer_bytes_const(&delivery.data))
+            .finish:
+                if not state.stopped:
+                    requests_request_did_finish(state.request, delivery.total_size, delivery.timing_info, delivery.network_error)
+
+## Queues `delivery` on the event loop.
+func in_process_http_post(delivery: InProcessHttpDelivery*):
+    core_deferred_invoke(ak.Function0[unit](call = InProcessHttpDelivery.run, context = delivery))
+
+## The response headers, delivered on a later turn of the event loop.
+func in_process_http_post_headers(state: InProcessRequest*, headers: HttpHeaderList*, status_code: u32, reason_phrase: ak.String):
+    let delivery = new InProcessHttpDelivery(state = state, kind = InProcessHttpDeliveryKind.headers, headers = headers, status_code = status_code,
+                                             reason_phrase = reason_phrase) else trap("out of memory")
+    in_process_http_post(delivery)
+
+## A chunk of the body (copied), delivered on a later turn of the event loop.
+func in_process_http_post_data(state: InProcessRequest*, data: const u8[]):
+    let bytes = ak.byte_buffer_copy_span_u8(data) else trap("out of memory")
+    let delivery = new InProcessHttpDelivery(state = state, kind = InProcessHttpDeliveryKind.data, data = bytes) else trap("out of memory")
+    in_process_http_post(delivery)
+
+## The end of the request, delivered on a later turn of the event loop. The request is finished from now on: stopping
+## it answers false.
+func in_process_http_post_finish(state: InProcessRequest*, total_size: u64, timing_info: RequestsRequestTimingInfo, network_error: RequestsNetworkError?):
+    if state.finished:
+        return
+    state.finished = true
+    let delivery = new InProcessHttpDelivery(state = state, kind = InProcessHttpDeliveryKind.finish, total_size = total_size, timing_info = timing_info,
+                                             network_error = network_error) else trap("out of memory")
+    in_process_http_post(delivery)
+
+# mark: Timing ==================================================================================
+
+## Microseconds from the request's start to `at` (zero when `at` is not set or earlier).
+func in_process_http_since_start(state: const InProcessRequest*, at: u64) -> i64:
+    if at <= state.start_nanoseconds:
+        return 0
+    return (i64)((at - state.start_nanoseconds) // 1000)
+
+## The timing info of the request `connection` carries, now (RequestServer's Request::acquire_timing_info).
+func in_process_http_timing_info(connection: const InProcessHttpConnection*, state: const InProcessRequest*) -> RequestsRequestTimingInfo:
+    let exchange = &connection.exchange
+    let queue_time = in_process_http_since_start(state, exchange.acquired_at)
+    var domain_lookup_time = queue_time
+    var connect_time = queue_time
+    var secure_connect_time: i64 = 0
+    if not connection.reused:
+        domain_lookup_time = in_process_http_since_start(state, connection.resolved_at)
+        connect_time = in_process_http_since_start(state, connection.connected_at)
+        secure_connect_time = in_process_http_since_start(state, connection.secured_at)
+    let request_start_time = in_process_http_since_start(state, exchange.pretransfer_at)
+    let response_start_time = in_process_http_since_start(state, exchange.starttransfer_at)
+    let response_end_time = in_process_http_since_start(state, in_process_http_now())
+    let established = queue_time + domain_lookup_time + connect_time + secure_connect_time
+    return RequestsRequestTimingInfo(domain_lookup_start_microseconds = queue_time, domain_lookup_end_microseconds = queue_time + domain_lookup_time,
+                                     connect_start_microseconds = queue_time + domain_lookup_time, connect_end_microseconds = established,
+                                     secure_connect_start_microseconds = queue_time + domain_lookup_time + connect_time,
+                                     request_start_microseconds = established + request_start_time, response_start_microseconds = established + response_start_time,
+                                     response_end_microseconds = established + response_end_time, encoded_body_size = (i64)exchange.encoded,
+                                     http_version_alpn_identifier = RequestsAlpnHttpVersion.http1_0 if exchange.http_1_0 else RequestsAlpnHttpVersion.http1_1)

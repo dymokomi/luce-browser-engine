@@ -13,11 +13,14 @@
 #
 #       A request runs as a deferred invocation on the current Core event loop, so its
 #       callbacks are set before anything is delivered (RequestServer replies over IPC later
-#       too): the response headers, then the body in chunks, then the completion. An http(s)
-#       request blocks the event loop while it runs (connect, TLS, the whole response): the
-#       event loop seam watches no sockets yet (Core::Notifier), so the network reads happen
-#       inside that one invocation. stop_request stops delivery at the next chunk.
-#
+#       too): the response headers, then the body in chunks, then the completion. file: and
+#       data: requests are read in that invocation. http(s) requests do not block the event
+#       loop: their connections resolve, connect, handshake, send and receive from Core
+#       notifiers on the loop (in_process_http_connection.lucb, in_process_http.lucb), are
+#       kept alive and reused per origin (in_process_http_pool.lucb), and deliver what arrives
+#       on later turns of the loop (in_process_http_delivery.lucb). stop_request stops
+#       delivery at once; an http(s) request in progress closes its connection.
+
 #       PageClient::request_file is the embedder's (WebContent asks the UI process to open
 #       the file): in_process_request_file is an implementation an embedder's PageClient can
 #       forward to, opening the file with luce-std on the next turn of the event loop.
@@ -29,11 +32,25 @@
 
 # mark: The client ==============================================================================
 
-## The in-process RequestClient: the seam's client, and how long an http(s) request may take.
+## The in-process RequestClient: the seam's client, the settings of its http(s) requests (RequestServer's curl
+## options), and its connections.
 pub struct InProcessRequestClient:
     pub var client: RequestsRequestClient  # the seam's client first: a pointer to one is a pointer to the other
-    ## The time an http(s) request may take, from connecting to its last byte.
+    ## The time an http(s) request may take, from its start to its last byte; zero for no limit (RequestServer sets no
+    ## CURLOPT_TIMEOUT).
     pub var m_timeout_nanoseconds: u64
+    ## The time resolving, connecting and the TLS handshake of a new connection may take (RequestServer's
+    ## CURLOPT_CONNECTTIMEOUT, 90 seconds); zero for no limit.
+    pub var m_connect_timeout_nanoseconds: u64
+    ## The most connections to one origin, zero for no limit (CURLMOPT_MAX_HOST_CONNECTIONS, which RequestServer leaves
+    ## at curl's default, 0).
+    pub var m_max_host_connections: usize
+    ## How long an idle connection is kept for reuse (curl's CURLOPT_MAXAGE_CONN default, 118 seconds).
+    pub var m_max_idle_nanoseconds: u64
+    ## What https: servers' certificates are checked against: the public roots (CURLSSLOPT_NATIVE_CA's role).
+    pub var m_trust: tls_stream.Trust
+    ## The connections and the requests waiting for one (the C heap).
+    pub var m_pool: InProcessHttpPool
 
 ## The vtable of the in-process client.
 let in_process_request_client_vtable: RequestsRequestClientVTable = RequestsRequestClientVTable(start_request = in_process_request_client_start_request,
@@ -44,12 +61,14 @@ let in_process_request_client_vtable: RequestsRequestClientVTable = RequestsRequ
 ## it with ResourceLoader::initialize, DESIGN.md §3.3 rule 7).
 pub func in_process_request_client_create(heap: gc.Heap*) -> InProcessRequestClient*:
     with memory.heap:
-        let this = new InProcessRequestClient(client = RequestsRequestClient(vtable = &in_process_request_client_vtable, m_heap = heap),
-                                              m_timeout_nanoseconds = 30000000000) else trap("out of memory")
+        let this = new InProcessRequestClient(client = RequestsRequestClient(vtable = &in_process_request_client_vtable, m_heap = heap), m_timeout_nanoseconds = 0,
+                                              m_connect_timeout_nanoseconds = 90000000000, m_max_host_connections = 0, m_max_idle_nanoseconds = 118000000000,
+                                              m_trust = tls_stream.Trust()) else trap("out of memory")
         requests_request_client_construct(&this.client, &in_process_request_client_vtable, heap)
         return this
 
-## One request of the in-process client: what start_request was given, and whether it was stopped.
+## One request of the in-process client: what start_request was given, whether it was stopped or has finished, and
+## for http(s) its origin, its bytes and where it is in the pool (in_process_http.lucb).
 struct InProcessRequest:
     var client: InProcessRequestClient*
     var request: RequestsRequest*
@@ -59,6 +78,16 @@ struct InProcessRequest:
     var request_body: ak.ByteBuffer
     var stopped: bool
     var finished: bool
+    ## When the request started (monotonic nanoseconds).
+    var start_nanoseconds: u64
+    var origin: InProcessHttpOrigin
+    ## The request's head and body, as sent.
+    var outgoing: ak.ByteBuffer
+    ## The connection carrying the request (the C heap), or none.
+    var connection: InProcessHttpConnection*?
+    ## Whether the request waits in the pool's queue, and whether it was retried on a new connection.
+    var waiting: bool
+    var retried: bool
 
 ## The client's start_request: the request runs on the next turn of the event loop.
 func in_process_request_client_start_request(base: RequestsRequestClient*, request: RequestsRequest*, arguments: const RequestsStartRequest*) -> bool:
@@ -68,22 +97,25 @@ func in_process_request_client_start_request(base: RequestsRequestClient*, reque
         request_headers = ak.vector_clone(http_header_list_headers(headers))
     let body = ak.byte_buffer_copy_span_u8(arguments.request_body) else trap("out of memory")
     let state = new InProcessRequest(client = this, request = request, method = arguments.method, url = arguments.url, request_headers = request_headers,
-                                     request_body = body, stopped = false, finished = false) else trap("out of memory")
+                                     request_body = body, stopped = false, finished = false, origin = InProcessHttpOrigin(secure = false, host = ak.String(), port = 0)) else trap("out of memory")
     request.m_client_data = state
     core_deferred_invoke(ak.Function0[unit](call = in_process_request_run, context = state))
     return true
 
-## The client's stop_request: nothing more is delivered to the request.
+## The client's stop_request: nothing more is delivered to the request; an http(s) request leaves the pool's queue or
+## closes its connection.
 func in_process_request_client_stop_request(base: RequestsRequestClient*, request: RequestsRequest*) -> bool:
     let state = (InProcessRequest*)(request.m_client_data else return false)
     if state.finished or state.stopped:
         return false
     state.stopped = true
+    in_process_http_stop(state)
     return true
 
-## The client's ensure_connection: the in-process client keeps no connections, so there is nothing to prepare.
+## The client's ensure_connection: a connection to the URL's origin opened ahead of a request (CreateConnection).
 func in_process_request_client_ensure_connection(base: RequestsRequestClient*, url: web_url.Url, cache_level: RequestServerCacheLevel):
-    return
+    let this = (InProcessRequestClient*)base
+    in_process_http_pool_preconnect(this, url, cache_level)
 
 # mark: Running a request =======================================================================
 

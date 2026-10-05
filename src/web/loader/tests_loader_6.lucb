@@ -1,0 +1,375 @@
+#==============================================================================================
+#
+#   tests_loader_6 - the non-blocking in-process client: Core::Notifier and the loop's
+#   readiness wait, a response dripping while timers fire, keep-alive reuse, concurrency and
+#   the per-host limit, a streamed gzip body, cancellation, timeouts, connection errors,
+#   TLS, preconnects, and a load of concurrent requests
+#
+#   DESCRIPTION:
+#       The http(s) tests run on tests_loader_5.lucb's server, through the in-process client
+#       and the loader tests' event loop (LoaderTestEventLoop: deferred invocations, then the
+#       notifiers whose descriptors are ready, then the timers that are due). Each log checks
+#       the delivery order LibRequests gives WebContent: the headers, the body chunks, the
+#       end, once. Redirects through Fetch over the new client are tests_fetching_3's.
+#
+#==============================================================================================
+
+# mark: Helpers =================================================================================
+
+## Runs the loader tests' loop for `milliseconds`, whatever is pending.
+func net_test_spin(event_loop: LoaderTestEventLoop*, milliseconds: u64):
+    let end = loader_test_now() + milliseconds * 1000000
+    while loader_test_now() < end:
+        while not ak.vector_is_empty(&event_loop.deferred):
+            _ = event_loop.pump(CoreEventLoopPumpMode.dont_wait_for_events)
+        if core_event_loop_notifiers_count(&event_loop.notifiers) == 0:
+            thread.sleep(1)
+        else:
+            var deadline = net.Deadline.at(end)
+            if let due = event_loop.next_due():
+                if due < end:
+                    deadline = net.Deadline.at(due)
+            _ = core_event_loop_notifiers_wait(&event_loop.notifiers, deadline)
+            _ = core_event_loop_notifiers_dispatch(&event_loop.notifiers)
+        _ = event_loop.fire_timers()
+
+## Waits (at most two seconds) until `counter` reaches `value`.
+func net_test_wait_for(counter: (@u64)*, value: u64):
+    var waited = 0
+    while counter.load(.acquire) < value and waited < 200:
+        thread.sleep(10)
+        waited += 1
+
+## Whether `log` heard one complete success with the body `text`, in order.
+func net_test_succeeded(log: const LoaderTestSeamLog*, text: str) -> bool:
+    return log.finishes == 1 and log.network_error == none and log.status_code == 200 and not log.out_of_order and log.received(text)
+
+## The client's connections: (all, idle).
+func net_test_counts(client: const InProcessRequestClient*) -> (usize, usize):
+    return in_process_request_client_connection_counts(client)
+
+## A repeating timer's ticks.
+struct NetTestTicks:
+    var count: i32
+
+    static func tick(context: void*?):
+        let ticks = (NetTestTicks*)(context else trap("no ticks"))
+        ticks.count += 1
+
+## A notifier's activations, and another notifier it disables when it fires.
+struct NetTestActivations:
+    var count: i32
+    var disable: CoreNotifier*?
+
+    static func activated(context: void*?):
+        let activations = (NetTestActivations*)(context else trap("no activations"))
+        activations.count += 1
+        if let other = activations.disable:
+            core_notifier_set_enabled(other, false)
+
+# mark: The event loop ==========================================================================
+
+test "Core::Notifier: registered while enabled; the loop's wait activates the notifiers whose descriptors are ready":
+    let event_loop = install_test_event_loop()
+    var listener = net.Listener.bind(net.SocketAddress.loopback(0)) else trap("a listener")
+    defer listener.destroy()
+    var outgoing = net.Connection.connect(listener.address() else trap("an address")) else trap("a connection")
+    defer outgoing.destroy()
+    var incoming = listener.accept() else trap("accepted")
+    defer incoming.destroy()
+    let fd = (i32)(incoming.descriptor() else trap("a descriptor"))
+
+    var reads = NetTestActivations()
+    var writes = NetTestActivations()
+    let read = core_notifier_create(fd, CoreNotificationType.read)
+    read.on_activation = ak.Function0[unit](call = NetTestActivations.activated, context = &reads)
+    let write = core_notifier_create(fd, CoreNotificationType.write)
+    write.on_activation = ak.Function0[unit](call = NetTestActivations.activated, context = &writes)
+    assert(event_loop.notifier_registrations == 2 and core_event_loop_notifiers_count(&event_loop.notifiers) == 2)
+
+    # Writable at once, nothing to read: the write notifier only (both share the descriptor's slot).
+    let soon = net.Deadline.after(1000000000) else trap("a deadline")
+    assert(core_event_loop_notifiers_wait(&event_loop.notifiers, soon) == 1)
+    assert(core_event_loop_notifiers_dispatch(&event_loop.notifiers) == 1 and writes.count == 1 and reads.count == 0)
+    # A byte arrives: both.
+    _ = outgoing.write(b"x") else trap("written")
+    _ = incoming.wait(net.WaitInterest.read, soon) else trap("the byte arrives")
+    assert(core_event_loop_notifiers_wait(&event_loop.notifiers, soon) == 2)
+    _ = core_event_loop_notifiers_dispatch(&event_loop.notifiers)
+    assert(writes.count == 2 and reads.count == 1)
+
+    # Disabled: no longer watched; set_type re-registers; close unregisters for good.
+    core_notifier_set_enabled(write, false)
+    assert(event_loop.notifier_unregistrations == 1 and core_event_loop_notifiers_count(&event_loop.notifiers) == 1)
+    core_notifier_set_type(read, CoreNotificationType.write)
+    assert(event_loop.notifier_registrations == 3 and core_notifier_type(read) == CoreNotificationType.write)
+    core_notifier_set_type(read, CoreNotificationType.read)
+    # A notifier unregistered by an activation before it in the same dispatch is not activated.
+    reads.disable = write
+    core_notifier_set_enabled(write, true)
+    _ = core_event_loop_notifiers_wait(&event_loop.notifiers, soon)
+    _ = core_event_loop_notifiers_dispatch(&event_loop.notifiers)
+    assert(reads.count == 2 and writes.count == 2)
+    core_notifier_close(read)
+    assert(core_notifier_fd(read) == -1 and not core_notifier_is_enabled(read))
+    core_notifier_set_enabled(read, true)
+    assert(core_event_loop_notifiers_count(&event_loop.notifiers) == 0)
+    # Nothing registered: the wait answers at once.
+    assert(core_event_loop_notifiers_wait(&event_loop.notifiers, net.Deadline()) == 0)
+    core_event_loop_installed = none
+
+# mark: Requests on the event loop ==============================================================
+
+test "the in-process client: a response that drips arrives in chunks while timers keep firing; keep-alive reuse":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    # The VM's heap is current, as the engine runs: what the requests deliver is managed, kept by the loop's queue.
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        var event_loop = LoaderTestEventLoop()
+        loader_test_install_event_loop(&event_loop)
+        defer loader_test_remove_event_loop()
+        let client = in_process_request_client_create(vm_heap(vm))
+        let server = net_test_server_start()
+
+        # The body comes ten bytes every 30 ms; a 5 ms timer fires all along.
+        var ticks = NetTestTicks()
+        let timer = core_timer_create_repeating(5, ak.Function0[unit](call = NetTestTicks.tick, context = &ticks))
+        core_timer_start(timer)
+        let (drip, _) = net_test_get(client, server, "/drip")
+        loader_test_drain(&event_loop)
+        core_timer_stop(timer)
+        assert(net_test_succeeded(drip, "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789"))
+        assert(drip.chunks >= 5 and ticks.count >= 20 and drip.total_size == 100)
+
+        # The connection is kept: the next requests reuse it, one after another.
+        for _ in 0..<5:
+            let (again, _) = net_test_get(client, server, "/id")
+            loader_test_drain(&event_loop)
+            assert(net_test_succeeded(again, "1"))
+        assert(server.accepted.load(.acquire) == 1)
+        let (all, idle) = net_test_counts(client)
+        assert(all == 1 and idle == 1)
+
+        # A response that closes the connection without saying so: the next request gets a new connection.
+        let (closing, _) = net_test_get(client, server, "/close")
+        loader_test_drain(&event_loop)
+        assert(net_test_succeeded(closing, "close"))
+        let (fresh, _) = net_test_get(client, server, "/id")
+        loader_test_drain(&event_loop)
+        assert(net_test_succeeded(fresh, "2") and server.accepted.load(.acquire) == 2)
+        in_process_request_client_close_idle_connections(client)
+        net_test_server_stop(server)
+
+test "the in-process client: concurrent requests, the per-host limit, a gzip body streamed in chunks":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    # The VM's heap is current, as the engine runs: what the requests deliver is managed, kept by the loop's queue.
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        var event_loop = LoaderTestEventLoop()
+        loader_test_install_event_loop(&event_loop)
+        defer loader_test_remove_event_loop()
+        let client = in_process_request_client_create(vm_heap(vm))
+        let server = net_test_server_start()
+
+        # Twenty at once, no limit: twenty connections, served together.
+        var logs: ak.Vector[LoaderTestSeamLog*]
+        for _ in 0..<20:
+            let (log, _) = net_test_get(client, server, "/keep")
+            ak.vector_append_t(&logs, log)
+        loader_test_drain(&event_loop)
+        for log in ak.vector_span_const(&logs):
+            assert(net_test_succeeded(log, "keep"))
+        assert(server.accepted.load(.acquire) == 20)
+        in_process_request_client_close_idle_connections(client)
+
+        # At most two connections to the origin: the others wait and take them in turn.
+        client.m_max_host_connections = 2
+        ak.vector_clear(&logs)
+        for _ in 0..<10:
+            let (log, _) = net_test_get(client, server, "/id")
+            ak.vector_append_t(&logs, log)
+        let (all, _) = net_test_counts(client)
+        assert(all == 0)
+        loader_test_drain(&event_loop)
+        for log in ak.vector_span_const(&logs):
+            assert(log.finishes == 1 and log.network_error == none and not log.out_of_order)
+            assert(log.received("21") or log.received("22"))
+        assert(server.accepted.load(.acquire) == 22)
+
+        # A gzip body sent chunked, a growing piece at a time: decoded as it comes, delivered in chunks.
+        let (gzip, _) = net_test_get(client, server, "/chunked-gzip")
+        loader_test_drain(&event_loop)
+        let text = net_test_gzip_text()
+        defer free(text) in memory.heap
+        assert(gzip.finishes == 1 and gzip.network_error == none and not gzip.out_of_order and gzip.chunks >= 2)
+        assert(gzip.total_size == (u64)text.length and ak.compare_bytes(ak.byte_buffer_bytes_const(&gzip.data), text) == 0)
+        in_process_request_client_close_idle_connections(client)
+        net_test_server_stop(server)
+
+test "the in-process client: stopping a request in flight closes its connection; a waiting one leaves the queue; timeouts":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    # The VM's heap is current, as the engine runs: what the requests deliver is managed, kept by the loop's queue.
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        var event_loop = LoaderTestEventLoop()
+        loader_test_install_event_loop(&event_loop)
+        defer loader_test_remove_event_loop()
+        let client = in_process_request_client_create(vm_heap(vm))
+        let server = net_test_server_start()
+        client.m_max_host_connections = 1
+
+        # A request the server never answers, and one waiting behind it for the only connection.
+        let (stalled, stalled_request) = net_test_get(client, server, "/hang")
+        let (queued, queued_request) = net_test_get(client, server, "/keep")
+        net_test_spin(&event_loop, 100)
+        assert(stalled.headers == none and queued.headers == none)
+        assert(requests_request_stop(queued_request))
+        assert(requests_request_stop(stalled_request))
+        assert(not requests_request_stop(stalled_request))
+        net_test_wait_for(&server.abandoned, 1)
+        assert(server.abandoned.load(.acquire) == 1)
+        net_test_spin(&event_loop, 50)
+        assert(stalled.finishes == 0 and queued.finishes == 0)
+        let (all, _) = net_test_counts(client)
+        assert(all == 0)
+
+        # A finished request cannot be stopped.
+        let (done, done_request) = net_test_get(client, server, "/keep")
+        loader_test_drain(&event_loop)
+        assert(net_test_succeeded(done, "keep") and not requests_request_stop(done_request))
+
+        # The request's time limit: TimeoutReached, and the connection is closed.
+        client.m_timeout_nanoseconds = 200000000
+        let (timed_out, _) = net_test_get(client, server, "/hang")
+        loader_test_drain(&event_loop)
+        assert(timed_out.finishes == 1 and timed_out.network_error == RequestsNetworkError.timeout_reached and timed_out.headers == none)
+        net_test_wait_for(&server.abandoned, 2)
+        assert(server.abandoned.load(.acquire) == 2)
+        in_process_request_client_close_idle_connections(client)
+        net_test_server_stop(server)
+
+test "the in-process client: names resolved off the loop, unknown hosts, refused connections, preconnects":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    # The VM's heap is current, as the engine runs: what the requests deliver is managed, kept by the loop's queue.
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        var event_loop = LoaderTestEventLoop()
+        loader_test_install_event_loop(&event_loop)
+        defer loader_test_remove_event_loop()
+        let client = in_process_request_client_create(vm_heap(vm))
+        let server = net_test_server_start()
+
+        # localhost is resolved on the lookup's thread (its addresses tried in order: ::1 is refused, 127.0.0.1 answers).
+        let (named, _) = net_test_get(client, server, "/keep", "localhost")
+        loader_test_drain(&event_loop)
+        assert(net_test_succeeded(named, "keep"))
+        let (unknown, _) = loader_test_start(client, "http://no-such-host.invalid/")
+        loader_test_drain(&event_loop)
+        assert(unknown.finishes == 1 and unknown.headers == none)
+        assert(unknown.network_error == RequestsNetworkError.unable_to_resolve_host or unknown.network_error == RequestsNetworkError.unable_to_connect)
+        var closed = net.Listener.bind(net.SocketAddress.loopback(0)) else trap("a listener")
+        let closed_port = (closed.address() else trap("an address")).port
+        closed.destroy()
+        var refused_url = ak.string_builder_new()
+        ak.string_builder_append(&refused_url, "http://127.0.0.1:")
+        loader_test_append_number(&refused_url, (i64)closed_port)
+        ak.string_builder_append(&refused_url, "/")
+        let (refused, _) = loader_test_start(client, ak.string_view_text(ak.string_builder_string_view(&refused_url)))
+        loader_test_drain(&event_loop)
+        assert(refused.finishes == 1 and refused.network_error == RequestsNetworkError.unable_to_connect)
+        in_process_request_client_close_idle_connections(client)
+
+        # ensure_connection (CreateConnection): the connection is opened ahead and the request takes it.
+        let id_url = net_test_url(server, "/id")
+        requests_request_client_ensure_connection(&client.client, loader_test_url(ak.string_view_text(ak.byte_string_view(&id_url))), RequestServerCacheLevel.create_connection)
+        net_test_wait_for(&server.accepted, 2)
+        net_test_spin(&event_loop, 50)
+        let (all, idle) = net_test_counts(client)
+        assert(all == 1 and idle == 1)
+        let (preconnected, _) = net_test_get(client, server, "/id")
+        loader_test_drain(&event_loop)
+        assert(net_test_succeeded(preconnected, "2") and server.accepted.load(.acquire) == 2)
+        in_process_request_client_close_idle_connections(client)
+        net_test_server_stop(server)
+
+test "the in-process client: https: on a TLS server with a pinned issuer, kept alive; an untrusted certificate fails":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    # The VM's heap is current, as the engine runs: what the requests deliver is managed, kept by the loop's queue.
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        var event_loop = LoaderTestEventLoop()
+        loader_test_install_event_loop(&event_loop)
+        defer loader_test_remove_event_loop()
+        let server = net_test_server_start(true)
+        let client = in_process_request_client_create(vm_heap(vm))
+        client.m_trust = tls_stream.Trust.pinned_issuer(server.issuer_x, server.issuer_y) else trap("a pinned issuer")
+
+        let (secure, _) = net_test_get(client, server, "/keep", "localhost")
+        loader_test_drain(&event_loop)
+        assert(net_test_succeeded(secure, "keep"))
+        let (big, _) = net_test_get(client, server, "/big", "localhost")
+        loader_test_drain(&event_loop)
+        assert(big.finishes == 1 and big.network_error == none and not big.out_of_order and ak.byte_buffer_size(&big.data) == net_test_big_size)
+        let body = ak.byte_buffer_bytes_const(&big.data)
+        for index in 0..<body.length:
+            assert(body[index] == net_test_big_byte(index))
+        assert(server.accepted.load(.acquire) == 1)
+        in_process_request_client_close_idle_connections(client)
+
+        # The public roots do not include the test certificate's issuer.
+        let untrusting = in_process_request_client_create(vm_heap(vm))
+        let (refused, _) = net_test_get(untrusting, server, "/keep", "localhost")
+        loader_test_drain(&event_loop)
+        assert(refused.finishes == 1 and refused.network_error == RequestsNetworkError.ssl_handshake_failed and refused.headers == none)
+        net_test_server_stop(server)
+
+test "the in-process client under load: hundreds of concurrent requests, with and without a per-host limit":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    # The VM's heap is current, as the engine runs: what the requests deliver is managed, kept by the loop's queue.
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        var event_loop = LoaderTestEventLoop()
+        loader_test_install_event_loop(&event_loop)
+        defer loader_test_remove_event_loop()
+        let server = net_test_server_start()
+        let client = in_process_request_client_create(vm_heap(vm))
+        let text = net_test_gzip_text()
+        defer free(text) in memory.heap
+        for round in 0..<4:
+            client.m_max_host_connections = 0 if round % 2 == 0 else 6
+            in_process_request_client_close_idle_connections(client)
+            let accepted_before = server.accepted.load(.acquire)
+            var logs: ak.Vector[LoaderTestSeamLog*]
+            var paths: ak.Vector[i32]
+            for index in 0..<150:
+                let kind = (i32)(index % 15)
+                var path = "/keep"
+                if kind == 1:
+                    path = "/chunked-gzip"
+                elif kind == 2:
+                    path = "/drip"
+                elif kind == 3 and index % 45 == 3:
+                    path = "/big"
+                let (log, _) = net_test_get(client, server, path)
+                ak.vector_append_t(&logs, log)
+                ak.vector_append_t(&paths, kind if path != "/keep" else 0)
+            loader_test_drain(&event_loop)
+            for index in 0..<ak.vector_size(&logs):
+                let log = *ak.vector_at_const(&logs, index)
+                assert(log.finishes == 1 and log.network_error == none and not log.out_of_order and log.status_code == 200)
+                match *ak.vector_at_const(&paths, index):
+                    1: assert(ak.compare_bytes(ak.byte_buffer_bytes_const(&log.data), text) == 0)
+                    2: assert(ak.byte_buffer_size(&log.data) == 100)
+                    3: assert(ak.byte_buffer_size(&log.data) == net_test_big_size)
+                    _: assert(log.received("keep"))
+            # With the limit, six connections carry all of them.
+            if round % 2 == 1:
+                assert(server.accepted.load(.acquire) - accepted_before <= 6)
+        in_process_request_client_close_idle_connections(client)
+        net_test_server_stop(server)

@@ -1,0 +1,272 @@
+#==============================================================================================
+#
+#   tests_loader_5 - a loopback HTTP/1.1 server for the non-blocking in-process client: keep-
+#   alive connections served concurrently, slow and stalled responses, TLS
+#
+#   DESCRIPTION:
+#       tests_loader_3.lucb's server answers one connection at a time and closes it; the
+#       non-blocking client needs more: a server on 127.0.0.1 (luce-std net, the C heap) that
+#       accepts on a thread of its own and serves every connection on a thread of its own,
+#       request after request while the client keeps the connection alive, optionally over
+#       TLS (luce-tls's Stream.accept_tls with a self-signed certificate minted for
+#       localhost). It counts the connections it accepted and the most it served at once, and
+#       answers by path: a small body (/keep, /id: the connection's number), a body dripped a
+#       few bytes at a time (/drip), a large gzip body sent chunked in pieces
+#       (/chunked-gzip), a large body (/big), a response that closes the connection without
+#       saying so (/close), and no response at all until the client goes away (/hang).
+#       tests_loader_6.lucb has the tests.
+#
+#==============================================================================================
+
+# mark: The server ==============================================================================
+
+## The server's state, in the C heap.
+struct NetTestServer:
+    var listener: net.Listener
+    var port: u16
+    var secure: bool
+    var certificate: u8[2048]
+    var certificate_length: usize
+    var key: u8[32]
+    var issuer_x: u8[32]
+    var issuer_y: u8[32]
+    var gzip_body: u8[]
+    var stopping: @u64
+    ## Connections accepted, served now, the most served at once, and stalled requests the client abandoned.
+    var accepted: @u64
+    var active: @u64
+    var most_active: @u64
+    var abandoned: @u64
+    var accept_thread: thread.Handle
+
+## The bytes of the body /big sends: 1 MiB of a pattern.
+let net_test_big_size: usize = 1048576
+
+## The byte of /big's body at `index`.
+func net_test_big_byte(index: usize) -> u8:
+    return (u8)((index * 7 + index // 251) % 256)
+
+## The text of /chunked-gzip's body: 4000 numbered lines.
+func net_test_gzip_text() -> u8[]:
+    var builder = ak.string_builder_new()
+    for line in 0..<4000:
+        ak.string_builder_append(&builder, "line ")
+        loader_test_append_number(&builder, (i64)line)
+        ak.string_builder_append(&builder, " of the streamed gzip body\n")
+    let text = ak.string_builder_to_byte_string(&builder)
+    let bytes = ak.byte_string_bytes(&text)
+    let copy = (new u8[bytes.length] --- in memory.heap) else trap("out of memory")
+    memory.copy(copy, bytes, bytes.length)
+    return copy
+
+## What one connection's thread serves: the server and its connection's number.
+struct NetTestConnection:
+    var server: NetTestServer*
+    var connection: net.Connection
+    var number: u64
+
+## Reads a request's head (and its Content-Length body) into `buffer`; answers its target, or none at the end of the
+## stream.
+func net_test_read_request(stream: tls_stream.Stream*, buffer: u8[], used: usize*) -> str?:
+    while true:
+        if let end = net.http_head_end(buffer[..<*used]):
+            let body_length = loader_test_server_content_length(buffer[..<end])
+            while *used < end + body_length:
+                let count = stream.read(buffer[*used..]) catch: return none
+                if count == 0:
+                    return none
+                *used += count
+            var first: usize = 0
+            while first < end and buffer[first] != ' ':
+                first += 1
+            var second = first + 1
+            while second < end and buffer[second] != ' ':
+                second += 1
+            let target = (str)buffer[first + 1..<second]
+            return target
+        if *used == buffer.length:
+            return none
+        let count = stream.read(buffer[*used..]) catch: return none
+        if count == 0:
+            return none
+        *used += count
+
+## Writes all of `bytes`; false when the client went away.
+func net_test_write(stream: tls_stream.Stream*, bytes: const u8[]) -> bool:
+    _ = stream.write(bytes) catch: return false
+    return true
+
+## Answers one request for `target`; false when the connection must close afterwards.
+func net_test_answer(served: NetTestConnection*, stream: tls_stream.Stream*, target: str) -> bool:
+    let server = served.server
+    if target == "/keep":
+        return net_test_write(stream, b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nkeep")
+    if target == "/id":
+        var head: u8[64] = ---
+        var text: u8[20] = ---
+        var digits: usize = 0
+        var number = served.number
+        while digits == 0 or number > 0:
+            text[19 - digits] = '0' + (u8)(number % 10)
+            number = number // 10
+            digits += 1
+        let prefix = "HTTP/1.1 200 OK\r\nContent-Length: "
+        memory.copy(head, prefix.bytes, prefix.length)
+        var length = prefix.length
+        head[length] = '0' + (u8)digits
+        memory.copy(head[length + 1..], b"\r\n\r\n", 4)
+        length += 5
+        memory.copy(head[length..], text[20 - digits..], digits)
+        length += digits
+        return net_test_write(stream, head[..<length])
+    if target == "/drip":
+        if not net_test_write(stream, b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n"):
+            return false
+        for _ in 0..<10:
+            thread.sleep(30)
+            if not net_test_write(stream, b"0123456789"):
+                return false
+        return true
+    if target == "/chunked-gzip":
+        if not net_test_write(stream, b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n"):
+            return false
+        let body = server.gzip_body
+        var at: usize = 0
+        var piece: usize = 1
+        while at < body.length:
+            let size = body.length - at if body.length - at < piece else piece
+            var line: u8[16] = ---
+            let digits = "0123456789abcdef"
+            var count: usize = 0
+            var rest = size
+            var reversed: u8[16] = ---
+            while count == 0 or rest > 0:
+                reversed[count] = digits.bytes[rest % 16]
+                rest = rest // 16
+                count += 1
+            for index in 0..<count:
+                line[index] = reversed[count - 1 - index]
+            line[count] = '\r'
+            line[count + 1] = '\n'
+            if not net_test_write(stream, line[..<count + 2]) or not net_test_write(stream, body[at..<at + size]) or not net_test_write(stream, b"\r\n"):
+                return false
+            at += size
+            piece = piece * 3 + 1
+            if piece < 64:
+                thread.sleep(2)
+        return net_test_write(stream, b"0\r\n\r\n")
+    if target == "/big":
+        if not net_test_write(stream, b"HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\n\r\n"):
+            return false
+        var block: u8[65536] = ---
+        var at: usize = 0
+        while at < net_test_big_size:
+            for index in 0..<block.length:
+                block[index] = net_test_big_byte(at + index)
+            if not net_test_write(stream, block):
+                return false
+            at += block.length
+        return true
+    if target == "/close":
+        _ = net_test_write(stream, b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nclose")
+        return false
+    if target == "/hang":
+        # Nothing until the client goes away (its read answers the end of the stream).
+        var buffer: u8[64] = ---
+        while true:
+            let count = stream.read(buffer) catch: break
+            if count == 0:
+                break
+        _ = server.abandoned.add(1, .acq_rel)
+        return false
+    _ = net_test_write(stream, b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+    return true
+
+## One connection's thread: requests until the client closes the connection (or a response closes it).
+func net_test_serve(context: void*?):
+    let served = (NetTestConnection*)(context else trap("no connection"))
+    let server = served.server
+    let active = server.active.add(1, .acq_rel) + 1
+    var most = server.most_active.load(.acquire)
+    while active > most:
+        let (swapped, seen) = server.most_active.cas(most, active, .acq_rel, .acquire)
+        if swapped:
+            break
+        most = seen
+    var stream = tls_stream.Stream.plain(served.connection)
+    var usable = true
+    if server.secure:
+        stream.accept_tls(server.certificate[..<server.certificate_length], server.key) catch:
+            usable = false
+    var buffer: u8[8192] = ---
+    while usable:
+        var used: usize = 0
+        let target = net_test_read_request(&stream, buffer, &used) else break
+        if not net_test_answer(served, &stream, target):
+            break
+    _ = stream.close() catch: recover ()
+    _ = server.active.add(0xFFFFFFFFFFFFFFFF, .acq_rel)
+    free(served) in memory.heap
+
+## The accepting thread: a thread per connection until the server stops.
+func net_test_accept(context: void*?):
+    let server = (NetTestServer*)(context else trap("no server"))
+    while server.stopping.load(.acquire) == 0:
+        let connection = server.listener.accept() catch: return
+        if server.stopping.load(.acquire) != 0:
+            var unused = connection
+            unused.destroy()
+            return
+        let number = server.accepted.add(1, .acq_rel) + 1
+        let served = (new NetTestConnection(server = server, connection = connection, number = number) in memory.heap) else trap("out of memory")
+        let handle = thread.spawn(net_test_serve, served, name = "net-test-connection") else trap("a connection's thread")
+        handle.detach()
+
+## A server on 127.0.0.1, over TLS when `secure`, accepting on its own thread.
+func net_test_server_start(secure: bool = false) -> NetTestServer*:
+    with memory.heap:
+        let listener = net.Listener.bind(net.SocketAddress.loopback(0)) else trap("the server's listener")
+        let address = listener.address() else trap("the server's address")
+        let server = new NetTestServer(listener = listener, port = address.port, secure = secure) else trap("out of memory")
+        let text = net_test_gzip_text()
+        server.gzip_body = compress_gzip.encode(text, 6) else trap("the gzip body")
+        free(text) in memory.heap
+        if secure:
+            crypto.ecdsa_p256_keygen(server.key, server.issuer_x, server.issuer_y) else trap("a key")
+            server.certificate_length = tls_x509.mint_self_signed("localhost", server.key, server.issuer_x, server.issuer_y, server.certificate) else trap("a certificate")
+        server.accept_thread = thread.spawn(net_test_accept, server, name = "net-test-server") else trap("the server's thread")
+        return server
+
+## The end of a server: it stops accepting, waits (at most five seconds) for its connections' threads to end, and is
+## freed. The client must have closed its connections first.
+func net_test_server_stop(server: NetTestServer*):
+    server.stopping.store(1, .release)
+    with memory.heap:
+        # Wake the accepting thread with one last connection.
+        var wake = net.Connection.connect(net.SocketAddress.loopback(server.port)) catch: recover net.Connection()
+        wake.destroy()
+    var joined = server.accept_thread
+    joined.join() else trap("the server's thread joins")
+    var waited = 0
+    while server.active.load(.acquire) > 0 and waited < 500:
+        thread.sleep(10)
+        waited += 1
+    assert(server.active.load(.acquire) == 0, "the server's connections ended")
+    server.listener.destroy()
+    free(server.gzip_body) in memory.heap
+    free(server) in memory.heap
+
+## `http(s)://<host>:<port><path>` on `server`.
+func net_test_url(server: const NetTestServer*, path: str, host: str = "127.0.0.1") -> ak.ByteString:
+    var builder = ak.string_builder_new()
+    ak.string_builder_append(&builder, "https://" if server.secure else "http://")
+    ak.string_builder_append(&builder, host)
+    ak.string_builder_append(&builder, ":")
+    loader_test_append_number(&builder, (i64)server.port)
+    ak.string_builder_append(&builder, path)
+    return ak.string_builder_to_byte_string(&builder)
+
+## Starts a GET of `path` on `server` through `client`.
+func net_test_get(client: InProcessRequestClient*, server: const NetTestServer*, path: str, host: str = "127.0.0.1") -> (LoaderTestSeamLog*, RequestsRequest*):
+    let url = net_test_url(server, path, host)
+    return loader_test_start(client, ak.string_view_text(ak.byte_string_view(&url)))

@@ -1,0 +1,164 @@
+#==============================================================================================
+#
+#   event_loop_notifiers - the notifiers of an event loop: their registry and the readiness
+#   wait, for the embedders' loops
+#
+#   DESCRIPTION:
+#       The notifier half of LibCore's EventLoopManagerUnix (EventLoopImplementationUnix.cpp):
+#       ThreadData's notifier list (lines 276-282), register_notifier and unregister_notifier
+#       (lines 657-690), and the part of wait_for_events (lines 334-433) that polls the
+#       notifiers' descriptors until the next timer is due, then posts NotifierActivation for
+#       each notifier whose descriptor is ready for its type. An embedder's event loop keeps a
+#       CoreEventLoopNotifiers, forwards its register_notifier and unregister_notifier to it,
+#       waits through core_event_loop_notifiers_wait instead of sleeping until its next timer,
+#       and processes the activations (core_event_loop_notifiers_dispatch) with its other
+#       events: the deferred invocations queued before the wait, then the notifiers, then the
+#       timers, the order ThreadEventQueue processes what wait_for_events posted.
+#
+#       The wait is luce-std net's Poller (poll on macOS and Linux, WSAPoll on Windows, as
+#       Ladybird polls), made for each wait in the C heap with one slot per descriptor:
+#       several notifiers of one descriptor (a socket's read and write notifiers) share a slot
+#       with their interests combined, since the poller takes each descriptor once. The wake
+#       pipe and POSIX signals are the embedder's: a loop of one thread has no other waker.
+#
+#       Copyright (c) 2018-2026, the Ladybird developers.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+## A registered notifier and its registration's serial number: a notifier unregistered and
+## registered again (or freed and another made at its address) is a new registration.
+pub struct CoreEventLoopNotifierEntry:
+    pub var notifier: CoreNotifier*
+    pub var serial: u64
+
+## The notifiers of an event loop (ThreadData's notifiers) and those the last wait found ready.
+## It lives where its loop does (managed storage the loop's owner keeps alive).
+pub struct CoreEventLoopNotifiers:
+    pub var m_entries: ak.Vector[CoreEventLoopNotifierEntry]
+    pub var m_activated: ak.Vector[CoreEventLoopNotifierEntry]
+    pub var m_next_serial: u64
+
+## Ported from Libraries/LibCore/EventLoopImplementationUnix.cpp:657 EventLoopManagerUnix::register_notifier.
+pub func core_event_loop_notifiers_register(this: CoreEventLoopNotifiers*, notifier: CoreNotifier*):
+    this.m_next_serial += 1
+    ak.vector_append_t(&this.m_entries, CoreEventLoopNotifierEntry(notifier = notifier, serial = this.m_next_serial))
+
+## Ported from Libraries/LibCore/EventLoopImplementationUnix.cpp:671 EventLoopManagerUnix::unregister_notifier.
+pub func core_event_loop_notifiers_unregister(this: CoreEventLoopNotifiers*, notifier: CoreNotifier*):
+    for index in 0..<ak.vector_size(&this.m_entries):
+        if ak.vector_at_const(&this.m_entries, index).notifier == notifier:
+            _ = ak.vector_take(&this.m_entries, index)
+            return
+
+## How many notifiers are registered.
+pub func core_event_loop_notifiers_count(this: const CoreEventLoopNotifiers*) -> usize:
+    return ak.vector_size(&this.m_entries)
+
+## The poll events of a notifier's type (notification_type_to_poll_events): read, write or both. A notifier of
+## neither (hang-up or error only) is watched for reading; its activation keeps to its type.
+func core_event_loop_notifiers_interest(kind: CoreNotificationType) -> net.WaitInterest:
+    let read = core_notification_type_has(kind, CoreNotificationType.read)
+    let write = core_notification_type_has(kind, CoreNotificationType.write)
+    if read and write:
+        return net.WaitInterest.both
+    if write:
+        return net.WaitInterest.write
+    return net.WaitInterest.read
+
+## The notification a poll result stands for (wait_for_events, lines 421-427): hang-up makes a descriptor readable and
+## writable as well.
+func core_event_loop_notifiers_notification(ready: net.Readiness) -> CoreNotificationType:
+    var kind = CoreNotificationType.none_
+    if ready.readable:
+        kind = core_notification_type_union(kind, CoreNotificationType.read)
+    if ready.writable:
+        kind = core_notification_type_union(kind, CoreNotificationType.write)
+    if ready.hangup:
+        kind = core_notification_type_union(kind, CoreNotificationType.read)
+        kind = core_notification_type_union(kind, CoreNotificationType.write)
+        kind = core_notification_type_union(kind, CoreNotificationType.hang_up)
+    if ready.failure:
+        kind = core_notification_type_union(kind, CoreNotificationType.error_)
+    return kind
+
+## Ported from Libraries/LibCore/EventLoopImplementationUnix.cpp:334 EventLoopManagerUnix::wait_for_events, its
+## notifier part: waits until a registered notifier's descriptor is ready or `deadline` passes (net.Deadline() waits
+## without a limit, an expired one only looks), then records the notifiers whose descriptors are ready for their
+## type, for core_event_loop_notifiers_dispatch. Answers how many it recorded. With no notifier registered there is
+## nothing to watch: it answers zero at once, and the loop sleeps until its next timer itself.
+pub func core_event_loop_notifiers_wait(this: CoreEventLoopNotifiers*, deadline: net.Deadline) -> usize:
+    ak.vector_clear(&this.m_activated)
+    let count = ak.vector_size(&this.m_entries)
+    if count == 0:
+        return 0
+
+    # One slot per descriptor, the interests of its notifiers combined.
+    var slots: ak.Vector[i32]
+    var types: ak.Vector[CoreNotificationType]
+    for index in 0..<count:
+        let notifier = ak.vector_at_const(&this.m_entries, index).notifier
+        var found = false
+        for slot in 0..<ak.vector_size(&slots):
+            if *ak.vector_at_const(&slots, slot) == notifier.m_fd:
+                let combined = core_notification_type_union(*ak.vector_at_const(&types, slot), notifier.m_type)
+                *ak.vector_at(&types, slot) = combined
+                found = true
+                break
+        if not found:
+            ak.vector_append_t(&slots, notifier.m_fd)
+            ak.vector_append_t(&types, notifier.m_type)
+
+    let slot_count = ak.vector_size(&slots)
+    var readiness: ak.Vector[CoreNotificationType]
+    with memory.heap:
+        var poller = net.Poller.create(slot_count) else trap("EventLoopImplementationUnix::wait_for_events: no poller")
+        defer poller.destroy()
+        for slot in 0..<slot_count:
+            let descriptor = (std_platform.SocketDescriptor)*ak.vector_at_const(&slots, slot)
+            poller.watch(slot, descriptor, core_event_loop_notifiers_interest(*ak.vector_at_const(&types, slot))) catch failure:
+                ak.dbgln(f"EventLoopImplementationUnix::wait_for_events: {failure.message}")
+                trap("VERIFY_NOT_REACHED")
+        let marked = poller.wait(deadline) catch failure:
+            ak.dbgln(f"EventLoopImplementationUnix::wait_for_events: {failure.message}")
+            trap("VERIFY_NOT_REACHED")
+        if marked == 0:
+            return 0
+        for slot in 0..<slot_count:
+            let ready = poller.readiness(slot) else net.Readiness()
+            ak.vector_append_t(&readiness, core_event_loop_notifiers_notification(ready))
+
+    # Post NotifierActivation for each notifier whose descriptor is ready for its type.
+    for index in 0..<count:
+        let entry = *ak.vector_at_const(&this.m_entries, index)
+        for slot in 0..<slot_count:
+            if *ak.vector_at_const(&slots, slot) != entry.notifier.m_fd:
+                continue
+            let kind = core_notification_type_intersection(*ak.vector_at_const(&readiness, slot), entry.notifier.m_type)
+            if kind != CoreNotificationType.none_:
+                ak.vector_append_t(&this.m_activated, entry)
+            break
+    return ak.vector_size(&this.m_activated)
+
+## Whether the registration `entry` is still current.
+func core_event_loop_notifiers_is_registered(this: const CoreEventLoopNotifiers*, entry: CoreEventLoopNotifierEntry) -> bool:
+    for index in 0..<ak.vector_size(&this.m_entries):
+        let current = ak.vector_at_const(&this.m_entries, index)
+        if current.notifier == entry.notifier and current.serial == entry.serial:
+            return true
+    return false
+
+## The NotifierActivation events the last wait posted (ThreadEventQueue::process): each notifier still registered is
+## activated, in registration order; one unregistered by an earlier activation is skipped, as the event of a
+## destroyed receiver is. Answers how many were activated.
+pub func core_event_loop_notifiers_dispatch(this: CoreEventLoopNotifiers*) -> usize:
+    let activated = this.m_activated
+    this.m_activated = ak.Vector[CoreEventLoopNotifierEntry]()
+    var processed: usize = 0
+    for index in 0..<ak.vector_size(&activated):
+        let entry = *ak.vector_at_const(&activated, index)
+        if not core_event_loop_notifiers_is_registered(this, entry):
+            continue
+        core_notifier_event(entry.notifier)
+        processed += 1
+    return processed

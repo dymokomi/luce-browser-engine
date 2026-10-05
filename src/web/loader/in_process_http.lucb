@@ -1,69 +1,37 @@
 #==============================================================================================
 #
-#   in_process_http - the in-process client's http(s): requests: HTTP/1.1 over luce-std net
-#   and luce-tls
+#   in_process_http - the in-process client's http(s): requests: one HTTP/1.1 exchange on a
+#   connection, as a state machine on the event loop
 #
 #   DESCRIPTION:
-#       What RequestServer does with curl for one request, minimally (DESIGN.md §7.0): resolve
-#       and connect (luce-tls's Stream over luce-std net), a TLS 1.3 handshake for https:
-#       against the public roots, one HTTP/1.1 request with `Connection: close` (the request's
-#       method, its headers, Host, Accept-Encoding and the body's Content-Length), then the
-#       response head (net.http_parse_response; 1xx heads are skipped) and its body, fixed,
-#       chunked or until the connection closes (net.HttpBodyDecoder). A Content-Encoding
-#       (deflate, gzip, br, stacked) is decoded once the body is complete, as curl decodes it
-#       (in_process_http_encoding.lucb); other bodies are delivered as they arrive. Redirects
-#       are Fetch's (the 3xx response is delivered).
-#       No connection is reused, no proxy is used, and no cache is kept.
+#       What curl does for RequestServer with one transfer, without blocking the event loop.
+#       The request (its method, its headers with Host, Accept-Encoding and the body's
+#       Content-Length, then its body) is written as the socket takes it; the response is read
+#       as it arrives, from the connection's Core::Notifier: 1xx heads are skipped, the final
+#       head is parsed (net.http_parse_response), its headers delivered, and the body, fixed,
+#       chunked or until the connection closes (net.HttpBodyDecoder), is decoded through its
+#       Content-Encoding as it comes (in_process_http_encoding.lucb) and delivered chunk by
+#       chunk, then the end. Everything is delivered on later turns of the event loop
+#       (in_process_http_delivery.lucb), as RequestServer's replies reach WebContent over IPC.
+#       Redirects are Fetch's (the 3xx response is delivered). No proxy is used and no cache
+#       is kept.
 #
-#       luce-std and luce-tls allocate from the current allocator, and this runs with a VM's
-#       heap current: their calls run with the C heap current (they free what they make), and
-#       what they answer is copied into managed memory before it is delivered.
+#       Connections are kept alive (HTTP/1.1's default; curl sends no Connection field): after
+#       a complete response that does not close the connection, the connection returns to the
+#       pool for the next request to its origin (in_process_http_pool.lucb). A request that
+#       fails on a reused connection before any byte of its response arrived is retried once
+#       on a new connection, as curl retries when a kept-alive connection turns out to have
+#       been closed by the server ("Connection died, retrying a fresh connect"). Errors are
+#       the network errors RequestServer's curl_code_to_network_error makes of curl's codes.
+#
+#       Not a port: new code of the RequestClient seam (DESIGN.md §7.1).
 #
 #       Copyright (c) 2026 the luce-browser authors.
 #       SPDX-License-Identifier: BSD-2-Clause
 #
 #==============================================================================================
 
-# mark: Connecting ==============================================================================
-
-## The network error a failed connect (resolve, then TCP) stands for.
-func in_process_http_connect_error(code: ErrorCode) -> RequestsNetworkError:
-    if code == net.unknown_host or code == net.resolution_temporary:
-        return RequestsNetworkError.unable_to_resolve_host
-    if code == net.timed_out:
-        return RequestsNetworkError.timeout_reached
-    return RequestsNetworkError.unable_to_connect
-
-## Connects `stream` to `host`:`port`, with a TLS handshake when `secure`; answers the error, if any.
-func in_process_http_connect(stream: tls_stream.Stream*, host: str, port: u16, secure: bool, deadline: net.Deadline) -> RequestsNetworkError?:
-    with memory.heap:
-        let connected = tls_stream.Stream.connect(host, port, false, deadline) catch failure:
-            return in_process_http_connect_error(failure.code)
-        *stream = connected
-        if secure:
-            stream.start_tls(host) catch failure:
-                stream.destroy()
-                if failure.code == net.timed_out:
-                    return RequestsNetworkError.timeout_reached
-                return RequestsNetworkError.ssl_handshake_failed
-    return none
-
-## Sends all of `data`.
-func in_process_http_write(stream: tls_stream.Stream*, data: const u8[]) -> !:
-    with memory.heap:
-        _ = try stream.write(data)
-
-## Reads what has arrived into `buffer` (zero at the end of the stream).
-func in_process_http_read(stream: tls_stream.Stream*, buffer: u8[]) -> usize!:
-    with memory.heap:
-        return try stream.read(buffer)
-
-## Closes the connection, ignoring its errors.
-func in_process_http_close(stream: tls_stream.Stream*):
-    with memory.heap:
-        stream.destroy()
-
-# mark: The request =============================================================================
+# mark: Starting a request ======================================================================
 
 ## Whether the request's own headers name `name`.
 func in_process_http_has_header(state: const InProcessRequest*, name: str) -> bool:
@@ -74,7 +42,7 @@ func in_process_http_has_header(state: const InProcessRequest*, name: str) -> bo
     return false
 
 ## The request's head: its request line, Host, the request's headers, and the headers the client adds.
-func in_process_http_request_head(state: const InProcessRequest*, host: ak.StringView, port: u16, secure: bool) -> ak.ByteString:
+func in_process_http_request_head(state: const InProcessRequest*) -> ak.ByteString:
     var builder = ak.string_builder_new()
     ak.string_builder_append_string_view(&builder, ak.byte_string_view(&state.method))
     ak.string_builder_append(&builder, " ")
@@ -86,10 +54,12 @@ func in_process_http_request_head(state: const InProcessRequest*, host: ak.Strin
     ak.string_builder_append(&builder, " HTTP/1.1\r\n")
 
     if not in_process_http_has_header(state, "Host"):
+        let host = web_url.url_host(&state.url) else trap("VERIFY_NOT_REACHED")
+        let serialized = web_url.host_serialize(&host)
         ak.string_builder_append(&builder, "Host: ")
-        ak.string_builder_append_string_view(&builder, host)
-        if port != (u16)(443 if secure else 80):
-            let port_text = ak.string_number_u64((u64)port)
+        ak.string_builder_append_string_view(&builder, ak.string_bytes_as_string_view(&serialized))
+        if state.origin.port != (u16)(443 if state.origin.secure else 80):
+            let port_text = ak.string_number_u64((u64)state.origin.port)
             ak.string_builder_append(&builder, ":")
             ak.string_builder_append_string_view(&builder, ak.string_bytes_as_string_view(&port_text))
         ak.string_builder_append(&builder, "\r\n")
@@ -111,13 +81,8 @@ func in_process_http_request_head(state: const InProcessRequest*, host: ak.Strin
         ak.string_builder_append(&builder, "Content-Length: ")
         ak.string_builder_append_string_view(&builder, ak.string_bytes_as_string_view(&length_text))
         ak.string_builder_append(&builder, "\r\n")
-    ak.string_builder_append(&builder, "Connection: close\r\n\r\n")
+    ak.string_builder_append(&builder, "\r\n")
     return ak.string_builder_to_byte_string(&builder)
-
-## Microseconds of the monotonic clock, for the timing info.
-func in_process_http_now_microseconds() -> i64:
-    let now = ak.monotonic_time_now()
-    return ak.monotonic_time_nanoseconds(&now) // 1000
 
 ## The host to connect to: the URL's host serialized, an IPv6 address without its brackets.
 func in_process_http_host(url: const web_url.Url*) -> ak.String?:
@@ -129,129 +94,335 @@ func in_process_http_host(url: const web_url.Url*) -> ak.String?:
         return ak.string_from_utf8(ak.string_view_from_bytes(bytes[1..<bytes.length - 1])) else trap("MUST: String::from_utf8")
     return serialized
 
-## An http(s): request (see the header).
+## Fills the http(s) part of a request's state from its URL: its origin and the bytes it sends; false when the URL
+## has no host.
+func in_process_http_prepare(state: InProcessRequest*) -> bool:
+    state.origin = in_process_http_origin_of(&state.url) else return false
+    let head = in_process_http_request_head(state)
+    var outgoing = ak.byte_buffer_copy_span_u8(ak.byte_string_bytes(&head)) else trap("out of memory")
+    ak.byte_buffer_append_span_u8(&outgoing, ak.byte_buffer_bytes_const(&state.request_body))
+    state.outgoing = outgoing
+    return true
+
+## An http(s): request (see the header): a connection from the pool, or a new one.
 func in_process_http_run(state: InProcessRequest*):
-    var timing_info = RequestsRequestTimingInfo()
-    let scheme = web_url.url_scheme(&state.url)
-    let secure = ak.string_eq_string_view(&scheme, ak.sv("https"))
-    let maybe_host = in_process_http_host(&state.url)
-    if maybe_host == none:
-        in_process_request_finish(state, 0, timing_info, RequestsNetworkError.malformed_url)
+    state.start_nanoseconds = in_process_http_now()
+    if not in_process_http_prepare(state):
+        in_process_request_finish(state, 0, RequestsRequestTimingInfo(), RequestsNetworkError.malformed_url)
         return
-    let host_string = maybe_host else trap("VERIFY_NOT_REACHED")
-    let host_view = ak.string_bytes_as_string_view(&host_string)
-    let host = ak.string_view_text(host_view)
-    let port = web_url.url_port_or_default(&state.url)
+    in_process_http_pool_acquire(state.client, state, false)
 
-    let deadline = net.Deadline.after(state.client.m_timeout_nanoseconds) else net.Deadline()
-    timing_info.domain_lookup_start_microseconds = in_process_http_now_microseconds()
-    timing_info.connect_start_microseconds = timing_info.domain_lookup_start_microseconds
-    var stream = tls_stream.Stream()
-    if let connect_error = in_process_http_connect(&stream, host, port, secure, deadline):
-        in_process_request_finish(state, 0, timing_info, connect_error)
+## The client's stop_request for an http(s) request: it leaves the pool's queue, or the connection carrying it closes
+## (curl closes a connection whose transfer is abandoned part way).
+func in_process_http_stop(state: InProcessRequest*):
+    if state.waiting:
+        in_process_http_pool_forget(state.client, state)
         return
-    timing_info.connect_end_microseconds = in_process_http_now_microseconds()
-    timing_info.domain_lookup_end_microseconds = timing_info.connect_start_microseconds
-    if secure:
-        timing_info.secure_connect_start_microseconds = timing_info.connect_start_microseconds
-    timing_info.http_version_alpn_identifier = RequestsAlpnHttpVersion.http1_1
+    let connection = state.connection else return
+    in_process_http_connection_detach(connection)
+    in_process_http_connection_close(connection)
 
-    let network_error = in_process_http_exchange(state, &stream, host_view, port, secure, &timing_info)
-    in_process_http_close(&stream)
-    timing_info.response_end_microseconds = in_process_http_now_microseconds()
-    in_process_request_finish(state, (u64)timing_info.encoded_body_size, timing_info, network_error)
+# mark: The exchange ============================================================================
 
-# mark: The response ============================================================================
+## The current request's exchange on a connection (the C heap, with the connection).
+struct InProcessHttpExchange:
+    ## The request's bytes not yet written.
+    var outgoing: InProcessHttpBytes
+    ## The response's bytes received and not yet processed.
+    var incoming: InProcessHttpBytes
+    ## Where the search for the end of the head resumes.
+    var head_scanned: usize
+    var head_done: bool
+    var keep_alive: bool
+    var until_close: bool
+    var http_1_0: bool
+    var body: net.HttpBodyDecoder
+    var unencoder: InProcessHttpUnencoder
+    ## Bytes of the response received, of its body as sent, and of its body delivered (decoded).
+    var received: u64
+    var encoded: u64
+    var delivered: u64
+    ## When the request was handed this connection, began to be sent, and the response began (monotonic ns).
+    var acquired_at: u64
+    var pretransfer_at: u64
+    var starttransfer_at: u64
 
-## Sends the request and receives the response, delivering its head and body; answers the network error, if any.
-func in_process_http_exchange(state: InProcessRequest*, stream: tls_stream.Stream*, host: ak.StringView, port: u16, secure: bool, timing_info: RequestsRequestTimingInfo*) -> RequestsNetworkError?:
-    timing_info.request_start_microseconds = in_process_http_now_microseconds()
-    let head = in_process_http_request_head(state, host, port, secure)
-    in_process_http_write(stream, ak.byte_string_bytes(&head)) catch failure:
-        return in_process_http_connect_error(failure.code)
-    in_process_http_write(stream, ak.byte_buffer_bytes_const(&state.request_body)) catch failure:
-        return in_process_http_connect_error(failure.code)
+## Releases what an exchange holds and makes it ready for the next one.
+func in_process_http_exchange_release(exchange: InProcessHttpExchange*):
+    in_process_http_unencoder_close(&exchange.unencoder)
+    exchange.outgoing.release()
+    exchange.incoming.release()
+    exchange.head_scanned = 0
+    exchange.head_done = false
+    exchange.received = 0
+    exchange.encoded = 0
+    exchange.delivered = 0
 
-    # The response head: read until a final (not 1xx) head is complete.
-    var buffer: u8[16384] = ---
-    var received = ak.ByteBuffer()
-    var head_end: usize = 0
-    var response: net.HttpHead = ---
+## Starts the exchange of the request `connection` carries: its bytes are written as the socket takes them.
+func in_process_http_exchange_begin(connection: InProcessHttpConnection*):
+    let state = in_process_http_connection_state(connection) else trap("in-process http: no request")
+    let exchange = &connection.exchange
+    in_process_http_exchange_release(exchange)
+    exchange.outgoing.append(ak.byte_buffer_bytes_const(&state.outgoing))
+    exchange.pretransfer_at = in_process_http_now()
+    exchange.starttransfer_at = 0
+    connection.phase = InProcessHttpPhase.sending
+    in_process_http_connection_arm_timer(connection)
+    in_process_http_exchange_send(connection)
+
+## Whether a failure of the current exchange should be retried on a new connection: the connection was reused, no
+## byte of the response came, and the request was not retried already.
+func in_process_http_exchange_retryable(connection: const InProcessHttpConnection*) -> bool:
+    let state = in_process_http_connection_state(connection) else return false
+    return connection.reused and connection.exchange.received == 0 and not state.retried
+
+## The request goes to a new connection: this one closes.
+func in_process_http_exchange_retry(connection: InProcessHttpConnection*):
+    let state = in_process_http_connection_state(connection) else trap("in-process http: no request")
+    let client = connection.client
+    in_process_http_connection_detach(connection)
+    state.retried = true
+    in_process_http_connection_close(connection)
+    in_process_http_pool_acquire(client, state, true)
+
+## A transfer failed with `code`: retried, or the request finishes with the error (CURLE_SEND_ERROR,
+## CURLE_RECV_ERROR: Unknown; a timeout: TimeoutReached).
+func in_process_http_exchange_failed(connection: InProcessHttpConnection*, code: ErrorCode):
+    if in_process_http_exchange_retryable(connection):
+        in_process_http_exchange_retry(connection)
+        return
+    in_process_http_exchange_end(connection, RequestsNetworkError.timeout_reached if code == net.timed_out else RequestsNetworkError.unknown)
+
+## Writes what the socket takes of the request; once all of it is sent, the response is awaited.
+func in_process_http_exchange_send(connection: InProcessHttpConnection*):
+    let exchange = &connection.exchange
+    while exchange.outgoing.count() > 0:
+        var blocked = false
+        var failure: ErrorCode? = none
+        var sent: usize = 0
+        with memory.heap:
+            sent = connection.stream.write(exchange.outgoing.view()) catch problem:
+                if problem.code == io.would_block:
+                    blocked = true
+                else:
+                    failure = problem.code
+                recover 0
+        if let code = failure:
+            in_process_http_exchange_failed(connection, code)
+            return
+        if blocked:
+            in_process_http_connection_watch_stream(connection, true)
+            return
+        exchange.outgoing.consume(sent)
+    var flushed = false
+    var failure: ErrorCode? = none
+    with memory.heap:
+        flushed = connection.stream.flush() catch problem:
+            failure = problem.code
+            recover false
+    if let code = failure:
+        in_process_http_exchange_failed(connection, code)
+        return
+    if not flushed:
+        in_process_http_connection_watch_stream(connection, true)
+        return
+    connection.phase = InProcessHttpPhase.receiving
+    in_process_http_connection_watch_stream(connection, false)
+
+## Reads what has arrived and processes it, until the socket has nothing more or the exchange ends. A burst of reads
+## yields to the rest of the event loop; decrypted bytes the stream holds are always read first (no readiness shows
+## them).
+func in_process_http_exchange_receive(connection: InProcessHttpConnection*):
+    let exchange = &connection.exchange
+    var reads: usize = 0
+    while reads < 16 or connection.stream.pending() > 0:
+        reads += 1
+        let room = exchange.incoming.room(16384)
+        var blocked = false
+        var failure: ErrorCode? = none
+        var count: usize = 0
+        var ended = false
+        with memory.heap:
+            count = connection.stream.read(room) catch problem:
+                if problem.code == io.would_block:
+                    blocked = true
+                elif problem.code == io.unexpected_eof:
+                    # A TLS server that closed without close_notify: the end of the stream all the same.
+                    ended = true
+                else:
+                    failure = problem.code
+                recover 0
+        if let code = failure:
+            in_process_http_exchange_failed(connection, code)
+            return
+        if blocked:
+            break
+        if count == 0 or ended:
+            in_process_http_exchange_eof(connection)
+            return
+        exchange.incoming.grow(count)
+        if exchange.received == 0:
+            exchange.starttransfer_at = in_process_http_now()
+        exchange.received += (u64)count
+        if in_process_http_exchange_process(connection):
+            return
+    in_process_http_connection_watch_stream(connection, false)
+
+## The server closed the connection: the end of an until-close body, or a response cut short.
+func in_process_http_exchange_eof(connection: InProcessHttpConnection*):
+    let exchange = &connection.exchange
+    if not exchange.head_done:
+        if in_process_http_exchange_retryable(connection):
+            in_process_http_exchange_retry(connection)
+            return
+        # CURLE_GOT_NOTHING, or a head cut short (CURLE_WEIRD_SERVER_REPLY): Unknown.
+        in_process_http_exchange_end(connection, RequestsNetworkError.unknown)
+        return
+    exchange.keep_alive = false
+    var truncated = false
+    exchange.body.finish() catch:
+        truncated = true
+    if truncated:
+        # CURLE_PARTIAL_FILE.
+        in_process_http_exchange_end(connection, RequestsNetworkError.incomplete_content)
+        return
+    let failure = in_process_http_unencoder_finish(&exchange.unencoder)
+    in_process_http_exchange_end(connection, failure)
+
+## Processes the bytes received: the head, then the body. Answers whether the exchange ended (the connection then
+## carries another request or is gone).
+func in_process_http_exchange_process(connection: InProcessHttpConnection*) -> bool:
+    let exchange = &connection.exchange
+    while true:
+        if not exchange.head_done:
+            let available = exchange.incoming.view()
+            let found = net.http_head_end(available, exchange.head_scanned)
+            if found == none:
+                exchange.head_scanned = available.length - 3 if available.length > 3 else 0
+                if available.length > 65536:
+                    in_process_http_exchange_end(connection, RequestsNetworkError.unknown)
+                    return true
+                return false
+            let end = found else trap("VERIFY_NOT_REACHED")
+            exchange.head_scanned = 0
+            if in_process_http_exchange_head(connection, available[..<end]):
+                return true
+            continue
+        if exchange.incoming.count() == 0:
+            return false
+        var malformed = false
+        let step = exchange.body.consume(exchange.incoming.view()) catch:
+            malformed = true
+            recover net.HttpBodyStep()
+        if malformed:
+            # A broken chunk (CURLE_RECV_ERROR): Unknown.
+            in_process_http_exchange_end(connection, RequestsNetworkError.unknown)
+            return true
+        exchange.encoded += (u64)step.body.length
+        let failure = in_process_http_unencoder_write(&exchange.unencoder, exchange.unencoder.count, step.body)
+        exchange.incoming.consume(step.consumed)
+        if failure != none:
+            in_process_http_exchange_end(connection, failure)
+            return true
+        in_process_http_exchange_deliver_output(connection)
+        if exchange.body.finished():
+            # Bytes after the response: the connection cannot carry another request.
+            if exchange.incoming.count() > 0:
+                exchange.keep_alive = false
+            in_process_http_exchange_end(connection, in_process_http_unencoder_finish(&exchange.unencoder))
+            return true
+        if step.consumed == 0:
+            return false
+
+## A complete head: skipped when informational; else its headers are delivered and the body prepared. Answers
+## whether the exchange ended (a bad head, or no body).
+func in_process_http_exchange_head(connection: InProcessHttpConnection*, bytes: const u8[]) -> bool:
+    let state = in_process_http_connection_state(connection) else trap("in-process http: no request")
+    let exchange = &connection.exchange
     var storage: net.HttpField[100] = ---
     let method = ak.string_view_text(ak.byte_string_view(&state.method))
-    while true:
-        let available = ak.byte_buffer_bytes_const(&received)
-        if let end = net.http_head_end(available):
-            response = net.http_parse_response(available[..<end], storage, method) catch:
-                return RequestsNetworkError.unknown
-            if response.status >= 100 and response.status < 200 and response.status != 101:
-                # An informational head: drop it and wait for the final one.
-                let rest = ak.byte_buffer_copy_span_u8(available[end..]) else trap("out of memory")
-                received = rest
-                continue
-            head_end = end
-            break
-        let count = in_process_http_read(stream, buffer) catch failure:
-            return in_process_http_connect_error(failure.code)
-        if count == 0:
-            return RequestsNetworkError.incomplete_content
-        ak.byte_buffer_append_span_u8(&received, buffer[..<count])
-        if state.stopped:
-            return none
-    timing_info.response_start_microseconds = in_process_http_now_microseconds()
+    let parsed = in_process_http_parse_head(bytes, storage, method)
+    if parsed == none:
+        # CURLE_WEIRD_SERVER_REPLY: Unknown.
+        in_process_http_exchange_end(connection, RequestsNetworkError.unknown)
+        return true
+    let response = parsed else trap("VERIFY_NOT_REACHED")
+    var invalid = false
+    if response.status >= 100 and response.status < 200 and response.status != 101:
+        # An informational head: drop it and wait for the final one.
+        exchange.incoming.consume(bytes.length)
+        return false
+
+    # The Content-Encoding codings, which a bodiless response (1xx, 204, 304, HEAD) ignores.
+    let bodiless = response.status < 200 or response.status == 204 or response.status == 304 or net.http_equal(method, "HEAD")
+    var codings = InProcessHttpCodings()
+    if not bodiless:
+        codings = in_process_http_codings(&response)
+        if codings.too_many:
+            in_process_http_exchange_end(connection, RequestsNetworkError.invalid_content_encoding)
+            return true
+    exchange.body = net.HttpBodyDecoder.create(response.body_kind, response.body_length) catch:
+        invalid = true
+        recover net.HttpBodyDecoder()
+    if invalid:
+        in_process_http_exchange_end(connection, RequestsNetworkError.unknown)
+        return true
+    exchange.unencoder = in_process_http_unencoder_create(&codings)
+    exchange.keep_alive = response.keep_alive and response.status != 101
+    exchange.until_close = response.body_kind == net.HttpBodyKind.until_eof
+    exchange.http_1_0 = response.version == "HTTP/1.0"
+    exchange.head_done = true
 
     # The headers, copied out of the received bytes, and the reason phrase of the status line.
     var headers: ak.Vector[HttpHeader]
     for field in response.fields:
         ak.vector_append_t(&headers, http_header_create(ak.string_view_from_bytes(field.name.bytes), ak.string_view_from_bytes(field.value.bytes)))
-    let head_bytes = ak.byte_buffer_bytes_const(&received)
     var line_end: usize = 0
-    while line_end < head_end and head_bytes[line_end] != '\r':
+    while line_end < bytes.length and bytes[line_end] != '\r':
         line_end += 1
     # "HTTP/1.1 200 OK": the reason phrase starts after the status code.
     let reason_start: usize = 13 if line_end > 13 else line_end
-    let reason_phrase = ak.string_from_utf8(ak.string_view_from_bytes(head_bytes[reason_start..<line_end])) else ak.String()
-    # The Content-Encoding codings, which a bodiless response (1xx, 204, 304, HEAD) ignores.
-    var codings = InProcessHttpCodings()
-    let bodiless = response.status < 200 or response.status == 204 or response.status == 304 or net.http_equal(method, "HEAD")
-    if not bodiless:
-        codings = in_process_http_codings(&response)
-        if codings.too_many:
-            return RequestsNetworkError.invalid_content_encoding
-    let decoding = codings.count > 0
-    let body_kind = response.body_kind
-    let body_length = response.body_length
-    in_process_request_deliver_headers(state, http_header_list_create(headers), (u32)response.status, reason_phrase)
+    let reason_phrase = ak.string_from_utf8(ak.string_view_from_bytes(bytes[reason_start..<line_end])) else ak.String()
+    in_process_http_post_headers(state, http_header_list_create(headers), (u32)response.status, reason_phrase)
+    exchange.incoming.consume(bytes.length)
+    if exchange.body.finished():
+        in_process_http_exchange_end(connection, none)
+        return true
+    return false
 
-    # The body.
-    var decoder = net.HttpBodyDecoder.create(body_kind, body_length) catch:
-        return RequestsNetworkError.unknown
-    var encoded = ak.ByteBuffer()
-    let first = ak.byte_buffer_copy_span_u8(head_bytes[head_end..]) else trap("out of memory")
-    var pending: const u8[] = ak.byte_buffer_bytes_const(&first)
-    while not decoder.finished():
-        if state.stopped:
-            return none
-        if pending.length == 0:
-            let count = in_process_http_read(stream, buffer) catch failure:
-                return in_process_http_connect_error(failure.code)
-            if count == 0:
-                decoder.finish() catch:
-                    return RequestsNetworkError.incomplete_content
-                break
-            pending = buffer[..<count]
-        let step = decoder.consume(pending) catch:
-            return RequestsNetworkError.incomplete_content
-        timing_info.encoded_body_size += (i64)step.body.length
-        if decoding:
-            ak.byte_buffer_append_span_u8(&encoded, step.body)
-        else:
-            in_process_request_deliver_data(state, step.body)
-        pending = pending[step.consumed..]
+## The response head in `bytes`, if it parses.
+func in_process_http_parse_head(bytes: const u8[], storage: net.HttpField[], method: str) -> net.HttpHead?:
+    let response = net.http_parse_response(bytes, storage, method) catch:
+        return none
+    return response
 
-    if decoding:
-        var decoded = ak.ByteBuffer()
-        if let failure = in_process_http_unencode(&codings, ak.byte_buffer_bytes_const(&encoded), &decoded):
-            return failure
-        in_process_request_deliver_data(state, ak.byte_buffer_bytes_const(&decoded))
-    return none
+## Delivers the body decoded so far.
+func in_process_http_exchange_deliver_output(connection: InProcessHttpConnection*):
+    let exchange = &connection.exchange
+    let output = exchange.unencoder.output.view()
+    if output.length == 0:
+        return
+    let state = in_process_http_connection_state(connection) else trap("in-process http: no request")
+    in_process_http_post_data(state, output)
+    exchange.delivered += (u64)output.length
+    exchange.unencoder.output.clear()
+
+## The end of the exchange, with `network_error` or none: what was decoded is delivered, then the end; the connection
+## returns to the pool if it can carry another request, else it closes.
+func in_process_http_exchange_end(connection: InProcessHttpConnection*, network_error: RequestsNetworkError?):
+    let state = in_process_http_connection_state(connection) else trap("in-process http: no request")
+    let exchange = &connection.exchange
+    in_process_http_exchange_deliver_output(connection)
+    let timing_info = in_process_http_timing_info(connection, state)
+    let reusable = network_error == none and exchange.head_done and exchange.keep_alive and not exchange.until_close and exchange.incoming.count() == 0 and connection.stream.queued() == 0
+    in_process_http_connection_detach(connection)
+    in_process_http_post_finish(state, exchange.delivered, timing_info, network_error)
+    in_process_http_exchange_release(exchange)
+    connection.reused = true
+    if not reusable:
+        in_process_http_connection_close(connection)
+        return
+    in_process_http_connection_unwatch(connection)
+    connection.phase = InProcessHttpPhase.idle
+    in_process_http_connection_arm_timer(connection)
+    in_process_http_pool_release(connection.client, connection)

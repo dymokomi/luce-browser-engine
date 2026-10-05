@@ -38,10 +38,8 @@ and images decode through luce-png and luce-jpeg behind `Platform::ImageCodecPlu
   delivers `requests_request_did_receive_headers`, `_did_receive_data` and `_did_finish` on the event loop, never during
   start_request. `requests_request_stop` (p2a's closure stub, now ported) answers `bool` as C++.
 - **`InProcessRequestClient`** (`in_process_request_client_create(heap)`) serves file:, data: and http(s):. A request
-  runs as a Core deferred invocation; an http(s) request blocks the event loop while it runs (connect, TLS 1.3 with the
-  public roots, one HTTP/1.1 exchange with `Connection: close` and `Accept-Encoding: gzip, deflate`, 1xx heads skipped,
-  fixed/chunked/until-close bodies, gzip and deflate decoded when the body is complete, redirects delivered for Fetch).
-  The event loop seam watches no sockets yet; non-blocking requests, connection reuse, HTTP/2 and a cache are follow-ups.
+  runs as a Core deferred invocation. (p2d's http(s) requests blocked the event loop for one HTTP/1.1 exchange with
+  `Connection: close`; region p2/net made them non-blocking, with connection reuse: see docs/regions/p2net.md.)
 - `in_process_request_file(file_request)` implements `PageClient::request_file` in process (WebContent asks the UI
   process): an embedder's PageClient forwards to it. web_test's worker does.
 - **Embedders** do what WebContent's main does: `core_resource_implementation_install(core_resource_implementation_file_create(dir))`

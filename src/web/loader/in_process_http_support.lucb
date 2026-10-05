@@ -1,0 +1,131 @@
+#==============================================================================================
+#
+#   in_process_http_support - the C-heap storage of the in-process client's connections:
+#   byte buffers and lists
+#
+#   DESCRIPTION:
+#       The client's connections, their pool and what they buffer outlive any VM (DESIGN.md
+#       §3.3 rule 7): they allocate from memory.heap whatever allocator is current, and free
+#       what they allocate. InProcessHttpBytes is a growable byte buffer (a socket's unread
+#       bytes, a request waiting to be sent, a decoder's output); InProcessHttpList a growable
+#       list of values (the pool's connections, the requests waiting for one).
+#
+#       Not a port: new code of the RequestClient seam (DESIGN.md §7.1).
+#
+#       Copyright (c) 2026 the luce-browser authors.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Bytes ===================================================================================
+
+## A growable byte buffer in the C heap: the bytes [start, end) of `data` are live.
+struct InProcessHttpBytes:
+    var data: u8[]
+    var start: usize
+    var end: usize
+
+    ## The live bytes.
+    func view() -> const u8[]:
+        return self.data[self.start..<self.end]
+
+    ## How many bytes are live.
+    func count() -> usize:
+        return self.end - self.start
+
+    ## Room for `extra` more bytes at the end (the live bytes moved to the front first).
+    func reserve(extra: usize):
+        if self.data.length - self.end >= extra:
+            return
+        let live = self.end - self.start
+        if self.start > 0 and self.data.length - live >= extra:
+            memory.move(self.data, self.data[self.start..<self.end], live)
+            self.start = 0
+            self.end = live
+            return
+        var capacity = self.data.length if self.data.length > 0 else 16384
+        while capacity - live < extra:
+            capacity *= 2
+        let grown = (new u8[capacity] --- in memory.heap) else trap("out of memory")
+        memory.copy(grown, self.data[self.start..<self.end], live)
+        if self.data.length > 0:
+            free(self.data) in memory.heap
+        self.data = grown
+        self.start = 0
+        self.end = live
+
+    ## Appends `bytes`.
+    func append(bytes: const u8[]):
+        if bytes.length == 0:
+            return
+        self.reserve(bytes.length)
+        memory.copy(self.data[self.end..], bytes, bytes.length)
+        self.end += bytes.length
+
+    ## The free room at the end, at least `minimum` bytes, for a read to fill; `grow` then counts what it filled.
+    func room(minimum: usize) -> u8[]:
+        self.reserve(minimum)
+        return self.data[self.end..]
+
+    ## Counts `count` bytes a read put in `room` as live.
+    func grow(count: usize):
+        self.end += count
+
+    ## Drops `count` live bytes from the front.
+    func consume(count: usize):
+        self.start += count
+        if self.start == self.end:
+            self.start = 0
+            self.end = 0
+
+    ## Drops every live byte, keeping the storage.
+    func clear():
+        self.start = 0
+        self.end = 0
+
+    ## Releases the storage.
+    func release():
+        if self.data.length > 0:
+            free(self.data) in memory.heap
+        var empty: u8[]
+        self.data = empty
+        self.start = 0
+        self.end = 0
+
+# mark: Lists ===================================================================================
+
+## A growable list of `T` in the C heap, in insertion order.
+struct InProcessHttpList[T]:
+    var items: T[]
+    var size: usize
+
+    ## How many items the list holds.
+    func count() -> usize:
+        return self.size
+
+    ## The item at `index`.
+    func at(index: usize) -> T:
+        assert(index < self.size)
+        return self.items[index]
+
+    ## Appends `item`.
+    func append(item: T):
+        if self.size == self.items.length:
+            let capacity = self.items.length * 2 if self.items.length > 0 else 8
+            let grown = (new T[capacity] --- in memory.heap) else trap("out of memory")
+            for index in 0..<self.size:
+                grown[index] = self.items[index]
+            if self.items.length > 0:
+                free(self.items) in memory.heap
+            self.items = grown
+        self.items[self.size] = item
+        self.size += 1
+
+    ## Removes the item at `index` (the later ones move up) and answers it.
+    func remove(index: usize) -> T:
+        assert(index < self.size)
+        let item = self.items[index]
+        for at in index..<self.size - 1:
+            self.items[at] = self.items[at + 1]
+        self.size -= 1
+        return item

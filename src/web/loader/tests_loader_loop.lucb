@@ -1,0 +1,137 @@
+#==============================================================================================
+#
+#   tests_loader_loop - the loader tests' event loop: deferred invocations, timers and the
+#   in-process client's notifiers
+#
+#   DESCRIPTION:
+#       The Core event loop the loader and network tests install (LoaderTestEventLoop): the
+#       deferred invocations in order, timers (single-shot and repeating) and the notifiers of
+#       the in-process client's sockets, waited for together through the engine's
+#       CoreEventLoopNotifiers, as EventLoopImplementationUnix's pump orders them.
+#
+#==============================================================================================
+
+# mark: An event loop ===========================================================================
+
+## An event loop for the loader tests: the deferred invocations in order, timers, and the notifiers of the in-process
+## client's sockets. It lives in the test's frame, so the scan of the stack keeps its queue (and what the queued
+## captures hold).
+struct LoaderTestEventLoop: CoreEventLoopImplementation:
+    var deferred: ak.Vector[ak.Function0[unit]]
+    var notifiers: CoreEventLoopNotifiers
+    var timers: ak.Vector[LoaderTestTimer]
+    var next_timer_id: isize
+
+    func pump(mode: CoreEventLoopPumpMode) -> usize:
+        let pending = self.deferred
+        self.deferred = ak.Vector[ak.Function0[unit]]()
+        for index in 0..<ak.vector_size(&pending):
+            var function = *ak.vector_at_const(&pending, index)
+            ak.function0_call(&function)
+        return ak.vector_size(&pending)
+
+    func quit(code: i32):
+        return
+
+    func was_exit_requested() -> bool:
+        return false
+
+    func wake():
+        return
+
+    func deferred_invoke(function: ak.Function0[unit]):
+        ak.vector_append_t(&self.deferred, function)
+
+    func register_timer(timer: CoreTimer*, milliseconds: i32, should_reload: bool) -> isize:
+        self.next_timer_id += 1
+        let interval = (u64)(milliseconds if milliseconds > 0 else 0) * 1000000
+        ak.vector_append_t(&self.timers, LoaderTestTimer(timer = timer, id = self.next_timer_id, due = loader_test_now() + interval, interval = interval,
+                                                         reload = should_reload))
+        return self.next_timer_id
+
+    func unregister_timer(timer_id: isize):
+        for index in 0..<ak.vector_size(&self.timers):
+            if ak.vector_at_const(&self.timers, index).id == timer_id:
+                _ = ak.vector_take(&self.timers, index)
+                return
+
+    func register_notifier(notifier: CoreNotifier*):
+        core_event_loop_notifiers_register(&self.notifiers, notifier)
+
+    func unregister_notifier(notifier: CoreNotifier*):
+        core_event_loop_notifiers_unregister(&self.notifiers, notifier)
+
+    ## When the next timer is due (monotonic nanoseconds), if one is registered.
+    func next_due() -> u64?:
+        var next: u64? = none
+        for index in 0..<ak.vector_size(&self.timers):
+            let due = ak.vector_at_const(&self.timers, index).due
+            if next == none or due < (next else 0):
+                next = due
+        return next
+
+    ## Fires the timers that are due, by id, each looked up again before it fires (firing one may stop another); a
+    ## repeating one is due again an interval later. Answers how many fired.
+    func fire_timers() -> usize:
+        let now = loader_test_now()
+        var due: ak.Vector[isize]
+        for entry in ak.vector_span_const(&self.timers):
+            if entry.due <= now:
+                ak.vector_append_t(&due, entry.id)
+        var fired: usize = 0
+        for id in ak.vector_span_const(&due):
+            for index in 0..<ak.vector_size(&self.timers):
+                let entry = ak.vector_at(&self.timers, index)
+                if entry.id != id:
+                    continue
+                let timer = entry.timer
+                if entry.reload:
+                    entry.due = now + entry.interval
+                else:
+                    _ = ak.vector_take(&self.timers, index)
+                core_timer_timer_event(timer)
+                fired += 1
+                break
+        return fired
+
+## A timer of the loader tests' loop.
+struct LoaderTestTimer:
+    var timer: CoreTimer*
+    var id: isize
+    var due: u64
+    var interval: u64
+    var reload: bool
+
+## Monotonic nanoseconds.
+func loader_test_now() -> u64:
+    let now = ak.monotonic_time_now()
+    return (u64)ak.monotonic_time_nanoseconds(&now)
+
+## Installs `event_loop` as the process's Core event loop, with an EventLoopPlugin over it.
+func loader_test_install_event_loop(event_loop: LoaderTestEventLoop*):
+    core_event_loop_installed = none
+    core_event_loop_install(event_loop)
+    web_test_install_event_loop_plugin()
+
+## The end of loader_test_install_event_loop.
+func loader_test_remove_event_loop():
+    web_test_remove_event_loop_plugin()
+    core_event_loop_installed = none
+
+## Runs the loop until nothing is queued and no connection waits for its socket: the deferred invocations, then the
+## notifiers whose descriptors are ready (waiting for them until the next timer, at most ten seconds), then the timers
+## that are due, as EventLoopImplementationUnix's pump orders them.
+func loader_test_drain(event_loop: LoaderTestEventLoop*):
+    while true:
+        while not ak.vector_is_empty(&event_loop.deferred):
+            _ = event_loop.pump(CoreEventLoopPumpMode.dont_wait_for_events)
+        if core_event_loop_notifiers_count(&event_loop.notifiers) == 0:
+            break
+        var deadline = net.Deadline.after(10000000000) else trap("a deadline")
+        if let due = event_loop.next_due():
+            deadline = net.Deadline.at(due)
+        let ready = core_event_loop_notifiers_wait(&event_loop.notifiers, deadline)
+        _ = core_event_loop_notifiers_dispatch(&event_loop.notifiers)
+        let fired = event_loop.fire_timers()
+        if ready == 0 and fired == 0 and event_loop.next_due() == none:
+            trap("loader_test_drain: the network stalled")

@@ -1,0 +1,375 @@
+#==============================================================================================
+#
+#   in_process_http_connection - the in-process client's connections: resolving, connecting
+#   and the TLS handshake as a state machine on the event loop
+#
+#   DESCRIPTION:
+#       What curl does for RequestServer before a transfer, without blocking the event loop:
+#       the host is resolved on a thread of its own (luce-std net.Lookup, as curl's threaded
+#       resolver; a numeric address needs none), each address is tried in turn with a
+#       nonblocking connect (net.Connection.start_connect, completed on write readiness), and
+#       an https: connection runs the TLS 1.3 handshake step by step as the server's messages
+#       arrive (luce-tls's nonblocking Stream: begin_tls, continue_tls). Each step runs from
+#       the connection's Core::Notifier, which watches the lookup's signal, then the socket,
+#       for what the step waits for; a Core::Timer bounds resolving, connecting and the
+#       handshake (RequestServer's CURLOPT_CONNECTTIMEOUT, 90 seconds) and the whole request
+#       when the embedder sets a limit. An established connection carries one request at a
+#       time (in_process_http.lucb) and returns to the pool (in_process_http_pool.lucb) for
+#       the next request to its origin.
+#
+#       A connection lives in the C heap for the process (DESIGN.md §3.3 rule 7): it refers to
+#       the request it carries only through a gc.Root of the request's cell (the request's own
+#       state is the cell's m_client_data), and is freed when it closes. luce-std and luce-tls
+#       allocate from the current allocator, so their calls run with the C heap current.
+#
+#       Not a port: new code of the RequestClient seam (DESIGN.md §7.1), after curl's
+#       connection handling as RequestServer configures it.
+#
+#       Copyright (c) 2026 the luce-browser authors.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: The connection ==========================================================================
+
+## Where a connection stands.
+enum InProcessHttpPhase:
+    resolving
+    connecting
+    handshaking
+    sending
+    receiving
+    idle
+    closed
+
+## One connection to an origin (scheme, host, port), in the C heap.
+struct InProcessHttpConnection:
+    var client: InProcessRequestClient*
+    var secure: bool
+    var host: InProcessHttpBytes
+    var port: u16
+    var phase: InProcessHttpPhase
+    var lookup: net.Lookup
+    var addresses: net.ResolvedAddresses
+    var next_address: usize
+    ## The error of the last address tried, for when none is left.
+    var connect_error: RequestsNetworkError
+    ## The socket while its connect is in progress; then the stream owns it.
+    var socket: net.Connection
+    var stream: tls_stream.Stream
+    var notifier: CoreNotifier
+    var timer: CoreTimer*?
+    ## When resolving, connecting and the handshake must be over (monotonic nanoseconds).
+    var connect_deadline: u64
+    ## The request the connection carries, if any (its state is the cell's m_client_data).
+    var request: gc.Root[RequestsRequest]
+    ## Whether the connection carried a request before the current one.
+    var reused: bool
+    var idle_since: u64
+    ## When the connection was opened, resolved, connected and secured (monotonic nanoseconds).
+    var opened_at: u64
+    var resolved_at: u64
+    var connected_at: u64
+    var secured_at: u64
+    ## The current request's exchange (in_process_http.lucb).
+    var exchange: InProcessHttpExchange
+
+## Monotonic nanoseconds.
+func in_process_http_now() -> u64:
+    let now = ak.monotonic_time_now()
+    return (u64)ak.monotonic_time_nanoseconds(&now)
+
+## The state of the request `connection` carries, if any.
+func in_process_http_connection_state(connection: const InProcessHttpConnection*) -> InProcessRequest*?:
+    let request = gc.root_ptr(&connection.request) else return none
+    return (InProcessRequest*?)request.m_client_data
+
+## The origin of an http(s) URL: the scheme's security, the host to connect to (an IPv6 address without its
+## brackets) and the port.
+struct InProcessHttpOrigin:
+    var secure: bool
+    var host: ak.String
+    var port: u16
+
+## The origin of `url`, if it has a host.
+func in_process_http_origin_of(url: const web_url.Url*) -> InProcessHttpOrigin?:
+    let host = in_process_http_host(url) else return none
+    let scheme = web_url.url_scheme(url)
+    return InProcessHttpOrigin(secure = ak.string_eq_string_view(&scheme, ak.sv("https")), host = host, port = web_url.url_port_or_default(url))
+
+## Whether `connection` is to `origin`.
+func in_process_http_connection_matches(connection: const InProcessHttpConnection*, origin: const InProcessHttpOrigin*) -> bool:
+    if connection.secure != origin.secure or connection.port != origin.port:
+        return false
+    let host = ak.string_bytes_as_string_view(&origin.host)
+    let bytes = ak.string_view_bytes(&host)
+    let own = connection.host.view()
+    return bytes.length == own.length and ak.compare_bytes(bytes, own) == 0
+
+## Opens a new connection to `origin` for the request of `state` (or for none: a preconnect), registered with the
+## pool; resolving starts at once (and may fail at once: the connection is then closed and the request finished).
+func in_process_http_connection_open(client: InProcessRequestClient*, origin: const InProcessHttpOrigin*, state: InProcessRequest*?):
+    # Zeroed storage: every part (the stream, the decoders) starts as its zero value, then the fields are set.
+    let storage = (new InProcessHttpConnection[1] --- in memory.heap) else trap("out of memory")
+    memory.set(u8[]((u8*)&storage[0], memory.size_of(InProcessHttpConnection)), 0)
+    let connection = &storage[0]
+    connection.client = client
+    connection.secure = origin.secure
+    connection.port = origin.port
+    connection.phase = InProcessHttpPhase.resolving
+    connection.connect_error = RequestsNetworkError.unable_to_connect
+    connection.notifier.m_fd = -1
+    let host = ak.string_bytes_as_string_view(&origin.host)
+    connection.host.append(ak.string_view_bytes(&host))
+    connection.opened_at = in_process_http_now()
+    if let carried = state:
+        connection.request = gc.root_create(carried.request)
+        connection.exchange.acquired_at = connection.opened_at
+        carried.connection = connection
+    in_process_http_pool_add(client, connection)
+    if client.m_connect_timeout_nanoseconds > 0:
+        connection.connect_deadline = connection.opened_at + client.m_connect_timeout_nanoseconds
+    in_process_http_connection_arm_timer(connection)
+
+    var started = true
+    with memory.heap:
+        connection.lookup = net.Lookup.start((str)connection.host.view(), connection.port) catch:
+            started = false
+            recover net.Lookup()
+    if not started:
+        in_process_http_connection_fail(connection, RequestsNetworkError.unable_to_resolve_host)
+    elif let descriptor = connection.lookup.descriptor():
+        in_process_http_connection_watch(connection, descriptor, CoreNotificationType.read)
+    else:
+        in_process_http_connection_resolved(connection)
+
+# mark: Watching ================================================================================
+
+## Watches `descriptor` for `type` with the connection's notifier (replacing what it watched).
+func in_process_http_connection_watch(connection: InProcessHttpConnection*, descriptor: std_platform.SocketDescriptor, kind: CoreNotificationType):
+    let fd = (i32)descriptor
+    let notifier = &connection.notifier
+    if notifier.m_is_enabled and notifier.m_fd == fd:
+        core_notifier_set_type(notifier, kind)
+        return
+    core_notifier_close(notifier)
+    notifier.on_activation = ak.Function0[unit](call = in_process_http_connection_on_activation, context = connection)
+    core_notifier_construct(notifier, fd, kind)
+
+## Watches the stream for what it waits for: write readiness while it has bytes queued, else read readiness.
+func in_process_http_connection_watch_stream(connection: InProcessHttpConnection*, want_write: bool):
+    let descriptor = connection.stream.descriptor() else return
+    let write = want_write or connection.stream.queued() > 0
+    in_process_http_connection_watch(connection, descriptor, CoreNotificationType.write if write else CoreNotificationType.read)
+
+## Stops watching.
+func in_process_http_connection_unwatch(connection: InProcessHttpConnection*):
+    core_notifier_close(&connection.notifier)
+
+## The notifier's activation: the step the connection waits for.
+func in_process_http_connection_on_activation(context: void*?):
+    let connection = (InProcessHttpConnection*)(context else trap("in-process http: no connection"))
+    match connection.phase:
+        .resolving: in_process_http_connection_resolved(connection)
+        .connecting: in_process_http_connection_connected(connection)
+        .handshaking: in_process_http_connection_handshake(connection)
+        .sending: in_process_http_exchange_send(connection)
+        .receiving: in_process_http_exchange_receive(connection)
+        .idle, .closed: in_process_http_connection_unwatch(connection)
+
+# mark: Timeouts ================================================================================
+
+## Arms the connection's timer for its nearest deadline: the connect deadline while it is being established, the
+## request's while it carries one under a limit; stops it when there is none.
+func in_process_http_connection_arm_timer(connection: InProcessHttpConnection*):
+    var deadline: u64 = 0
+    if connection.phase == InProcessHttpPhase.resolving or connection.phase == InProcessHttpPhase.connecting or connection.phase == InProcessHttpPhase.handshaking:
+        deadline = connection.connect_deadline
+    if let state = in_process_http_connection_state(connection):
+        if connection.client.m_timeout_nanoseconds > 0:
+            let request_deadline = state.start_nanoseconds + connection.client.m_timeout_nanoseconds
+            if deadline == 0 or request_deadline < deadline:
+                deadline = request_deadline
+    if deadline == 0:
+        if let timer = connection.timer:
+            core_timer_stop(timer)
+        return
+    let now = in_process_http_now()
+    let remaining = deadline - now if deadline > now else 0
+    let milliseconds = (i32)((remaining + 999999) // 1000000) if remaining < 2000000000000 else 2000000000
+    with memory.heap:
+        if connection.timer == none:
+            connection.timer = core_timer_create_single_shot(milliseconds, ak.Function0[unit](call = in_process_http_connection_on_timeout, context = connection))
+    let timer = connection.timer else trap("VERIFY_NOT_REACHED")
+    core_timer_restart_i32(timer, milliseconds)
+
+## The timer: a deadline passed (TimeoutReached, CURLE_OPERATION_TIMEDOUT), or the timer is re-armed for a later one.
+func in_process_http_connection_on_timeout(context: void*?):
+    let connection = (InProcessHttpConnection*)(context else trap("in-process http: no connection"))
+    let now = in_process_http_now()
+    let establishing = connection.phase == InProcessHttpPhase.resolving or connection.phase == InProcessHttpPhase.connecting or connection.phase == InProcessHttpPhase.handshaking
+    var expired = establishing and connection.connect_deadline != 0 and now >= connection.connect_deadline
+    if let state = in_process_http_connection_state(connection):
+        if connection.client.m_timeout_nanoseconds > 0 and now >= state.start_nanoseconds + connection.client.m_timeout_nanoseconds:
+            expired = true
+    if expired:
+        in_process_http_connection_fail(connection, RequestsNetworkError.timeout_reached)
+    else:
+        in_process_http_connection_arm_timer(connection)
+
+# mark: Establishing ============================================================================
+
+## The network error a failed connect stands for.
+func in_process_http_connect_error(code: ErrorCode) -> RequestsNetworkError:
+    if code == net.unknown_host or code == net.resolution_temporary:
+        return RequestsNetworkError.unable_to_resolve_host
+    if code == net.timed_out:
+        return RequestsNetworkError.timeout_reached
+    return RequestsNetworkError.unable_to_connect
+
+## The lookup answered: try the addresses in the resolver's order.
+func in_process_http_connection_resolved(connection: InProcessHttpConnection*):
+    if not connection.lookup.finished():
+        return
+    in_process_http_connection_unwatch(connection)
+    connection.resolved_at = in_process_http_now()
+    var failure: RequestsNetworkError? = none
+    with memory.heap:
+        connection.addresses = connection.lookup.take() catch problem:
+            failure = in_process_http_connect_error(problem.code)
+            recover net.ResolvedAddresses()
+        connection.lookup.destroy()
+    if let error_ = failure:
+        in_process_http_connection_fail(connection, error_)
+        return
+    connection.phase = InProcessHttpPhase.connecting
+    in_process_http_connection_try_next(connection)
+
+## Starts connecting to the next address; fails the connection when none is left.
+func in_process_http_connection_try_next(connection: InProcessHttpConnection*):
+    let addresses = connection.addresses.view()
+    while connection.next_address < addresses.length:
+        let address = addresses[connection.next_address]
+        connection.next_address += 1
+        var started = true
+        with memory.heap:
+            connection.socket = net.Connection.start_connect(address) catch problem:
+                connection.connect_error = in_process_http_connect_error(problem.code)
+                started = false
+                recover net.Connection()
+        if started:
+            in_process_http_connection_watch(connection, connection.socket.descriptor() else -1, CoreNotificationType.write)
+            return
+    in_process_http_connection_fail(connection, connection.connect_error)
+
+## The socket became writable: the connect completed (or failed: then the next address).
+func in_process_http_connection_connected(connection: InProcessHttpConnection*):
+    var failed = false
+    var done = false
+    with memory.heap:
+        done = connection.socket.finish_connect() catch problem:
+            connection.connect_error = in_process_http_connect_error(problem.code)
+            failed = true
+            recover false
+    if failed:
+        in_process_http_connection_unwatch(connection)
+        with memory.heap:
+            connection.socket.destroy()
+        in_process_http_connection_try_next(connection)
+        return
+    if not done:
+        return
+    connection.connected_at = in_process_http_now()
+    with memory.heap:
+        connection.stream = tls_stream.Stream.plain(connection.socket)
+        connection.socket = net.Connection()
+        _ = connection.stream.set_nonblocking(true) catch: recover ()
+    if not connection.secure:
+        in_process_http_connection_established(connection)
+        return
+    connection.phase = InProcessHttpPhase.handshaking
+    var refused = false
+    with memory.heap:
+        connection.stream.begin_tls((str)connection.host.view(), connection.client.m_trust) catch:
+            refused = true
+    if refused:
+        in_process_http_connection_fail(connection, RequestsNetworkError.ssl_handshake_failed)
+        return
+    in_process_http_connection_watch_stream(connection, false)
+
+## The TLS handshake advances with what the server sent.
+func in_process_http_connection_handshake(connection: InProcessHttpConnection*):
+    var failure: RequestsNetworkError? = none
+    var done = false
+    with memory.heap:
+        done = connection.stream.continue_tls() catch problem:
+            failure = RequestsNetworkError.timeout_reached if problem.code == net.timed_out else RequestsNetworkError.ssl_handshake_failed
+            recover false
+    if let error_ = failure:
+        in_process_http_connection_fail(connection, error_)
+        return
+    if not done:
+        in_process_http_connection_watch_stream(connection, false)
+        return
+    connection.secured_at = in_process_http_now()
+    in_process_http_connection_established(connection)
+
+## Connected (and secured): the request it was opened for is sent, or the connection waits in the pool.
+func in_process_http_connection_established(connection: InProcessHttpConnection*):
+    in_process_http_connection_unwatch(connection)
+    connection.phase = InProcessHttpPhase.idle
+    connection.connect_deadline = 0
+    in_process_http_connection_arm_timer(connection)
+    if in_process_http_connection_state(connection) != none:
+        in_process_http_exchange_begin(connection)
+    else:
+        in_process_http_pool_release(connection.client, connection)
+
+# mark: Failing and closing =====================================================================
+
+## The connection failed with `network_error`: the request it carries (if any) finishes with that error, and the
+## connection closes.
+func in_process_http_connection_fail(connection: InProcessHttpConnection*, network_error: RequestsNetworkError):
+    if let state = in_process_http_connection_state(connection):
+        var timing_info = in_process_http_timing_info(connection, state)
+        in_process_http_connection_detach(connection)
+        in_process_http_post_finish(state, connection.exchange.delivered, timing_info, network_error)
+    in_process_http_connection_close(connection)
+
+## The connection stops carrying its request.
+func in_process_http_connection_detach(connection: InProcessHttpConnection*):
+    if let state = in_process_http_connection_state(connection):
+        state.connection = none
+    gc.root_release(&connection.request)
+
+## Closes the connection and frees it: its notifier, timer, lookup, socket and buffers. It must not carry a request.
+func in_process_http_connection_close(connection: InProcessHttpConnection*):
+    assert(gc.root_is_null(&connection.request))
+    in_process_http_connection_unwatch(connection)
+    if let timer = connection.timer:
+        core_timer_stop(timer)
+        free(timer) in memory.heap
+        connection.timer = none
+    connection.phase = InProcessHttpPhase.closed
+    with memory.heap:
+        connection.lookup.destroy()
+        connection.addresses.destroy()
+        connection.socket.destroy()
+        connection.stream.destroy()
+    in_process_http_exchange_release(&connection.exchange)
+    connection.host.release()
+    in_process_http_pool_remove(connection.client, connection)
+    free(InProcessHttpConnection[](connection, 1)) in memory.heap
+
+## Whether an idle connection still looks usable (curl's Curl_conn_seems_dead): nothing to read on it (no data
+## nobody asked for, no end of stream).
+func in_process_http_connection_alive(connection: InProcessHttpConnection*) -> bool:
+    if connection.stream.pending() > 0 or connection.stream.closed_by_peer():
+        return false
+    var readable = true
+    with memory.heap:
+        _ = connection.stream.wait(net.WaitInterest.read, net.Deadline.at(0)) catch problem:
+            # Expired at once: nothing to read. Any other failure: not usable either.
+            readable = problem.code != net.timed_out
+            recover net.Readiness()
+    return not readable

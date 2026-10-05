@@ -1,0 +1,193 @@
+#==============================================================================================
+#
+#   in_process_http_pool - the in-process client's connections: reuse per origin, the
+#   per-host limit, the requests waiting for a connection
+#
+#   DESCRIPTION:
+#       curl's connection pool as RequestServer's multi handle uses it: a request takes an idle
+#       connection to its origin (scheme, host, port) that still looks alive (curl's
+#       Curl_conn_seems_dead: nothing readable on it) and is younger than the idle limit
+#       (CURLOPT_MAXAGE_CONN, 118 seconds); otherwise it opens a new one, unless the per-host
+#       limit is reached (CURLMOPT_MAX_HOST_CONNECTIONS; RequestServer leaves it at curl's
+#       default, no limit, and so does the client by default), in which case it waits for a
+#       connection to that origin to become idle or close. A connection whose response is
+#       complete returns here and is handed to the first request waiting for its origin;
+#       idle connections beyond curl's default pool size (four per transfer in progress, at
+#       least four) are closed, the oldest first.
+#
+#       The pool lives in the client, in the C heap (in_process_http_support.lucb); a waiting
+#       request is kept by a gc.Root of its cell, whose m_client_data is its state.
+#
+#       Not a port: new code of the RequestClient seam (DESIGN.md §7.1).
+#
+#       Copyright (c) 2026 the luce-browser authors.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+## The client's connections and the requests waiting for one.
+pub struct InProcessHttpPool:
+    var connections: InProcessHttpList[InProcessHttpConnection*]
+    var waiting: InProcessHttpList[gc.Root[RequestsRequest]]
+
+## The state of a waiting request.
+func in_process_http_waiting_state(root: const gc.Root[RequestsRequest]*) -> InProcessRequest*:
+    let request = gc.root_ptr(root) else trap("in-process http: a waiting request was collected")
+    return (InProcessRequest*)(request.m_client_data else trap("in-process http: no request state"))
+
+## Registers a new connection.
+func in_process_http_pool_add(client: InProcessRequestClient*, connection: InProcessHttpConnection*):
+    client.m_pool.connections.append(connection)
+
+## How many connections (in any phase) go to `origin`.
+func in_process_http_pool_count_for(client: const InProcessRequestClient*, origin: const InProcessHttpOrigin*) -> usize:
+    var count: usize = 0
+    for index in 0..<client.m_pool.connections.count():
+        if in_process_http_connection_matches(client.m_pool.connections.at(index), origin):
+            count += 1
+    return count
+
+## Whether another connection to `origin` may be opened.
+func in_process_http_pool_has_room_for(client: const InProcessRequestClient*, origin: const InProcessHttpOrigin*) -> bool:
+    return client.m_max_host_connections == 0 or in_process_http_pool_count_for(client, origin) < client.m_max_host_connections
+
+## Closes the idle connections older than the idle limit (curl prunes its pool as it is used).
+func in_process_http_pool_prune(client: InProcessRequestClient*):
+    let now = in_process_http_now()
+    var index: usize = 0
+    while index < client.m_pool.connections.count():
+        let connection = client.m_pool.connections.at(index)
+        if connection.phase == InProcessHttpPhase.idle and client.m_max_idle_nanoseconds > 0 and now - connection.idle_since >= client.m_max_idle_nanoseconds:
+            in_process_http_connection_close(connection)
+            continue
+        index += 1
+
+## Gives `state` a connection: an idle one to its origin that is still alive (unless `fresh`), else a new one if the
+## per-host limit allows, else a place in the queue.
+func in_process_http_pool_acquire(client: InProcessRequestClient*, state: InProcessRequest*, fresh: bool):
+    in_process_http_pool_prune(client)
+    if not fresh:
+        var index: usize = 0
+        while index < client.m_pool.connections.count():
+            let connection = client.m_pool.connections.at(index)
+            if connection.phase != InProcessHttpPhase.idle or not in_process_http_connection_matches(connection, &state.origin):
+                index += 1
+                continue
+            if not in_process_http_connection_alive(connection):
+                in_process_http_connection_close(connection)
+                continue
+            in_process_http_pool_bind(connection, state)
+            return
+    if in_process_http_pool_has_room_for(client, &state.origin):
+        in_process_http_connection_open(client, &state.origin, state)
+        return
+    client.m_pool.waiting.append(gc.root_create(state.request))
+    state.waiting = true
+
+## `connection` (idle) carries `state`'s request from now on: its exchange begins.
+func in_process_http_pool_bind(connection: InProcessHttpConnection*, state: InProcessRequest*):
+    connection.request = gc.root_create(state.request)
+    state.connection = connection
+    connection.exchange.acquired_at = in_process_http_now()
+    in_process_http_exchange_begin(connection)
+
+## The index of the first request waiting for the origin of `connection`, if any.
+func in_process_http_pool_first_waiting(client: const InProcessRequestClient*, connection: const InProcessHttpConnection*) -> usize?:
+    for index in 0..<client.m_pool.waiting.count():
+        var root = client.m_pool.waiting.at(index)
+        if in_process_http_connection_matches(connection, &in_process_http_waiting_state(&root).origin):
+            return index
+    return none
+
+## Takes the waiting request at `index` out of the queue: its state.
+func in_process_http_pool_take_waiting(client: InProcessRequestClient*, index: usize) -> InProcessRequest*:
+    var root = client.m_pool.waiting.remove(index)
+    let state = in_process_http_waiting_state(&root)
+    gc.root_release(&root)
+    state.waiting = false
+    return state
+
+## `connection` is idle: the first request waiting for its origin takes it; otherwise it stays for later requests,
+## and the oldest idle connections close beyond the pool's size.
+func in_process_http_pool_release(client: InProcessRequestClient*, connection: InProcessHttpConnection*):
+    connection.phase = InProcessHttpPhase.idle
+    connection.idle_since = in_process_http_now()
+    if let index = in_process_http_pool_first_waiting(client, connection):
+        in_process_http_pool_bind(connection, in_process_http_pool_take_waiting(client, index))
+        return
+    # curl's default pool size: four connections per transfer in progress, here at least four.
+    var busy: usize = client.m_pool.waiting.count()
+    var idle: usize = 0
+    for index in 0..<client.m_pool.connections.count():
+        if client.m_pool.connections.at(index).phase == InProcessHttpPhase.idle:
+            idle += 1
+        else:
+            busy += 1
+    let limit = 4 * (busy if busy > 0 else 1)
+    while idle > limit:
+        var oldest: InProcessHttpConnection*? = none
+        for index in 0..<client.m_pool.connections.count():
+            let candidate = client.m_pool.connections.at(index)
+            if candidate.phase != InProcessHttpPhase.idle:
+                continue
+            if let current = oldest:
+                if candidate.idle_since < current.idle_since:
+                    oldest = candidate
+            else:
+                oldest = candidate
+        let victim = oldest else break
+        in_process_http_connection_close(victim)
+        idle -= 1
+
+## Forgets a closed connection; a request waiting for its origin may now open a new one.
+func in_process_http_pool_remove(client: InProcessRequestClient*, connection: InProcessHttpConnection*):
+    let connections = &client.m_pool.connections
+    for index in 0..<connections.count():
+        if connections.at(index) == connection:
+            _ = connections.remove(index)
+            break
+    let waiting = in_process_http_pool_first_waiting(client, connection) else return
+    let state = in_process_http_waiting_state(&client.m_pool.waiting.items[waiting])
+    if in_process_http_pool_has_room_for(client, &state.origin):
+        let taken = in_process_http_pool_take_waiting(client, waiting)
+        in_process_http_connection_open(client, &taken.origin, taken)
+
+## A waiting request was stopped: it leaves the queue.
+func in_process_http_pool_forget(client: InProcessRequestClient*, state: InProcessRequest*):
+    for index in 0..<client.m_pool.waiting.count():
+        var root = client.m_pool.waiting.at(index)
+        if gc.root_ptr(&root) == state.request:
+            _ = in_process_http_pool_take_waiting(client, index)
+            return
+
+## ensure_connection with CacheLevel::CreateConnection: a connection to the origin of `url` is opened ahead of a
+## request, unless one exists (or the limit is reached). CacheLevel::ResolveOnly does nothing: no resolution is
+## cached.
+func in_process_http_pool_preconnect(client: InProcessRequestClient*, url: web_url.Url, cache_level: RequestServerCacheLevel):
+    if cache_level != RequestServerCacheLevel.create_connection:
+        return
+    let scheme = web_url.url_scheme(&url)
+    if not ak.string_eq_string_view(&scheme, ak.sv("http")) and not ak.string_eq_string_view(&scheme, ak.sv("https")):
+        return
+    let origin = in_process_http_origin_of(&url) else return
+    if in_process_http_pool_count_for(client, &origin) > 0:
+        return
+    in_process_http_connection_open(client, &origin, none)
+
+## Closes every idle connection of `client` (an embedder shutting down, a test ending).
+pub func in_process_request_client_close_idle_connections(client: InProcessRequestClient*):
+    var index: usize = 0
+    while index < client.m_pool.connections.count():
+        let connection = client.m_pool.connections.at(index)
+        if connection.phase == InProcessHttpPhase.idle:
+            in_process_http_connection_close(connection)
+            continue
+        index += 1
+
+## How many connections `client` keeps, and how many of them are idle (for tests and diagnostics).
+pub func in_process_request_client_connection_counts(client: const InProcessRequestClient*) -> (usize, usize):
+    var idle: usize = 0
+    for index in 0..<client.m_pool.connections.count():
+        if client.m_pool.connections.at(index).phase == InProcessHttpPhase.idle:
+            idle += 1
+    return (client.m_pool.connections.count(), idle)

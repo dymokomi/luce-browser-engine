@@ -251,6 +251,48 @@ test "the worker's event loop: deferred invocations first, then due timers by re
     event_loop.quit(3)
     assert(event_loop.was_exit_requested() and event_loop.exit_code == 3)
 
+test "the worker's event loop: one wait for timers and notifiers; a ready socket wakes it before a later timer":
+    var event_loop = WorkerEventLoop(next_timer_id = 0, exit_requested = false, exit_code = 0)
+    web.core_event_loop_install(&event_loop)
+    defer web.core_event_loop_uninstall()
+    var log = TestLoopLog()
+    var timer_event = TestLoopEvent(log = &log, name = 't')
+    var socket_event = TestLoopEvent(log = &log, name = 's')
+    var deferred = TestLoopEvent(log = &log, name = 'd')
+    var listener = net.Listener.bind(net.SocketAddress.loopback(0)) else trap("a listener")
+    defer listener.destroy()
+    var outgoing = net.Connection.connect(listener.address() else trap("an address")) else trap("a connection")
+    defer outgoing.destroy()
+    var incoming = listener.accept() else trap("accepted")
+    defer incoming.destroy()
+
+    # A timer a second away and a notifier on a socket with nothing to read yet.
+    let timer = web.core_timer_create_single_shot(1000, ak.Function0[unit](call = TestLoopEvent.call, context = &timer_event))
+    web.core_timer_start(timer)
+    let notifier = web.core_notifier_create((i32)(incoming.descriptor() else trap("a descriptor")), web.CoreNotificationType.read)
+    notifier.on_activation = ak.Function0[unit](call = TestLoopEvent.call, context = &socket_event)
+    _ = event_loop.pump(web.CoreEventLoopPumpMode.dont_wait_for_events)
+    assert(log.count == 0)
+
+    # The socket becomes readable 30 ms later (another thread writes): the wait ends then, not at the timer.
+    let writer = thread.spawn(test_loop_write_later, &outgoing) else trap("a thread")
+    let start = time.now()
+    web.core_deferred_invoke(ak.Function0[unit](call = TestLoopEvent.call, context = &deferred))
+    _ = event_loop.pump(web.CoreEventLoopPumpMode.wait_for_events)
+    assert(log.count == 1 and log.events[0] == 'd')
+    _ = event_loop.pump(web.CoreEventLoopPumpMode.wait_for_events)
+    var joined = writer
+    joined.join() else trap("the writer joins")
+    assert(log.count == 2 and log.events[1] == 's' and time.now() - start < 900000000)
+    web.core_notifier_set_enabled(notifier, false)
+    web.core_timer_stop(timer)
+
+## Writes a byte to the connection `context` after 30 ms.
+func test_loop_write_later(context: void*?):
+    let connection = (net.Connection*)(context else trap("no connection"))
+    thread.sleep(30)
+    _ = connection.write(b"x") catch: recover 0
+
 # mark: The hermetic RequestClient ==============================================================
 
 ## Whether `url` is one the hermetic client lets through.

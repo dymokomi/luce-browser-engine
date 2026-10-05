@@ -5,11 +5,12 @@
 #   DESCRIPTION:
 #       What WebContent's main (Services/WebContent/main.cpp) installs before it serves a page,
 #       for one test in layout-test mode:
-#         - the process's event loop: Core::EventLoop over a timer registry and a queue of
-#           deferred invocations (LibCore's EventLoopImplementationUnix, minus file
-#           descriptors and signals, which phase 1 does not use), installed behind the
-#           engine's Core seam (external/lib_core/event_loop.lucb), and the
-#           Platform::EventLoopPlugin over it;
+#         - the process's event loop: Core::EventLoop over a timer registry, a queue of
+#           deferred invocations and the Core::Notifiers of the in-process client's sockets,
+#           waited for together (LibCore's EventLoopImplementationUnix, minus signals and
+#           the wake pipe, which one thread does not need), installed behind the engine's
+#           Core seam (external/lib_core/event_loop.lucb), and the Platform::EventLoopPlugin
+#           over it;
 #         - the fonts: a PathFontProvider with the test fonts (resource://fonts in Ladybird:
 #           SerenitySans and Noto Emoji, here tests/libweb/fonts) and Platform::FontPlugin in
 #           layout-test mode, which maps every generic family to SerenitySans. Ladybird's
@@ -44,26 +45,39 @@ struct LoopTimer:
     var should_reload: bool
     var fire_time: u64
 
-## The worker's event loop (web.CoreEventLoopImplementation): one thread, no file descriptors.
+## The worker's event loop (web.CoreEventLoopImplementation): one thread; its notifiers are the
+## in-process client's sockets.
 struct WorkerEventLoop: web.CoreEventLoopImplementation:
     var timers: ak.Vector[LoopTimer]
     var next_timer_id: isize
     var deferred: ak.Vector[ak.Function0[unit]]
+    var notifiers: web.CoreEventLoopNotifiers
     var exit_requested: bool
     var exit_code: i32
 
-    ## Runs the deferred invocations queued so far, then fires the timers that are due; in
-    ## wait_for_events mode, first sleeps until a timer is due when nothing else is pending.
-    ## Answers how many events were processed. With nothing queued and no timer registered,
-    ## nothing can ever happen in this process: the test is stalled, and the worker stops.
+    ## EventLoopImplementationUnix::pump: waits for events (in wait_for_events mode with nothing
+    ## queued: until a notifier's descriptor is ready or the next timer is due; otherwise it
+    ## only looks at the descriptors), then runs the deferred invocations queued so far, the
+    ## notifiers whose descriptors are ready, and the timers that are due. Answers how many
+    ## events were processed. With nothing queued, no timer and no notifier registered, nothing
+    ## can ever happen in this process: the test is stalled, and the worker stops.
     func pump(mode: web.CoreEventLoopPumpMode) -> usize:
-        if mode == web.CoreEventLoopPumpMode.wait_for_events and ak.vector_is_empty(&self.deferred):
+        let waiting = mode == web.CoreEventLoopPumpMode.wait_for_events and ak.vector_is_empty(&self.deferred)
+        let watching = web.core_event_loop_notifiers_count(&self.notifiers) > 0
+        if waiting and not watching:
             if let next = self.next_fire_time():
                 let now = time.now()
                 if next > now:
                     thread.sleep((next - now + 999999) // 1000000)
             else:
                 trap("web_test: stalled: the event loop has nothing left to run")
+        elif watching:
+            var deadline = net.Deadline.at(0)
+            if waiting:
+                deadline = net.Deadline()
+                if let next = self.next_fire_time():
+                    deadline = net.Deadline.at(next)
+            _ = web.core_event_loop_notifiers_wait(&self.notifiers, deadline)
         var processed: usize = 0
 
         # Deferred invocations queued while these run wait for the next pump.
@@ -73,6 +87,9 @@ struct WorkerEventLoop: web.CoreEventLoopImplementation:
             var function = *ak.vector_at_const(&pending, index)
             ak.function0_call(&function)
             processed += 1
+
+        # The notifiers the wait found ready.
+        processed += web.core_event_loop_notifiers_dispatch(&self.notifiers)
 
         # The timers due now, by id; each is looked up again before it fires, since firing one
         # may stop another.
@@ -94,6 +111,12 @@ struct WorkerEventLoop: web.CoreEventLoopImplementation:
             web.core_timer_timer_event(timer)
             processed += 1
         return processed
+
+    func register_notifier(notifier: web.CoreNotifier*):
+        web.core_event_loop_notifiers_register(&self.notifiers, notifier)
+
+    func unregister_notifier(notifier: web.CoreNotifier*):
+        web.core_event_loop_notifiers_unregister(&self.notifiers, notifier)
 
     func quit(code: i32):
         self.exit_requested = true
