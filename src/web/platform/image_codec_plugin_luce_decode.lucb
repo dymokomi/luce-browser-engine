@@ -1,0 +1,229 @@
+#==============================================================================================
+#
+#   image_codec_plugin_luce_decode - the engine's image decoders: PNG, JPEG, GIF, BMP and
+#   ICO/CUR through our luce packages, converted to premultiplied BGRA8888 bitmaps
+#
+#   DESCRIPTION:
+#       What Ladybird's ImageDecoder process does with LibGfx (Services/ImageDecoder/
+#       ConnectionFromClient.cpp decode_image_to_details, LibGfx/ImageFormats/ImageDecoder.cpp
+#       probe_and_sniff_for_appropriate_plugin), done in process over our own decoders
+#       (DESIGN.md §7.0): luce-png, luce-jpeg, luce-gif, luce-bmp and luce-ico. Not a port: new
+#       code behind the ported seam, platform/image_codec_plugin_luce.
+#
+#       The decoder is chosen by the bytes, as LibGfx sniffs them: MimeSniff's "match an
+#       image type pattern" (ported, r13) names the type, and the type's essence names the
+#       decoder, so image/png, image/jpeg, image/gif, image/bmp and image/x-icon (icons and
+#       cursors) and the declared image/vnd.microsoft.icon reach theirs. WebP (which the
+#       table also recognises) and AVIF (an ISO BMFF file of brand avif or avis) fail as not
+#       supported yet, as does anything else. An animated PNG decodes as its still default
+#       image. The packages give 8-bit straight RGBA; this fragment converts it to the
+#       bitmaps gfx and the rasterizer draw, premultiplied BGRA8888 (raster.premultiply_u8,
+#       Skia's rounding), as LibGfx's frames are made premultiplied with
+#       set_alpha_type_destructive. Pictures are sRGB: no ICC profile is read.
+#
+#       A GIF's frames are whole canvases, each composited over what the frames before it
+#       left (luce-gif's Animation, as browsers draw them), with the durations browsers play
+#       (a delay of 10 ms or less plays as 100 ms, as LibGfx's GIFLoader does too) and the
+#       number of plays browsers make as the loop count (0 forever, 1 without a loop
+#       extension, else the count written and the first play), which is what
+#       HTMLImageElement and ImageStyleValue count completed loops against.
+#
+#       Copyright (c) 2026 the luce-browser authors.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Choosing the decoder ====================================================================
+
+## The image could not be decoded.
+pub let luce_image_codec_unsupported: ErrorCode = ErrorCode.package(5)
+
+## The formats the plugin tells apart.
+enum LuceImageCodecFormat:
+    png
+    jpeg
+    gif
+    bmp
+    ico
+    webp
+    avif
+    unknown
+
+## The decoder for an image MIME type's essence (ASCII case-insensitive): image/x-icon and
+## image/vnd.microsoft.icon are both icons (and cursors).
+func luce_image_codec_format_for_essence(essence: ak.StringView) -> LuceImageCodecFormat:
+    if ak.string_view_equals_ignoring_ascii_case(&essence, ak.sv("image/png")):
+        return LuceImageCodecFormat.png
+    if ak.string_view_equals_ignoring_ascii_case(&essence, ak.sv("image/jpeg")):
+        return LuceImageCodecFormat.jpeg
+    if ak.string_view_equals_ignoring_ascii_case(&essence, ak.sv("image/gif")):
+        return LuceImageCodecFormat.gif
+    if ak.string_view_equals_ignoring_ascii_case(&essence, ak.sv("image/bmp")):
+        return LuceImageCodecFormat.bmp
+    if ak.string_view_equals_ignoring_ascii_case(&essence, ak.sv("image/x-icon")) or ak.string_view_equals_ignoring_ascii_case(&essence, ak.sv("image/vnd.microsoft.icon")):
+        return LuceImageCodecFormat.ico
+    if ak.string_view_equals_ignoring_ascii_case(&essence, ak.sv("image/webp")):
+        return LuceImageCodecFormat.webp
+    if ak.string_view_equals_ignoring_ascii_case(&essence, ak.sv("image/avif")):
+        return LuceImageCodecFormat.avif
+    return LuceImageCodecFormat.unknown
+
+## Whether `bytes` start an ISO BMFF file whose major brand is AVIF's (`ftyp` then `avif` or `avis`).
+func luce_image_codec_is_avif(bytes: const u8[]) -> bool:
+    if bytes.length < 12 or bytes[4] != 'f' or bytes[5] != 't' or bytes[6] != 'y' or bytes[7] != 'p':
+        return false
+    return bytes[8] == 'a' and bytes[9] == 'v' and bytes[10] == 'i' and (bytes[11] == 'f' or bytes[11] == 's')
+
+## The format of the image in `bytes`, by MimeSniff's image type pattern (and AVIF's file type box).
+func luce_image_codec_sniff(bytes: const u8[]) -> LuceImageCodecFormat:
+    if let mime_type = match_an_image_type_pattern(bytes):
+        let essence = mime_type_essence(&mime_type)
+        return luce_image_codec_format_for_essence(ak.string_bytes_as_string_view(&essence))
+    if luce_image_codec_is_avif(bytes):
+        return LuceImageCodecFormat.avif
+    return LuceImageCodecFormat.unknown
+
+# mark: Decoding ================================================================================
+
+## The decoded image of a PNG, JPEG, GIF, BMP or ICO/CUR file, every frame a premultiplied BGRA8888
+## bitmap: one for a still image, every composited frame of an animated GIF (with its durations and
+## loop count). The plugin's decode_image streams an animated GIF's frames instead.
+pub func luce_image_codec_plugin_decode(bytes: const u8[]) -> PlatformDecodedImage!:
+    match luce_image_codec_sniff(bytes):
+        .png:
+            return luce_image_codec_still(try luce_image_codec_decode_png(bytes), 0, 0)
+        .jpeg:
+            return luce_image_codec_still(try luce_image_codec_decode_jpeg(bytes), 0, 0)
+        .gif:
+            return try luce_image_codec_decode_gif(bytes)
+        .bmp:
+            return luce_image_codec_still(try luce_image_codec_decode_bmp(bytes), 0, 0)
+        .ico:
+            return luce_image_codec_still(try luce_image_codec_decode_ico(bytes), 0, 0)
+        .webp:
+            error(luce_image_codec_unsupported, "WebP images are not supported yet")
+        .avif:
+            error(luce_image_codec_unsupported, "AVIF images are not supported yet")
+        .unknown:
+            error(luce_image_codec_unsupported, "Unsupported image format")
+
+## A decoded image of one frame shown for `duration` ms and played `loop_count` times.
+func luce_image_codec_still(bitmap: gfx.Bitmap*, duration: u32, loop_count: u32) -> PlatformDecodedImage:
+    var image = PlatformDecodedImage(color_space = luce_image_codec_srgb())
+    image.loop_count = loop_count
+    image.frame_count = 1
+    ak.vector_append_t(&image.frames, PlatformFrame(bitmap = bitmap, duration = (usize)duration))
+    ak.vector_append_t(&image.all_durations, duration)
+    return image
+
+## The color space of every decoded image: sRGB, the default.
+func luce_image_codec_srgb() -> gfx.ColorSpace:
+    var color_space: gfx.ColorSpace = ---
+    gfx.color_space_construct(&color_space)
+    return color_space
+
+## A PNG's image (its default image, for an animated PNG).
+func luce_image_codec_decode_png(bytes: const u8[]) -> gfx.Bitmap*!:
+    let found = try png_codec.info(bytes)
+    try luce_image_codec_check_size(found.width, found.height)
+    let pixels = try new u8[found.width * found.height * 4] --- in memory.heap
+    defer free(pixels) in memory.heap
+    with memory.heap:
+        try png_codec.decode_rgba8(bytes, pixels)
+    return try luce_image_codec_bitmap(pixels, found.width, found.height)
+
+## A JPEG's image.
+func luce_image_codec_decode_jpeg(bytes: const u8[]) -> gfx.Bitmap*!:
+    let found = try jpeg_codec.info(bytes)
+    try luce_image_codec_check_size(found.width, found.height)
+    let pixels = try new u8[found.width * found.height * 4] --- in memory.heap
+    defer free(pixels) in memory.heap
+    with memory.heap:
+        try jpeg_codec.decode_rgba8(bytes, pixels)
+    return try luce_image_codec_bitmap(pixels, found.width, found.height)
+
+## A BMP's image; one holding a PNG or JPEG (BI_PNG, BI_JPEG) is that image.
+func luce_image_codec_decode_bmp(bytes: const u8[]) -> gfx.Bitmap*!:
+    if let payload = bmp_codec.embedded(bytes):
+        match luce_image_codec_sniff(payload):
+            .png:
+                return try luce_image_codec_decode_png(payload)
+            .jpeg:
+                return try luce_image_codec_decode_jpeg(payload)
+            _:
+                error(luce_image_codec_unsupported, "the BMP holds neither a PNG nor a JPEG")
+    let found = try bmp_codec.info(bytes)
+    try luce_image_codec_check_size(found.width, found.height)
+    let pixels = try new u8[found.width * found.height * 4] --- in memory.heap
+    defer free(pixels) in memory.heap
+    with memory.heap:
+        try bmp_codec.decode_rgba8(bytes, pixels)
+    return try luce_image_codec_bitmap(pixels, found.width, found.height)
+
+## An icon's or cursor's image: the entry luce-ico chooses (the largest, then the one with the most
+## bits, then the first), a BMP entry with its AND mask, a PNG entry decoded as a PNG. An entry whose
+## image is not the size its directory lists does not decode (as Ladybird and Firefox require).
+func luce_image_codec_decode_ico(bytes: const u8[]) -> gfx.Bitmap*!:
+    let entry = try ico_codec.choose(bytes)
+    if not entry.readable:
+        error(ico_codec.corrupt, "the icon's image is damaged or not the size its directory lists")
+    if entry.png:
+        return try luce_image_codec_decode_png(ico_codec.image(bytes, &entry))
+    try luce_image_codec_check_size(entry.width, entry.height)
+    let pixels = try new u8[entry.width * entry.height * 4] --- in memory.heap
+    defer free(pixels) in memory.heap
+    with memory.heap:
+        try ico_codec.decode_rgba8(bytes, &entry, pixels)
+    return try luce_image_codec_bitmap(pixels, entry.width, entry.height)
+
+## Every frame of a GIF, composited (decode_image_to_bitmaps_and_durations_with_decoder): one frame
+## for a still GIF, all of an animation's with their durations.
+func luce_image_codec_decode_gif(bytes: const u8[]) -> PlatformDecodedImage!:
+    var animation = try luce_image_codec_gif_open(bytes)
+    defer animation.release()
+    let frames = animation.frames()
+    var image = PlatformDecodedImage(color_space = luce_image_codec_srgb())
+    image.is_animated = animation.info.animated()
+    image.loop_count = animation.info.plays()
+    image.frame_count = (u32)frames.length
+    let pixels = try new u8[animation.info.width * animation.info.height * 4] --- in memory.heap
+    defer free(pixels) in memory.heap
+    for index in 0..<frames.length:
+        let bitmap = try luce_image_codec_gif_frame(&animation, index, pixels)
+        ak.vector_append_t(&image.frames, PlatformFrame(bitmap = bitmap, duration = (usize)frames[index].duration))
+        ak.vector_append_t(&image.all_durations, frames[index].duration)
+    return image
+
+## A GIF's animation over `bytes` (which must outlive it), its canvas checked.
+func luce_image_codec_gif_open(bytes: const u8[]) -> gif_codec.Animation!:
+    var animation = try gif_codec.Animation.open(bytes)
+    errdefer animation.release()
+    try luce_image_codec_check_size(animation.info.width, animation.info.height)
+    return animation
+
+## Frame `index` of a GIF animation, composited, rendered through `pixels` (a canvas of RGBA).
+func luce_image_codec_gif_frame(animation: gif_codec.Animation*, index: usize, pixels: u8[]) -> gfx.Bitmap*!:
+    try animation.render(index, pixels)
+    return try luce_image_codec_bitmap(pixels, animation.info.width, animation.info.height)
+
+# mark: Bitmaps =================================================================================
+
+## Fails for a picture with no pixels or too many (above 2^14 on a side, as Gfx::Bitmap's size check).
+func luce_image_codec_check_size(width: usize, height: usize) -> !:
+    if width == 0 or height == 0 or width > 16384 or height > 16384:
+        error(luce_image_codec_unsupported, "the image's size is out of range")
+
+## A premultiplied BGRA8888 bitmap of the 8-bit RGBA `pixels`.
+func luce_image_codec_bitmap(pixels: const u8[], width: usize, height: usize) -> gfx.Bitmap*!:
+    let size = gfx.IntSize(m_width = (i32)width, m_height = (i32)height)
+    let bitmap = try gfx.bitmap_create_alpha_type(gfx.BitmapFormat.bgra8888, gfx.AlphaType.premultiplied, size)
+    for y in 0..<height:
+        let row = gfx.bitmap_scanline(bitmap, (i32)y) else trap("VERIFY: bitmap data")
+        let source = pixels[y * width * 4..]
+        for x in 0..<width:
+            let alpha = source[x * 4 + 3]
+            let red = (u32)raster.premultiply_u8(source[x * 4], alpha)
+            let green = (u32)raster.premultiply_u8(source[x * 4 + 1], alpha)
+            let blue = (u32)raster.premultiply_u8(source[x * 4 + 2], alpha)
+            row[x] = ((u32)alpha << 24) | (red << 16) | (green << 8) | blue
+    return bitmap
