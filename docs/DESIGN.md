@@ -981,8 +981,9 @@ a `JS::Map`. Before luce-js these are **cells of the engine** (`external/lib_js/
   objects (or cells holding them) and the `js_*` functions their operations.
 - Anything that needs JS keeps trapping `unported (P3)`: `Get(x, "then")` of an object that is not
   one of these promises answers undefined (no JS properties exist), the self-resolution TypeError,
-  `JS::Array` (`get_promise_for_wait_for_all`'s results), PromiseRejectionEvent (firing
-  `unhandledrejection` / `rejectionhandled`), GetFunctionRealm of bound functions and proxies.
+  `JS::Array` (`get_promise_for_wait_for_all`'s results), GetFunctionRealm of bound functions and
+  proxies. (PromiseRejectionEvent is a plain event since region p2r: `unhandledrejection` and
+  `rejectionhandled` are fired, and an unhandled DOMException rejection is logged.)
   WebIDL `ReactionSteps` cannot throw before P3 (a GC::Function's result cannot be fallible).
 
 **The ReadableStream stand-in (phase 2, region p2s).** Streams are P4, but every fetch body is a
@@ -1811,6 +1812,7 @@ P1 regions wrote for these files (with their signatures) moved there from `stubs
 | p2f | `csp_directives`: `Directives/DirectiveOperations` (1.1k), `SourceExpression` and the 22 directive classes | ≈3.5k | p2e |
 | p2d | `loader_resources`: `Loader/*` (`ResourceLoader`, `FileRequest`, `LoadRequest`, `GeneratedPagesLoader`, `ContentFilter`, `ProxyMappings`), `HTML/PotentialCORSRequest`, `PreloadEntry`, `NavigationObserver`, `BitmapDecodedImageData`, `XML/XMLDocumentBuilder`; the LibCore seams `Core::Resource` and `Core::Promise` (not ported: implemented over luce-std) | ≈2.6k | p2b |
 | p2c | `fetch_fetching`: `Fetch/Fetching/*` (`Fetching.cpp` 2.5k: fetch, main fetch, scheme/HTTP/redirect/network fetch, CORS preflight; `FetchedDataReceiver`, `PendingResponse`, `Checks`) | ≈3.1k | p2a, p2b, p2d, p2e |
+| p2r | the rest of phase 2 without rendering: a hermetic `web_test` (no network), what `Document::destroy` walks (MessagePort's registry, the blob URL store, the window's event sources, web sockets and IndexedDB connections) so SVG-as-image documents load, History and Navigation's entry list as data, BeforeUnloadEvent and PromiseRejectionEvent, StructuredDeserialize of undefined and null | ≈0.7k | p2c |
 
 In dependency order: p2b, then p2a, p2e and p2d in parallel, then p2f and p2c (≈17.7k donor
 lines in all; `docs/regions.tsv` has the files). `stubs/stub_p2_closure.lucb` holds the virtuals
