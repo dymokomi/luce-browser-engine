@@ -31,12 +31,20 @@
 #       a CoreEventLoopNotifiers (web's external/lib_core/event_loop_notifiers.lucb), as
 #       web_test's WorkerEventLoop does. Each turn first looks at their descriptors without
 #       waiting and fires the ready ones after the deferred invocations and before the timers,
-#       LibCore's order (ThreadEventQueue::process after wait_for_events); and while any is
-#       registered the loop is next due within a poll interval, so the embedder's loop comes
-#       back to look (the macOS loop has the kernel watch them as CFSocket sources; a thread
-#       that polls them and calls the wake hook would replace the interval, see the module's
-#       follow-ups). Core::EventLoop::spin_until (pump in wait_for_events mode) waits on the
-#       descriptors until the next timer is due, as the worker does.
+#       LibCore's order (ThreadEventQueue::process after wait_for_events). Someone must notice
+#       when a descriptor turns ready while the embedder's loop sleeps, one of two ways:
+#
+#         - by default, while any notifier is registered the loop is next due within a poll
+#           interval, so the embedder's loop comes back to look;
+#         - an embedder whose loop can watch descriptors itself (luce-ui's Application.watch)
+#           takes them over instead (webview_event_loop_hand_over_sockets), as the macOS loop
+#           makes each notifier a CFSocket source in register_notifier: the loop queues each
+#           descriptor whose notifiers changed (webview_event_loop_take_socket_change, with the
+#           wake hook called when the queue was empty), the embedder watches it for what
+#           webview_event_loop_socket_interest answers, and the poll interval no longer applies.
+#
+#       Core::EventLoop::spin_until (pump in wait_for_events mode) waits on the descriptors
+#       until the next timer is due, as the worker does.
 #
 #       Copyright (c) 2018-2026, the Ladybird developers.
 #       Copyright (c) 2023-2025, Tim Flynn <trflynn89@ladybird.org>
@@ -75,6 +83,10 @@ pub struct WebViewEventLoop: web.CoreEventLoopImplementation:
     var next_timer_id: isize
     var deferred: ak.Vector[ak.Function0[unit]]
     var notifiers: web.CoreEventLoopNotifiers
+    ## Whether the embedder's loop watches the notifiers' descriptors itself, and the descriptors
+    ## whose notifiers changed since it last took them (webview_event_loop_take_socket_change).
+    var sockets_handed_over: bool
+    var socket_changes: ak.Vector[i32]
     var exit_requested: bool
     var exit_code: i32
     var wake_hook: WebViewWakeHook?
@@ -176,17 +188,33 @@ pub struct WebViewEventLoop: web.CoreEventLoopImplementation:
         if let slot = self.find_timer(timer_id):
             _ = ak.vector_take(&self.timers, slot)
 
-    ## EventLoopManager::register_notifier: watched from the next turn on; the embedder's loop is
-    ## woken so it comes back within the poll interval.
+    ## EventLoopManager::register_notifier: watched from the next turn on. The embedder's loop is
+    ## woken so it comes back within the poll interval, or, when it watches the descriptors
+    ## itself, so it takes the change.
     func register_notifier(notifier: web.CoreNotifier*):
         let was_watching = self.is_watching()
         web.core_event_loop_notifiers_register(&self.notifiers, notifier)
-        if not was_watching:
+        if self.sockets_handed_over:
+            self.note_socket_change(notifier.m_fd)
+        elif not was_watching:
             self.call_wake_hook()
 
     ## EventLoopManager::unregister_notifier.
     func unregister_notifier(notifier: web.CoreNotifier*):
         web.core_event_loop_notifiers_unregister(&self.notifiers, notifier)
+        if self.sockets_handed_over:
+            self.note_socket_change(notifier.m_fd)
+
+    ## Queues `fd` for the embedder's loop, which watches it (once, however often it changes
+    ## before the embedder takes it); the first change since it last took them wakes it.
+    func note_socket_change(fd: i32):
+        let was_idle = ak.vector_is_empty(&self.socket_changes)
+        for index in 0..<ak.vector_size(&self.socket_changes):
+            if *ak.vector_at_const(&self.socket_changes, index) == fd:
+                return
+        ak.vector_append_t(&self.socket_changes, fd)
+        if was_idle:
+            self.call_wake_hook()
 
     ## The index of the registered timer `id`, if it is registered.
     func find_timer(id: isize) -> usize?:
@@ -231,7 +259,7 @@ var webview_event_loop_the: WebViewEventLoop*?
 pub func webview_event_loop_install() -> WebViewEventLoop*:
     assert(webview_event_loop_the == none, "webview: the event loop is installed once")
     with memory.heap:
-        let event_loop = new WebViewEventLoop(next_timer_id = 0, notifiers = web.CoreEventLoopNotifiers(), exit_requested = false, exit_code = 0, wake_hook = none) else trap("out of memory")
+        let event_loop = new WebViewEventLoop(next_timer_id = 0, notifiers = web.CoreEventLoopNotifiers(), sockets_handed_over = false, exit_requested = false, exit_code = 0, wake_hook = none) else trap("out of memory")
         web.core_event_loop_install(event_loop)
         let plugin = new web.PlatformEventLoopPlugin else trap("out of memory")
         web.platform_event_loop_plugin_install(plugin)
@@ -264,16 +292,52 @@ pub func webview_event_loop_process(event_loop: WebViewEventLoop*) -> usize:
     return processed
 
 ## When the loop next has work (a time.now() moment): now while invocations are queued, else the
-## earliest timer, no later than a poll interval while sockets are watched; none when nothing
-## is registered.
+## earliest timer, no later than a poll interval while sockets are watched (unless the embedder
+## watches them itself); none when nothing is registered.
 pub func webview_event_loop_next_due(event_loop: WebViewEventLoop*) -> u64?:
     let now = time.now()
     if not ak.vector_is_empty(&event_loop.deferred):
         return now
     let next = event_loop.next_fire_time()
-    if event_loop.is_watching():
+    if event_loop.is_watching() and not event_loop.sockets_handed_over:
         let poll = now + webview_event_loop_poll_nanoseconds
         if let timer = next:
             return timer if timer < poll else poll
         return poll
     return next
+
+# mark: Sockets the embedder watches ===========================================================
+
+## Makes the embedder's loop watch the notifiers' descriptors (`handed_over`), or the loop poll
+## them again: every registered descriptor is queued for the embedder to take, and the poll
+## interval stops (or starts again) applying to webview_event_loop_next_due.
+pub func webview_event_loop_hand_over_sockets(event_loop: WebViewEventLoop*, handed_over: bool):
+    event_loop.sockets_handed_over = handed_over
+    ak.vector_clear(&event_loop.socket_changes)
+    if not handed_over:
+        return
+    for index in 0..<ak.vector_size(&event_loop.notifiers.m_entries):
+        event_loop.note_socket_change(ak.vector_at_const(&event_loop.notifiers.m_entries, index).notifier.m_fd)
+
+## The next descriptor whose notifiers changed since the embedder last took it, if any; it
+## watches it for what webview_event_loop_socket_interest now answers.
+pub func webview_event_loop_take_socket_change(event_loop: WebViewEventLoop*) -> i32?:
+    if ak.vector_is_empty(&event_loop.socket_changes):
+        return none
+    return ak.vector_take_first(&event_loop.socket_changes)
+
+## What the notifiers registered for `fd` wait for together: read, write, both, or none_ when none
+## is registered (stop watching it). A notifier of neither read nor write (hang-up or error only)
+## waits as a reader, as the loop's own wait has it (core_event_loop_notifiers_interest).
+pub func webview_event_loop_socket_interest(event_loop: const WebViewEventLoop*, fd: i32) -> web.CoreNotificationType:
+    var registered = false
+    var kind = web.CoreNotificationType.none_
+    for index in 0..<ak.vector_size(&event_loop.notifiers.m_entries):
+        let notifier = ak.vector_at_const(&event_loop.notifiers.m_entries, index).notifier
+        if notifier.m_fd == fd:
+            registered = true
+            kind = web.core_notification_type_union(kind, notifier.m_type)
+    let wanted = web.core_notification_type_intersection(kind, web.core_notification_type_union(web.CoreNotificationType.read, web.CoreNotificationType.write))
+    if registered and wanted == web.CoreNotificationType.none_:
+        return web.CoreNotificationType.read
+    return wanted
