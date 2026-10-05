@@ -1,0 +1,100 @@
+#==============================================================================================
+#
+#   tests_loader_4 - Content-Encoding through the in-process RequestClient on a loopback
+#   server
+#
+#   DESCRIPTION:
+#       The responses of tests_loader_3.lucb's server that carry a Content-Encoding, decoded
+#       as curl decodes them for RequestServer (in_process_http_encoding.lucb): Brotli, gzip
+#       and deflate (a zlib stream, raw DEFLATE, a zlib stream labelled x-gzip), codings
+#       stacked in one field and across fields, identity, an unknown coding with and without
+#       a body, more codings than curl stacks (ignored on a 304), damaged gzip and Brotli,
+#       bytes after a gzip member, and a Brotli stream cut short. The parsing of the field
+#       is checked on its own as well.
+#
+#==============================================================================================
+
+# mark: Helpers =================================================================================
+
+## Starts a GET of `path` on `server` through `client`.
+func loader_test_encoded(client: InProcessRequestClient*, server: const LoaderTestServer*, path: str) -> LoaderTestSeamLog*:
+    let url = loader_test_server_url(server, path)
+    let (log, _) = loader_test_start(client, ak.string_view_text(ak.byte_string_view(&url)))
+    return log
+
+## Whether the body `log` received is a prefix of `text`.
+func loader_test_received_prefix(log: const LoaderTestSeamLog*, text: str) -> bool:
+    let data = ak.byte_buffer_bytes_const(&log.data)
+    if data.length > text.length:
+        return false
+    for index in 0..<data.length:
+        if data[index] != text.bytes[index]:
+            return false
+    return true
+
+# mark: Tests ===================================================================================
+
+test "Content-Encoding fields stack their codings as curl's Curl_build_unencoding_stack does":
+    var fields: net.HttpField[3] = [net.HttpField(name = "Content-Type", value = "text/plain"), net.HttpField(name = "content-encoding", value = " gzip ,, X-GZIP,br"), net.HttpField(name = "Content-Encoding", value = "none,  zstd \t")]
+    var head = net.HttpHead(status = 200, fields = fields[0..<3])
+    let codings = in_process_http_codings(&head)
+    assert(codings.too_many)
+    fields[2] = net.HttpField(name = "Content-Encoding", value = "identity")
+    head = net.HttpHead(status = 200, fields = fields[0..<3])
+    let four = in_process_http_codings(&head)
+    assert(not four.too_many and four.count == 4)
+    assert(four.items[0] == InProcessHttpCoding.gzip and four.items[1] == InProcessHttpCoding.gzip)
+    assert(four.items[2] == InProcessHttpCoding.br and four.items[3] == InProcessHttpCoding.identity)
+    assert(in_process_http_coding_named("zstd") == InProcessHttpCoding.unknown)
+    assert(in_process_http_coding_named("Deflate") == InProcessHttpCoding.deflate)
+
+test "the in-process RequestClient: http: Content-Encodings: br, gzip, deflate, stacked, identity, unknown, damaged":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    var event_loop = LoaderTestEventLoop()
+    loader_test_install_event_loop(&event_loop)
+    defer loader_test_remove_event_loop()
+    let client = in_process_request_client_create(vm_heap(vm))
+    let (server, handle) = loader_test_server_start(14)
+
+    # Decoded bodies: Brotli, gzip under Brotli in one field and across two, raw DEFLATE
+    # labelled deflate, a zlib stream labelled x-gzip, identity (and none) passing it on.
+    let br = loader_test_encoded(client, server, "/br")
+    let stacked = loader_test_encoded(client, server, "/stacked")
+    let stacked_fields = loader_test_encoded(client, server, "/stacked-fields")
+    let raw = loader_test_encoded(client, server, "/raw-deflate")
+    let zlib = loader_test_encoded(client, server, "/x-gzip-zlib")
+    let identity = loader_test_encoded(client, server, "/identity")
+    loader_test_drain(&event_loop)
+    assert(br.finishes == 1 and br.network_error == none and br.received("hello brotli world, hello brotli world") and br.total_size == 33)
+    assert(stacked.network_error == none and stacked.received("stacked gzip then br"))
+    assert(stacked_fields.network_error == none and stacked_fields.received("stacked gzip then br"))
+    assert(raw.network_error == none and raw.received("hello raw deflate"))
+    assert(zlib.network_error == none and zlib.received("zlib inside gzip"))
+    assert(identity.network_error == none and identity.received("plain"))
+
+    # An unknown coding fails once body bytes reach it; with no body it does not. A fifth
+    # coding fails before the headers, except on a response without a body.
+    let unknown = loader_test_encoded(client, server, "/unknown")
+    let unknown_empty = loader_test_encoded(client, server, "/unknown-empty")
+    let too_many = loader_test_encoded(client, server, "/too-many")
+    let not_modified = loader_test_encoded(client, server, "/not-modified")
+    loader_test_drain(&event_loop)
+    assert(unknown.finishes == 1 and unknown.network_error == RequestsNetworkError.invalid_content_encoding)
+    assert(unknown_empty.network_error == none and ak.byte_buffer_size(&unknown_empty.data) == 0)
+    assert(too_many.finishes == 1 and too_many.network_error == RequestsNetworkError.invalid_content_encoding and too_many.headers == none)
+    assert(not_modified.network_error == none and not_modified.status_code == 304)
+
+    # Damaged data is a bad content encoding; bytes after the stream are curl's write error
+    # (Unknown); a stream cut short gives what it decoded, without an error.
+    let corrupt_gzip = loader_test_encoded(client, server, "/corrupt-gzip")
+    let corrupt_br = loader_test_encoded(client, server, "/corrupt-br")
+    let trailing = loader_test_encoded(client, server, "/trailing-gzip")
+    let truncated = loader_test_encoded(client, server, "/truncated-br")
+    loader_test_drain(&event_loop)
+    assert(corrupt_gzip.finishes == 1 and corrupt_gzip.network_error == RequestsNetworkError.invalid_content_encoding)
+    assert(corrupt_br.finishes == 1 and corrupt_br.network_error == RequestsNetworkError.invalid_content_encoding)
+    assert(trailing.finishes == 1 and trailing.network_error == RequestsNetworkError.unknown)
+    assert(truncated.finishes == 1 and truncated.network_error == none)
+    assert(loader_test_received_prefix(truncated, "truncated brotli body truncated brotli body truncated brotli body truncated brotli body "))
+    loader_test_server_stop(server, handle)
