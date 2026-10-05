@@ -1012,8 +1012,21 @@ order (`streams/`), over two more JS stand-ins in `external/lib_js`:
   callers. Still P4 (trap): default controllers (JS underlying sources, ReadableStreamDefaultTee),
   BYOB readers and requests and pull-into descriptors (autoAllocateChunkSize), piping, streams
   from iterables, transferring; the JS-facing IDL members (the constructor, `getReader`,
-  `read()`'s iterator results); and still P3: `JS::TypeError::create` (releasing a reader, a chunk
-  that is not a Uint8Array) and `JS::Array` (canceling both branches of a tee).
+  `read()`'s iterator results); and still P3: `JS::Array` (canceling both branches of a tee).
+
+**The Error and TransformStream stand-ins (phase 2, region p2c).** Fetch errors a body's stream
+with `JS::TypeError::create(realm, message)` when a load fails, and pipes every response body
+through an identity `TransformStream` (fetch response handover). So:
+
+- `JS::Error` is a cell of the engine (`external/lib_js/error`): its realm, its class (Error or
+  TypeError, recognized by ClassInfo) and the `message` that `Error::set_message` sets.
+  `js_type_error_create` keeps the signature LibWeb's callers use (it answers the `js.Value`), so
+  phase 3 swaps in luce-js's errors. Stack traces, `cause` and the other native errors stay P3.
+- `TransformStream` keeps `set_up`'s shape (the algorithms on a `TransformStreamDefaultController`)
+  with a readable byte stream as its readable side; `ReadableStream::piped_through` reads the source
+  chunk by chunk into the transform algorithm and, at its end, runs the flush algorithm and closes
+  the readable side (an error errors it). The WritableStream side, ReadableStreamPipeTo,
+  backpressure, aborting and canceling through the pipe and its AbortSignal stay P4.
 
 ### 3.7 Weak references
 
