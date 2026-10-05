@@ -1434,7 +1434,10 @@ The worker does natively what Ladybird's `test-web` does through JavaScript and 
 1. Install the platform plugins in **test mode**: `FontPlugin(is_layout_test_mode = true)`, which
    maps every generic family to `SerenitySans` and uses `Noto Emoji` for symbols (both copied from
    the donor's `Base/res/fonts/` into `tests/libweb/fonts/`); load only those fonts plus fonts the test itself provides (Ladybird
-   also loads system fonts, but tests that rely on them are not portable).
+   also loads system fonts, but tests that rely on them are not portable). As test-web runs WebContent with
+   `--disable-scrollbar-painting` (PaintViewportScrollbars::No), the worker calls
+   `Painting::set_paint_viewport_scrollbars(false)`: no viewport, the top-level one or an iframe's, paints its
+   scrollbars, in every suite.
 2. Create a `Page` (viewport 800×600, device pixel ratio 1, scripting disabled in P1) and a
    top-level traversable.
 3. P1: read the file, create the `Document` for the bytes (`Document::create_and_initialize` with
