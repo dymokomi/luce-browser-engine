@@ -1,0 +1,153 @@
+#==============================================================================================
+#
+#   incrementally_populated_stream - LibMedia's stream of fetched media bytes
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibMedia/IncrementallyPopulatedStream.h (lines 1-126) and .cpp (lines
+#       1-293), the writing side: HTMLMediaElement adds each chunk the fetch delivers at its
+#       offset (chunks that touch are joined), sets the expected size from Content-Length and
+#       closes the stream at the end of the body; the stream asks the element, through its data
+#       request callback, to fetch again from an offset when a chunk ends inside data it already
+#       has.
+#
+#       The reading side (Cursor, read_at, size(), the forward-request heuristics) is a
+#       demuxer's, which runs on a decoder thread; no demuxer is ported (playback_manager.lucb),
+#       so it is left out, and with it the mutex and condition variable that guard the chunks
+#       between the threads: everything here runs on the main thread. The deferred request
+#       goes to the current event loop (Core::EventLoop::current_weak() at set time).
+#
+#       Copyright (c) 2025, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
+#       Copyright (c) 2026 the luce-browser authors.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Types ===================================================================================
+
+## Media::IncrementallyPopulatedStream::DataChunk (Libraries/LibMedia/IncrementallyPopulatedStream.h:83).
+pub struct MediaDataChunk:
+    pub var m_offset: u64
+    pub var m_data: ak.ByteBuffer
+
+## Media::IncrementallyPopulatedStream (Libraries/LibMedia/IncrementallyPopulatedStream.h:20), without
+## its cursors (see the header).
+pub struct MediaIncrementallyPopulatedStream:
+    pub var m_chunks: ak.RedBlackTree[u64, MediaDataChunk]
+    pub var m_expected_size: u64?
+    pub var m_closed: bool  # C++ default: { false }
+    ## DataRequestCallback m_data_request_callback (a null Function when its call is none).
+    pub var m_data_request_callback: ak.Function1[u64, unit]
+    pub var m_currently_requested_position: u64  # C++ default: { 0 }
+    pub var m_last_chunk_end: u64  # C++ default: { 0 }
+
+# mark: DataChunk ===============================================================================
+
+## Ported from IncrementallyPopulatedStream.h:88 DataChunk::size.
+func media_data_chunk_size(this: const MediaDataChunk*) -> u64:
+    return (u64)ak.byte_buffer_size(&this.m_data)
+
+## Ported from IncrementallyPopulatedStream.h:89 DataChunk::end.
+func media_data_chunk_end(this: const MediaDataChunk*) -> u64:
+    return this.m_offset + media_data_chunk_size(this)
+
+# mark: The stream ==============================================================================
+
+## Ported from IncrementallyPopulatedStream.cpp:17 Media::IncrementallyPopulatedStream::create_empty.
+pub func media_incrementally_populated_stream_create_empty() -> MediaIncrementallyPopulatedStream*:
+    return new MediaIncrementallyPopulatedStream(m_expected_size = none) else trap("out of memory")
+
+## Ported from IncrementallyPopulatedStream.cpp:40 Media::IncrementallyPopulatedStream::set_data_request_callback
+## (none: the null Function).
+pub func media_incrementally_populated_stream_set_data_request_callback(this: MediaIncrementallyPopulatedStream*, callback: ak.Function1[u64, unit]?):
+    if let function = callback:
+        this.m_data_request_callback = function
+        return
+    this.m_data_request_callback = ak.Function1[u64, unit](call = none, context = none)
+
+## Ported from IncrementallyPopulatedStream.cpp:54 Media::IncrementallyPopulatedStream::add_chunk_at.
+pub func media_incrementally_populated_stream_add_chunk_at(this: MediaIncrementallyPopulatedStream*, offset: u64, data: const u8[]):
+    assert(data.length > 0, "VERIFY: !data.is_empty()")
+    let new_chunk_end = offset + (u64)data.length
+    this.m_last_chunk_end = new_chunk_end
+
+    var previous_chunk_iter = ak.red_black_tree_find_largest_not_above_iterator(&this.m_chunks, offset)
+
+    # Add a new chunk to the collection if there are none.
+    if ak.red_black_tree_iterator_is_end(&previous_chunk_iter) or media_data_chunk_end(ak.red_black_tree_iterator_deref(&previous_chunk_iter)) < offset:
+        let new_chunk = MediaDataChunk(m_offset = offset, m_data = ak.byte_buffer_copy_span_u8(data) else trap("MUST: ByteBuffer::copy"))
+        ak.red_black_tree_insert(&this.m_chunks, offset, new_chunk)
+        return
+
+    let chunk = ak.red_black_tree_iterator_deref(&previous_chunk_iter)
+
+    # donor quirk: compares the chunk's size, not its end, with the new chunk's end.
+    if media_data_chunk_size(chunk) >= new_chunk_end:
+        # The chunk is fully covered by the existing chunk, skip until after it.
+        media_incrementally_populated_stream_begin_new_request_while_locked(this, media_data_chunk_end(chunk))
+        return
+
+    # Expand the existing chunk to contain this new data.
+    ak.byte_buffer_resize(&chunk.m_data, (usize)(new_chunk_end - chunk.m_offset))
+    memory.copy(ak.byte_buffer_bytes(&chunk.m_data)[(usize)(offset - chunk.m_offset)..], data, data.length)
+
+    # Join the chunk to the next one if they intersect.
+    var next_chunk_iter = previous_chunk_iter
+    _ = ak.red_black_tree_iterator_inc(&next_chunk_iter)
+
+    if not ak.red_black_tree_iterator_is_end(&next_chunk_iter) and ak.red_black_tree_iterator_deref(&next_chunk_iter).m_offset <= media_data_chunk_end(chunk):
+        let next_chunk = ak.red_black_tree_iterator_deref(&next_chunk_iter)
+
+        ak.byte_buffer_resize(&chunk.m_data, (usize)(media_data_chunk_end(next_chunk) - chunk.m_offset))
+        memory.copy(ak.byte_buffer_bytes(&chunk.m_data)[(usize)(next_chunk.m_offset - chunk.m_offset)..], ak.byte_buffer_bytes_const(&next_chunk.m_data), ak.byte_buffer_size(&next_chunk.m_data))
+
+        let next_offset = next_chunk.m_offset
+        assert(ak.red_black_tree_remove(&this.m_chunks, next_offset), "VERIFY: m_chunks.remove(next_chunk.offset())")
+
+        media_incrementally_populated_stream_begin_new_request_while_locked(this, media_data_chunk_end(chunk))
+
+## Ported from IncrementallyPopulatedStream.h:42 Media::IncrementallyPopulatedStream::next_chunk_start.
+pub func media_incrementally_populated_stream_next_chunk_start(this: MediaIncrementallyPopulatedStream*) -> u64:
+    return this.m_last_chunk_end
+
+## Ported from IncrementallyPopulatedStream.cpp:104 Media::IncrementallyPopulatedStream::close.
+pub func media_incrementally_populated_stream_close(this: MediaIncrementallyPopulatedStream*):
+    this.m_expected_size = this.m_last_chunk_end
+    this.m_closed = true
+
+## Ported from IncrementallyPopulatedStream.cpp:120 Media::IncrementallyPopulatedStream::set_expected_size.
+pub func media_incrementally_populated_stream_set_expected_size(this: MediaIncrementallyPopulatedStream*, expected_size: u64):
+    this.m_expected_size = expected_size
+
+## Ported from IncrementallyPopulatedStream.cpp:127 Media::IncrementallyPopulatedStream::expected_size.
+pub func media_incrementally_populated_stream_expected_size(this: MediaIncrementallyPopulatedStream*) -> u64?:
+    return this.m_expected_size
+
+## The captures of begin_new_request_while_locked's deferred invocation: `[stream = NonnullRefPtr(*this), position]`.
+struct MediaIncrementallyPopulatedStreamRequest:
+    var stream: MediaIncrementallyPopulatedStream*
+    var position: u64
+
+    static func invoke(context: void*?):
+        let captures = (MediaIncrementallyPopulatedStreamRequest*)(context else trap("data request: no captures"))
+        let stream = captures.stream
+        if ak.function1_is_set(&stream.m_data_request_callback):
+            ak.function1_call(&stream.m_data_request_callback, captures.position)
+
+## Ported from IncrementallyPopulatedStream.cpp:133 Media::IncrementallyPopulatedStream::begin_new_request_while_locked.
+func media_incrementally_populated_stream_begin_new_request_while_locked(this: MediaIncrementallyPopulatedStream*, position: u64):
+    if position == this.m_currently_requested_position:
+        return
+
+    this.m_currently_requested_position = position
+    this.m_last_chunk_end = position
+
+    if let expected_size = this.m_expected_size:
+        if position >= expected_size:
+            return
+
+    # auto event_loop = m_callback_event_loop->take(); if (!event_loop) return;
+    # (the callback was set on this thread's loop; without one there is nothing to call)
+    if not ak.function1_is_set(&this.m_data_request_callback):
+        return
+    let captures = new MediaIncrementallyPopulatedStreamRequest(stream = this, position = position) else trap("out of memory")
+    core_deferred_invoke(ak.Function0[unit](call = MediaIncrementallyPopulatedStreamRequest.invoke, context = captures))

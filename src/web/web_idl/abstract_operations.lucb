@@ -146,16 +146,113 @@ pub func idl_to_usv_string(vm: Vm*, value: JsValue) -> ak.String!:
 pub func idl_to_utf16_usv_string(vm: Vm*, value: JsValue) -> ak.Utf16String!:
     trap("unported (P3): Web::WebIDL::to_utf16_usv_string (JS ToString)")
 
+## `JS::call(...)` as the Completion a ThrowCompletionOr<Value> converts to: the value, or the
+## exception the call stored.
+func idl_call_as_completion(vm: Vm*, function: JsFunctionObject*, this_value: JsValue, args: const JsValue[]) -> JsCompletion:
+    let value = js_call(vm, function, this_value, args) catch:
+        return vm_take_throw_completion(vm)
+    return js_completion_from_value(value)
+
 ## Ported from Libraries/LibWeb/WebIDL/AbstractOperations.cpp:258 Web::WebIDL::invoke_callback_impl:
-## the shared steps of invoking a callback function (the return steps differ).
+## the shared steps of invoking a callback function. The C++ template takes the return steps as
+## a lambda; here the caller runs them on the realm and completion this answers.
 ## https://webidl.spec.whatwg.org/#invoke-a-callback-function
-func idl_invoke_callback_impl(callback: IdlCallbackType*, this_argument: JsValue?, args: const JsValue[]) -> JsCompletion:
-    trap("unported (P3): Web::WebIDL::invoke_callback_impl (a JS call)")
+## https://whatpr.org/webidl/1437.html#invoke-a-callback-function
+func idl_invoke_callback_impl(callback: IdlCallbackType*, this_argument: JsValue?, args: const JsValue[]) -> (Realm*, JsCompletion):
+    # 1. Let completion be an uninitialized variable.
+
+    # 2. If thisArg was not given, let thisArg be undefined.
+    let this_value = this_argument else js_undefined()
+
+    # 3. Let F be the ECMAScript object corresponding to callable.
+    let function_object = callback.callback
+
+    # 5. Let realm be F’s associated realm.
+    let realm = js_object_shape_realm(function_object)
+
+    # 6. Let relevant settings be realm’s settings object.
+    let relevant_settings = html_principal_realm_settings_object(realm)
+
+    # 4. If ! IsCallable(F) is false:
+    if not js_object_is_function(function_object):
+        # 1. Note: This is only possible when the callback function came from an attribute marked with [LegacyTreatNonObjectAsNull].
+
+        # 2. Return the result of converting undefined to the callback function’s return type.
+        return (realm, js_completion_from_value(js_undefined()))
+
+    # 7. Let stored settings be callable’s callback context.
+    let stored_settings = callback.callback_context
+
+    # 8. Prepare to run script with relevant realm.
+    html_prepare_to_run_script(relevant_settings)
+
+    # 9. Prepare to run a callback with stored realm.
+    html_prepare_to_run_callback(stored_settings)
+
+    # FIXME: 10. Let jsArgs be the result of converting args to a JavaScript arguments list.
+    #            If this throws an exception, set completion to the completion value representing the thrown exception and jump to the step labeled return.
+
+    # 11. Let callResult be Call(F, thisArg, jsArgs).
+    let call_result = idl_call_as_completion(realm_vm(realm), (JsFunctionObject*)function_object, this_value, args)
+
+    # 12. If callResult is an abrupt completion, set completion to callResult and jump to the step labeled return.
+    # 13. Set completion to the result of converting callResult.[[Value]] to an IDL value of the same type as callable’s
+    #     return type. If this throws an exception, set completion to the completion value representing the thrown exception.
+    # 14. Return: at this point completion will be set to an IDL value or an abrupt completion.
+
+    # 1. Clean up after running a callback with stored settings.
+    html_clean_up_after_running_callback(stored_settings)
+
+    # 2. Clean up after running script with relevant settings.
+    # FIXME: This method follows an older version of the spec, which takes a realm, so we use F's associated realm instead.
+    html_clean_up_after_running_script(relevant_settings)
+
+    return (realm, call_result)
 
 ## Ported from Libraries/LibWeb/WebIDL/AbstractOperations.cpp:314 Web::WebIDL::invoke_callback.
 ## https://webidl.spec.whatwg.org/#invoke-a-callback-function
 pub func idl_invoke_callback_idl_exception_behavior(callback: IdlCallbackType*, this_argument: JsValue?, exception_behavior: IdlExceptionBehavior, args: const JsValue[]) -> JsCompletion:
-    return idl_invoke_callback_impl(callback, this_argument, args)
+    # https://webidl.spec.whatwg.org/#js-invoking-callback-functions
+    # The exceptionBehavior argument must be supplied if, and only if, callable’s return type is not a promise type. If callable’s return type is neither undefined nor any, it must be "rethrow".
+    # NOTE: Until call sites are updated to respect this, specifications which fail to provide a value here when it would be mandatory should be understood as supplying "rethrow".
+    var behavior = exception_behavior
+    if behavior == IdlExceptionBehavior.not_specified and callback.operation_returns_promise == IdlOperationReturnsPromise.no:
+        behavior = IdlExceptionBehavior.rethrow
+
+    assert(behavior == IdlExceptionBehavior.not_specified or callback.operation_returns_promise == IdlOperationReturnsPromise.no)
+
+    let (relevant_realm, completion) = idl_invoke_callback_impl(callback, this_argument, args)
+
+    # 3. If completion is an IDL value, return completion.
+    if not js_completion_is_abrupt(&completion):
+        return completion
+
+    # 4. Assert: completion is an abrupt completion.
+
+    # 5. If exceptionBehavior is "rethrow", throw completion.[[Value]].
+    if behavior == IdlExceptionBehavior.rethrow:
+        return js_throw_completion(js_completion_value(&completion))
+
+    # 6. Otherwise, if exceptionBehavior is "report":
+    if behavior == IdlExceptionBehavior.report:
+        # FIXME: 1. Assert: callable’s return type is undefined or any.
+
+        # 2. Report an exception completion.[[Value]] for relevant realm’s global object.
+        let window_or_worker = as_if_window_or_worker_global_scope_mixin((gc.Cell*)realm_global_object(relevant_realm)) else trap("as<HTML::WindowOrWorkerGlobalScopeMixin> failed")
+        html_window_or_worker_global_scope_mixin_report_an_exception(window_or_worker, js_completion_value(&completion))
+
+        # 3. Return the unique undefined IDL value.
+        return js_completion_from_value(js_undefined())
+
+    # 7. Assert: callable’s return type is a promise type.
+    assert(callback.operation_returns_promise == IdlOperationReturnsPromise.yes)
+
+    # 8. Let rejectedPromise be ! Call(%Promise.reject%, %Promise%, «completion.[[Value]]»).
+    let rejected_promise = idl_create_rejected_promise(relevant_realm, js_completion_value(&completion))
+
+    # 9. Return the result of converting rejectedPromise to the callback function’s return type.
+    _ = rejected_promise
+    trap("unported (P3): Web::WebIDL::invoke_callback of a promise callback (JS::Value of the promise)")
 
 ## Ported from Libraries/LibWeb/WebIDL/AbstractOperations.cpp:360 Web::WebIDL::invoke_callback.
 pub func idl_invoke_callback_span_js_value(callback: IdlCallbackType*, this_argument: JsValue?, args: const JsValue[]) -> JsCompletion:

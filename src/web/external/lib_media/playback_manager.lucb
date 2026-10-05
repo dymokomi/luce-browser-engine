@@ -1,0 +1,239 @@
+#==============================================================================================
+#
+#   playback_manager - LibMedia's PlaybackManager, a seam without demuxers
+#
+#   DESCRIPTION:
+#       LibMedia plays media through FFmpeg and its own Matroska reader (Containers/,
+#       FFmpeg/, the data providers and sinks, the audio output). None of it is ported yet
+#       (phase 4), so this port keeps LibMedia as a seam, like a Ladybird built without
+#       demuxers: PlaybackManager::create_demuxer_for_stream answers a NotImplemented
+#       DecoderError for every stream. Everything else here is
+#       Libraries/LibMedia/PlaybackManager.h and .cpp as they run when that happens:
+#
+#         - add_media_source reports the error through on_unsupported_format_error on the
+#           event loop (handle_media_init_error), so HTMLMediaElement takes the "media data
+#           ... in an unsupported format" steps: it cancels the fetch and goes back to its
+#           resource selection, which tries the next <source> and ends in the dedicated media
+#           source failure steps (error event, poster shown, the load event no longer delayed);
+#         - the manager stays in the Starting state (StartingStateHandler over
+#           ResumingStateHandler): play and pause only flip its playing flag, its state is
+#           Starting and no data is available;
+#         - its time comes from a GenericTimeProvider and is clamped to the duration (zero);
+#         - it has no tracks, so buffered_time_ranges is empty and nothing has a sink.
+#
+#       The thread pool is not used: the demuxer's verdict is known at once, and the report
+#       is deferred to the event loop as handle_media_init_error defers it. What only a demuxer
+#       makes reachable (track data, Playing/Paused/Seeking states, sinks) traps.
+#
+#       The manager is an OwnPtr in HTMLMediaElement; its destructor revokes the weak link
+#       (media_playback_manager_destruct), which the element calls where the C++ OwnPtr
+#       destroys it.
+#
+#       Copyright (c) 2022-2026, Gregory Bertilson <gregory@ladybird.org>
+#       Copyright (c) 2026 the luce-browser authors.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: GenericTimeProvider =====================================================================
+
+## Ported from Libraries/LibMedia/Providers/GenericTimeProvider.cpp:15 Media::GenericTimeProvider::current_time.
+func media_generic_time_provider_current_time(this: const MediaGenericTimeProvider*) -> ak.Duration:
+    var time = this.m_media_time
+    if let resumed = this.m_monotonic_time_on_resume:
+        let now = ak.monotonic_time_now()
+        _ = ak.duration_add_assign(&time, ak.monotonic_time_sub_monotonic_time(&now, resumed))
+    return time
+
+# mark: Creation and destruction ================================================================
+
+## Ported from Libraries/LibMedia/PlaybackManager.cpp:146 Media::PlaybackManager::create, with the
+## constructor (PlaybackManager.cpp:154).
+pub func media_playback_manager_create() -> MediaPlaybackManager*:
+    let link = new MediaWeakPlaybackManagerLink(m_manager = none) else trap("out of memory")
+    let time_provider = new MediaGenericTimeProvider(m_monotonic_time_on_resume = none, m_media_time = ak.duration_zero()) else trap("out of memory")
+    let playback_manager = new MediaPlaybackManager(m_handler = none, m_weak_link = link, m_time_provider = time_provider, m_preferred_video_track = none,
+                                                    m_preferred_audio_track = none, m_duration = ak.duration_zero()) else trap("out of memory")
+    link.m_manager = playback_manager
+    playback_manager.m_handler = new MediaStartingStateHandler(m_manager = playback_manager) else trap("out of memory")
+    # m_handler->on_enter(): ResumingStateHandler's does nothing.
+    return playback_manager
+
+## Ported from Libraries/LibMedia/PlaybackManager.cpp:160 Media::PlaybackManager::~PlaybackManager:
+## the OwnPtr's destructor (see the header).
+pub func media_playback_manager_destruct(this: MediaPlaybackManager*):
+    this.m_weak_link.m_manager = none
+
+## Ported from Libraries/LibMedia/PlaybackManager.h:56 Media::PlaybackManager::set_audio_output_disabled.
+pub func media_playback_manager_set_audio_output_disabled(this: MediaPlaybackManager*, disabled: bool):
+    this.m_audio_output_disabled = disabled
+
+# mark: Media sources ===========================================================================
+
+## Ported from Libraries/LibMedia/PlaybackManager.cpp:25 Media::PlaybackManager::create_demuxer_for_stream:
+## the seam (see the header). Ladybird asks its Matroska reader, then FFmpeg.
+func media_playback_manager_create_demuxer_for_stream(stream: MediaIncrementallyPopulatedStream*) -> MediaDecoderError:
+    _ = stream
+    return media_decoder_error_with_description(MediaDecoderErrorCategory.not_implemented, "No demuxer for this media: LibMedia's demuxers are not ported")
+
+## The captures of handle_media_init_error's deferred invocation: `[self = move(self), error = move(error)]`.
+struct MediaPlaybackManagerInitError:
+    var link: MediaWeakPlaybackManagerLink*
+    var error_: MediaDecoderError
+
+    static func invoke(context: void*?):
+        let captures = (MediaPlaybackManagerInitError*)(context else trap("media init error: no captures"))
+        let self_ = captures.link.m_manager else return
+        if ak.function1_is_set(&self_.on_unsupported_format_error):
+            ak.function1_call(&self_.on_unsupported_format_error, captures.error_)
+
+## Ported from Libraries/LibMedia/PlaybackManager.cpp:165 Media::handle_media_init_error (static).
+func media_playback_manager_handle_media_init_error(link: MediaWeakPlaybackManagerLink*, error_: MediaDecoderError):
+    let captures = new MediaPlaybackManagerInitError(link = link, error_ = error_) else trap("out of memory")
+    core_deferred_invoke(ak.Function0[unit](call = MediaPlaybackManagerInitError.invoke, context = captures))
+
+## Ported from Libraries/LibMedia/PlaybackManager.cpp:178 Media::PlaybackManager::add_media_source (a stream).
+pub func media_playback_manager_add_media_source(this: MediaPlaybackManager*, stream: MediaIncrementallyPopulatedStream*):
+    # Threading::ThreadPool::the().submit([...] { auto demuxer_or_error = create_demuxer_for_stream(stream); ... }),
+    # run here: the seam's demuxer always fails, so prepare_playback_from_demuxer is never reached.
+    let error_ = media_playback_manager_create_demuxer_for_stream(stream)
+    media_playback_manager_handle_media_init_error(this.m_weak_link, error_)
+
+# mark: Tracks ==================================================================================
+
+## Ported from Libraries/LibMedia/PlaybackManager.h:62 Media::PlaybackManager::video_tracks.
+pub func media_playback_manager_video_tracks(this: MediaPlaybackManager*) -> ak.Vector[MediaTrack]:
+    return this.m_video_tracks
+
+## Ported from Libraries/LibMedia/PlaybackManager.h:63 Media::PlaybackManager::audio_tracks.
+pub func media_playback_manager_audio_tracks(this: MediaPlaybackManager*) -> ak.Vector[MediaTrack]:
+    return this.m_audio_tracks
+
+## Ported from Libraries/LibMedia/PlaybackManager.h:64 Media::PlaybackManager::preferred_video_track.
+pub func media_playback_manager_preferred_video_track(this: MediaPlaybackManager*) -> MediaTrack?:
+    return this.m_preferred_video_track
+
+## Ported from Libraries/LibMedia/PlaybackManager.h:65 Media::PlaybackManager::preferred_audio_track.
+pub func media_playback_manager_preferred_audio_track(this: MediaPlaybackManager*) -> MediaTrack?:
+    return this.m_preferred_audio_track
+
+## Ported from Libraries/LibMedia/PlaybackManager.cpp:318 Media::PlaybackManager::get_or_create_the_displaying_video_sink_for_track:
+## get_video_data_for_track finds no data for any track here (VERIFY_NOT_REACHED, as in C++).
+pub func media_playback_manager_get_or_create_the_displaying_video_sink_for_track(this: MediaPlaybackManager*, track: MediaTrack) -> MediaDisplayingVideoSink*:
+    trap("VERIFY_NOT_REACHED: PlaybackManager::get_video_data_for_track (no demuxer, no track data)")
+
+## Ported from Libraries/LibMedia/PlaybackManager.cpp:335 Media::PlaybackManager::remove_the_displaying_video_sink_for_track.
+pub func media_playback_manager_remove_the_displaying_video_sink_for_track(this: MediaPlaybackManager*, track: MediaTrack):
+    trap("VERIFY_NOT_REACHED: PlaybackManager::get_video_data_for_track (no demuxer, no track data)")
+
+## Ported from Libraries/LibMedia/PlaybackManager.cpp:345 Media::PlaybackManager::enable_an_audio_track.
+pub func media_playback_manager_enable_an_audio_track(this: MediaPlaybackManager*, track: MediaTrack):
+    trap("VERIFY_NOT_REACHED: PlaybackManager::get_audio_data_for_track (no demuxer, no track data)")
+
+## Ported from Libraries/LibMedia/PlaybackManager.cpp:358 Media::PlaybackManager::disable_an_audio_track.
+pub func media_playback_manager_disable_an_audio_track(this: MediaPlaybackManager*, track: MediaTrack):
+    trap("VERIFY_NOT_REACHED: PlaybackManager::get_audio_data_for_track (no demuxer, no track data)")
+
+# mark: Playback ================================================================================
+
+## The manager's state handler (always the Starting state here, see the header).
+func media_playback_manager_handler(this: MediaPlaybackManager*) -> MediaStartingStateHandler*:
+    return this.m_handler else trap("PlaybackManager: no state handler")
+
+## Ported from Libraries/LibMedia/PlaybackStates/ResumingStateHandler.cpp:15 Media::ResumingStateHandler::resume:
+## replace_state_handler<PlayingStateHandler> or <PausedStateHandler>, which only a demuxer's tracks reach.
+func media_starting_state_handler_resume(this: MediaStartingStateHandler*):
+    if this.m_playing:
+        trap("unported (P4): Media::PlayingStateHandler (media playback)")
+    trap("unported (P4): Media::PausedStateHandler (media playback)")
+
+## Ported from Libraries/LibMedia/PlaybackManager.cpp:387 Media::PlaybackManager::start, with
+## StartingStateHandler::start (StartingStateHandler.cpp:13).
+pub func media_playback_manager_start(this: MediaPlaybackManager*):
+    let handler = media_playback_manager_handler(this)
+    handler.m_started = true
+
+    # if (manager().m_tracks_still_buffering.is_empty()) resume(); (no track ever buffers here)
+    media_starting_state_handler_resume(handler)
+
+## Ported from Libraries/LibMedia/PlaybackManager.cpp:392 Media::PlaybackManager::play, with
+## ResumingStateHandler::play.
+pub func media_playback_manager_play(this: MediaPlaybackManager*):
+    media_playback_manager_handler(this).m_playing = true
+
+## Ported from Libraries/LibMedia/PlaybackManager.cpp:397 Media::PlaybackManager::pause, with
+## ResumingStateHandler::pause.
+pub func media_playback_manager_pause(this: MediaPlaybackManager*):
+    media_playback_manager_handler(this).m_playing = false
+
+## Ported from Libraries/LibMedia/PlaybackManager.cpp:402 Media::PlaybackManager::seek: the handler's
+## seek (PlaybackStateHandler::seek) replaces it with a SeekingStateHandler, which drives the
+## data providers.
+pub func media_playback_manager_seek(this: MediaPlaybackManager*, timestamp: ak.Duration, seek_mode: MediaSeekMode):
+    trap("unported (P4): Media::SeekingStateHandler (media playback)")
+
+## Ported from Libraries/LibMedia/PlaybackManager.cpp:408 Media::PlaybackManager::is_playing.
+pub func media_playback_manager_is_playing(this: MediaPlaybackManager*) -> bool:
+    return media_playback_manager_handler(this).m_playing
+
+## Ported from Libraries/LibMedia/PlaybackManager.cpp:413 Media::PlaybackManager::state
+## (StartingStateHandler::state).
+pub func media_playback_manager_state(this: MediaPlaybackManager*) -> MediaPlaybackState:
+    _ = media_playback_manager_handler(this)
+    return MediaPlaybackState.starting
+
+## Ported from Libraries/LibMedia/PlaybackManager.cpp:418 Media::PlaybackManager::available_data
+## (StartingStateHandler::available_data).
+pub func media_playback_manager_available_data(this: MediaPlaybackManager*) -> MediaAvailableData:
+    _ = media_playback_manager_handler(this)
+    return MediaAvailableData.none_
+
+## Ported from Libraries/LibMedia/PlaybackManager.cpp:423 Media::PlaybackManager::buffered_time_ranges:
+## the intersection of the enabled tracks' buffered ranges; there are no tracks here.
+pub func media_playback_manager_buffered_time_ranges(this: MediaPlaybackManager*) -> MediaTimeRanges:
+    _ = this
+    return MediaTimeRanges()
+
+## Ported from Libraries/LibMedia/PlaybackManager.cpp:446 Media::PlaybackManager::set_volume: the audio
+## sink's volume, when there is a sink (there is none without audio tracks).
+pub func media_playback_manager_set_volume(this: MediaPlaybackManager*, volume: f64):
+    _ = this
+    _ = volume
+
+## Ported from Libraries/LibMedia/PlaybackManager.h:58 Media::PlaybackManager::duration.
+pub func media_playback_manager_duration(this: MediaPlaybackManager*) -> ak.Duration:
+    return this.m_duration
+
+## Ported from Libraries/LibMedia/PlaybackManager.h:60 Media::PlaybackManager::current_time:
+## `min(m_time_provider->current_time(), duration())`.
+pub func media_playback_manager_current_time(this: MediaPlaybackManager*) -> ak.Duration:
+    let time = media_generic_time_provider_current_time(this.m_time_provider)
+    if ak.duration_cmp(&time, this.m_duration) < 0:
+        return time
+    return this.m_duration
+
+# mark: Callbacks ===============================================================================
+
+## `playback_manager->on_duration_change = ...` (Libraries/LibMedia/PlaybackManager.h).
+pub func media_playback_manager_set_on_duration_change(this: MediaPlaybackManager*, callback: ak.Function1[ak.Duration, unit]):
+    this.on_duration_change = callback
+
+## `playback_manager->on_track_added = ...` (Libraries/LibMedia/PlaybackManager.h).
+pub func media_playback_manager_set_on_track_added(this: MediaPlaybackManager*, callback: ak.Function1[const MediaTrack*, unit]):
+    this.on_track_added = callback
+
+## `playback_manager->on_metadata_parsed = ...` (Libraries/LibMedia/PlaybackManager.h).
+pub func media_playback_manager_set_on_metadata_parsed(this: MediaPlaybackManager*, callback: ak.Function0[unit]):
+    this.on_metadata_parsed = callback
+
+## `playback_manager->on_unsupported_format_error = ...` (Libraries/LibMedia/PlaybackManager.h).
+pub func media_playback_manager_set_on_unsupported_format_error(this: MediaPlaybackManager*, callback: ak.Function1[MediaDecoderError, unit]):
+    this.on_unsupported_format_error = callback
+
+## `playback_manager->on_error = ...` (Libraries/LibMedia/PlaybackManager.h).
+pub func media_playback_manager_set_on_error(this: MediaPlaybackManager*, callback: ak.Function1[MediaDecoderError, unit]):
+    this.on_error = callback
+
+## `playback_manager->on_playback_state_change = ...` (Libraries/LibMedia/PlaybackManager.h).
+pub func media_playback_manager_set_on_playback_state_change(this: MediaPlaybackManager*, callback: ak.Function0[unit]):
+    this.on_playback_state_change = callback
