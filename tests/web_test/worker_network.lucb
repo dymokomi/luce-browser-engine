@@ -1,0 +1,111 @@
+#==============================================================================================
+#
+#   worker_network - the worker's RequestClient: the engine's in-process client, kept off the
+#   network
+#
+#   DESCRIPTION:
+#       Ladybird's tests run where test-web runs them: on a developer's machine or in CI, where
+#       a test that names a remote host (Layout/input/object-fallback.html fetches
+#       https://ladybird.org/does-not-exist.html) gets whatever that host answers, or nothing
+#       offline. The runner must not depend on it, so the worker's RequestClient is hermetic:
+#       a request for a local URL (file:, data:, about:, resource:, or http(s) on a loopback
+#       host: localhost, 127.0.0.0/8, ::1) goes to the engine's in-process client
+#       (loader/in_process_request_client); any other request fails as an offline machine's
+#       RequestServer fails it, with UnableToResolveHost, delivered on the event loop like any
+#       completion.
+#
+#       Not a port: new code of the RequestClient seam (DESIGN.md §7.1) for the runner.
+#
+#       Copyright (c) 2026 the luce-browser authors.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: The client ==============================================================================
+
+## The worker's RequestClient: the seam's client first (a pointer to one is a pointer to the
+## other), and the in-process client local requests go to.
+struct HermeticRequestClient:
+    var client: web.RequestsRequestClient
+    var local: web.InProcessRequestClient*
+
+## The vtable of the hermetic client.
+let hermetic_request_client_vtable: web.RequestsRequestClientVTable = web.RequestsRequestClientVTable(start_request = hermetic_request_client_start_request,
+                                                                                                      stop_request = hermetic_request_client_stop_request,
+                                                                                                      ensure_connection = hermetic_request_client_ensure_connection)
+
+## A new hermetic client whose requests are cells of `heap`, over a new in-process client of the
+## same heap; both live in the C heap for the process, as the embedder's client does.
+func hermetic_request_client_create(heap: gc.Heap*) -> HermeticRequestClient*:
+    let local = web.in_process_request_client_create(heap)
+    with memory.heap:
+        let this = new HermeticRequestClient(client = web.RequestsRequestClient(vtable = &hermetic_request_client_vtable, m_heap = heap), local = local) else trap("out of memory")
+        web.requests_request_client_construct(&this.client, &hermetic_request_client_vtable, heap)
+        return this
+
+## Whether `url` may be loaded without the network: every scheme but http(s), and http(s) on a
+## loopback host (localhost or a name under it, 127.0.0.0/8, ::1).
+func hermetic_url_is_local(url: const web_url.Url*) -> bool:
+    let scheme = web_url.url_scheme(url)
+    if not ak.string_eq_string_view(&scheme, ak.sv("http")) and not ak.string_eq_string_view(&scheme, ak.sv("https")):
+        return true
+    let host = web_url.url_host(url) else return false
+    if web_url.host_has_i_pv4_address(&host):
+        # (URL::IPv4Address is the address as a number: the first octet is the high byte.)
+        let address = web_url.host_get_i_pv4_address(&host)
+        return ak.i_pv4_address_to_u32(&address) >> 24 == 127
+    if web_url.host_has_i_pv6_address(&host):
+        return web_url.host_get_i_pv6_address(&host) == ak.i_pv6_address_loopback()
+    let name = web_url.host_get_string(&host)
+    let view = ak.string_bytes_as_string_view(&name)
+    return ak.string_view_equals(&view, "localhost") or ak.string_view_ends_with_string_view(&view, ak.sv(".localhost"))
+
+## A request the hermetic client refused: it fails on the next turn of the event loop unless it
+## is stopped first. `client` comes first and is the hermetic client, which tells a refusal from
+## the in-process client's own state (whose first field is the in-process client).
+struct HermeticRefusal:
+    var client: HermeticRequestClient*
+    var request: web.RequestsRequest*
+    var stopped: bool
+    var finished: bool
+
+## The client's start_request: a local request goes to the in-process client; any other is
+## refused, failing as an offline RequestServer fails it.
+func hermetic_request_client_start_request(base: web.RequestsRequestClient*, request: web.RequestsRequest*, arguments: const web.RequestsStartRequest*) -> bool:
+    let this = (HermeticRequestClient*)base
+    if hermetic_url_is_local(&arguments.url):
+        let local = &this.local.client
+        return local.vtable.start_request(local, request, arguments)
+    let refusal = new HermeticRefusal(client = this, request = request, stopped = false, finished = false) else trap("out of memory")
+    request.m_client_data = refusal
+    web.core_deferred_invoke(ak.Function0[unit](call = hermetic_refusal_run, context = refusal))
+    return true
+
+## The refusal of a request, unless it was stopped: no headers, no body, UnableToResolveHost.
+func hermetic_refusal_run(context: void*?):
+    let refusal = (HermeticRefusal*)(context else trap("hermetic refusal: no state"))
+    if refusal.stopped:
+        return
+    refusal.finished = true
+    web.requests_request_did_finish(refusal.request, 0, web.RequestsRequestTimingInfo(), web.RequestsNetworkError.unable_to_resolve_host)
+
+## The client's stop_request: a refused request is not failed after all; a local one is the
+## in-process client's to stop.
+func hermetic_request_client_stop_request(base: web.RequestsRequestClient*, request: web.RequestsRequest*) -> bool:
+    let this = (HermeticRequestClient*)base
+    let data = request.m_client_data else return false
+    if *(HermeticRequestClient**)data == this:
+        let refusal = (HermeticRefusal*)data
+        if refusal.finished or refusal.stopped:
+            return false
+        refusal.stopped = true
+        return true
+    let local = &this.local.client
+    return local.vtable.stop_request(local, request)
+
+## The client's ensure_connection: only a local URL may be connected to ahead of a request.
+func hermetic_request_client_ensure_connection(base: web.RequestsRequestClient*, url: web_url.Url, cache_level: web.RequestServerCacheLevel):
+    let this = (HermeticRequestClient*)base
+    if hermetic_url_is_local(&url):
+        let local = &this.local.client
+        local.vtable.ensure_connection(local, url, cache_level)

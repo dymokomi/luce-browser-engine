@@ -1,0 +1,149 @@
+#==============================================================================================
+#
+#   tests_message_port - what destroying a document walks: the ports of MessagePort's registry,
+#   the blob URL store and the window's event sources, web sockets and IndexedDB connections
+#
+#   DESCRIPTION:
+#       Ladybird tests MessagePort and blob URLs through Tests/LibWeb/Text (script), so these pin
+#       the C++ that region p2r ports: every port joins the static weak set as it is made and
+#       leaves it when it is finalized; for_each_message_port visits the live ports from a copy;
+#       disentangle unpairs a port and its remote port; FileAPI's unloading cleanup steps
+#       remove the store's entries of the document's environment and keep the rest; the
+#       window's registries are empty before phase 4. The helpers are tests_html_elements_2's
+#       and bindings/tests_bindings'.
+#
+#==============================================================================================
+
+# mark: MessagePort =============================================================================
+
+## What for_each_message_port visited: the number of ports, and whether `port` was one.
+struct TestMessagePortsSeen:
+    var count: i32
+    var port: HtmlMessagePort*?
+    var saw_port: bool
+
+    static func visit(context: void*?, port: HtmlMessagePort*):
+        let seen = (TestMessagePortsSeen*)(context else trap("no captures"))
+        seen.count += 1
+        if seen.port == port:
+            seen.saw_port = true
+
+## for_each_message_port's visit of every port, looking for `port`.
+noinline func test_message_ports_seen(port: HtmlMessagePort*?) -> TestMessagePortsSeen:
+    var seen = TestMessagePortsSeen(port = port)
+    html_message_port_for_each_message_port(ak.Function1[HtmlMessagePort*, unit](call = TestMessagePortsSeen.visit, context = &seen))
+    return seen
+
+## A port of `realm` that nothing keeps: its Weak, without its address in the caller's frame.
+noinline func make_test_message_port(realm: Realm*) -> gc.Weak[HtmlMessagePort]:
+    return gc.make_weak(html_message_port_create(realm))
+
+test "MessagePort: every port is in the registry until it is collected; for_each visits the live ones":
+    let (vm, realm, _) = test_elements_setup()
+    defer web_test_destroy_vm(vm)
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        assert(test_message_ports_seen(none).count == 0)
+        let port = html_message_port_create(realm)
+        assert(is_html_message_port(port) and is_dom_event_target(port) and not is_dom_node(port))
+        let seen = test_message_ports_seen(port)
+        assert(seen.count == 1 and seen.saw_port)
+        assert(html_message_port_entangled_port(port) == none and not html_message_port_is_entangled(port))
+
+        # A port nothing keeps is finalized and leaves the set; the kept one stays.
+        let weak = make_test_message_port(realm)
+        assert(web_test_alive(&weak))
+        assert(test_message_ports_seen(port).count == 2)
+        test_html_forms_collect(vm)
+        assert(not web_test_alive(&weak))
+        let after = test_message_ports_seen(port)
+        assert(after.count == 1 and after.saw_port)
+
+test "MessagePort::disentangle: both ports forget each other; the worker event target is cleared":
+    let (vm, realm, document) = test_elements_setup()
+    defer web_test_destroy_vm(vm)
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        let port = html_message_port_create(realm)
+        let remote = html_message_port_create(realm)
+        # (entangle_with is phase 4's: the pair is made by hand.)
+        port.m_remote_port = remote
+        remote.m_remote_port = port
+        port.m_should_shutdown_on_enable = true
+        html_message_port_set_worker_event_target(port, document.dom_event_target())
+        assert(html_message_port_entangled_port(port) == remote)
+        html_message_port_disentangle(port)
+        assert(html_message_port_entangled_port(port) == none and html_message_port_entangled_port(remote) == none)
+        assert(port.m_worker_event_target == none and not port.m_should_shutdown_on_enable)
+        # Disentangling a port that is not entangled changes nothing.
+        html_message_port_disentangle(remote)
+        assert(html_message_port_entangled_port(remote) == none)
+
+# mark: The blob URL store ======================================================================
+
+## A store entry of `environment` (none: no environment) with no blob.
+func test_blob_url_entry(environment: HtmlEnvironmentSettingsObject*?) -> FileApiBlobUrlEntry:
+    return FileApiBlobUrlEntry(object = FileApiBlobUrlEntryObject.blob(gc.Root[FileApiBlob](m_impl = none)), environment = gc.root_create(environment))
+
+## Adds `entry` to the blob URL store as `url` (the store is in the C heap).
+func test_blob_url_store_add(url: str, entry: FileApiBlobUrlEntry):
+    let saved_atomic_allocator = ak.atomic_allocator
+    ak.atomic_allocator = none
+    defer ak.atomic_allocator = saved_atomic_allocator
+    with memory.heap:
+        _ = ak.hash_map_set(file_api_blob_url_store(), ak.string_from_str(url), entry)
+
+test "FileAPI: the unloading cleanup steps remove the store's entries of the document's environment":
+    let (vm, _, document) = test_elements_setup()
+    defer web_test_destroy_vm(vm)
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        let environment = dom_document_relevant_settings_object(document)
+        test_blob_url_store_add("blob:null/document-1", test_blob_url_entry(environment))
+        test_blob_url_store_add("blob:null/elsewhere", test_blob_url_entry(none))
+        test_blob_url_store_add("blob:null/document-2", test_blob_url_entry(environment))
+        assert(ak.hash_map_size(file_api_blob_url_store()) == 3)
+        file_api_run_unloading_cleanup_steps(document)
+        assert(ak.hash_map_size(file_api_blob_url_store()) == 1)
+        let kept = ak.hash_map_get_k(file_api_blob_url_store(), ak.string_from_str("blob:null/elsewhere")) else trap("the other entry stays")
+        assert(gc.root_ptr(&kept.environment) == none)
+        # Nothing left of the document: a second run removes nothing.
+        file_api_run_unloading_cleanup_steps(document)
+        assert(ak.hash_map_size(file_api_blob_url_store()) == 1)
+        var removed = ak.hash_map_take_k(file_api_blob_url_store(), ak.string_from_str("blob:null/elsewhere")) else trap("taken")
+        gc.root_release(&removed.environment)
+        assert(ak.hash_map_is_empty(file_api_blob_url_store()))
+
+# mark: Destroying a document ==================================================================
+
+test "Document::destroy: the window's ports are disentangled; its registries hold nothing before phase 4":
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    _ = web_test_install_agent(vm)
+    web_test_install_event_loop_plugin()
+    defer web_test_remove_event_loop_plugin()
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        let (test_page, traversable) = test_browsing_page_with_traversable(vm)
+        _ = test_page
+        let document = html_navigable_active_document(traversable.html_navigable()) else trap("no document")
+        let window = dom_document_window(document) else trap("no window")
+        let mixin = &window.window_or_worker_global_scope_mixin
+        assert(html_window_or_worker_global_scope_mixin_make_disappear_all_web_sockets(mixin) == HtmlWindowOrWorkerGlobalScopeMixinAffectedAnyWebSockets.no)
+        assert(ak.hash_table_is_empty(&mixin.m_registered_event_sources))
+
+        # A pair of ports of the window's realm (entangled by hand: entangle_with is phase 4's), and a pair of a
+        # realm whose global is not a window, which destroy() leaves alone.
+        let port = html_message_port_create(dom_document_realm(document))
+        let remote = html_message_port_create(dom_document_realm(document))
+        port.m_remote_port = remote
+        remote.m_remote_port = port
+        let other_realm = web_test_create_settings_realm(vm)
+        let other = html_message_port_create(other_realm)
+        let other_remote = html_message_port_create(other_realm)
+        other.m_remote_port = other_remote
+        other_remote.m_remote_port = other
+        dom_document_destroy(document)
+        assert(html_message_port_entangled_port(port) == none and html_message_port_entangled_port(remote) == none)
+        assert(html_message_port_entangled_port(other) == other_remote)
+        assert(dom_document_has_been_destroyed(document))

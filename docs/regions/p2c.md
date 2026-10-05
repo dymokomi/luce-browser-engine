@@ -168,11 +168,9 @@ them pass every time.
 - The `TRY_OR_IGNORE(String::formatted(...))` messages of the CORS-preflight fetch are built and validated
   (`fetch_fetching_preflight_message`); a message that is not valid UTF-8 returns without resolving, as C++.
 - `AnimationTimeline::associated_animations` answers the live animations of the weak set as a Vector (the closure
-  stub's signature); `gc.WeakHashSetValues`' `iterator` is not public in the pinned foundation, so the table's weak
-  entries are read directly (a foundation follow-up).
-- luce-std's HTTP parser refuses a `204` response with `Content-Length: 0` ("body framing is forbidden"), which
-  servers do send (browsers and curl accept it): an in-process HTTP load of such a response fails. The tests' 204s
-  have no Content-Length; luce-std follow-up.
+  stub's signature), looping over the set with `gc.weak_hash_set_begin` (public since foundation e0d0c05, region p2r).
+- luce-std 0.5.0's HTTP parser refused a `204` response with `Content-Length: 0`, which servers do send; luce-std
+  0.5.1 (pinned since region p2r) reads such a response as bodiless, and the tests' 204s carry `Content-Length: 0`.
 - HANDOFF.md §5 item 4's engine follow-ups were done by earlier regions; none concerns this region.
 
 ## Compiler issues

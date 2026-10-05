@@ -220,6 +220,7 @@ struct TestLoopEvent:
 test "the worker's event loop: deferred invocations first, then due timers by registration, single-shot ones once":
     var event_loop = WorkerEventLoop(next_timer_id = 0, exit_requested = false, exit_code = 0)
     web.core_event_loop_install(&event_loop)
+    defer web.core_event_loop_uninstall()
     var log = TestLoopLog()
     var first = TestLoopEvent(log = &log, name = 'a')
     var second = TestLoopEvent(log = &log, name = 'b')
@@ -249,3 +250,72 @@ test "the worker's event loop: deferred invocations first, then due timers by re
 
     event_loop.quit(3)
     assert(event_loop.was_exit_requested() and event_loop.exit_code == 3)
+
+# mark: The hermetic RequestClient ==============================================================
+
+## Whether `url` is one the hermetic client lets through.
+func hermetic_test_is_local(url: str) -> bool:
+    let parsed = web_url.parser_basic_parse(ak.sv(url)) else trap("the URL parses")
+    return hermetic_url_is_local(&parsed)
+
+## What a request of the hermetic client delivered.
+struct HermeticTestLog:
+    var headers: u32
+    var data: usize
+    var finishes: u32
+    var network_error: web.RequestsNetworkError?
+
+    static func on_headers(context: void*?, headers: web.HttpHeaderList*, status_code: u32?, reason_phrase: ak.String?):
+        let log = (HermeticTestLog*)(context else trap("no log"))
+        log.headers += 1
+
+    static func on_data(context: void*?, data: const u8[]):
+        let log = (HermeticTestLog*)(context else trap("no log"))
+        log.data += data.length
+
+    static func on_finish(context: void*?, total_size: u64, timing_info: web.RequestsRequestTimingInfo, network_error: web.RequestsNetworkError?):
+        let log = (HermeticTestLog*)(context else trap("no log"))
+        log.finishes += 1
+        log.network_error = network_error
+
+## Starts a GET of `url` through the hermetic client, its deliveries recorded in `log`.
+func hermetic_test_start(client: HermeticRequestClient*, url: str, log: HermeticTestLog*) -> web.RequestsRequest*:
+    let parsed = web_url.parser_basic_parse(ak.sv(url)) else trap("the URL parses")
+    let request = web.requests_request_client_start_request(&client.client, ak.byte_string_from_str("GET"), parsed, none, b"") else trap("the request starts")
+    web.requests_request_set_unbuffered_request_callbacks(request, ak.Function3[web.HttpHeaderList*, u32?, ak.String?, unit](call = HermeticTestLog.on_headers, context = log),
+                                                          ak.Function1[const u8[], unit](call = HermeticTestLog.on_data, context = log),
+                                                          ak.Function3[u64, web.RequestsRequestTimingInfo, web.RequestsNetworkError?, unit](call = HermeticTestLog.on_finish, context = log))
+    return request
+
+test "the hermetic RequestClient: local URLs go to the in-process client, the network fails as offline":
+    assert(hermetic_test_is_local("file:///tmp/a.html") and hermetic_test_is_local("data:,x") and hermetic_test_is_local("about:blank"))
+    assert(hermetic_test_is_local("resource://ladybird/templates/error.html") and hermetic_test_is_local("blob:null/1"))
+    assert(hermetic_test_is_local("http://127.0.0.1:8000/") and hermetic_test_is_local("http://127.2.3.4/") and hermetic_test_is_local("https://[::1]/"))
+    assert(hermetic_test_is_local("http://localhost/") and hermetic_test_is_local("http://www.localhost:9/"))
+    assert(not hermetic_test_is_local("https://ladybird.org/does-not-exist.html") and not hermetic_test_is_local("http://128.0.0.1/"))
+    assert(not hermetic_test_is_local("http://[::2]/") and not hermetic_test_is_local("http://localhost.example/") and not hermetic_test_is_local("http://10.0.0.1/"))
+
+    var event_loop = WorkerEventLoop(next_timer_id = 0, exit_requested = false, exit_code = 0)
+    web.core_event_loop_install(&event_loop)
+    defer web.core_event_loop_uninstall()
+    let vm = web.vm_create()
+    let client = hermetic_request_client_create(web.vm_heap(vm))
+    var remote = HermeticTestLog()
+    var local = HermeticTestLog()
+    var stopped = HermeticTestLog()
+    let remote_request = hermetic_test_start(client, "https://ladybird.org/does-not-exist.html", &remote)
+    _ = hermetic_test_start(client, "data:,hello", &local)
+    let stopped_request = hermetic_test_start(client, "http://example.com/", &stopped)
+    assert(web.requests_request_id(remote_request) == 0 and web.requests_request_id(stopped_request) == 2)
+
+    # Nothing is delivered before the event loop runs; a refused request can still be stopped.
+    assert(remote.finishes == 0 and local.finishes == 0)
+    assert(web.requests_request_stop(stopped_request))
+    assert(not web.requests_request_stop(stopped_request))
+    worker_drain(&event_loop)
+    assert(remote.finishes == 1 and remote.headers == 0 and remote.data == 0)
+    assert(remote.network_error == web.RequestsNetworkError.unable_to_resolve_host)
+    assert(local.finishes == 1 and local.headers == 1 and local.data == 5 and local.network_error == none)
+    assert(stopped.finishes == 0 and stopped.headers == 0)
+    # A finished refusal cannot be stopped.
+    assert(not web.requests_request_stop(remote_request))
