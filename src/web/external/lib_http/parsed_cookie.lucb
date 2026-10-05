@@ -1,0 +1,487 @@
+#==============================================================================================
+#
+#   parsed_cookie - HTTP::Cookie::parse_cookie: a Set-Cookie string as a cookie's attributes
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibHTTP/Cookie/ParsedCookie.cpp (lines 28-476: parse_cookie, the
+#       attribute steps and parse_date_time) with ParsedCookie.h's MAXIMUM_COOKIE_AGE, and the
+#       two helpers of Cookie.cpp it calls (same_site_from_string, default_path). Storing the
+#       cookies is the embedder's (LibWebView's CookieJar, through PageClient's
+#       page_did_set_cookie).
+#
+#       Copyright (c) 2021-2023, Tim Flynn <trflynn89@serenityos.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+## ParsedCookie.h:39 HTTP::Cookie::MAXIMUM_COOKIE_AGE: 400 days, in seconds.
+let http_maximum_cookie_age_seconds: i64 = 400 * 24 * 60 * 60
+
+## AK's short_month_names (AK/DateConstants.h).
+let http_short_month_names: str[12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+## Ported from Cookie.cpp:52 HTTP::Cookie::same_site_from_string.
+pub func http_same_site_from_string(same_site_mode: ak.StringView) -> HttpSameSite:
+    if ak.string_view_equals_ignoring_ascii_case(&same_site_mode, ak.sv("None")):
+        return HttpSameSite.none_
+    if ak.string_view_equals_ignoring_ascii_case(&same_site_mode, ak.sv("Strict")):
+        return HttpSameSite.strict
+    if ak.string_view_equals_ignoring_ascii_case(&same_site_mode, ak.sv("Lax")):
+        return HttpSameSite.lax
+    return HttpSameSite.default
+
+## Ported from Cookie.cpp:130 HTTP::Cookie::default_path.
+## https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis-22#section-5.1.4-1
+pub func http_default_path(url: const web_url.Url*) -> ak.String:
+    # 1. Let uri-path be the path portion of the request-uri if such a portion exists (and empty otherwise).
+    let serialized_path = web_url.url_serialize_path(url)
+    let uri_path = web_url.percent_decode(ak.string_bytes_as_string_view(&serialized_path))
+    let uri_path_text = ak.string_view_text(ak.byte_string_view(&uri_path))
+
+    # 2. If the uri-path is empty or if the first character of the uri-path is not a %x2F ("/") character, output
+    #    %x2F ("/") and skip the remaining steps.
+    if uri_path_text.length == 0 or uri_path_text.bytes[0] != '/':
+        return ak.string_from_str("/")
+
+    var last_separator = uri_path_text.length - 1
+    while uri_path_text.bytes[last_separator] != '/':
+        last_separator -= 1
+
+    # 3. If the uri-path contains no more than one %x2F ("/") character, output %x2F ("/") and skip the remaining step.
+    if last_separator == 0:
+        return ak.string_from_str("/")
+
+    # 4. Output the characters of the uri-path from the first character up to, but not including, the right-most
+    #    %x2F ("/").
+    # FIXME: The path might not be valid UTF-8.
+    return ak.string_from_utf8(ak.sv((str)uri_path_text.bytes[..<last_separator])) else trap("MUST: String::from_utf8")
+
+## Ported from ParsedCookie.cpp:30 HTTP::Cookie::cookie_contains_invalid_control_character.
+pub func http_cookie_contains_invalid_control_character(cookie_string: ak.StringView) -> bool:
+    var view: ak.Utf8View = ---
+    ak.utf8_view_construct_string_view(&view, cookie_string)
+    var iterator = ak.utf8_view_begin(&view)
+    while not ak.utf8_code_point_iterator_done(&iterator):
+        let code_point = ak.utf8_code_point_iterator_deref(&iterator)
+        _ = ak.utf8_code_point_iterator_inc(&iterator)
+        if code_point <= 0x08:
+            return true
+        if code_point >= 0x0a and code_point <= 0x1f:
+            return true
+        if code_point == 0x7f:
+            return true
+    return false
+
+## The index of the first `byte` in `text`, if any (StringView::find).
+func http_find(text: str, byte: u8) -> usize?:
+    for index in 0..<text.length:
+        if text.bytes[index] == byte:
+            return index
+    return none
+
+## `view.trim_whitespace()` of a str.
+func http_trim(text: str) -> str:
+    let view = ak.sv(text)
+    return ak.string_view_text(ak.string_view_trim_whitespace(&view))
+
+## Ported from ParsedCookie.cpp:45 HTTP::Cookie::parse_cookie.
+## https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis-22#section-5.6-6
+pub func http_parse_cookie(url: web_url.Url, cookie_view: ak.StringView) -> HttpParsedCookie?:
+    let cookie_string = ak.string_view_text(cookie_view)
+
+    # 1. If the set-cookie-string contains a %x00-08 / %x0A-1F / %x7F character (CTL characters excluding HTAB):
+    #    Abort this algorithm and ignore the set-cookie-string entirely.
+    if http_cookie_contains_invalid_control_character(cookie_view):
+        return none
+
+    var name_value_pair = cookie_string
+    var unparsed_attributes = ""
+
+    # 2. If the set-cookie-string contains a %x3B (";") character:
+    if let position = http_find(cookie_string, ';'):
+        # 1. The name-value-pair string consists of the characters up to, but not including, the first %x3B (";"), and
+        #    the unparsed-attributes consist of the remainder of the set-cookie-string (including the %x3B (";") in
+        #    question).
+        name_value_pair = (str)cookie_string.bytes[..<position]
+        unparsed_attributes = (str)cookie_string.bytes[position..]
+    # Otherwise: the name-value-pair string consists of all the characters contained in the set-cookie-string, and the
+    # unparsed-attributes is the empty string.
+
+    var name = ""
+    var value = ""
+
+    # 3. If the name-value-pair string lacks a %x3D ("=") character, then the name string is empty, and the value
+    #    string is the value of name-value-pair.
+    if let position = http_find(name_value_pair, '='):
+        # Otherwise, the (possibly empty) name string consists of the characters up to, but not including, the first
+        # %x3D ("=") character, and the (possibly empty) value string consists of the characters after the first
+        # %x3D ("=") character.
+        name = (str)name_value_pair.bytes[..<position]
+        if position < name_value_pair.length - 1:
+            value = (str)name_value_pair.bytes[position + 1..]
+    else:
+        value = name_value_pair
+
+    # 4. Remove any leading or trailing WSP characters from the name string and the value string.
+    name = http_trim(name)
+    value = http_trim(value)
+
+    # 5. If the sum of the lengths of the name string and the value string is more than 4096 octets, abort this
+    #    algorithm and ignore the set-cookie-string entirely.
+    if name.length + value.length > 4096:
+        return none
+
+    # 6. The cookie-name is the name string, and the cookie-value is the value string.
+    var parsed_cookie = HttpParsedCookie(name = ak.string_from_utf8(ak.sv(name)) else trap("MUST: String::from_utf8"),
+                                         value = ak.string_from_utf8(ak.sv(value)) else trap("MUST: String::from_utf8"))
+
+    if not http_parse_attributes(&url, &parsed_cookie, unparsed_attributes):
+        return none
+
+    return parsed_cookie
+
+## Ported from ParsedCookie.cpp:106 parse_attributes (its recursion as a loop; false is its error).
+## https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis-22#section-5.6-8
+func http_parse_attributes(url: const web_url.Url*, parsed_cookie: HttpParsedCookie*, a_unparsed_attributes: str) -> bool:
+    var unparsed_attributes = a_unparsed_attributes
+    while true:
+        # 1. If the unparsed-attributes string is empty, skip the rest of these steps.
+        if unparsed_attributes.length == 0:
+            return true
+
+        # 2. Discard the first character of the unparsed-attributes (which will be a %x3B (";") character).
+        unparsed_attributes = (str)unparsed_attributes.bytes[1..]
+
+        var cookie_av = ""
+
+        # 3. If the remaining unparsed-attributes contains a %x3B (";") character:
+        if let position = http_find(unparsed_attributes, ';'):
+            # 1. Consume the characters of the unparsed-attributes up to, but not including, the first %x3B (";") character.
+            cookie_av = (str)unparsed_attributes.bytes[..<position]
+            unparsed_attributes = (str)unparsed_attributes.bytes[position..]
+        else:
+            # Otherwise: 1. Consume the remainder of the unparsed-attributes.
+            cookie_av = unparsed_attributes
+            unparsed_attributes = ""
+        # Let the cookie-av string be the characters consumed in this step; unparsed-attributes now contains any remaining
+        # characters.
+
+        var attribute_name = ""
+        var attribute_value = ""
+
+        # 4. If the cookie-av string contains a %x3D ("=") character:
+        if let position = http_find(cookie_av, '='):
+            # 1. The (possibly empty) attribute-name string consists of the characters up to, but not including, the first
+            #    %x3D ("=") character, and the (possibly empty) attribute-value string consists of the characters after the
+            #    first %x3D ("=") character.
+            attribute_name = (str)cookie_av.bytes[..<position]
+            if position < cookie_av.length - 1:
+                attribute_value = (str)cookie_av.bytes[position + 1..]
+        else:
+            # Otherwise: 1. The attribute-name string consists of the entire cookie-av string, and the attribute-value string is empty.
+            attribute_name = cookie_av
+
+        # 5. Remove any leading or trailing WSP characters from the attribute-name string and the attribute-value string.
+        attribute_name = http_trim(attribute_name)
+        attribute_value = http_trim(attribute_value)
+
+        # 6. If the attribute-value is longer than 1024 octets, ignore the cookie-av string and return to Step 1 of this
+        #    algorithm.
+        if attribute_value.length > 1024:
+            continue
+
+        # 7. Process the attribute-name and attribute-value according to the requirements in the following subsections.
+        #    (Notice that attributes with unrecognized attribute-names are ignored.)
+        if not http_process_attribute(url, parsed_cookie, ak.sv(attribute_name), attribute_value):
+            return false
+
+        # 8. Return to Step 1 of this algorithm.
+
+## Ported from ParsedCookie.cpp:168 process_attribute (false is its error).
+func http_process_attribute(url: const web_url.Url*, parsed_cookie: HttpParsedCookie*, attribute_name: ak.StringView, attribute_value: str) -> bool:
+    if ak.string_view_equals_ignoring_ascii_case(&attribute_name, ak.sv("Expires")):
+        http_on_expires_attribute(parsed_cookie, attribute_value)
+    elif ak.string_view_equals_ignoring_ascii_case(&attribute_name, ak.sv("Max-Age")):
+        http_on_max_age_attribute(parsed_cookie, attribute_value)
+    elif ak.string_view_equals_ignoring_ascii_case(&attribute_name, ak.sv("Domain")):
+        return http_on_domain_attribute(parsed_cookie, attribute_value)
+    elif ak.string_view_equals_ignoring_ascii_case(&attribute_name, ak.sv("Path")):
+        http_on_path_attribute(url, parsed_cookie, attribute_value)
+    elif ak.string_view_equals_ignoring_ascii_case(&attribute_name, ak.sv("Secure")):
+        parsed_cookie.secure_attribute_present = true
+    elif ak.string_view_equals_ignoring_ascii_case(&attribute_name, ak.sv("HttpOnly")):
+        parsed_cookie.http_only_attribute_present = true
+    elif ak.string_view_equals_ignoring_ascii_case(&attribute_name, ak.sv("SameSite")):
+        # https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis-22#section-5.6.7
+        parsed_cookie.same_site_attribute = http_same_site_from_string(ak.sv(attribute_value))
+    return true
+
+## Ported from ParsedCookie.cpp:189 on_expires_attribute.
+## https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis-22#section-5.6.1
+func http_on_expires_attribute(parsed_cookie: HttpParsedCookie*, attribute_value: str):
+    # 1. Let the expiry-time be the result of parsing the attribute-value as cookie-date (see Section 5.1.1).
+    # 2. If the attribute-value failed to parse as a cookie date, ignore the cookie-av.
+    var expiry_time = http_parse_date_time(attribute_value) else return
+
+    # 3. Let cookie-age-limit be the maximum age of the cookie (which SHOULD be 400 days in the future or sooner, see
+    #    Section 5.5).
+    let now = ak.unix_date_time_now()
+    let cookie_age_limit = ak.unix_date_time_add(&now, ak.duration_from_seconds(http_maximum_cookie_age_seconds))
+
+    # 4. If the expiry-time is more than cookie-age-limit, the user agent MUST set the expiry time to cookie-age-limit
+    #    in seconds.
+    if ak.unix_date_time_seconds_since_epoch(&expiry_time) > ak.unix_date_time_seconds_since_epoch(&cookie_age_limit):
+        expiry_time = cookie_age_limit
+
+    # 5. If the expiry-time is earlier than the earliest date the user agent can represent, the user agent MAY replace
+    #    the expiry-time with the earliest representable date.
+    let earliest = ak.unix_date_time_earliest()
+    if ak.unix_date_time_nanoseconds_since_epoch(&expiry_time) < ak.unix_date_time_nanoseconds_since_epoch(&earliest):
+        expiry_time = earliest
+
+    # 6. Append an attribute to the cookie-attribute-list with an attribute-name of Expires and an attribute-value of
+    #    expiry-time.
+    parsed_cookie.expiry_time_from_expires_attribute = expiry_time
+
+## Ported from ParsedCookie.cpp:218 on_max_age_attribute.
+## https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis-22#section-5.6.2
+func http_on_max_age_attribute(parsed_cookie: HttpParsedCookie*, attribute_value: str):
+    # 1. If the attribute-value is empty, ignore the cookie-av.
+    if attribute_value.length == 0:
+        return
+
+    # 2. If the first character of the attribute-value is neither a DIGIT, nor a "-" character followed by a DIGIT,
+    #    ignore the cookie-av.
+    # 3. If the remainder of attribute-value contains a non-DIGIT character, ignore the cookie-av.
+    let negative = attribute_value.bytes[0] == '-'
+    let digits = (str)attribute_value.bytes[1..] if negative else attribute_value
+    if digits.length == 0:
+        return
+    for byte in digits.bytes:
+        if byte < '0' or byte > '9':
+            return
+
+    # 4. Let delta-seconds be the attribute-value converted to a base 10 integer.
+    # We know the attribute value only contains digits, so if we failed to parse, it is because the result did not
+    # fit in an i64. Set the value to the i64 limits in that case. The positive limit will be further capped below,
+    # and the negative limit will be immediately expired in the cookie jar.
+    var delta_seconds: i64 = 0
+    var overflowed = false
+    for byte in digits.bytes:
+        let multiplied: i64? = delta_seconds *? 10
+        let shifted = multiplied else 0
+        let added: i64? = shifted +? (i64)(byte - '0')
+        if multiplied == none or added == none:
+            overflowed = true
+            break
+        delta_seconds = added else 0
+    if overflowed:
+        delta_seconds = -9223372036854775807 - 1 if negative else 9223372036854775807
+    elif negative:
+        delta_seconds = -delta_seconds
+
+    # 5. Let cookie-age-limit be the maximum age of the cookie (which SHOULD be 400 days or less, see Section 5.5).
+    # 6. Set delta-seconds to the smaller of its present value and cookie-age-limit.
+    if delta_seconds > http_maximum_cookie_age_seconds:
+        delta_seconds = http_maximum_cookie_age_seconds
+
+    # 7. If delta-seconds is less than or equal to zero (0), let expiry-time be the earliest representable date and
+    #    time. Otherwise, let the expiry-time be the current date and time plus delta-seconds seconds.
+    var expiry_time = ak.unix_date_time_earliest()
+    if delta_seconds > 0:
+        let now = ak.unix_date_time_now()
+        expiry_time = ak.unix_date_time_add(&now, ak.duration_from_seconds(delta_seconds))
+
+    # 8. Append an attribute to the cookie-attribute-list with an attribute-name of Max-Age and an attribute-value of
+    #    expiry-time.
+    parsed_cookie.expiry_time_from_max_age_attribute = expiry_time
+
+## Ported from ParsedCookie.cpp:260 on_domain_attribute (false is its error).
+## https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis-22#section-5.6.3
+func http_on_domain_attribute(parsed_cookie: HttpParsedCookie*, attribute_value: str) -> bool:
+    # https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis-22#section-4.1.1-9
+    # The domain-value is a subdomain as defined by Section 3.5 of [RFC1034], and as enhanced by Section 2.1 of [RFC1123].
+    # Thus, domain-value is a string of [USASCII] characters, such as an "A-label" as defined in Section 2.3.2.1 of [RFC5890].
+    for byte in attribute_value.bytes:
+        if byte >= 0x80:
+            return false  # "Domain must be a string of ASCII characters"
+
+    # 1. Let cookie-domain be the attribute-value.
+    var cookie_domain = attribute_value
+
+    # 2. If cookie-domain starts with %x2E ("."), let cookie-domain be cookie-domain without its leading %x2E (".").
+    if cookie_domain.length > 0 and cookie_domain.bytes[0] == '.':
+        cookie_domain = (str)cookie_domain.bytes[1..]
+
+    # 3. Convert the cookie-domain to lower case.
+    let view = ak.sv(cookie_domain)
+    let lowercase_cookie_domain = ak.string_view_to_ascii_lowercase_string(&view)
+
+    # 4. Append an attribute to the cookie-attribute-list with an attribute-name of Domain and an attribute-value of
+    #    cookie-domain.
+    parsed_cookie.domain = lowercase_cookie_domain
+    return true
+
+## Ported from ParsedCookie.cpp:286 on_path_attribute.
+## https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis-22#section-5.6.4
+func http_on_path_attribute(url: const web_url.Url*, parsed_cookie: HttpParsedCookie*, attribute_value: str):
+    # 1. If the attribute-value is empty or if the first character of the attribute-value is not %x2F ("/"):
+    #    1. Let cookie-path be the default-path.
+    # Otherwise: 1. Let cookie-path be the attribute-value.
+    var cookie_path = ak.string_new()
+    if attribute_value.length == 0 or attribute_value.bytes[0] != '/':
+        cookie_path = http_default_path(url)
+    else:
+        cookie_path = ak.string_from_utf8(ak.sv(attribute_value)) else trap("MUST: String::from_utf8")
+
+    # 2. Append an attribute to the cookie-attribute-list with an attribute-name of Path and an attribute-value of
+    #    cookie-path.
+    parsed_cookie.path = cookie_path
+
+## `to_uint`: a token of ASCII digits as an unsigned number.
+func http_to_uint(token: str) -> u32?:
+    if token.length == 0 or token.length > 9:
+        return none if token.length == 0 else http_to_uint_long(token)
+    var result: u32 = 0
+    for byte in token.bytes:
+        if byte < '0' or byte > '9':
+            return none
+        result = result * 10 + (u32)(byte - '0')
+    return result
+
+## A long digit token: digits all, or none; too large for an unsigned (StringView::to_number fails).
+func http_to_uint_long(token: str) -> u32?:
+    var result: u64 = 0
+    for byte in token.bytes:
+        if byte < '0' or byte > '9':
+            return none
+        result = result * 10 + (u64)(byte - '0')
+        if result > 4294967295:
+            return none
+    return (u32)result
+
+## The date-token delimiters of RFC 6265 section 5.1.1.
+func http_is_delimiter(ch: u8) -> bool:
+    return ch == 0x09 or (ch >= 0x20 and ch <= 0x2f) or (ch >= 0x3b and ch <= 0x40) or (ch >= 0x5b and ch <= 0x60) or (ch >= 0x7b and ch <= 0x7e)
+
+## Ported from ParsedCookie.cpp:333 parse_date_time.
+## https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis-22#section-5.1.1
+func http_parse_date_time(date_string: str) -> ak.UnixDateTime?:
+    # https://tools.ietf.org/html/rfc6265#section-5.1.1
+    var hour: u32 = 0
+    var minute: u32 = 0
+    var second: u32 = 0
+    var day_of_month: u32 = 0
+    var month: u32 = 0
+    var year: u32 = 0
+
+    # 2. Process each date-token sequentially in the order the date-tokens appear in the cookie-date:
+    var found_time = false
+    var found_day_of_month = false
+    var found_month = false
+    var found_year = false
+
+    # 1. Using the grammar below, divide the cookie-date into date-tokens.
+    var start: usize = 0
+    while start < date_string.length:
+        while start < date_string.length and http_is_delimiter(date_string.bytes[start]):
+            start += 1
+        var end = start
+        while end < date_string.length and not http_is_delimiter(date_string.bytes[end]):
+            end += 1
+        if end == start:
+            break
+        let date_token = (str)date_string.bytes[start..<end]
+        start = end
+
+        # 1. If the found-time flag is not set and the token matches the time production, set the found-time flag and
+        #    set the hour-value, minute-value, and second-value to the numbers denoted by the digits in the date-token,
+        #    respectively. Skip the remaining sub-steps and continue to the next date-token.
+        if not found_time and http_parse_time(date_token, &hour, &minute, &second):
+            found_time = true
+        # 2. If the found-day-of-month flag is not set and the date-token matches the day-of-month production, set the
+        #    found-day-of-month flag and set the day-of-month-value to the number denoted by the date-token.
+        elif not found_day_of_month and date_token.length <= 2 and http_to_uint(date_token) != none:
+            day_of_month = http_to_uint(date_token) else 0
+            found_day_of_month = true
+        # 3. If the found-month flag is not set and the date-token matches the month production, set the found-month
+        #    flag and set the month-value to the month denoted by the date-token.
+        elif not found_month and http_parse_month(date_token) != 0:
+            month = http_parse_month(date_token)
+            found_month = true
+        # 4. If the found-year flag is not set and the date-token matches the year production, set the found-year flag
+        #    and set the year-value to the number denoted by the date-token.
+        elif not found_year and (date_token.length == 2 or date_token.length == 4) and http_to_uint(date_token) != none:
+            year = http_to_uint(date_token) else 0
+            found_year = true
+
+    # 3. If the year-value is greater than or equal to 70 and less than or equal to 99, increment the year-value by 1900.
+    if year >= 70 and year <= 99:
+        year += 1900
+
+    # 4. If the year-value is greater than or equal to 0 and less than or equal to 69, increment the year-value by 2000.
+    if year <= 69:
+        year += 2000
+
+    # 5. Abort this algorithm and fail to parse the cookie-date if:
+    # * at least one of the found-day-of-month, found-month, found-year, or found-time flags is not set,
+    if not found_day_of_month or not found_month or not found_year or not found_time:
+        return none
+    # * the day-of-month-value is less than 1 or greater than 31,
+    if day_of_month < 1 or day_of_month > 31:
+        return none
+    # * the year-value is less than 1601,
+    if year < 1601:
+        return none
+    # * the hour-value is greater than 23,
+    if hour > 23:
+        return none
+    # * the minute-value is greater than 59, or
+    if minute > 59:
+        return none
+    # * the second-value is greater than 59.
+    if second > 59:
+        return none
+
+    # 6. Let the parsed-cookie-date be the date whose day-of-month, month, year, hour, minute, and second (in UTC) are
+    #    the day-of-month-value, the month-value, the year-value, the hour-value, the minute-value, and the second-value,
+    #    respectively. If no such date exists, abort this algorithm and fail to parse the cookie-date.
+    if day_of_month > (u32)ak.days_in_month((i32)year, month):
+        return none
+
+    # FIXME: This currently uses UNIX time, which is not equivalent to UTC due to leap seconds.
+    # 7. Return the parsed-cookie-date as the result of this algorithm.
+    return ak.unix_date_time_from_unix_time_parts((i32)year, (u8)month, (u8)day_of_month, (u8)hour, (u8)minute, (u8)second, 0)
+
+## parse_date_time's parse_time lambda: "hh:mm:ss" with one or two digits each.
+func http_parse_time(token: str, hour: u32*, minute: u32*, second: u32*) -> bool:
+    var parts: str[3] = ["", "", ""]
+    var count: usize = 0
+    var start: usize = 0
+    for index in 0..<token.length + 1:
+        if index == token.length or token.bytes[index] == ':':
+            if count == 3:
+                return false
+            parts[count] = (str)token.bytes[start..<index]
+            count += 1
+            start = index + 1
+    if count != 3:
+        return false
+    for part in parts:
+        if part.length == 0 or part.length > 2:
+            return false
+    let parsed_hour = http_to_uint(parts[0]) else return false
+    let parsed_minute = http_to_uint(parts[1]) else return false
+    let parsed_second = http_to_uint(parts[2]) else return false
+    *hour = parsed_hour
+    *minute = parsed_minute
+    *second = parsed_second
+    return true
+
+## parse_date_time's parse_month lambda: the month's number 1-12, 0 when the token names none.
+func http_parse_month(token: str) -> u32:
+    let view = ak.sv(token)
+    for index in 0..<12:
+        if ak.string_view_equals_ignoring_ascii_case(&view, ak.sv(http_short_month_names[index])):
+            return (u32)index + 1
+    return 0

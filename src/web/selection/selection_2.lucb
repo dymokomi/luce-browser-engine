@@ -1,0 +1,314 @@
+#==============================================================================================
+#
+#   selection_2 - Selection::Selection: modify, containment, the stringifier, set_range and
+#   the caret's movement
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibWeb/Selection/Selection.cpp lines 400-744: modify,
+#       deleteFromDocument, containsNode, the stringifier, set_range (the range's back pointer,
+#       the editing overrides, the editing host's focus), cursor_position and the non-standard
+#       offset movement by character, word and line the event handler's keys use.
+#
+#       Copyright (c) 2021-2022, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2025, Jelle Raaijmakers <jelle@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Modify ==================================================================================
+
+## Whether `value` matches one of `names`, ignoring ASCII case (StringView::is_one_of_ignoring_ascii_case).
+func selection_is_one_of_ignoring_ascii_case(value: ak.String*, names: const str[]) -> bool:
+    for name in names:
+        if ak.string_equals_ignoring_ascii_case_string_view(value, ak.sv(name)):
+            return true
+    return false
+
+## Ported from Selection.cpp:402 Web::Selection::Selection::modify.
+## https://w3c.github.io/selection-api/#dom-selection-modify
+pub func selection_selection_modify(this: SelectionSelection*, alter_: ak.String?, direction_: ak.String?, granularity_: ak.String?) -> !:
+    let anchor_node = selection_selection_anchor_node(this) else return
+    let text_node = as_if_dom_text(anchor_node) else return
+
+    # 1. If alter is not ASCII case-insensitive match with "extend" or "move", abort these steps.
+    var alter = alter_ else return
+    if not selection_is_one_of_ignoring_ascii_case(&alter, ["extend", "move"]):
+        return
+
+    # 2. If direction is not ASCII case-insensitive match with "forward", "backward", "left", or "right", abort these steps.
+    var direction = direction_ else return
+    if not selection_is_one_of_ignoring_ascii_case(&direction, ["forward", "backward", "left", "right"]):
+        return
+
+    # 3. If granularity is not ASCII case-insensitive match with "character", "word", "sentence", "line", "paragraph",
+    #    "lineboundary", "sentenceboundary", "paragraphboundary", "documentboundary", abort these steps.
+    var granularity = granularity_ else return
+    if not selection_is_one_of_ignoring_ascii_case(&granularity, ["character", "word", "sentence", "line", "paragraph", "lineboundary", "sentenceboundary", "paragraphboundary", "documentboundary"]):
+        return
+
+    # 4. If this selection is empty, abort these steps.
+    if this.m_range == none:
+        return
+
+    # 5. Let effectiveDirection be backwards.
+    var effective_direction = SelectionSelectionDirection.backwards
+
+    # 6. If direction is ASCII case-insensitive match with "forward", set effectiveDirection to forwards.
+    if ak.string_equals_ignoring_ascii_case_string_view(&direction, ak.sv("forward")):
+        effective_direction = SelectionSelectionDirection.forwards
+
+    # 7. If direction is ASCII case-insensitive match with "right" and inline base direction of this selection's focus is ltr, set effectiveDirection to forwards.
+    # 8. If direction is ASCII case-insensitive match with "left" and inline base direction of this selection's focus is rtl, set effectiveDirection to forwards.
+    if let directionality = dom_text_directionality(text_node):
+        if ak.string_equals_ignoring_ascii_case_string_view(&direction, ak.sv("right")) and directionality == DomElementDirectionality.ltr:
+            effective_direction = SelectionSelectionDirection.forwards
+        if ak.string_equals_ignoring_ascii_case_string_view(&direction, ak.sv("left")) and directionality == DomElementDirectionality.rtl:
+            effective_direction = SelectionSelectionDirection.forwards
+
+    # 9. Set this selection's direction to effectiveDirection.
+    # NOTE: This is handled by calls to move_offset_to_* later on
+
+    # 10. If alter is ASCII case-insensitive match with "extend", set this selection's focus to the location as if the user had requested to extend selection by granularity.
+    # 11. Otherwise, set this selection's focus and anchor to the location as if the user had requested to move selection by granularity.
+    let collapse_selection = ak.string_equals_ignoring_ascii_case_string_view(&alter, ak.sv("move"))
+
+    # TODO: Implement the other granularity options.
+    let character = ak.string_equals_ignoring_ascii_case_string_view(&granularity, ak.sv("character"))
+    let word = ak.string_equals_ignoring_ascii_case_string_view(&granularity, ak.sv("word"))
+    if effective_direction == SelectionSelectionDirection.forwards:
+        if character:
+            selection_selection_move_offset_to_next_character(this, collapse_selection)
+        if word:
+            selection_selection_move_offset_to_next_word(this, collapse_selection)
+    else:
+        if character:
+            selection_selection_move_offset_to_previous_character(this, collapse_selection)
+        if word:
+            selection_selection_move_offset_to_previous_word(this, collapse_selection)
+
+## Ported from Selection.cpp:474 Web::Selection::Selection::delete_from_document.
+## https://w3c.github.io/selection-api/#dom-selection-deletefromdocument
+pub func selection_selection_delete_from_document(this: SelectionSelection*) -> !:
+    # The method must invoke deleteContents() on this's range if this is not empty.
+    # Otherwise the method must do nothing.
+    if let range = this.m_range:
+        try dom_range_delete_contents(range)
+
+# mark: Containment and text ====================================================================
+
+## Whether `position` is Before or Equal.
+func selection_before_or_equal(position: DomRelativeBoundaryPointPosition) -> bool:
+    return position == DomRelativeBoundaryPointPosition.before or position == DomRelativeBoundaryPointPosition.equal
+
+## Whether `position` is Equal or After.
+func selection_equal_or_after(position: DomRelativeBoundaryPointPosition) -> bool:
+    return position == DomRelativeBoundaryPointPosition.equal or position == DomRelativeBoundaryPointPosition.after
+
+## Ported from Selection.cpp:484 Web::Selection::Selection::contains_node.
+## https://w3c.github.io/selection-api/#dom-selection-containsnode
+pub func selection_selection_contains_node(this: SelectionSelection*, node: DomNode*, allow_partial_containment: bool) -> bool:
+    # The method must return false if this is empty or if node's root is not the document associated with this.
+    let range = this.m_range else return false
+    if tree_node_root(node) != this.m_document.dom_node():
+        return false
+
+    let start = dom_abstract_range_start(range.dom_abstract_range())
+    let end = dom_abstract_range_end(range.dom_abstract_range())
+    let first = DomBoundaryPoint(node = node, offset = 0)
+    let last = DomBoundaryPoint(node = node, offset = (u32)dom_node_length(node))
+
+    # Otherwise, if allowPartialContainment is false, the method must return true if and only if
+    # start of its range is before or visually equivalent to the first boundary point in the node
+    # and end of its range is after or visually equivalent to the last boundary point in the node.
+    if not allow_partial_containment:
+        let start_relative_position = dom_position_of_boundary_point_relative_to_other_boundary_point(start, first)
+        let end_relative_position = dom_position_of_boundary_point_relative_to_other_boundary_point(end, last)
+        return selection_before_or_equal(start_relative_position) and selection_equal_or_after(end_relative_position)
+
+    # If allowPartialContainment is true, the method must return true if and only if
+    # start of its range is before or visually equivalent to the last boundary point in the node
+    # and end of its range is after or visually equivalent to the first boundary point in the node.
+    let start_relative_position = dom_position_of_boundary_point_relative_to_other_boundary_point(start, last)
+    let end_relative_position = dom_position_of_boundary_point_relative_to_other_boundary_point(end, first)
+    return selection_before_or_equal(start_relative_position) and selection_equal_or_after(end_relative_position)
+
+## Ported from Selection.cpp:513 Web::Selection::Selection::try_form_control_selected_text_for_stringifier.
+pub func selection_selection_try_form_control_selected_text_for_stringifier(this: SelectionSelection*) -> ak.Utf16String?:
+    # FIXME: According to https://bugzilla.mozilla.org/show_bug.cgi?id=85686#c69,
+    # sometimes you want the selection from a previously focused form text, probably
+    # when a button or context menu has temporarily stolen focus but page scripts
+    # still expect window.getSelection() to have the goodies.
+    let active_element = dom_document_active_element(this.m_document) else return none
+    let form_element = as_if_form_associated_text_control_element(active_element) else return none
+    return html_form_associated_text_control_element_selected_text_for_stringifier(form_element)
+
+## Ported from Selection.cpp:526 Web::Selection::Selection::to_string.
+## https://w3c.github.io/selection-api/#dom-selection-stringifier
+pub func selection_selection_to_string(this: SelectionSelection*) -> ak.Utf16String:
+    # If the selection is within a textarea or input element, it must return the
+    # selected substring in its value.
+    if let form_text = selection_selection_try_form_control_selected_text_for_stringifier(this):
+        return form_text
+
+    # FIXME: This needs more work to be compatible with other engines.
+    #        See https://www.w3.org/Bugs/Public/show_bug.cgi?id=10583
+    let range = this.m_range else return ak.utf16_string_new()
+    return dom_range_to_string(range)
+
+## Ported from Selection.cpp:540 Web::Selection::Selection::document.
+pub func selection_selection_document(this: SelectionSelection*) -> DomDocument*:
+    return this.m_document
+
+## Ported from Selection.cpp:545 Web::Selection::Selection::range.
+pub func selection_selection_range(this: SelectionSelection*) -> DomRange*?:
+    return this.m_range
+
+## Ported from Selection.cpp:550 Web::Selection::Selection::set_range.
+func selection_selection_set_range(this: SelectionSelection*, range: DomRange*?):
+    let old_range = this.m_range
+    if old_range == range:
+        return
+
+    if let old = old_range:
+        dom_range_set_associated_selection(old, none)
+
+    this.m_range = range
+
+    if let new_range = range:
+        dom_range_set_associated_selection(new_range, this)
+
+    # https://w3c.github.io/editing/docs/execCommand/#state-override
+    # Whenever the number of ranges in the selection changes to something different, and whenever a boundary point of
+    # the range at a given index in the selection changes to something different, the state override and value override
+    # must be unset for every command.
+    var changed = (old_range == none) != (range == none)
+    if let old = old_range:
+        if let new_range = range:
+            changed = not dom_abstract_range_eq(old.dom_abstract_range(), new_range.dom_abstract_range())
+    if changed:
+        dom_document_reset_command_state_overrides(this.m_document)
+        dom_document_reset_command_value_overrides(this.m_document)
+
+    # https://developer.mozilla.org/en-US/docs/Web/API/Selection#behavior_of_selection_api_in_terms_of_editing_host_focus_changes
+    # AD-HOC: Focus editing host if the previous selection was outside of it. There seems to be no spec for this.
+    let new_range = range else return
+    let start_container = dom_abstract_range_start_container(new_range.dom_abstract_range())
+    if dom_node_is_editable_or_editing_host(start_container):
+        let new_editing_host = dom_node_editing_host(start_container) else trap("an editable node has an editing host")
+        if dom_document_focused_area(this.m_document) != new_editing_host:
+            # FIXME: Determine and propagate the right focus trigger.
+            html_run_focusing_steps(new_editing_host, none, HtmlFocusTrigger.other)
+
+## Ported from Selection.cpp:585 Web::Selection::Selection::cursor_position.
+pub func selection_selection_cursor_position(this: SelectionSelection*) -> DomPosition*?:
+    let range = this.m_range else return none
+    if not selection_selection_is_collapsed(this):
+        return none
+    let realm = bind_platform_object_realm(this.m_document.bind_platform_object())
+    return dom_position_create(realm, dom_abstract_range_start_container(range.dom_abstract_range()), dom_abstract_range_start_offset(range.dom_abstract_range()))
+
+# mark: Caret movement ==========================================================================
+
+# FIXME: The offset adjustment algorithms below do not handle moving over multiple DOM nodes. For example, if we have:
+#        `<div contenteditable><p>Well hello</p><p>friends</p></div>`, we should be able to move the cursor between the
+#        two <p> elements. But the algorithms below limit us to a single DOM node.
+
+## The selection moved to `offset` in `text_node`: collapsed there (restarting the caret's
+## blink) or extended to it from the anchor.
+func selection_selection_move_focus_to(this: SelectionSelection*, text_node: DomText*, offset: u32, collapse_selection: bool):
+    if collapse_selection:
+        selection_selection_collapse(this, text_node.dom_node(), offset) else trap("MUST: Selection::collapse")
+        dom_document_reset_cursor_blink_cycle(this.m_document)
+    else:
+        selection_selection_set_base_and_extent(this, text_node.dom_node(), selection_selection_anchor_offset(this), text_node.dom_node(), offset) else trap("MUST: Selection::set_base_and_extent")
+
+## The anchor node as Text, or none.
+func selection_selection_anchor_text(this: SelectionSelection*) -> DomText*?:
+    let anchor = selection_selection_anchor_node(this) else return none
+    return as_if_dom_text(anchor)
+
+## Ported from Selection.cpp:597 Web::Selection::Selection::move_offset_to_next_character.
+pub func selection_selection_move_offset_to_next_character(this: SelectionSelection*, collapse_selection: bool):
+    let text_node = selection_selection_anchor_text(this) else return
+
+    # If there is a selection range, collapse to the end (max) of that range without moving forward
+    if collapse_selection and not selection_selection_is_collapsed(this):
+        let anchor_offset = selection_selection_anchor_offset(this)
+        let focus_offset = selection_selection_focus_offset(this)
+        selection_selection_collapse(this, text_node.dom_node(), anchor_offset if anchor_offset > focus_offset else focus_offset) else trap("MUST: Selection::collapse")
+        dom_document_reset_cursor_blink_cycle(this.m_document)
+    # Otherwise, move forward if possible
+    elif let offset = web_unicode.segmenter_next_boundary(dom_character_data_grapheme_segmenter(text_node.dom_character_data()), (usize)selection_selection_focus_offset(this), web_unicode.SegmenterInclusive.no):
+        selection_selection_move_focus_to(this, text_node, (u32)offset, collapse_selection)
+    selection_selection_scroll_focus_into_view(this)
+
+## Ported from Selection.cpp:620 Web::Selection::Selection::move_offset_to_previous_character.
+pub func selection_selection_move_offset_to_previous_character(this: SelectionSelection*, collapse_selection: bool):
+    let text_node = selection_selection_anchor_text(this) else return
+
+    # If there is a selection range, collapse to the start (min) of that range without moving backward
+    if collapse_selection and not selection_selection_is_collapsed(this):
+        let anchor_offset = selection_selection_anchor_offset(this)
+        let focus_offset = selection_selection_focus_offset(this)
+        selection_selection_collapse(this, text_node.dom_node(), anchor_offset if anchor_offset < focus_offset else focus_offset) else trap("MUST: Selection::collapse")
+        dom_document_reset_cursor_blink_cycle(this.m_document)
+    # Otherwise, move backward if possible
+    elif let offset = web_unicode.segmenter_previous_boundary(dom_character_data_grapheme_segmenter(text_node.dom_character_data()), (usize)selection_selection_focus_offset(this), web_unicode.SegmenterInclusive.no):
+        selection_selection_move_focus_to(this, text_node, (u32)offset, collapse_selection)
+    selection_selection_scroll_focus_into_view(this)
+
+## Ported from Selection.cpp:643 Web::Selection::Selection::move_offset_to_next_word.
+pub func selection_selection_move_offset_to_next_word(this: SelectionSelection*, collapse_selection: bool):
+    let text_node = selection_selection_anchor_text(this) else return
+
+    while true:
+        let focus_offset = (usize)selection_selection_focus_offset(this)
+        var data = dom_character_data_data(text_node.dom_character_data())
+        if focus_offset == ak.utf16_string_base_length_in_code_units(&data.utf16_string_base):
+            break
+
+        if let offset = web_unicode.segmenter_next_boundary(dom_character_data_word_segmenter(text_node.dom_character_data()), focus_offset, web_unicode.SegmenterInclusive.no):
+            selection_selection_move_focus_to(this, text_node, (u32)offset, collapse_selection)
+            let word = ak.utf16_string_base_substring_view_usize(&data.utf16_string_base, focus_offset, (usize)offset - focus_offset)
+            if web_unicode.segmenter_should_continue_beyond_word(word):
+                continue
+        break
+    selection_selection_scroll_focus_into_view(this)
+
+## Ported from Selection.cpp:671 Web::Selection::Selection::move_offset_to_previous_word.
+pub func selection_selection_move_offset_to_previous_word(this: SelectionSelection*, collapse_selection: bool):
+    let text_node = selection_selection_anchor_text(this) else return
+
+    while true:
+        let focus_offset = (usize)selection_selection_focus_offset(this)
+        if let offset = web_unicode.segmenter_previous_boundary(dom_character_data_word_segmenter(text_node.dom_character_data()), focus_offset, web_unicode.SegmenterInclusive.no):
+            selection_selection_move_focus_to(this, text_node, (u32)offset, collapse_selection)
+            var data = dom_character_data_data(text_node.dom_character_data())
+            let word = ak.utf16_string_base_substring_view_usize(&data.utf16_string_base, (usize)offset, focus_offset - (usize)offset)
+            if web_unicode.segmenter_should_continue_beyond_word(word):
+                continue
+        break
+    selection_selection_scroll_focus_into_view(this)
+
+## Ported from Selection.cpp:696 Web::Selection::Selection::move_offset_to_next_line.
+pub func selection_selection_move_offset_to_next_line(this: SelectionSelection*, collapse_selection: bool):
+    let text_node = selection_selection_anchor_text(this) else return
+    let new_offset = compute_cursor_position_on_next_line(text_node, (usize)selection_selection_focus_offset(this)) else return
+    selection_selection_move_focus_to(this, text_node, (u32)new_offset, collapse_selection)
+    selection_selection_scroll_focus_into_view(this)
+
+## Ported from Selection.cpp:715 Web::Selection::Selection::move_offset_to_previous_line.
+pub func selection_selection_move_offset_to_previous_line(this: SelectionSelection*, collapse_selection: bool):
+    let text_node = selection_selection_anchor_text(this) else return
+    let new_offset = compute_cursor_position_on_previous_line(text_node, (usize)selection_selection_focus_offset(this)) else return
+    selection_selection_move_focus_to(this, text_node, (u32)new_offset, collapse_selection)
+    selection_selection_scroll_focus_into_view(this)
+
+## Ported from Selection.cpp:734 Web::Selection::Selection::scroll_focus_into_view.
+pub func selection_selection_scroll_focus_into_view(this: SelectionSelection*):
+    let focus = selection_selection_focus_node(this) else return
+
+    dom_document_update_layout(this.m_document, DomUpdateLayoutReason.scroll_cursor_into_view)
+
+    let paintable = dom_node_paintable(focus) else return
+    paint_paintable_scroll_ancestor_to_offset_into_view(paintable, (usize)selection_selection_focus_offset(this))
