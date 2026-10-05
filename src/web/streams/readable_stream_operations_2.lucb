@@ -1,0 +1,494 @@
+#==============================================================================================
+#
+#   readable_stream_operations_2 - the abstract operations of readable byte stream
+#   controllers: pulling, closing, enqueueing, erroring, filling read requests, setting up
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibWeb/Streams/ReadableStreamOperations.cpp (lines 1619-2822), as part
+#       of the ReadableStream stand-in of DESIGN.md §3.6 (region p2s): a byte stream's queue of
+#       chunks (transferred ArrayBuffers) read by default readers. Pull-into descriptors, which
+#       only BYOB readers and autoAllocateChunkSize make (phase 4), are never pending here: the
+#       operations over them (commit, convert, fill, respond, pull into, shift) are not ported,
+#       and the branches that would reach them trap. Default controllers are phase 4 too.
+#
+#       Copyright (c) 2022, Linus Groh <linusg@serenityos.org>
+#       Copyright (c) 2023, Matthew Olsson <mattco@serenityos.org>
+#       Copyright (c) 2023-2025, Shannon Booth <shannon@serenityos.org>
+#       Copyright (c) 2023-2024, Kenneth Myhra <kennethmyhra@serenityos.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Pulling =================================================================================
+
+## call_pull_if_needed's fulfillment step for pullPromise, `[&controller](JS::Value)`.
+func streams_readable_byte_stream_controller_pull_fulfilled(context: void*?, value: JsValue) -> JsValue:
+    let controller = (StreamsReadableByteStreamController*)(context else trap("no captures"))
+    # 1. Set controller.[[pulling]] to false.
+    controller.m_pulling = false
+
+    # 2. If controller.[[pullAgain]] is true,
+    if controller.m_pull_again:
+        # 1. Set controller.[[pullAgain]] to false.
+        controller.m_pull_again = false
+
+        # 2. Perform ! ReadableByteStreamControllerCallPullIfNeeded(controller).
+        streams_readable_byte_stream_controller_call_pull_if_needed(controller)
+
+    return js_undefined()
+
+## call_pull_if_needed's and set_up's rejection step, `[&controller](JS::Value error)`.
+func streams_readable_byte_stream_controller_error_on_rejection(context: void*?, error_: JsValue) -> JsValue:
+    let controller = (StreamsReadableByteStreamController*)(context else trap("no captures"))
+    # 1. Perform ! ReadableByteStreamControllerError(controller, e).
+    streams_readable_byte_stream_controller_error_2(controller, error_)
+
+    return js_undefined()
+
+## Ported from Libraries/LibWeb/Streams/ReadableStreamOperations.cpp:1620 Web::Streams::readable_byte_stream_controller_call_pull_if_needed.
+## https://streams.spec.whatwg.org/#readable-byte-stream-controller-call-pull-if-needed
+pub func streams_readable_byte_stream_controller_call_pull_if_needed(controller: StreamsReadableByteStreamController*):
+    # 1. Let shouldPull be ! ReadableByteStreamControllerShouldCallPull(controller).
+    let should_pull = streams_readable_byte_stream_controller_should_call_pull(controller)
+
+    # 2. If shouldPull is false, return.
+    if not should_pull:
+        return
+
+    # 3. If controller.[[pulling]] is true,
+    if controller.m_pulling:
+        # 1. Set controller.[[pullAgain]] to true.
+        controller.m_pull_again = true
+
+        # 2. Return.
+        return
+
+    # 4. Assert: controller.[[pullAgain]] is false.
+    assert(not controller.m_pull_again)
+
+    # 5. Set controller.[[pulling]] to true.
+    controller.m_pulling = true
+
+    # 6. Let pullPromise be the result of performing controller.[[pullAlgorithm]].
+    let pull_algorithm = controller.m_pull_algorithm else trap("VERIFY: the controller's pull algorithm")
+    let pull_promise = ak.function0_call(&pull_algorithm.function)
+
+    let heap = gc.cell_heap(controller.cell())
+    # 7. Upon fulfillment of pullPromise,
+    let on_fulfilled = gc.create_function1(heap, ak.Function1[JsValue, JsValue](call = streams_readable_byte_stream_controller_pull_fulfilled, context = controller))
+    # 8. Upon rejection of pullPromise with reason e,
+    let on_rejected = gc.create_function1(heap, ak.Function1[JsValue, JsValue](call = streams_readable_byte_stream_controller_error_on_rejection, context = controller))
+    _ = idl_react_to_promise(pull_promise, on_fulfilled, on_rejected)
+
+## Ported from Libraries/LibWeb/Streams/ReadableStreamOperations.cpp:1675 Web::Streams::readable_byte_stream_controller_clear_algorithms.
+## https://streams.spec.whatwg.org/#readable-byte-stream-controller-clear-algorithms
+pub func streams_readable_byte_stream_controller_clear_algorithms(controller: StreamsReadableByteStreamController*):
+    # 1. Set controller.[[pullAlgorithm]] to undefined.
+    controller.m_pull_algorithm = none
+
+    # 2. Set controller.[[cancelAlgorithm]] to undefined.
+    controller.m_cancel_algorithm = none
+
+## Ported from Libraries/LibWeb/Streams/ReadableStreamOperations.cpp:1685 Web::Streams::readable_byte_stream_controller_clear_pending_pull_intos.
+## https://streams.spec.whatwg.org/#readable-byte-stream-controller-clear-pending-pull-intos
+pub func streams_readable_byte_stream_controller_clear_pending_pull_intos(controller: StreamsReadableByteStreamController*):
+    # 1. Perform ! ReadableByteStreamControllerInvalidateBYOBRequest(controller).
+    streams_readable_byte_stream_controller_invalidate_byob_request(controller)
+
+    # 2. Set controller.[[pendingPullIntos]] to a new empty list.
+    ak.singly_linked_list_clear(&controller.m_pending_pull_intos)
+
+# mark: Closing and enqueueing ==================================================================
+
+## Ported from Libraries/LibWeb/Streams/ReadableStreamOperations.cpp:1695 Web::Streams::readable_byte_stream_controller_close.
+## https://streams.spec.whatwg.org/#readable-byte-stream-controller-close
+pub func streams_readable_byte_stream_controller_close_2(controller: StreamsReadableByteStreamController*) -> !:
+    # 1. Let stream be controller.[[stream]].
+    let stream = controller.m_stream else trap("VERIFY: the controller has a stream")
+
+    # 2. If controller.[[closeRequested]] is true or stream.[[state]] is not "readable", return.
+    if controller.m_close_requested or stream.m_state != StreamsReadableStreamState.readable:
+        return
+
+    # 3. If controller.[[queueTotalSize]] > 0,
+    if controller.m_queue_total_size > 0.0:
+        # 1. Set controller.[[closeRequested]] to true.
+        controller.m_close_requested = true
+
+        # 2. Return.
+        return
+
+    # 4. If controller.[[pendingPullIntos]] is not empty,
+    if not ak.singly_linked_list_is_empty(&controller.m_pending_pull_intos):
+        # 1. Let firstPendingPullInto be controller.[[pendingPullIntos]][0].
+        # 2. If the remainder after dividing firstPendingPullInto’s bytes filled by firstPendingPullInto’s element size is not 0,
+        #    1. Let e be a new TypeError exception.
+        #    2. Perform ! ReadableByteStreamControllerError(controller, e).
+        #    3. Throw e.
+        trap("unported (P4): closing a byte stream with pending pull-into descriptors")
+
+    # 5. Perform ! ReadableByteStreamControllerClearAlgorithms(controller).
+    streams_readable_byte_stream_controller_clear_algorithms(controller)
+
+    # 6. Perform ! ReadableStreamClose(stream).
+    streams_readable_stream_close_2(stream)
+
+## Ported from Libraries/LibWeb/Streams/ReadableStreamOperations.cpp:1806 Web::Streams::readable_byte_stream_controller_enqueue.
+## https://streams.spec.whatwg.org/#readable-byte-stream-controller-enqueue
+pub func streams_readable_byte_stream_controller_enqueue_2(controller: StreamsReadableByteStreamController*, chunk: JsValue) -> !:
+    let realm = bind_platform_object_realm(controller.bind_platform_object())
+    let vm = realm_vm(realm)
+
+    # 1. Let stream be controller.[[stream]].
+    let stream = controller.m_stream else trap("VERIFY: the controller has a stream")
+
+    # 2. If controller.[[closeRequested]] is true or stream.[[state]] is not "readable", return.
+    if controller.m_close_requested or stream.m_state != StreamsReadableStreamState.readable:
+        return
+
+    # 3. Let buffer be chunk.[[ViewedArrayBuffer]].
+    let typed_array = try js_typed_array_from(vm, chunk)
+    let buffer = js_typed_array_base_viewed_array_buffer(typed_array)
+
+    # 4. Let byteOffset be chunk.[[ByteOffset]].
+    let byte_offset = js_typed_array_base_byte_offset(typed_array)
+
+    # 6. If ! IsDetachedBuffer(buffer) is true, throw a TypeError exception.
+    # FIXME: The streams spec has not been updated for resizable ArrayBuffer objects. We must perform step 6 before
+    #        invoking TypedArrayByteLength in step 5. We also must check if the array is out-of-bounds, rather than
+    #        just detached.
+    let typed_array_record = js_make_typed_array_with_buffer_witness_record(typed_array)
+
+    if js_is_typed_array_out_of_bounds(&typed_array_record):
+        return try vm_throw_completion(vm, IdlSimpleExceptionType.type_error, .string_view(ak.sv("TypedArray contains a property which is out of bounds")))
+
+    # 5. Let byteLength be chunk.[[ByteLength]].
+    let byte_length = js_typed_array_byte_length(&typed_array_record)
+
+    # 7. Let transferredBuffer be ? TransferArrayBuffer(buffer).
+    let transferred_buffer = try streams_transfer_array_buffer(realm, buffer)
+
+    # 8. If controller.[[pendingPullIntos]] is not empty,
+    if not ak.singly_linked_list_is_empty(&controller.m_pending_pull_intos):
+        # 1. Let firstPendingPullInto be controller.[[pendingPullIntos]][0].
+        # 2. If ! IsDetachedBuffer(firstPendingPullInto’s buffer) is true, throw a TypeError exception.
+        # 3. Perform ! ReadableByteStreamControllerInvalidateBYOBRequest(controller).
+        # 4. Set firstPendingPullInto’s buffer to ! TransferArrayBuffer(firstPendingPullInto’s buffer).
+        # 5. If firstPendingPullInto’s reader type is "none", perform ? ReadableByteStreamControllerEnqueueDetachedPullIntoToQueue(controller, firstPendingPullInto).
+        trap("unported (P4): enqueueing into a byte stream with pending pull-into descriptors")
+
+    # 9. If ! ReadableStreamHasDefaultReader(stream) is true,
+    if streams_readable_stream_has_default_reader(stream):
+        # 1. Perform ! ReadableByteStreamControllerProcessReadRequestsUsingQueue(controller).
+        streams_readable_byte_stream_controller_process_read_requests_using_queue(controller)
+
+        # 2. If ! ReadableStreamGetNumReadRequests(stream) is 0,
+        if streams_readable_stream_get_num_read_requests(stream) == 0:
+            # 1. Assert: controller.[[pendingPullIntos]] is empty.
+            assert(ak.singly_linked_list_is_empty(&controller.m_pending_pull_intos))
+
+            # 2. Perform ! ReadableByteStreamControllerEnqueueChunkToQueue(controller, transferredBuffer, byteOffset, byteLength).
+            streams_readable_byte_stream_controller_enqueue_chunk_to_queue(controller, transferred_buffer, byte_offset, byte_length)
+        # 3. Otherwise.
+        else:
+            # 1. Assert: controller.[[queue]] is empty.
+            assert(ak.singly_linked_list_is_empty(&controller.m_queue))
+
+            # 2. If controller.[[pendingPullIntos]] is not empty,
+            #    1. Assert: controller.[[pendingPullIntos]][0]'s reader type is "default".
+            #    2. Perform ! ReadableByteStreamControllerShiftPendingPullInto(controller).
+            # (They are empty: see step 8.)
+
+            # 3. Let transferredView be ! Construct(%Uint8Array%, « transferredBuffer, byteOffset, byteLength »).
+            let transferred_view = js_construct_uint8_array(vm, transferred_buffer, (u64)byte_offset, (u64)byte_length) else trap("MUST: Construct(%Uint8Array%)")
+
+            # 4. Perform ! ReadableStreamFulfillReadRequest(stream, transferredView, false).
+            streams_readable_stream_fulfill_read_request(stream, js_value_from_object((JsObject*)transferred_view), false)
+    # 10. Otherwise, if ! ReadableStreamHasBYOBReader(stream) is true,
+    elif streams_readable_stream_has_byob_reader(stream):
+        # 1. Perform ! ReadableByteStreamControllerEnqueueChunkToQueue(controller, transferredBuffer, byteOffset, byteLength).
+        # 2. Let filledPullIntos be the result of performing ! ReadableByteStreamControllerProcessPullIntoDescriptorsUsingQueue(controller).
+        # 3. For each filledPullInto of filledPullIntos,
+        #    1. Perform ! ReadableByteStreamControllerCommitPullIntoDescriptor(stream, filledPullInto).
+        trap("unported (P4): enqueueing into a byte stream locked to a ReadableStreamBYOBReader")
+    # 11. Otherwise,
+    else:
+        # 1. Assert: ! IsReadableStreamLocked(stream) is false.
+        assert(not streams_is_readable_stream_locked(stream))
+
+        # 2. Perform ! ReadableByteStreamControllerEnqueueChunkToQueue(controller, transferredBuffer, byteOffset, byteLength).
+        streams_readable_byte_stream_controller_enqueue_chunk_to_queue(controller, transferred_buffer, byte_offset, byte_length)
+
+    # 12. Perform ! ReadableByteStreamControllerCallPullIfNeeded(controller).
+    streams_readable_byte_stream_controller_call_pull_if_needed(controller)
+
+## Ported from Libraries/LibWeb/Streams/ReadableStreamOperations.cpp:1924 Web::Streams::readable_byte_stream_controller_enqueue_chunk_to_queue.
+## https://streams.spec.whatwg.org/#readable-byte-stream-controller-enqueue-chunk-to-queue
+pub func streams_readable_byte_stream_controller_enqueue_chunk_to_queue(controller: StreamsReadableByteStreamController*, buffer: JsArrayBuffer*, byte_offset: u32, byte_length: u32):
+    # 1. Append a new readable byte stream queue entry with buffer buffer, byte offset byteOffset, and byte length byteLength to controller.[[queue]].
+    ak.singly_linked_list_append(&controller.m_queue, StreamsReadableByteStreamQueueEntry(buffer = buffer, byte_offset = (u64)byte_offset, byte_length = (u64)byte_length))
+
+    # 2. Set controller.[[queueTotalSize]] to controller.[[queueTotalSize]] + byteLength.
+    controller.m_queue_total_size = controller.m_queue_total_size + (f64)byte_length
+
+## Ported from Libraries/LibWeb/Streams/ReadableStreamOperations.cpp:1979 Web::Streams::readable_byte_stream_controller_error.
+## https://streams.spec.whatwg.org/#readable-byte-stream-controller-error
+pub func streams_readable_byte_stream_controller_error_2(controller: StreamsReadableByteStreamController*, error_: JsValue):
+    # 1. Let stream be controller.[[stream]].
+    let stream = controller.m_stream else trap("VERIFY: the controller has a stream")
+
+    # 2. If stream.[[state]] is not "readable", return.
+    if stream.m_state != StreamsReadableStreamState.readable:
+        return
+
+    # 3. Perform ! ReadableByteStreamControllerClearPendingPullIntos(controller).
+    streams_readable_byte_stream_controller_clear_pending_pull_intos(controller)
+
+    # 4. Perform ! ResetQueue(controller).
+    streams_reset_queue(controller)
+
+    # 5. Perform ! ReadableByteStreamControllerClearAlgorithms(controller).
+    streams_readable_byte_stream_controller_clear_algorithms(controller)
+
+    # 6. Perform ! ReadableStreamError(stream, e).
+    streams_readable_stream_error_2(stream, error_)
+
+# mark: The queue ===============================================================================
+
+## Ported from Libraries/LibWeb/Streams/ReadableStreamOperations.cpp:2123 Web::Streams::readable_byte_stream_controller_fill_read_request_from_queue.
+## https://streams.spec.whatwg.org/#abstract-opdef-readablebytestreamcontrollerfillreadrequestfromqueue
+pub func streams_readable_byte_stream_controller_fill_read_request_from_queue(controller: StreamsReadableByteStreamController*, read_request: StreamsReadRequest*):
+    let vm = realm_vm(bind_platform_object_realm(controller.bind_platform_object()))
+
+    # 1. Assert: controller.[[queueTotalSize]] > 0.
+    assert(controller.m_queue_total_size > 0.0)
+
+    # 2. Let entry be controller.[[queue]][0].
+    # 3. Remove entry from controller.[[queue]].
+    let entry = ak.singly_linked_list_take_first(&controller.m_queue)
+
+    # 4. Set controller.[[queueTotalSize]] to controller.[[queueTotalSize]] − entry’s byte length.
+    controller.m_queue_total_size = controller.m_queue_total_size - (f64)entry.byte_length
+
+    # 5. Perform ! ReadableByteStreamControllerHandleQueueDrain(controller).
+    streams_readable_byte_stream_controller_handle_queue_drain(controller)
+
+    # 6. Let view be ! Construct(%Uint8Array%, « entry’s buffer, entry’s byte offset, entry’s byte length »).
+    let view = js_construct_uint8_array(vm, entry.buffer, entry.byte_offset, entry.byte_length) else trap("MUST: Construct(%Uint8Array%)")
+
+    # 7. Perform readRequest’s chunk steps, given view.
+    streams_read_request_on_chunk(read_request, js_value_from_object((JsObject*)view))
+
+## Ported from Libraries/LibWeb/Streams/ReadableStreamOperations.cpp:2149 Web::Streams::readable_byte_stream_controller_get_byob_request.
+## https://streams.spec.whatwg.org/#abstract-opdef-readablebytestreamcontrollergetbyobrequest
+pub func streams_readable_byte_stream_controller_get_byob_request(controller: StreamsReadableByteStreamController*) -> StreamsReadableStreamByobRequest*?:
+    # 1. If controller.[[byobRequest]] is null and controller.[[pendingPullIntos]] is not empty,
+    if controller.m_byob_request == none and not ak.singly_linked_list_is_empty(&controller.m_pending_pull_intos):
+        # 1. Let firstDescriptor be controller.[[pendingPullIntos]][0].
+        # 2. Let view be ! Construct(%Uint8Array%, « firstDescriptor’s buffer, firstDescriptor’s byte offset + firstDescriptor’s bytes filled, firstDescriptor’s byte length − firstDescriptor’s bytes filled »).
+        # 3. Let byobRequest be a new ReadableStreamBYOBRequest.
+        # 4. Set byobRequest.[[controller]] to controller.
+        # 5. Set byobRequest.[[view]] to view.
+        # 6. Set controller.[[byobRequest]] to byobRequest.
+        trap("unported (P4): Web::Streams::ReadableStreamBYOBRequest")
+
+    # 2. Return controller.[[byobRequest]].
+    return controller.m_byob_request
+
+## Ported from Libraries/LibWeb/Streams/ReadableStreamOperations.cpp:2180 Web::Streams::readable_byte_stream_controller_get_desired_size.
+## https://streams.spec.whatwg.org/#readable-byte-stream-controller-get-desired-size
+pub func streams_readable_byte_stream_controller_get_desired_size(controller: StreamsReadableByteStreamController*) -> f64?:
+    # 1. Let state be controller.[[stream]].[[state]].
+    let state = (controller.m_stream else trap("VERIFY: the controller has a stream")).m_state
+
+    # 2. If state is "errored", return null.
+    if state == StreamsReadableStreamState.errored:
+        return none
+
+    # 3. If state is "closed", return 0.
+    if state == StreamsReadableStreamState.closed:
+        return 0.0
+
+    # 4. Return controller.[[strategyHWM]] − controller.[[queueTotalSize]].
+    return controller.m_strategy_hwm - controller.m_queue_total_size
+
+## Ported from Libraries/LibWeb/Streams/ReadableStreamOperations.cpp:2198 Web::Streams::readable_byte_stream_controller_handle_queue_drain.
+## https://streams.spec.whatwg.org/#readable-byte-stream-controller-handle-queue-drain
+pub func streams_readable_byte_stream_controller_handle_queue_drain(controller: StreamsReadableByteStreamController*):
+    let stream = controller.m_stream else trap("VERIFY: the controller has a stream")
+
+    # 1. Assert: controller.[[stream]].[[state]] is "readable".
+    assert(stream.m_state == StreamsReadableStreamState.readable)
+
+    # 2. If controller.[[queueTotalSize]] is 0 and controller.[[closeRequested]] is true,
+    if controller.m_queue_total_size == 0.0 and controller.m_close_requested:
+        # 1. Perform ! ReadableByteStreamControllerClearAlgorithms(controller).
+        streams_readable_byte_stream_controller_clear_algorithms(controller)
+
+        # 2. Perform ! ReadableStreamClose(controller.[[stream]]).
+        streams_readable_stream_close_2(stream)
+    # 3. Otherwise,
+    else:
+        # 1. Perform ! ReadableByteStreamControllerCallPullIfNeeded(controller).
+        streams_readable_byte_stream_controller_call_pull_if_needed(controller)
+
+## Ported from Libraries/LibWeb/Streams/ReadableStreamOperations.cpp:2221 Web::Streams::readable_byte_stream_controller_invalidate_byob_request.
+## https://streams.spec.whatwg.org/#readable-byte-stream-controller-invalidate-byob-request
+pub func streams_readable_byte_stream_controller_invalidate_byob_request(controller: StreamsReadableByteStreamController*):
+    # 1. If controller.[[byobRequest]] is null, return.
+    if streams_readable_byte_stream_controller_byob_request(controller) == none:
+        return
+
+    # 2. Set controller.[[byobRequest]].[[controller]] to undefined.
+    # 3. Set controller.[[byobRequest]].[[view]] to null.
+    # 4. Set controller.[[byobRequest]] to null.
+    trap("unported (P4): Web::Streams::ReadableStreamBYOBRequest")
+
+## Ported from Libraries/LibWeb/Streams/ReadableStreamOperations.cpp:2270 Web::Streams::readable_byte_stream_controller_process_read_requests_using_queue.
+## https://streams.spec.whatwg.org/#abstract-opdef-readablebytestreamcontrollerprocessreadrequestsusingqueue
+pub func streams_readable_byte_stream_controller_process_read_requests_using_queue(controller: StreamsReadableByteStreamController*):
+    # 1. Let reader be controller.[[stream]].[[reader]].
+    # 2. Assert: reader implements ReadableStreamDefaultReader.
+    let reader = streams_readable_stream_default_reader_of(controller.m_stream else trap("VERIFY: the controller has a stream"))
+
+    # 3. While reader.[[readRequests]] is not empty,
+    while not ak.singly_linked_list_is_empty(&reader.m_read_requests):
+        # 1. If controller.[[queueTotalSize]] is 0, return.
+        if controller.m_queue_total_size == 0.0:
+            return
+
+        # 2. Let readRequest be reader.[[readRequests]][0].
+        # 3. Remove readRequest from reader.[[readRequests]].
+        let read_request = ak.singly_linked_list_take_first(&reader.m_read_requests)
+
+        # 4. Perform ! ReadableByteStreamControllerFillReadRequestFromQueue(controller, readRequest).
+        streams_readable_byte_stream_controller_fill_read_request_from_queue(controller, read_request)
+
+## Ported from Libraries/LibWeb/Streams/ReadableStreamOperations.cpp:2443 Web::Streams::readable_byte_stream_controller_respond.
+## https://streams.spec.whatwg.org/#readable-byte-stream-controller-respond
+pub func streams_readable_byte_stream_controller_respond(controller: StreamsReadableByteStreamController*, bytes_written: u64) -> !:
+    # 1. Assert: controller.[[pendingPullIntos]] is not empty.
+    assert(not ak.singly_linked_list_is_empty(&controller.m_pending_pull_intos))
+
+    # 2.-7. Respond to the first pull-into descriptor: pull-into descriptors are phase 4.
+    _ = bytes_written
+    trap("unported (P4): Web::Streams::readable_byte_stream_controller_respond (pull-into descriptors)")
+
+# mark: Setting up ==============================================================================
+
+## Ported from Libraries/LibWeb/Streams/ReadableStreamOperations.cpp:2696 Web::Streams::readable_byte_stream_controller_should_call_pull.
+## https://streams.spec.whatwg.org/#readable-byte-stream-controller-should-call-pull
+pub func streams_readable_byte_stream_controller_should_call_pull(controller: StreamsReadableByteStreamController*) -> bool:
+    # 1. Let stream be controller.[[stream]].
+    let stream = controller.m_stream else trap("VERIFY: the controller has a stream")
+
+    # 2. If stream.[[state]] is not "readable", return false.
+    if stream.m_state != StreamsReadableStreamState.readable:
+        return false
+
+    # 3. If controller.[[closeRequested]] is true, return false.
+    if controller.m_close_requested:
+        return false
+
+    # 4. If controller.[[started]] is false, return false.
+    if not controller.m_started:
+        return false
+
+    # 5. If ! ReadableStreamHasDefaultReader(stream) is true and ! ReadableStreamGetNumReadRequests(stream) > 0, return true.
+    if streams_readable_stream_has_default_reader(stream) and streams_readable_stream_get_num_read_requests(stream) > 0:
+        return true
+
+    # 6. If ! ReadableStreamHasBYOBReader(stream) is true and ! ReadableStreamGetNumReadIntoRequests(stream) > 0, return true.
+    if streams_readable_stream_has_byob_reader(stream):
+        trap("unported (P4): Web::Streams::readable_stream_get_num_read_into_requests")
+
+    # 7. Let desiredSize be ! ReadableByteStreamControllerGetDesiredSize(controller).
+    # 8. Assert: desiredSize is not null.
+    let desired_size = streams_readable_byte_stream_controller_get_desired_size(controller) else trap("VERIFY: desiredSize is not null")
+
+    # 9. If desiredSize > 0, return true.
+    if desired_size > 0.0:
+        return true
+
+    # 10. Return false.
+    return false
+
+## set_up_readable_byte_stream_controller's fulfillment step for startPromise, `[&controller](JS::Value)`.
+func streams_readable_byte_stream_controller_start_fulfilled(context: void*?, value: JsValue) -> JsValue:
+    let controller = (StreamsReadableByteStreamController*)(context else trap("no captures"))
+    # 1. Set controller.[[started]] to true.
+    controller.m_started = true
+
+    # 2. Assert: controller.[[pulling]] is false.
+    assert(not controller.m_pulling)
+
+    # 3. Assert: controller.[[pullAgain]] is false.
+    assert(not controller.m_pull_again)
+
+    # 4. Perform ! ReadableByteStreamControllerCallPullIfNeeded(controller).
+    streams_readable_byte_stream_controller_call_pull_if_needed(controller)
+
+    return js_undefined()
+
+## Ported from Libraries/LibWeb/Streams/ReadableStreamOperations.cpp:2736 Web::Streams::set_up_readable_byte_stream_controller.
+## https://streams.spec.whatwg.org/#set-up-readable-byte-stream-controller
+pub func streams_set_up_readable_byte_stream_controller(stream: StreamsReadableStream*, controller: StreamsReadableByteStreamController*, start_algorithm: gc.Function0[JsValue]*, pull_algorithm: gc.Function0[JsPromiseCapability*]*, cancel_algorithm: gc.Function1[JsValue, JsPromiseCapability*]*, high_water_mark: f64, auto_allocate_chunk_size: JsValue) -> !:
+    let realm = streams_readable_stream_realm(stream)
+
+    # 1. Assert: stream.[[controller]] is undefined.
+    assert(stream.m_controller == none)
+
+    # 2. If autoAllocateChunkSize is not undefined,
+    if not js_value_is_undefined(auto_allocate_chunk_size):
+        # 1. Assert: ! IsInteger(autoAllocateChunkSize) is true.
+        # 2. Assert: autoAllocateChunkSize is positive.
+        assert(js_value_is_number(auto_allocate_chunk_size) and js_value_as_double(auto_allocate_chunk_size) > 0.0)
+
+    # 3. Set controller.[[stream]] to stream.
+    controller.m_stream = stream
+
+    # 4. Set controller.[[pullAgain]] and controller.[[pulling]] to false.
+    controller.m_pull_again = false
+    controller.m_pulling = false
+
+    # 5. Set controller.[[byobRequest]] to null.
+    controller.m_byob_request = none
+
+    # 6. Perform ! ResetQueue(controller).
+    streams_reset_queue(controller)
+
+    # 7. Set controller.[[closeRequested]] and controller.[[started]] to false.
+    controller.m_close_requested = false
+    controller.m_started = false
+
+    # 8. Set controller.[[strategyHWM]] to highWaterMark.
+    controller.m_strategy_hwm = high_water_mark
+
+    # 9. Set controller.[[pullAlgorithm]] to pullAlgorithm.
+    controller.m_pull_algorithm = pull_algorithm
+
+    # 10. Set controller.[[cancelAlgorithm]] to cancelAlgorithm.
+    controller.m_cancel_algorithm = cancel_algorithm
+
+    # 11. Set controller.[[autoAllocateChunkSize]] to autoAllocateChunkSize.
+    if js_value_is_number(auto_allocate_chunk_size):
+        controller.m_auto_allocate_chunk_size = (u64)js_value_as_double(auto_allocate_chunk_size)
+
+    # 12. Set controller.[[pendingPullIntos]] to a new empty list.
+    ak.singly_linked_list_clear(&controller.m_pending_pull_intos)
+
+    # 13. Set stream.[[controller]] to controller.
+    stream.m_controller = .streams_readable_byte_stream_controller(controller)
+
+    # 14. Let startResult be the result of performing startAlgorithm.
+    let start_result = ak.function0_call(&start_algorithm.function)
+
+    # 15. Let startPromise be a promise resolved with startResult.
+    let start_promise = idl_create_resolved_promise(realm, start_result)
+
+    let heap = gc.cell_heap(controller.cell())
+    # 16. Upon fulfillment of startPromise,
+    let on_fulfilled = gc.create_function1(heap, ak.Function1[JsValue, JsValue](call = streams_readable_byte_stream_controller_start_fulfilled, context = controller))
+    # 17. Upon rejection of startPromise with reason r,
+    let on_rejected = gc.create_function1(heap, ak.Function1[JsValue, JsValue](call = streams_readable_byte_stream_controller_error_on_rejection, context = controller))
+    _ = idl_react_to_promise(start_promise, on_fulfilled, on_rejected)

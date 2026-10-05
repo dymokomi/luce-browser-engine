@@ -1,0 +1,378 @@
+#==============================================================================================
+#
+#   tests_streams_1 - the ReadableStream stand-in: ArrayBuffers and Uint8Arrays, byte
+#   streams read by default readers (chunk order, closing, erroring, reading all bytes)
+#
+#   DESCRIPTION:
+#       Tests of the stand-in of DESIGN.md §3.6 (region p2s), pinned to the Streams spec and
+#       Ladybird's steps: chunks are read in the order they were enqueued, whether a read waits
+#       or the chunks wait in the queue; a close requested while chunks are queued closes the
+#       stream once they are read; an error reaches the pending and later reads and the reader's
+#       closed promise; read all bytes concatenates the chunks; a stream locked to a reader
+#       refuses a second one. They run in a principal realm of tests_environments, entered as a
+#       TemporaryExecutionContext, whose microtasks run when it is left (tests_promise's helpers).
+#
+#==============================================================================================
+
+# mark: Helpers =================================================================================
+
+## What a test read request saw: the bytes of its chunks (with a `|` after each), how many
+## chunks, whether it was closed, and the error it was given.
+struct TestStreamsReadLog:
+    var bytes: ak.ByteBuffer
+    var chunks: usize
+    var closed: usize
+    var errors: usize
+    var error_: JsValue
+
+## A read request that records its steps in a log (a ReadRequest subclass of the tests).
+struct TestStreamsReadRequest: IsStreamsReadRequest, IsJsCell, gc.IsCell:
+    var read_request: StreamsReadRequest
+    var log: TestStreamsReadLog*
+
+    func streams_read_request() -> StreamsReadRequest*: return (StreamsReadRequest*)&self
+
+    func js_cell() -> JsCell*: return (JsCell*)&self
+
+    func cell() -> gc.Cell*: return (gc.Cell*)&self
+
+## The test read request's chunk steps: append the chunk's bytes and a `|`.
+func test_streams_read_request_on_chunk(base: StreamsReadRequest*, chunk: JsValue):
+    let this = (TestStreamsReadRequest*)base
+    let bytes = js_value_as_if_uint8_array_data(chunk) else trap("the chunk is a Uint8Array")
+    ak.byte_buffer_append_span_u8(&this.log.bytes, bytes)
+    ak.byte_buffer_append_u8(&this.log.bytes, '|')
+    this.log.chunks += 1
+
+## The test read request's close steps.
+func test_streams_read_request_on_close(base: StreamsReadRequest*):
+    let this = (TestStreamsReadRequest*)base
+    this.log.closed += 1
+
+## The test read request's error steps.
+func test_streams_read_request_on_error(base: StreamsReadRequest*, error_: JsValue):
+    let this = (TestStreamsReadRequest*)base
+    this.log.errors += 1
+    this.log.error_ = error_
+
+## The vtable of the test read request.
+let test_streams_read_request_vtable: StreamsReadRequestVTable = StreamsReadRequestVTable(cell_vtable = JsCellVTable(cell_vtable = gc.CellVTable(class_info = &test_streams_read_request_class)), on_chunk = test_streams_read_request_on_chunk, on_close = test_streams_read_request_on_close, on_error = test_streams_read_request_on_error)
+
+## Class information of the test read request.
+let test_streams_read_request_class: ak.ClassInfo = ak.ClassInfo(name = "TestStreamsReadRequest", first_id = 1, last_id = 1, size = memory.size_of(TestStreamsReadRequest), vtable = (const void*)&test_streams_read_request_vtable)
+
+## A new test read request of `realm` logging into `log`.
+func test_streams_read_request(realm: Realm*, log: TestStreamsReadLog*) -> StreamsReadRequest*:
+    let this = (TestStreamsReadRequest*)web_allocate_cell(realm, &test_streams_read_request_class)
+    this.log = log
+    web_initialize_cell(this.cell(), realm)
+    return this.streams_read_request()
+
+## Whether the log's bytes are `text`.
+func test_streams_log_is(log: const TestStreamsReadLog*, text: str) -> bool:
+    return ak.compare_bytes(ak.byte_buffer_bytes_const(&log.bytes), text.bytes) == 0
+
+## Whether a ByteBuffer holds `text`.
+func test_streams_bytes_are(bytes: const ak.ByteBuffer*, text: str) -> bool:
+    return ak.compare_bytes(ak.byte_buffer_bytes_const(bytes), text.bytes) == 0
+
+## A Uint8Array of `realm` over a new ArrayBuffer holding `text`.
+func test_streams_chunk(realm: Realm*, text: str) -> JsValue:
+    let buffer = js_array_buffer_create_byte_buffer(realm, ak.byte_buffer_copy_span_u8(text.bytes) else trap("MUST"))
+    let view = js_uint8_array_create(realm, (u32)text.length, buffer)
+    return js_value_from_object((JsObject*)view)
+
+## A new ReadableStream of `realm` set up with byte reading support (no pull or cancel algorithm).
+func test_streams_byte_stream(realm: Realm*) -> StreamsReadableStream*:
+    let stream = realm_create_streams_readable_stream(realm, realm)
+    streams_readable_stream_set_up_with_byte_reading_support(stream)
+    return stream
+
+## Enqueue `text` into a byte stream as the network does (FetchedDataReceiver: a Uint8Array given
+## to ReadableByteStreamControllerEnqueue).
+func test_streams_enqueue(stream: StreamsReadableStream*, text: str):
+    let chunk = test_streams_chunk(streams_readable_stream_realm(stream), text)
+    streams_readable_byte_stream_controller_enqueue_2(streams_readable_stream_byte_controller(stream), chunk) else trap("enqueue")
+
+## Read one chunk from `reader` with a test read request logging into `log`.
+func test_streams_read(realm: Realm*, reader: StreamsReadableStreamDefaultReader*, log: TestStreamsReadLog*):
+    streams_readable_stream_default_reader_read_2(reader, test_streams_read_request(realm, log))
+
+## The captures of the read-all-bytes steps of the tests: what they were given.
+struct TestStreamsReadAll:
+    var bytes: ak.ByteBuffer
+    var successes: usize
+    var failures: usize
+    var error_: JsValue
+
+## read_all_bytes' successSteps of the tests.
+func test_streams_read_all_success(context: void*?, bytes: ak.ByteBuffer):
+    let captures = (TestStreamsReadAll*)(context else trap("no captures"))
+    captures.bytes = bytes
+    captures.successes += 1
+
+## read_all_bytes' failureSteps of the tests.
+func test_streams_read_all_failure(context: void*?, error_: JsValue):
+    let captures = (TestStreamsReadAll*)(context else trap("no captures"))
+    captures.error_ = error_
+    captures.failures += 1
+
+## Read all bytes from `reader` into `captures`.
+func test_streams_read_all_bytes(vm: Vm*, reader: StreamsReadableStreamDefaultReader*, captures: TestStreamsReadAll*):
+    let heap = vm_heap(vm)
+    streams_readable_stream_default_reader_read_all_bytes(reader, gc.create_function1(heap, ak.Function1[ak.ByteBuffer, unit](call = test_streams_read_all_success, context = captures)), gc.create_function1(heap, ak.Function1[JsValue, unit](call = test_streams_read_all_failure, context = captures)))
+
+## Whether ReadableByteStreamController::close refuses with a TypeError (taken from the VM).
+func test_streams_close_is_refused(controller: StreamsReadableByteStreamController*) -> bool:
+    streams_readable_byte_stream_controller_close(controller) catch failure:
+        assert(failure.code == webidl_exception)
+        match idl_take_pending_exception():
+            .idl_simple_exception(exception): return exception.type_ == IdlSimpleExceptionType.type_error
+            _: return false
+    return false
+
+## The state of a promise capability's promise.
+func test_streams_promise_state(promise: JsPromiseCapability*) -> JsPromiseState:
+    return js_promise_state(as_js_promise((gc.Cell*)js_promise_capability_promise(promise)))
+
+# mark: ArrayBuffers and Uint8Arrays ============================================================
+
+test "Streams stand-in: ArrayBuffer transfer detaches, Uint8Array views a range, CloneAsUint8Array copies it":
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    let settings = test_promise_enter(realm)
+
+    let buffer = js_array_buffer_create_byte_buffer(realm, ak.byte_buffer_copy_span_u8("abcdefgh".bytes) else trap("MUST"))
+    assert(js_array_buffer_byte_length(buffer) == 8 and not js_array_buffer_is_detached(buffer))
+    assert(js_object_shape_realm((JsObject*)buffer) == realm)
+
+    # Construct(%Uint8Array%, « buffer, 2, 3 »): "cde"; the offset and length are checked against the buffer.
+    let view = js_construct_uint8_array(vm, buffer, 2, 3) else trap("construct")
+    assert(ak.compare_bytes(js_typed_array_base_data(view), "cde".bytes) == 0)
+    assert(js_typed_array_base_byte_offset(view) == 2 and js_typed_array_base_array_length(view) == 3)
+    let too_long: JsTypedArrayBase*? = js_construct_uint8_array(vm, buffer, 6, 3) catch failure:
+        assert(failure.code == js_exception)
+        _ = vm_take_pending_exception(vm)
+        recover none
+    assert(too_long == none)
+
+    # The WebIDL view of it.
+    let idl_view = realm_create_idl_array_buffer_view(realm, (JsObject*)view)
+    assert(idl_bufferable_object_base_is_typed_array_base(idl_view.idl_bufferable_object_base()))
+    assert(idl_bufferable_object_base_byte_length(idl_view.idl_bufferable_object_base()) == 3)
+    assert(idl_bufferable_object_base_byte_offset(idl_view.idl_bufferable_object_base()) == 2)
+    assert(idl_bufferable_object_base_viewed_array_buffer(idl_view.idl_bufferable_object_base()) == buffer)
+
+    # CloneAsUint8Array: a new buffer holding just the view's bytes.
+    let clone = streams_clone_as_uint8_array(realm, idl_view) else trap("clone")
+    let clone_array = (JsTypedArrayBase*)js_value_as_object(clone)
+    assert(js_typed_array_base_viewed_array_buffer(clone_array) != buffer)
+    assert(js_array_buffer_byte_length(js_typed_array_base_viewed_array_buffer(clone_array)) == 3)
+    assert(ak.compare_bytes(js_value_as_if_uint8_array_data(clone) else trap("data"), "cde".bytes) == 0)
+
+    # TransferArrayBuffer: a new buffer with the bytes; the old one is detached and its views out of bounds.
+    assert(streams_can_transfer_array_buffer(buffer))
+    let transferred = streams_transfer_array_buffer(realm, buffer) else trap("transfer")
+    assert(js_array_buffer_is_detached(buffer) and js_array_buffer_byte_length(buffer) == 0)
+    assert(not streams_can_transfer_array_buffer(buffer))
+    assert(test_streams_bytes_are(js_array_buffer_buffer(transferred), "abcdefgh"))
+    let record = js_make_typed_array_with_buffer_witness_record(view)
+    assert(js_is_typed_array_out_of_bounds(&record))
+    assert(js_typed_array_byte_length(&record) == 0)
+    assert((js_value_as_if_uint8_array_data(js_value_from_object((JsObject*)view)) else trap("data")).length == 0)
+
+    # A value that is not a Uint8Array has no bytes.
+    assert(js_value_as_if_uint8_array_data(js_undefined()) == none)
+    assert(js_value_as_if_uint8_array_data(js_value_from_object((JsObject*)buffer)) == none)
+    test_promise_leave(settings)
+
+# mark: Reading =================================================================================
+
+test "ReadableStream: chunks are read in order, from the queue or by waiting reads":
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    let settings = test_promise_enter(realm)
+    var log = TestStreamsReadLog(error_ = js_undefined())
+
+    let stream = test_streams_byte_stream(realm)
+    assert(streams_readable_stream_is_readable(stream) and not streams_readable_stream_is_locked(stream))
+    let controller = streams_readable_stream_byte_controller(stream)
+    assert(controller.m_strategy_hwm == 0.0)
+
+    # Chunks enqueued before any reader wait in the queue.
+    test_streams_enqueue(stream, "ab")
+    test_streams_enqueue(stream, "cd")
+    assert(ak.singly_linked_list_size(&controller.m_queue) == 2 and controller.m_queue_total_size == 4.0)
+
+    let reader = streams_readable_stream_get_a_reader(stream) else trap("get_a_reader")
+    assert(streams_readable_stream_is_locked(stream) and streams_readable_stream_has_default_reader(stream))
+    assert(not streams_readable_stream_is_disturbed(stream))
+
+    # Reads take them from the queue at once, in order.
+    test_streams_read(realm, reader, &log)
+    assert(test_streams_log_is(&log, "ab|") and streams_readable_stream_is_disturbed(stream))
+    test_streams_read(realm, reader, &log)
+    assert(test_streams_log_is(&log, "ab|cd|"))
+    assert(ak.singly_linked_list_is_empty(&controller.m_queue) and controller.m_queue_total_size == 0.0)
+
+    # Reads made before the chunks wait, and the chunks go to them in order.
+    test_streams_read(realm, reader, &log)
+    test_streams_read(realm, reader, &log)
+    assert(streams_readable_stream_get_num_read_requests(stream) == 2 and log.chunks == 2)
+    test_streams_enqueue(stream, "ef")
+    test_streams_enqueue(stream, "g")
+    assert(test_streams_log_is(&log, "ab|cd|ef|g|") and streams_readable_stream_get_num_read_requests(stream) == 0)
+    assert(ak.singly_linked_list_is_empty(&controller.m_queue))
+
+    # Closing closes the waiting reads and the reader's closed promise; reads after it close at once.
+    test_streams_read(realm, reader, &log)
+    streams_readable_stream_close(stream)
+    assert(streams_readable_stream_is_closed(stream) and log.closed == 1)
+    test_streams_read(realm, reader, &log)
+    assert(log.closed == 2 and log.errors == 0 and log.chunks == 4)
+    let closed = streams_readable_stream_generic_reader_mixin_closed(&reader.generic_reader) else trap("closed promise")
+    assert(test_streams_promise_state(closed) == JsPromiseState.fulfilled)
+
+    # Enqueueing into a closed stream does nothing.
+    test_streams_enqueue(stream, "late")
+    assert(log.chunks == 4)
+    test_promise_leave(settings)
+
+test "ReadableStream: a close requested while chunks are queued closes the stream once they are read":
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    let settings = test_promise_enter(realm)
+    var log = TestStreamsReadLog(error_ = js_undefined())
+
+    let stream = test_streams_byte_stream(realm)
+    let controller = streams_readable_stream_byte_controller(stream)
+    test_streams_enqueue(stream, "one")
+    test_streams_enqueue(stream, "two")
+    streams_readable_stream_close(stream)
+    assert(controller.m_close_requested and streams_readable_stream_is_readable(stream))
+
+    # A requested close refuses more chunks and a second close through the controller.
+    test_streams_enqueue(stream, "three")
+    assert(controller.m_queue_total_size == 6.0)
+    assert(test_streams_close_is_refused(controller))
+
+    let reader = streams_readable_stream_get_a_reader(stream) else trap("get_a_reader")
+    test_streams_read(realm, reader, &log)
+    assert(streams_readable_stream_is_readable(stream))
+    test_streams_read(realm, reader, &log)
+    assert(test_streams_log_is(&log, "one|two|"))
+    # The last chunk drained the queue: the stream closed, its algorithms cleared.
+    assert(streams_readable_stream_is_closed(stream) and controller.m_pull_algorithm == none and controller.m_cancel_algorithm == none)
+    test_streams_read(realm, reader, &log)
+    assert(log.closed == 1)
+    assert(streams_readable_byte_stream_controller_desired_size(controller) == 0.0)
+    test_promise_leave(settings)
+
+test "ReadableStream: an error reaches waiting and later reads and rejects the closed promise":
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    let settings = test_promise_enter(realm)
+    var log = TestStreamsReadLog(error_ = js_undefined())
+
+    let stream = test_streams_byte_stream(realm)
+    let controller = streams_readable_stream_byte_controller(stream)
+    let reader = streams_readable_stream_get_a_reader(stream) else trap("get_a_reader")
+    test_streams_read(realm, reader, &log)
+    test_streams_read(realm, reader, &log)
+
+    streams_readable_stream_error(stream, js_value_from_f64(42.0))
+    assert(streams_readable_stream_is_errored(stream))
+    assert(log.errors == 2 and test_promise_is_number(log.error_, 42.0))
+    assert(test_promise_is_number(streams_readable_stream_stored_error(stream), 42.0))
+    assert(streams_readable_byte_stream_controller_desired_size(controller) == none)
+
+    # The closed promise is rejected with the error and marked as handled.
+    let closed = streams_readable_stream_generic_reader_mixin_closed(&reader.generic_reader) else trap("closed promise")
+    let closed_object = as_js_promise((gc.Cell*)js_promise_capability_promise(closed))
+    assert(js_promise_state(closed_object) == JsPromiseState.rejected and js_promise_is_handled(closed_object))
+
+    # Later reads error at once; a second error and enqueues do nothing.
+    test_streams_read(realm, reader, &log)
+    assert(log.errors == 3)
+    streams_readable_stream_error(stream, js_value_from_f64(7.0))
+    test_streams_enqueue(stream, "late")
+    assert(test_promise_is_number(streams_readable_stream_stored_error(stream), 42.0))
+    assert(log.chunks == 0 and log.closed == 0)
+
+    # Erroring resets the queue.
+    let queued = test_streams_byte_stream(realm)
+    test_streams_enqueue(queued, "kept")
+    streams_readable_stream_error(queued, js_undefined())
+    assert(ak.singly_linked_list_is_empty(&streams_readable_stream_byte_controller(queued).m_queue))
+    assert(streams_readable_stream_byte_controller(queued).m_queue_total_size == 0.0)
+    test_promise_leave(settings)
+
+test "ReadableStream: read all bytes concatenates the chunks, whether they came before or after":
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    let settings = test_promise_enter(realm)
+
+    # Chunks queued, then the stream closed, then read.
+    let queued = test_streams_byte_stream(realm)
+    test_streams_enqueue(queued, "Hello, ")
+    test_streams_enqueue(queued, "world")
+    streams_readable_stream_close(queued)
+    var first = TestStreamsReadAll(error_ = js_undefined())
+    test_streams_read_all_bytes(vm, streams_readable_stream_get_a_reader(queued) else trap("get_a_reader"), &first)
+    assert(first.successes == 1 and first.failures == 0)
+    assert(test_streams_bytes_are(&first.bytes, "Hello, world"))
+
+    # Reading first: the read loop waits for each chunk and succeeds on close.
+    let streamed = test_streams_byte_stream(realm)
+    var second = TestStreamsReadAll(error_ = js_undefined())
+    test_streams_read_all_bytes(vm, streams_readable_stream_get_a_reader(streamed) else trap("get_a_reader"), &second)
+    test_streams_enqueue(streamed, "abc")
+    test_streams_enqueue(streamed, "")
+    test_streams_enqueue(streamed, "def")
+    assert(second.successes == 0)
+    streams_readable_stream_close(streamed)
+    assert(second.successes == 1 and test_streams_bytes_are(&second.bytes, "abcdef"))
+
+    # An error fails it with the error.
+    let failing = test_streams_byte_stream(realm)
+    var third = TestStreamsReadAll(error_ = js_undefined())
+    test_streams_read_all_bytes(vm, streams_readable_stream_get_a_reader(failing) else trap("get_a_reader"), &third)
+    test_streams_enqueue(failing, "partial")
+    streams_readable_stream_error(failing, js_value_from_f64(3.0))
+    assert(third.successes == 0 and third.failures == 1 and test_promise_is_number(third.error_, 3.0))
+
+    # An empty closed stream reads as no bytes.
+    let empty = test_streams_byte_stream(realm)
+    streams_readable_stream_close(empty)
+    var fourth = TestStreamsReadAll(error_ = js_undefined())
+    test_streams_read_all_bytes(vm, streams_readable_stream_get_a_reader(empty) else trap("get_a_reader"), &fourth)
+    assert(fourth.successes == 1 and ak.byte_buffer_size(&fourth.bytes) == 0)
+    test_promise_leave(settings)
+
+test "ReadableStream: a locked stream refuses a second reader; pull_from_bytes enqueues a Uint8Array":
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    let settings = test_promise_enter(realm)
+    var log = TestStreamsReadLog(error_ = js_undefined())
+
+    let stream = test_streams_byte_stream(realm)
+    let reader = streams_readable_stream_get_a_reader(stream) else trap("get_a_reader")
+    let second: StreamsReadableStreamDefaultReader*? = streams_readable_stream_get_a_reader(stream) catch failure:
+        assert(failure.code == webidl_exception)
+        match idl_take_pending_exception():
+            .idl_simple_exception(exception): assert(exception.type_ == IdlSimpleExceptionType.type_error)
+            _: trap("a TypeError")
+        recover none
+    assert(second == none)
+
+    streams_readable_stream_pull_from_bytes(stream, ak.byte_buffer_copy_span_u8("pulled".bytes) else trap("MUST")) else trap("pull_from_bytes")
+    test_streams_read(realm, reader, &log)
+    assert(test_streams_log_is(&log, "pulled|"))
+
+    # A reader of an errored stream starts with a rejected, handled closed promise.
+    let errored = test_streams_byte_stream(realm)
+    streams_readable_stream_error(errored, js_undefined())
+    let late_reader = streams_readable_stream_get_a_reader(errored) else trap("get_a_reader")
+    let closed = late_reader.generic_reader.m_closed_promise else trap("closed promise")
+    assert(test_streams_promise_state(closed) == JsPromiseState.rejected)
+    test_promise_leave(settings)

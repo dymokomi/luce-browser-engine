@@ -1,0 +1,751 @@
+#==============================================================================================
+#
+#   readable_stream_operations_1 - the abstract operations of readable streams and their
+#   default readers: acquiring, creating, teeing a byte stream, canceling, closing, erroring,
+#   reading
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibWeb/Streams/ReadableStreamOperations.cpp (lines 56-1258), as part
+#       of the ReadableStream stand-in of DESIGN.md §3.6 (region p2s): the operations of byte
+#       streams read by default readers. Default controllers (ReadableStreamDefaultTee,
+#       CreateReadableStream), BYOB readers and read-into requests, piping and streams from
+#       iterables are phase 4; a path that reaches one traps.
+#
+#       Where a ReadableStream member has the snake name of an abstract operation (close,
+#       error, tee, cancel; ReadableStreamDefaultReader's read), the member keeps the name and
+#       the operation takes `_2`, as the skeleton generator names a later declaration
+#       (DESIGN.md §4.2).
+#
+#       Copyright (c) 2022, Linus Groh <linusg@serenityos.org>
+#       Copyright (c) 2023, Matthew Olsson <mattco@serenityos.org>
+#       Copyright (c) 2023-2025, Shannon Booth <shannon@serenityos.org>
+#       Copyright (c) 2023-2024, Kenneth Myhra <kennethmyhra@serenityos.org>
+#       Copyright (c) 2025, Tim Flynn <trflynn89@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Creating ================================================================================
+
+## Ported from Libraries/LibWeb/Streams/ReadableStreamOperations.cpp:57 Web::Streams::acquire_readable_stream_default_reader.
+## https://streams.spec.whatwg.org/#acquire-readable-stream-reader
+pub func streams_acquire_readable_stream_default_reader(stream: StreamsReadableStream*) -> StreamsReadableStreamDefaultReader*!:
+    let realm = streams_readable_stream_realm(stream)
+
+    # 1. Let reader be a new ReadableStreamDefaultReader.
+    let reader = realm_create_streams_readable_stream_default_reader(realm, realm)
+
+    # 2. Perform ? SetUpReadableStreamDefaultReader(reader, stream).
+    try streams_set_up_readable_stream_default_reader(reader, stream)
+
+    # 3. Return reader.
+    return reader
+
+## Ported from Libraries/LibWeb/Streams/ReadableStreamOperations.cpp:114 Web::Streams::create_readable_byte_stream.
+## https://streams.spec.whatwg.org/#abstract-opdef-createreadablebytestream
+pub func streams_create_readable_byte_stream(realm: Realm*, start_algorithm: gc.Function0[JsValue]*, pull_algorithm: gc.Function0[JsPromiseCapability*]*, cancel_algorithm: gc.Function1[JsValue, JsPromiseCapability*]*) -> StreamsReadableStream*!:
+    # 1. Let stream be a new ReadableStream.
+    let stream = realm_create_streams_readable_stream(realm, realm)
+
+    # 2. Perform ! InitializeReadableStream(stream).
+    streams_initialize_readable_stream(stream)
+
+    # 3. Let controller be a new ReadableByteStreamController.
+    let controller = realm_create_streams_readable_byte_stream_controller(realm, realm)
+
+    # 4. Perform ? SetUpReadableByteStreamController(stream, controller, startAlgorithm, pullAlgorithm, cancelAlgorithm, 0, undefined).
+    try streams_set_up_readable_byte_stream_controller(stream, controller, start_algorithm, pull_algorithm, cancel_algorithm, 0.0, js_undefined())
+
+    # 5. Return stream.
+    return stream
+
+## Ported from Libraries/LibWeb/Streams/ReadableStreamOperations.cpp:133 Web::Streams::initialize_readable_stream.
+## https://streams.spec.whatwg.org/#initialize-readable-stream
+pub func streams_initialize_readable_stream(stream: StreamsReadableStream*):
+    # 1. Set stream.[[state]] to "readable".
+    stream.m_state = StreamsReadableStreamState.readable
+
+    # 2. Set stream.[[reader]] and stream.[[storedError]] to undefined.
+    stream.m_reader = none
+    stream.m_stored_error = js_undefined()
+
+    # 3. Set stream.[[disturbed]] to false.
+    stream.m_disturbed = false
+
+## Ported from Libraries/LibWeb/Streams/ReadableStreamOperations.cpp:147 Web::Streams::is_readable_stream_locked.
+## https://streams.spec.whatwg.org/#is-readable-stream-locked
+pub func streams_is_readable_stream_locked(stream: StreamsReadableStream*) -> bool:
+    # 1. If stream.[[reader]] is undefined, return false.
+    if stream.m_reader == none:
+        return false
+
+    # 2. Return true.
+    return true
+
+# mark: Teeing ==================================================================================
+
+## Ported from Libraries/LibWeb/Streams/ReadableStreamOperations.cpp:371 Web::Streams::readable_stream_tee.
+## https://streams.spec.whatwg.org/#readable-stream-tee
+pub func streams_readable_stream_tee_2(realm: Realm*, stream: StreamsReadableStream*, clone_for_branch2: bool) -> (StreamsReadableStream*, StreamsReadableStream*)!:
+    # 1. Assert: stream implements ReadableStream.
+    # 2. Assert: cloneForBranch2 is a boolean.
+
+    # 3. If stream.[[controller]] implements ReadableByteStreamController, return ? ReadableByteStreamTee(stream).
+    match stream.m_controller else trap("VERIFY: the stream has a controller"):
+        .streams_readable_byte_stream_controller(_): return try streams_readable_byte_stream_tee(realm, stream)
+        .streams_readable_stream_default_controller(_): _ = clone_for_branch2
+
+    # 4. Return ? ReadableStreamDefaultTee(stream, cloneForBranch2).
+    trap("unported (P4): Web::Streams::readable_stream_default_tee")
+
+## `this_reader != params->reader` (and ==) on two ReadableStreamReader variants: the same reader.
+func streams_readable_stream_reader_is(a: StreamsReadableStreamReader, b: StreamsReadableStreamReader) -> bool:
+    match a:
+        .streams_readable_stream_default_reader(default_reader):
+            match b:
+                .streams_readable_stream_default_reader(other): return default_reader == other
+                _: return false
+        .streams_readable_stream_byob_reader(byob_reader):
+            match b:
+                .streams_readable_stream_byob_reader(other): return byob_reader == other
+                _: return false
+
+## The captures of readable_byte_stream_tee's forwardReaderError, `[&realm, params, cancel_promise]`.
+struct StreamsReadableByteStreamTeeForwardReaderError:
+    var realm: Realm*
+    var params: StreamsReadableByteStreamTeeParams*
+    var cancel_promise: JsPromiseCapability*
+
+## The captures of forwardReaderError's rejection steps, `[&realm, this_reader, params, cancel_promise]`.
+struct StreamsReadableByteStreamTeeForwardReaderErrorOnRejection:
+    var realm: Realm*
+    var this_reader: StreamsReadableStreamReader
+    var params: StreamsReadableByteStreamTeeParams*
+    var cancel_promise: JsPromiseCapability*
+
+## forwardReaderError's step 1: upon rejection of thisReader.[[closedPromise]] with reason r.
+func streams_readable_byte_stream_tee_forward_reader_error_on_rejection(context: void*?, reason: JsValue) -> JsValue:
+    let captures = (StreamsReadableByteStreamTeeForwardReaderErrorOnRejection*)(context else trap("no captures"))
+    let params = captures.params
+    let controller1 = streams_readable_stream_byte_controller(params.branch1 else trap("VERIFY: branch1"))
+    let controller2 = streams_readable_stream_byte_controller(params.branch2 else trap("VERIFY: branch2"))
+
+    # 1. If thisReader is not reader, return.
+    if not streams_readable_stream_reader_is(captures.this_reader, params.reader):
+        return js_undefined()
+
+    # 2. Perform ! ReadableByteStreamControllerError(branch1.[[controller]], r).
+    streams_readable_byte_stream_controller_error_2(controller1, reason)
+
+    # 3. Perform ! ReadableByteStreamControllerError(branch2.[[controller]], r).
+    streams_readable_byte_stream_controller_error_2(controller2, reason)
+
+    # 4. If canceled1 is false or canceled2 is false, resolve cancelPromise with undefined.
+    if not params.canceled1 or not params.canceled2:
+        idl_resolve_promise(captures.realm, captures.cancel_promise, js_undefined())
+
+    return js_undefined()
+
+## readable_byte_stream_tee's forwardReaderError, taking a thisReader argument.
+func streams_readable_byte_stream_tee_forward_reader_error(context: void*?, this_reader: StreamsReadableStreamReader):
+    let captures = (StreamsReadableByteStreamTeeForwardReaderError*)(context else trap("no captures"))
+    # 1. Upon rejection of thisReader.[[closedPromise]] with reason r,
+    let closed_promise = match this_reader:
+        .streams_readable_stream_default_reader(underlying_reader) => underlying_reader.generic_reader.m_closed_promise
+        .streams_readable_stream_byob_reader(_) => trap("unported (P4): ReadableStreamBYOBReader's closed promise")
+
+    let on_rejection = new StreamsReadableByteStreamTeeForwardReaderErrorOnRejection(realm = captures.realm, this_reader = this_reader, params = captures.params, cancel_promise = captures.cancel_promise) else trap("out of memory")
+    _ = idl_upon_rejection(closed_promise else trap("VERIFY: a closed promise"), gc.create_function1(realm_heap(captures.realm), ak.Function1[JsValue, JsValue](call = streams_readable_byte_stream_tee_forward_reader_error_on_rejection, context = on_rejection)))
+
+## The captures of readable_byte_stream_tee's pullWithDefaultReader and pullWithBYOBReader,
+## `[&realm, &stream, params, cancel_promise, forward_reader_error]`.
+struct StreamsReadableByteStreamTeePullWithReader:
+    var realm: Realm*
+    var stream: StreamsReadableStream*
+    var params: StreamsReadableByteStreamTeeParams*
+    var cancel_promise: JsPromiseCapability*
+    var forward_reader_error: gc.Function1[StreamsReadableStreamReader, unit]*
+
+## readable_byte_stream_tee's pullWithDefaultReader.
+func streams_readable_byte_stream_tee_pull_with_default_reader(context: void*?):
+    let captures = (StreamsReadableByteStreamTeePullWithReader*)(context else trap("no captures"))
+    let params = captures.params
+
+    # 1. If reader implements ReadableStreamBYOBReader,
+    match params.reader:
+        .streams_readable_stream_byob_reader(_):
+            # 1. Assert: reader.[[readIntoRequests]] is empty.
+            # 2. Perform ! ReadableStreamBYOBReaderRelease(reader).
+            # 3. Set reader to ! AcquireReadableStreamDefaultReader(stream).
+            # 4. Perform forwardReaderError, given reader.
+            trap("unported (P4): Web::Streams::readable_byte_stream_tee's pullWithDefaultReader after a BYOB reader")
+        _:
+            _ = 0
+
+    # 2. Let readRequest be a read request with the following items:
+    let read_request = heap_allocate_streams_readable_byte_stream_tee_default_read_request(realm_heap(captures.realm), captures.realm, captures.stream, params, captures.cancel_promise)
+
+    # 3. Perform ! ReadableStreamDefaultReaderRead(reader, readRequest).
+    let reader = match params.reader:
+        .streams_readable_stream_default_reader(default_reader) => default_reader
+        .streams_readable_stream_byob_reader(_) => trap("VERIFY: reader.get<GC::Ref<ReadableStreamDefaultReader>>()")
+    streams_readable_stream_default_reader_read_2(reader, read_request.streams_read_request())
+
+## readable_byte_stream_tee's pullWithBYOBReader, given view and forBranch2: BYOB requests are phase 4.
+func streams_readable_byte_stream_tee_pull_with_byob_reader(context: void*?, view: IdlArrayBufferView*, for_branch2: bool):
+    # 1. If reader implements ReadableStreamDefaultReader,
+    #    2. Assert: reader.[[readRequests]] is empty.
+    #    3. Perform ! ReadableStreamDefaultReaderRelease(reader).
+    #    4. Set reader to ! AcquireReadableStreamBYOBReader(stream).
+    #    5. Perform forwardReaderError, given reader.
+    # 2. Let byobBranch be branch2 if forBranch2 is true, and branch1 otherwise.
+    # 3. Let otherBranch be branch2 if forBranch2 is false, and branch1 otherwise.
+    # 4. Let readIntoRequest be a read-into request with the following items:
+    # 5. Perform ! ReadableStreamBYOBReaderRead(reader, view, 1, readIntoRequest).
+    _ = context
+    _ = view
+    _ = for_branch2
+    trap("unported (P4): Web::Streams::readable_byte_stream_tee's pullWithBYOBReader")
+
+## The captures of readable_byte_stream_tee's pull1Algorithm and pull2Algorithm,
+## `[&realm, params, pull_with_default_reader, pull_with_byob_reader]`.
+struct StreamsReadableByteStreamTeePullAlgorithm:
+    var realm: Realm*
+    var params: StreamsReadableByteStreamTeeParams*
+    var pull_with_default_reader: gc.Function0[unit]*
+    var pull_with_byob_reader: gc.Function2[IdlArrayBufferView*, bool, unit]*
+
+## readable_byte_stream_tee's pull1Algorithm.
+func streams_readable_byte_stream_tee_pull1_algorithm(context: void*?) -> JsPromiseCapability*:
+    let captures = (StreamsReadableByteStreamTeePullAlgorithm*)(context else trap("no captures"))
+    let params = captures.params
+    let controller1 = streams_readable_stream_byte_controller(params.branch1 else trap("VERIFY: branch1"))
+
+    # 1. If reading is true,
+    if params.reading:
+        # 1. Set readAgainForBranch1 to true.
+        params.read_again_for_branch1 = true
+
+        # 2. Return a promise resolved with undefined.
+        return idl_create_resolved_promise(captures.realm, js_undefined())
+
+    # 2. Set reading to true.
+    params.reading = true
+
+    # 3. Let byobRequest be ! ReadableByteStreamControllerGetBYOBRequest(branch1.[[controller]]).
+    let byob_request = streams_readable_byte_stream_controller_get_byob_request(controller1)
+
+    # 4. If byobRequest is null, perform pullWithDefaultReader.
+    if byob_request == none:
+        ak.function0_call(&captures.pull_with_default_reader.function)
+    # 5. Otherwise, perform pullWithBYOBReader, given byobRequest.[[view]] and false.
+    else:
+        trap("unported (P4): Web::Streams::ReadableStreamBYOBRequest::view")
+
+    # 6. Return a promise resolved with undefined.
+    return idl_create_resolved_promise(captures.realm, js_undefined())
+
+## readable_byte_stream_tee's pull2Algorithm.
+func streams_readable_byte_stream_tee_pull2_algorithm(context: void*?) -> JsPromiseCapability*:
+    let captures = (StreamsReadableByteStreamTeePullAlgorithm*)(context else trap("no captures"))
+    let params = captures.params
+    let controller2 = streams_readable_stream_byte_controller(params.branch2 else trap("VERIFY: branch2"))
+
+    # 1. If reading is true,
+    if params.reading:
+        # 1. Set readAgainForBranch2 to true.
+        params.read_again_for_branch2 = true
+
+        # 2. Return a promise resolved with undefined.
+        return idl_create_resolved_promise(captures.realm, js_undefined())
+
+    # 2. Set reading to true.
+    params.reading = true
+
+    # 3. Let byobRequest be ! ReadableByteStreamControllerGetBYOBRequest(branch2.[[controller]]).
+    let byob_request = streams_readable_byte_stream_controller_get_byob_request(controller2)
+
+    # 4. If byobRequest is null, perform pullWithDefaultReader.
+    if byob_request == none:
+        ak.function0_call(&captures.pull_with_default_reader.function)
+    # 5. Otherwise, perform pullWithBYOBReader, given byobRequest.[[view]] and true.
+    else:
+        trap("unported (P4): Web::Streams::ReadableStreamBYOBRequest::view")
+
+    # 6. Return a promise resolved with undefined.
+    return idl_create_resolved_promise(captures.realm, js_undefined())
+
+## The captures of readable_byte_stream_tee's cancel1Algorithm and cancel2Algorithm,
+## `[&realm, &stream, params, cancel_promise]`.
+struct StreamsReadableByteStreamTeeCancelAlgorithm:
+    var realm: Realm*
+    var stream: StreamsReadableStream*
+    var params: StreamsReadableByteStreamTeeParams*
+    var cancel_promise: JsPromiseCapability*
+
+## Steps 3-4 shared by cancel1Algorithm and cancel2Algorithm: once both branches are canceled,
+## cancel the stream with « reason1, reason2 »; return cancelPromise.
+func streams_readable_byte_stream_tee_cancel_both(captures: StreamsReadableByteStreamTeeCancelAlgorithm*, other_canceled: bool) -> JsPromiseCapability*:
+    let params = captures.params
+    # 3. If canceled2 (canceled1) is true,
+    if other_canceled:
+        # 1. Let compositeReason be ! CreateArrayFromList(« reason1, reason2 »).
+        let reasons: JsValue[2] = [params.reason1, params.reason2]
+        let composite_reason = js_value_from_object((JsObject*)js_array_create_from(captures.realm, reasons))
+
+        # 2. Let cancelResult be ! ReadableStreamCancel(stream, compositeReason).
+        let cancel_result = streams_readable_stream_cancel_2(captures.stream, composite_reason)
+
+        # 3. Resolve cancelPromise with cancelResult.
+        idl_resolve_promise(captures.realm, captures.cancel_promise, js_value_from_object(js_promise_capability_promise(cancel_result)))
+
+    # 4. Return cancelPromise.
+    return captures.cancel_promise
+
+## readable_byte_stream_tee's cancel1Algorithm, taking a reason argument.
+func streams_readable_byte_stream_tee_cancel1_algorithm(context: void*?, reason: JsValue) -> JsPromiseCapability*:
+    let captures = (StreamsReadableByteStreamTeeCancelAlgorithm*)(context else trap("no captures"))
+    # 1. Set canceled1 to true.
+    captures.params.canceled1 = true
+
+    # 2. Set reason1 to reason.
+    captures.params.reason1 = reason
+
+    return streams_readable_byte_stream_tee_cancel_both(captures, captures.params.canceled2)
+
+## readable_byte_stream_tee's cancel2Algorithm, taking a reason argument.
+func streams_readable_byte_stream_tee_cancel2_algorithm(context: void*?, reason: JsValue) -> JsPromiseCapability*:
+    let captures = (StreamsReadableByteStreamTeeCancelAlgorithm*)(context else trap("no captures"))
+    # 1. Set canceled2 to true.
+    captures.params.canceled2 = true
+
+    # 2. Set reason2 to reason.
+    captures.params.reason2 = reason
+
+    return streams_readable_byte_stream_tee_cancel_both(captures, captures.params.canceled1)
+
+## Ported from Libraries/LibWeb/Streams/ReadableStreamOperations.cpp:516 Web::Streams::readable_byte_stream_tee:
+## the two branches.
+## https://streams.spec.whatwg.org/#abstract-opdef-readablebytestreamtee
+pub func streams_readable_byte_stream_tee(realm: Realm*, stream: StreamsReadableStream*) -> (StreamsReadableStream*, StreamsReadableStream*)!:
+    let heap = realm_heap(realm)
+
+    # 1. Assert: stream implements ReadableStream.
+    # 2. Assert: stream.[[controller]] implements ReadableByteStreamController.
+    _ = streams_readable_stream_byte_controller(stream)
+
+    # 3. Let reader be ? AcquireReadableStreamDefaultReader(stream).
+    let reader = try streams_acquire_readable_stream_default_reader(stream)
+
+    # 4. Let reading be false.
+    # 5. Let readAgainForBranch1 be false.
+    # 6. Let readAgainForBranch2 be false.
+    # 7. Let canceled1 be false.
+    # 8. Let canceled2 be false.
+    # 9. Let reason1 be undefined.
+    # 10. Let reason2 be undefined.
+    # 11. Let branch1 be undefined.
+    # 12. Let branch2 be undefined.
+    let params = realm_create_streams_readable_byte_stream_tee_params(realm, .streams_readable_stream_default_reader(reader))
+
+    # 13. Let cancelPromise be a new promise.
+    let cancel_promise = idl_create_promise(realm)
+
+    # 14. Let forwardReaderError be the following steps, taking a thisReader argument:
+    let forward_captures = new StreamsReadableByteStreamTeeForwardReaderError(realm = realm, params = params, cancel_promise = cancel_promise) else trap("out of memory")
+    let forward_reader_error = gc.create_function1(heap, ak.Function1[StreamsReadableStreamReader, unit](call = streams_readable_byte_stream_tee_forward_reader_error, context = forward_captures))
+
+    # 15. Let pullWithDefaultReader be the following steps:
+    # 16. Let pullWithBYOBReader be the following steps, given view and forBranch2:
+    let pull_captures = new StreamsReadableByteStreamTeePullWithReader(realm = realm, stream = stream, params = params, cancel_promise = cancel_promise, forward_reader_error = forward_reader_error) else trap("out of memory")
+    let pull_with_default_reader = gc.create_function0(heap, ak.Function0[unit](call = streams_readable_byte_stream_tee_pull_with_default_reader, context = pull_captures))
+    let pull_with_byob_reader = gc.create_function2(heap, ak.Function2[IdlArrayBufferView*, bool, unit](call = streams_readable_byte_stream_tee_pull_with_byob_reader, context = pull_captures))
+
+    # 17. Let pull1Algorithm be the following steps:
+    # 18. Let pull2Algorithm be the following steps:
+    let pull_algorithm_captures = new StreamsReadableByteStreamTeePullAlgorithm(realm = realm, params = params, pull_with_default_reader = pull_with_default_reader, pull_with_byob_reader = pull_with_byob_reader) else trap("out of memory")
+    let pull1_algorithm = gc.create_function0(heap, ak.Function0[JsPromiseCapability*](call = streams_readable_byte_stream_tee_pull1_algorithm, context = pull_algorithm_captures))
+    let pull2_algorithm = gc.create_function0(heap, ak.Function0[JsPromiseCapability*](call = streams_readable_byte_stream_tee_pull2_algorithm, context = pull_algorithm_captures))
+
+    # AD-HOC: The read requests within the pull algorithms must be able to re-invoke the pull algorithms, so cache them here.
+    params.pull1_algorithm = pull1_algorithm
+    params.pull2_algorithm = pull2_algorithm
+
+    # 19. Let cancel1Algorithm be the following steps, taking a reason argument:
+    # 20. Let cancel2Algorithm be the following steps, taking a reason argument:
+    let cancel_captures = new StreamsReadableByteStreamTeeCancelAlgorithm(realm = realm, stream = stream, params = params, cancel_promise = cancel_promise) else trap("out of memory")
+    let cancel1_algorithm = gc.create_function1(heap, ak.Function1[JsValue, JsPromiseCapability*](call = streams_readable_byte_stream_tee_cancel1_algorithm, context = cancel_captures))
+    let cancel2_algorithm = gc.create_function1(heap, ak.Function1[JsValue, JsPromiseCapability*](call = streams_readable_byte_stream_tee_cancel2_algorithm, context = cancel_captures))
+
+    # 21. Let startAlgorithm be an algorithm that returns undefined.
+    let start_algorithm = gc.create_function0(heap, ak.Function0[JsValue](call = streams_readable_stream_start_algorithm_returning_undefined, context = none))
+
+    # 22. Set branch1 to ! CreateReadableByteStream(startAlgorithm, pull1Algorithm, cancel1Algorithm).
+    params.branch1 = streams_create_readable_byte_stream(realm, start_algorithm, pull1_algorithm, cancel1_algorithm) else trap("MUST: CreateReadableByteStream")
+
+    # 23. Set branch2 to ! CreateReadableByteStream(startAlgorithm, pull2Algorithm, cancel2Algorithm).
+    params.branch2 = streams_create_readable_byte_stream(realm, start_algorithm, pull2_algorithm, cancel2_algorithm) else trap("MUST: CreateReadableByteStream")
+
+    # 24. Perform forwardReaderError, given reader.
+    ak.function1_call(&forward_reader_error.function, .streams_readable_stream_default_reader(reader))
+
+    # 25. Return « branch1, branch2 ».
+    return (params.branch1 else trap("unreachable: branch1 was set"), params.branch2 else trap("unreachable: branch2 was set"))
+
+# mark: Requests, canceling, closing, erroring ==================================================
+
+## Ported from Libraries/LibWeb/Streams/ReadableStreamOperations.cpp:772 Web::Streams::readable_stream_add_read_request.
+## https://streams.spec.whatwg.org/#readable-stream-add-read-request
+pub func streams_readable_stream_add_read_request(stream: StreamsReadableStream*, read_request: StreamsReadRequest*):
+    # 1. Assert: stream.[[reader]] implements ReadableStreamDefaultReader.
+    let reader = streams_readable_stream_default_reader_of(stream)
+
+    # 2. Assert: stream.[[state]] is "readable".
+    assert(stream.m_state == StreamsReadableStreamState.readable)
+
+    # 3. Append readRequest to stream.[[reader]].[[readRequests]].
+    ak.singly_linked_list_append(&reader.m_read_requests, read_request)
+
+## `stream.reader()->get<GC::Ref<ReadableStreamDefaultReader>>()`: the stream's default reader (it must
+## have one: VERIFY).
+func streams_readable_stream_default_reader_of(stream: StreamsReadableStream*) -> StreamsReadableStreamDefaultReader*:
+    match stream.m_reader else trap("VERIFY: stream.reader().has_value()"):
+        .streams_readable_stream_default_reader(reader): return reader
+        .streams_readable_stream_byob_reader(_): trap("VERIFY: the stream's reader is a ReadableStreamDefaultReader")
+
+## The closed promise of either kind of reader, `reader->visit([](auto reader) { return reader->closed_promise_capability(); })`.
+func streams_readable_stream_reader_closed_promise(reader: StreamsReadableStreamReader) -> JsPromiseCapability*:
+    match reader:
+        .streams_readable_stream_default_reader(default_reader):
+            return default_reader.generic_reader.m_closed_promise else trap("VERIFY: the reader has a closed promise")
+        .streams_readable_stream_byob_reader(_):
+            trap("unported (P4): ReadableStreamBYOBReader's closed promise")
+
+## readable_stream_cancel's fulfillment step: a step that returns undefined.
+func streams_readable_stream_cancel_fulfillment_step(context: void*?, value: JsValue) -> JsValue:
+    return js_undefined()
+
+## Ported from Libraries/LibWeb/Streams/ReadableStreamOperations.cpp:787 Web::Streams::readable_stream_cancel.
+## https://streams.spec.whatwg.org/#readable-stream-cancel
+pub func streams_readable_stream_cancel_2(stream: StreamsReadableStream*, reason: JsValue) -> JsPromiseCapability*:
+    let realm = streams_readable_stream_realm(stream)
+
+    # 1. Set stream.[[disturbed]] to true.
+    stream.m_disturbed = true
+
+    # 2. If stream.[[state]] is "closed", return a promise resolved with undefined.
+    if stream.m_state == StreamsReadableStreamState.closed:
+        return idl_create_resolved_promise(realm, js_undefined())
+
+    # 3. If stream.[[state]] is "errored", return a promise rejected with stream.[[storedError]].
+    if stream.m_state == StreamsReadableStreamState.errored:
+        return idl_create_rejected_promise(realm, stream.m_stored_error)
+
+    # 4. Perform ! ReadableStreamClose(stream).
+    streams_readable_stream_close_2(stream)
+
+    # 5. Let reader be stream.[[reader]].
+    # 6. If reader is not undefined and reader implements ReadableStreamBYOBReader,
+    if let reader = stream.m_reader:
+        match reader:
+            .streams_readable_stream_byob_reader(_):
+                # 1. Let readIntoRequests be reader.[[readIntoRequests]].
+                # 2. Set reader.[[readIntoRequests]] to an empty list.
+                # 3. For each readIntoRequest of readIntoRequests,
+                #    1. Perform readIntoRequest’s close steps, given undefined.
+                trap("unported (P4): canceling a stream locked to a ReadableStreamBYOBReader")
+            _:
+                _ = 0
+
+    # 7. Let sourceCancelPromise be ! stream.[[controller]].[[CancelSteps]](reason).
+    let source_cancel_promise = match stream.m_controller else trap("VERIFY: the stream has a controller"):
+        .streams_readable_byte_stream_controller(controller) => streams_readable_byte_stream_controller_cancel_steps(controller, reason)
+        .streams_readable_stream_default_controller(_) => trap("unported (P4): Web::Streams::ReadableStreamDefaultController::cancel_steps")
+
+    # 8. Return the result of reacting to sourceCancelPromise with a fulfillment step that returns undefined.
+    return idl_upon_fulfillment(source_cancel_promise, gc.create_function1(gc.cell_heap(stream.cell()), ak.Function1[JsValue, JsValue](call = streams_readable_stream_cancel_fulfillment_step, context = none)))
+
+## Ported from Libraries/LibWeb/Streams/ReadableStreamOperations.cpp:836 Web::Streams::readable_stream_close.
+## https://streams.spec.whatwg.org/#readable-stream-close
+pub func streams_readable_stream_close_2(stream: StreamsReadableStream*):
+    let realm = streams_readable_stream_realm(stream)
+
+    # 1. Assert: stream.[[state]] is "readable".
+    assert(stream.m_state == StreamsReadableStreamState.readable)
+
+    # 2. Set stream.[[state]] to "closed".
+    stream.m_state = StreamsReadableStreamState.closed
+
+    # 3. Let reader be stream.[[reader]].
+    # 4. If reader is undefined, return.
+    let reader = stream.m_reader else return
+
+    # 5. Resolve reader.[[closedPromise]] with undefined.
+    idl_resolve_promise(realm, streams_readable_stream_reader_closed_promise(reader), js_undefined())
+
+    # 6. If reader implements ReadableStreamDefaultReader,
+    match reader:
+        .streams_readable_stream_default_reader(default_reader):
+            # 1. Let readRequests be reader.[[readRequests]].
+            # 2. Set reader.[[readRequests]] to an empty list.
+            var read_requests = default_reader.m_read_requests
+            default_reader.m_read_requests = ak.SinglyLinkedList[StreamsReadRequest*, ak.DefaultSizeCalculationPolicy[StreamsReadRequest*]]()
+
+            # 3. For each readRequest of readRequests,
+            for read_request in ak.singly_linked_list_begin(&read_requests):
+                # 1. Perform readRequest’s close steps.
+                streams_read_request_on_close(*read_request)
+        _:
+            return
+
+## Ported from Libraries/LibWeb/Streams/ReadableStreamOperations.cpp:873 Web::Streams::readable_stream_error.
+## https://streams.spec.whatwg.org/#readable-stream-error
+pub func streams_readable_stream_error_2(stream: StreamsReadableStream*, error_: JsValue):
+    let realm = streams_readable_stream_realm(stream)
+
+    # 1. Assert: stream.[[state]] is "readable".
+    assert(stream.m_state == StreamsReadableStreamState.readable)
+
+    # 2. Set stream.[[state]] to "errored".
+    stream.m_state = StreamsReadableStreamState.errored
+
+    # 3. Set stream.[[storedError]] to e.
+    stream.m_stored_error = error_
+
+    # 4. Let reader be stream.[[reader]].
+    # 5. If reader is undefined, return.
+    let reader = stream.m_reader else return
+
+    let closed_promise_capability = streams_readable_stream_reader_closed_promise(reader)
+
+    # 6. Reject reader.[[closedPromise]] with e.
+    idl_reject_promise(realm, closed_promise_capability, error_)
+
+    # 7. Set reader.[[closedPromise]].[[PromiseIsHandled]] to true.
+    idl_mark_promise_as_handled(closed_promise_capability)
+
+    match reader:
+        # 8. If reader implements ReadableStreamDefaultReader,
+        .streams_readable_stream_default_reader(default_reader):
+            # 1. Perform ! ReadableStreamDefaultReaderErrorReadRequests(reader, e).
+            streams_readable_stream_default_reader_error_read_requests(default_reader, error_)
+        # 9. Otherwise,
+        .streams_readable_stream_byob_reader(_):
+            # 1. Assert: reader implements ReadableStreamBYOBReader.
+            # 2. Perform ! ReadableStreamBYOBReaderErrorReadIntoRequests(reader, e).
+            trap("unported (P4): Web::Streams::readable_stream_byob_reader_error_read_into_requests")
+
+## Ported from Libraries/LibWeb/Streams/ReadableStreamOperations.cpp:942 Web::Streams::readable_stream_fulfill_read_request.
+## https://streams.spec.whatwg.org/#readable-stream-fulfill-read-request
+pub func streams_readable_stream_fulfill_read_request(stream: StreamsReadableStream*, chunk: JsValue, done: bool):
+    # 1. Assert: ! ReadableStreamHasDefaultReader(stream) is true.
+    assert(streams_readable_stream_has_default_reader(stream))
+
+    # 2. Let reader be stream.[[reader]].
+    let reader = streams_readable_stream_default_reader_of(stream)
+
+    # 3. Assert: reader.[[readRequests]] is not empty.
+    assert(not ak.singly_linked_list_is_empty(&reader.m_read_requests))
+
+    # 4. Let readRequest be reader.[[readRequests]][0].
+    # 5. Remove readRequest from reader.[[readRequests]].
+    let read_request = ak.singly_linked_list_take_first(&reader.m_read_requests)
+
+    # 6. If done is true, perform readRequest’s close steps.
+    if done:
+        streams_read_request_on_close(read_request)
+    # 7. Otherwise, perform readRequest’s chunk steps, given chunk.
+    else:
+        streams_read_request_on_chunk(read_request, chunk)
+
+## Ported from Libraries/LibWeb/Streams/ReadableStreamOperations.cpp:978 Web::Streams::readable_stream_get_num_read_requests.
+## https://streams.spec.whatwg.org/#readable-stream-get-num-read-requests
+pub func streams_readable_stream_get_num_read_requests(stream: StreamsReadableStream*) -> usize:
+    # 1. Assert: ! ReadableStreamHasDefaultReader(stream) is true.
+    assert(streams_readable_stream_has_default_reader(stream))
+
+    # 2. Return stream.[[reader]].[[readRequests]]'s size.
+    return ak.singly_linked_list_size(&streams_readable_stream_default_reader_of(stream).m_read_requests)
+
+## Ported from Libraries/LibWeb/Streams/ReadableStreamOperations.cpp:988 Web::Streams::readable_stream_has_byob_reader.
+## https://streams.spec.whatwg.org/#readable-stream-has-byob-reader
+pub func streams_readable_stream_has_byob_reader(stream: StreamsReadableStream*) -> bool:
+    # 1. Let reader be stream.[[reader]].
+    # 2. If reader is undefined, return false.
+    let reader = stream.m_reader else return false
+
+    # 3. If reader implements ReadableStreamBYOBReader, return true.
+    match reader:
+        .streams_readable_stream_byob_reader(_): return true
+        _: _ = 0
+
+    # 4. Return false.
+    return false
+
+## Ported from Libraries/LibWeb/Streams/ReadableStreamOperations.cpp:1006 Web::Streams::readable_stream_has_default_reader.
+## https://streams.spec.whatwg.org/#readable-stream-has-default-reader
+pub func streams_readable_stream_has_default_reader(stream: StreamsReadableStream*) -> bool:
+    # 1. Let reader be stream.[[reader]].
+    # 2. If reader is undefined, return false.
+    let reader = stream.m_reader else return false
+
+    # 3. If reader implements ReadableStreamDefaultReader, return true.
+    match reader:
+        .streams_readable_stream_default_reader(_): return true
+        _: _ = 0
+
+    # 4. Return false.
+    return false
+
+# mark: Readers =================================================================================
+
+## Ported from Libraries/LibWeb/Streams/ReadableStreamOperations.cpp:1024 Web::Streams::readable_stream_reader_generic_cancel.
+## https://streams.spec.whatwg.org/#readable-stream-reader-generic-cancel
+pub func streams_readable_stream_reader_generic_cancel(reader: StreamsReadableStreamGenericReaderMixin*, reason: JsValue) -> JsPromiseCapability*:
+    # 1. Let stream be reader.[[stream]]
+    # 2. Assert: stream is not undefined
+    let stream = reader.m_stream else trap("VERIFY: the reader has a stream")
+
+    # 3. Return ! ReadableStreamCancel(stream, reason)
+    return streams_readable_stream_cancel_2(stream, reason)
+
+## Ported from Libraries/LibWeb/Streams/ReadableStreamOperations.cpp:1037 Web::Streams::readable_stream_reader_generic_initialize.
+## https://streams.spec.whatwg.org/#readable-stream-reader-generic-initialize
+pub func streams_readable_stream_reader_generic_initialize(reader: StreamsReadableStreamReader, stream: StreamsReadableStream*):
+    let (mixin, reader_object) = match reader:
+        .streams_readable_stream_default_reader(default_reader) => (&default_reader.generic_reader, (JsObject*)default_reader)
+        .streams_readable_stream_byob_reader(_) => trap("unported (P4): Web::Streams::ReadableStreamBYOBReader")
+
+    # FIXME: Exactly when we should effectively be using the relevant realm of `this` is to be clarified by the spec.
+    #        For now, we do so as needed by WPT tests. See: https://github.com/whatwg/streams/issues/1213
+    let realm = html_relevant_realm(reader_object)
+
+    # 1. Set reader.[[stream]] to stream.
+    mixin.m_stream = stream
+
+    # 2. Set stream.[[reader]] to reader.
+    stream.m_reader = reader
+
+    # 3. If stream.[[state]] is "readable",
+    let state = stream.m_state
+    if state == StreamsReadableStreamState.readable:
+        # 1. Set reader.[[closedPromise]] to a new promise.
+        mixin.m_closed_promise = idl_create_promise(realm)
+    # 4. Otherwise, if stream.[[state]] is "closed",
+    elif state == StreamsReadableStreamState.closed:
+        # 1. Set reader.[[closedPromise]] to a promise resolved with undefined.
+        mixin.m_closed_promise = idl_create_resolved_promise(realm, js_undefined())
+    # 5. Otherwise,
+    else:
+        # 1. Assert: stream.[[state]] is "errored".
+        assert(state == StreamsReadableStreamState.errored)
+
+        # 2. Set reader.[[closedPromise]] to a promise rejected with stream.[[storedError]].
+        let closed_promise = idl_create_rejected_promise(realm, stream.m_stored_error)
+        mixin.m_closed_promise = closed_promise
+
+        # 3. Set reader.[[closedPromise]].[[PromiseIsHandled]] to true.
+        idl_mark_promise_as_handled(closed_promise)
+
+## Ported from Libraries/LibWeb/Streams/ReadableStreamOperations.cpp:1075 Web::Streams::readable_stream_reader_generic_release.
+## https://streams.spec.whatwg.org/#readable-stream-reader-generic-release
+pub func streams_readable_stream_reader_generic_release(reader: StreamsReadableStreamGenericReaderMixin*):
+    # 1. Let stream be reader.[[stream]].
+    # 2. Assert: stream is not undefined.
+    let stream = reader.m_stream else trap("VERIFY: the reader has a stream")
+
+    # 3. Assert: stream.[[reader]] is reader.
+    match stream.m_reader else trap("VERIFY: stream.reader() is reader"):
+        .streams_readable_stream_default_reader(default_reader): assert(&default_reader.generic_reader == reader)
+        .streams_readable_stream_byob_reader(_): trap("unported (P4): Web::Streams::ReadableStreamBYOBReader")
+
+    let realm = streams_readable_stream_realm(stream)
+    let exception = js_type_error_create(realm, ak.string_from_str("Reader has been released"))
+
+    # 4. If stream.[[state]] is "readable", reject reader.[[closedPromise]] with a TypeError exception.
+    if stream.m_state == StreamsReadableStreamState.readable:
+        idl_reject_promise(realm, reader.m_closed_promise else trap("VERIFY: the reader has a closed promise"), exception)
+    # 5. Otherwise, set reader.[[closedPromise]] to a promise rejected with a TypeError exception.
+    else:
+        reader.m_closed_promise = idl_create_rejected_promise(realm, exception)
+
+    # 6. Set reader.[[closedPromise]].[[PromiseIsHandled]] to true.
+    idl_mark_promise_as_handled(reader.m_closed_promise else trap("VERIFY: the reader has a closed promise"))
+
+    # 7. Perform ! stream.[[controller]].[[ReleaseSteps]]().
+    match stream.m_controller else trap("VERIFY: the stream has a controller"):
+        .streams_readable_byte_stream_controller(controller): streams_readable_byte_stream_controller_release_steps(controller)
+        .streams_readable_stream_default_controller(_): trap("unported (P4): Web::Streams::ReadableStreamDefaultController::release_steps")
+
+    # 8. Set stream.[[reader]] to undefined.
+    stream.m_reader = none
+
+    # 9. Set reader.[[stream]] to undefined.
+    reader.m_stream = none
+
+## Ported from Libraries/LibWeb/Streams/ReadableStreamOperations.cpp:1163 Web::Streams::readable_stream_default_reader_error_read_requests.
+## https://streams.spec.whatwg.org/#abstract-opdef-readablestreamdefaultreadererrorreadrequests
+pub func streams_readable_stream_default_reader_error_read_requests(reader: StreamsReadableStreamDefaultReader*, error_: JsValue):
+    # 1. Let readRequests be reader.[[readRequests]].
+    # 2. Set reader.[[readRequests]] to a new empty list.
+    var read_requests = reader.m_read_requests
+    reader.m_read_requests = ak.SinglyLinkedList[StreamsReadRequest*, ak.DefaultSizeCalculationPolicy[StreamsReadRequest*]]()
+
+    # 3. For each readRequest of readRequests,
+    for read_request in ak.singly_linked_list_begin(&read_requests):
+        # 1. Perform readRequest’s error steps, given e.
+        streams_read_request_on_error(*read_request, error_)
+
+## Ported from Libraries/LibWeb/Streams/ReadableStreamOperations.cpp:1177 Web::Streams::readable_stream_default_reader_read.
+## https://streams.spec.whatwg.org/#readable-stream-default-reader-read
+pub func streams_readable_stream_default_reader_read_2(reader: StreamsReadableStreamDefaultReader*, read_request: StreamsReadRequest*):
+    # 1. Let stream be reader.[[stream]].
+    # 2. Assert: stream is not undefined.
+    let stream = reader.generic_reader.m_stream else trap("VERIFY: the reader has a stream")
+
+    # 3. Set stream.[[disturbed]] to true.
+    stream.m_disturbed = true
+
+    # 4. If stream.[[state]] is "closed", perform readRequest’s close steps.
+    let state = stream.m_state
+    if state == StreamsReadableStreamState.closed:
+        streams_read_request_on_close(read_request)
+    # 5. Otherwise, if stream.[[state]] is "errored", perform readRequest’s error steps given stream.[[storedError]].
+    elif state == StreamsReadableStreamState.errored:
+        streams_read_request_on_error(read_request, stream.m_stored_error)
+    # 6. Otherwise,
+    else:
+        # 1. Assert: stream.[[state]] is "readable".
+        assert(state == StreamsReadableStreamState.readable)
+
+        # 2. Perform ! stream.[[controller]].[[PullSteps]](readRequest).
+        match stream.m_controller else trap("VERIFY: the stream has a controller"):
+            .streams_readable_byte_stream_controller(controller): streams_readable_byte_stream_controller_pull_steps(controller, read_request)
+            .streams_readable_stream_default_controller(_): trap("unported (P4): Web::Streams::ReadableStreamDefaultController::pull_steps")
+
+## Ported from Libraries/LibWeb/Streams/ReadableStreamOperations.cpp:1209 Web::Streams::readable_stream_default_reader_release.
+## https://streams.spec.whatwg.org/#abstract-opdef-readablestreamdefaultreaderrelease
+pub func streams_readable_stream_default_reader_release(reader: StreamsReadableStreamDefaultReader*):
+    let realm = streams_readable_stream_default_reader_realm(reader)
+
+    # 1. Perform ! ReadableStreamReaderGenericRelease(reader).
+    streams_readable_stream_reader_generic_release(&reader.generic_reader)
+
+    # 2. Let e be a new TypeError exception.
+    let exception = js_type_error_create(realm, ak.string_from_str("Reader has been released"))
+
+    # 3. Perform ! ReadableStreamDefaultReaderErrorReadRequests(reader, e).
+    streams_readable_stream_default_reader_error_read_requests(reader, exception)
+
+## Ported from Libraries/LibWeb/Streams/ReadableStreamOperations.cpp:1244 Web::Streams::set_up_readable_stream_default_reader.
+## https://streams.spec.whatwg.org/#set-up-readable-stream-default-reader
+pub func streams_set_up_readable_stream_default_reader(reader: StreamsReadableStreamDefaultReader*, stream: StreamsReadableStream*) -> !:
+    # 1. If ! IsReadableStreamLocked(stream) is true, throw a TypeError exception.
+    if streams_is_readable_stream_locked(stream):
+        return try idl_throw_simple(IdlSimpleExceptionType.type_error, .string_view(ak.sv("Cannot create stream reader for a locked stream")))
+
+    # 2. Perform ! ReadableStreamReaderGenericInitialize(reader, stream).
+    streams_readable_stream_reader_generic_initialize(.streams_readable_stream_default_reader(reader), stream)
+
+    # 3. Set reader.[[readRequests]] to a new empty list.
+    ak.singly_linked_list_clear(&reader.m_read_requests)

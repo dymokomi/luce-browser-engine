@@ -1,0 +1,136 @@
+#==============================================================================================
+#
+#   array_buffer - JS::ArrayBuffer before luce-js: a cell holding a byte buffer
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibJS/Runtime/ArrayBuffer.cpp (lines 33-329) and ArrayBuffer.h, as
+#       the stand-in of DESIGN.md §3.6 that byte streams need (region p2s): an ArrayBuffer is a
+#       cell owning its data block, fixed-length and unshared, which can be detached (its bytes
+#       taken, as TransferArrayBuffer does). Its detach key is always undefined (only
+#       WebAssembly memories set one), resizable and shared buffers, the cached typed array
+#       views and the prototypes are phase 3.
+#
+#       Copyright (c) 2020, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2023, Shannon Booth <shannon@serenityos.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Creation ================================================================================
+
+## Ported from Libraries/LibJS/Runtime/ArrayBuffer.cpp:33 JS::ArrayBuffer::create(Realm&, ByteBuffer):
+## an ArrayBuffer of `realm` owning `buffer` (unshared; its prototype, %ArrayBuffer.prototype%,
+## is a JS object: phase 3).
+pub func js_array_buffer_create_byte_buffer(realm: Realm*, buffer: ak.ByteBuffer) -> JsArrayBuffer*:
+    let this = (JsArrayBuffer*)web_allocate_cell(realm, &js_array_buffer_class)
+    js_array_buffer_construct(this, realm, buffer)
+    web_initialize_cell(this.cell(), realm)
+    return this
+
+## Ported from Libraries/LibJS/Runtime/ArrayBuffer.cpp:43 JS::ArrayBuffer::ArrayBuffer(ByteBuffer, Shared, Object&).
+func js_array_buffer_construct(this: JsArrayBuffer*, realm: Realm*, buffer: ak.ByteBuffer):
+    this.m_realm = realm
+    # m_data_block(DataBlock { move(buffer), is_shared }), m_detach_key(js_undefined())
+    var moved = buffer
+    ak.byte_buffer_move_from(&this.m_data_block, &moved)
+    this.m_detached = false
+
+## JS_OBJECT(ArrayBuffer, Object)'s class_name.
+func js_array_buffer_class_name_impl(this: gc.Cell*) -> ak.StringView:
+    return ak.sv("ArrayBuffer")
+
+## Ported from Libraries/LibJS/Runtime/ArrayBuffer.cpp:57 JS::ArrayBuffer::visit_edges (override): the
+## shape's realm (the detach key is always undefined).
+pub func js_array_buffer_visit_edges_impl(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (JsArrayBuffer*)base
+    gc.cell_visit_edges_impl(base, visitor)
+    gc.cell_visitor_visit_t_2(visitor, this.m_realm)
+
+# mark: Accessors ===============================================================================
+
+## Ported from Libraries/LibJS/Runtime/ArrayBuffer.h:98 JS::ArrayBuffer::byte_length: 0 once detached.
+pub func js_array_buffer_byte_length(this: JsArrayBuffer*) -> usize:
+    if this.m_detached:
+        return 0
+    return ak.byte_buffer_size(&this.m_data_block)
+
+## Ported from Libraries/LibJS/Runtime/ArrayBuffer.h:101 JS::ArrayBuffer::buffer: the data block.
+pub func js_array_buffer_buffer(this: JsArrayBuffer*) -> ak.ByteBuffer*:
+    assert(not this.m_detached)
+    return &this.m_data_block
+
+## Ported from Libraries/LibJS/Runtime/ArrayBuffer.h:123 JS::ArrayBuffer::is_detached.
+pub func js_array_buffer_is_detached(this: JsArrayBuffer*) -> bool:
+    return this.m_detached
+
+## Ported from Libraries/LibJS/Runtime/ArrayBuffer.cpp:254 JS::ArrayBuffer::detach_buffer: the data
+## block becomes null (there are no cached views to reset).
+pub func js_array_buffer_detach_buffer(this: JsArrayBuffer*):
+    this.m_data_block = ak.ByteBuffer()
+    this.m_detached = true
+
+## Ported from Libraries/LibJS/Runtime/ArrayBuffer.cpp:265 JS::ArrayBuffer::detach_and_take_bytes: the
+## data block, taken out of this buffer, which is detached. The detach key is always undefined,
+## so this does not fail before phase 3.
+pub func js_array_buffer_detach_and_take_bytes(this: JsArrayBuffer*, vm: Vm*) -> ak.ByteBuffer!:
+    # VERIFY(!is_shared_array_buffer()): the stand-in's buffers are never shared.
+    # if (!same_value(detach_key(), js_undefined())) throw a TypeError: the key is undefined.
+    _ = vm
+    assert(not this.m_detached)  # Empty: VERIFY_NOT_REACHED
+
+    var bytes = ak.ByteBuffer()
+    ak.byte_buffer_move_from(&bytes, &this.m_data_block)
+    js_array_buffer_detach_buffer(this)
+    return bytes
+
+# mark: Abstract operations =====================================================================
+
+## Ported from Libraries/LibJS/Runtime/ArrayBuffer.cpp:308 JS::clone_array_buffer:
+## 25.1.3.6 CloneArrayBuffer ( srcBuffer, srcByteOffset, srcLength ),
+## https://tc39.es/ecma262/#sec-clonearraybuffer
+pub func js_clone_array_buffer(vm: Vm*, source_buffer: JsArrayBuffer*, source_byte_offset: usize, source_length: usize) -> JsArrayBuffer*!:
+    let realm = vm_current_realm(vm) else trap("VERIFY: a current realm")
+
+    # 1. Assert: IsDetachedBuffer(srcBuffer) is false.
+    assert(not js_array_buffer_is_detached(source_buffer))
+
+    # 2. Let targetBuffer be ? AllocateArrayBuffer(%ArrayBuffer%, srcLength).
+    # (AllocateArrayBuffer's CreateByteDataBlock: the bytes are zeroed.)
+    let data_block = ak.byte_buffer_create_zeroed(source_length) else trap("FIXME: a RangeError when the data block cannot be allocated")
+    let target_buffer = js_array_buffer_create_byte_buffer(realm, data_block)
+
+    # 3. Let srcBlock be srcBuffer.[[ArrayBufferData]].
+    let source_block = js_array_buffer_buffer(source_buffer)
+
+    # 4. Let targetBlock be targetBuffer.[[ArrayBufferData]].
+    let target_block = js_array_buffer_buffer(target_buffer)
+
+    # 5. Perform CopyDataBlockBytes(targetBlock, 0, srcBlock, srcByteOffset, srcLength).
+    js_copy_data_block_bytes(target_block, 0, source_block, source_byte_offset, source_length)
+
+    # 6. Return targetBuffer.
+    return target_buffer
+
+## Ported from Libraries/LibJS/Runtime/ArrayBuffer.cpp JS::copy_data_block_bytes:
+## 6.2.9.3 CopyDataBlockBytes ( toBlock, toIndex, fromBlock, fromIndex, count ),
+## https://tc39.es/ecma262/#sec-copydatablockbytes (unshared blocks only).
+pub func js_copy_data_block_bytes(to_block: ak.ByteBuffer*, to_index: usize, from_block: const ak.ByteBuffer*, from_index: usize, count: usize):
+    # 1. Assert: fromBlock and toBlock are distinct values.
+    assert(to_block != from_block)
+
+    # 2. Let fromSize be the number of bytes in fromBlock.
+    let from_size = ak.byte_buffer_size(from_block)
+
+    # 3. Assert: fromIndex + count ≤ fromSize.
+    assert(from_index + count <= from_size)
+
+    # 4. Let toSize be the number of bytes in toBlock.
+    let to_size = ak.byte_buffer_size(to_block)
+
+    # 5. Assert: toIndex + count ≤ toSize.
+    assert(to_index + count <= to_size)
+
+    # 6. Repeat, while count > 0,
+    #    (the blocks are never shared: each byte is copied in order)
+    if count > 0:
+        memory.copy(ak.byte_buffer_bytes(to_block)[to_index..<to_index + count], ak.byte_buffer_bytes_const(from_block)[from_index..<from_index + count], count)

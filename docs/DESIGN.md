@@ -562,11 +562,11 @@ pub struct LayoutImageBox:
 | `HashTable<T>`, `HashMap<K, V>`, `OrderedHashMap<K, V>` | `ak.HashTable[T, TT]`, `ak.HashMap[K, V, KT]`, `ak.OrderedHashMap[K, V, KT]` | ported from AK with AK's traits and hash functions, `KT: Traits[K]` a one-byte traits struct (e.g. `FlyStringTraits`) |
 | `Span<T>`, `ReadonlySpan<T>`, `Bytes`, `ReadonlyBytes` | `T[]`, `const T[]`, `u8[]`, `const u8[]` | |
 | `Array<T, N>` | `T[N]` | |
-| `String` | `ak.String` (8-byte value: short-string inline or a pointer to immutable UTF-8 data) | equality blocked by a union member so `==` is a compile error (checked); use `.equals()` |
+| `String` | `ak.String` (8-byte value: short-string inline or a pointer to immutable UTF-8 data) | equality blocked by a union member so `==` is a compile error (checked); use `.equals()`. Eight zero bytes are the empty string (p2s), so a zeroed cell's Strings, FlyStrings, Utf16Strings and Utf16FlyStrings are `T {}` with no constructor setting them; C++'s null sentinel of `Optional<String>` does not exist (`String?` is a Luce optional) |
 | `FlyString` | `ak.FlyString` (8 bytes: inline short string or interned pointer) | compared with `fly_string_eq_fly_string` (pointer or inline identity): it holds a union, and Luce gives `==` only to structs whose every component has equality (base.md §6) |
 | `StringView` | `ak.StringView` (a `const u8[]` in a struct) | not `str`: a StringView may hold non-UTF-8 bytes (ByteString), and `(str)` on non-UTF-8 is undefined |
 | `Utf16String`, `Utf16View`, `Utf16FlyString` | `ak.Utf16String` (ASCII storage or UTF-16), … | DOM text and layout offsets are UTF-16 code units (the dumps print them) |
-| `ByteString` | `ak.ByteString` | |
+| `ByteString` | `ak.ByteString` | a zeroed ByteString (no impl) is the empty string (p2s) |
 | `StringBuilder` | `ak.StringBuilder` (implements `io.Writer`) | `appendff` → `builder.append(f"...")` only when the format is plain `{}`; AK format specs (`{:.2}`, `{:x}`) go through `ak.format` |
 | `"foo"sv`, `"foo"_string`, `"foo"_fly_string` | `sv("foo")`, `ak.string("foo")`, generated FlyString constants | short FlyStrings (≤ 7 bytes) are constant `let`s built by the generator; longer ones are `var`s interned by `web_initialize_strings()` at startup (as older Ladybird did) |
 | `Function<R(A…)>` | one generic struct per arity (luce-base has no variadic generics): `ak.Function0[R]`, `ak.Function1[A, R]`, `ak.Function2[A, B, R]`, … each `{ call: func(void*, A, …) -> R, context: void* }` | §2.7 |
@@ -984,6 +984,36 @@ a `JS::Map`. Before luce-js these are **cells of the engine** (`external/lib_js/
   `JS::Array` (`get_promise_for_wait_for_all`'s results), PromiseRejectionEvent (firing
   `unhandledrejection` / `rejectionhandled`), GetFunctionRealm of bound functions and proxies.
   WebIDL `ReactionSteps` cannot throw before P3 (a GC::Function's result cannot be fallible).
+
+**The ReadableStream stand-in (phase 2, region p2s).** Streams are P4, but every fetch body is a
+`Streams::ReadableStream`: `Body::fully_read`, `incrementally_read`, `clone` (a tee),
+`byte_sequence_as_body` and the network's chunks all go through one. So the engine ports the part
+of LibWeb's Streams that byte streams read by default readers need, with Ladybird's steps and
+order (`streams/`), over two more JS stand-ins in `external/lib_js`:
+
+- `JS::ArrayBuffer` (a cell owning its data block, fixed-length, unshared, detachable: create,
+  `detach_and_take_bytes`, CloneArrayBuffer) and `JS::Uint8Array` (a cell viewing a buffer:
+  create, `Construct(%Uint8Array%, « buffer, offset, length »)`, `typed_array_from`, the
+  witness-record operations, `data()`). WebIDL's `BufferableObjectBase` reads them.
+- `ReadableStream` (its slots; tee, close, error, enqueue, `pull_from_bytes`, get a reader,
+  `set_up_with_byte_reading_support`), `ReadableByteStreamController` (the queue of transferred
+  buffers, cancel/pull/release steps), `ReadableStreamDefaultReader` with its generic reader mixin
+  and `ReadLoopReadRequest` (read a chunk, read all bytes, release), ReadableByteStreamTee with its
+  default read request, the abstract operations those call (`ReadableStreamOperations.cpp`'s
+  acquire/create/initialize/cancel/close/error/fulfill/reader operations and the byte controller's
+  call-pull/close/enqueue/error/fill/drain/should-call-pull/set-up), `TransferArrayBuffer`,
+  `CloneAsUint8Array`, `ResetQueue`; and `Fetch::extract_body` of a byte sequence.
+- They are cells as in the donor; reactions go through the P1 promise stand-ins and the microtask
+  queue, so a stream must be made and read in an execution context (a TemporaryExecutionContext),
+  as Fetch does. Names follow the generator: where a ReadableStream member has an abstract
+  operation's snake name (close, error, tee, cancel, the reader's read, the controller's close,
+  error and enqueue) the member keeps it and the operation takes `_2`.
+- The signatures are the C++ ones, so P4's full Streams replaces the bodies without touching
+  callers. Still P4 (trap): default controllers (JS underlying sources, ReadableStreamDefaultTee),
+  BYOB readers and requests and pull-into descriptors (autoAllocateChunkSize), piping, streams
+  from iterables, transferring; the JS-facing IDL members (the constructor, `getReader`,
+  `read()`'s iterator results); and still P3: `JS::TypeError::create` (releasing a reader, a chunk
+  that is not a Uint8Array) and `JS::Array` (canceling both branches of a tee).
 
 ### 3.7 Weak references
 
@@ -1771,7 +1801,8 @@ P1 regions wrote for these files (with their signatures) moved there from `stubs
 
 In dependency order: p2b, then p2a, p2e and p2d in parallel, then p2f and p2c (≈17.7k donor
 lines in all; `docs/regions.tsv` has the files). `stubs/stub_p2_closure.lucb` holds the virtuals
-of `Streams::ReadRequest`, whose class the P2 types pull in whole (Streams stay P4).
+of `Streams::ReadRequest`, whose class the P2 types pull in whole (Streams stay P4; the byte
+streams fetch bodies need are the stand-in of §3.6, region p2s).
 
 Decisions of the phase-2 closure:
 

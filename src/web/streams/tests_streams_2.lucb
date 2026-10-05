@@ -1,0 +1,296 @@
+#==============================================================================================
+#
+#   tests_streams_2 - the ReadableStream stand-in: teeing a byte stream, canceling, pull
+#   algorithms, and what a stream keeps alive
+#
+#   DESCRIPTION:
+#       Tests of the stand-in of DESIGN.md §3.6 (region p2s), pinned to the Streams spec and
+#       Ladybird's steps: a tee's branches get the original's chunks (the second a copy, a
+#       microtask later), close when it closes, error when it errors, and a canceled branch
+#       stops receiving; canceling a stream closes its waiting reads and calls its cancel
+#       algorithm; a pull algorithm runs once the stream started and a read waits, and again
+#       when asked while it was pulling; a reader keeps its stream, controller and queued
+#       chunks through a collection. Helpers are tests_streams_1's and tests_promise's.
+#
+#==============================================================================================
+
+# mark: Helpers =================================================================================
+
+## What a test pull or cancel algorithm saw and answers.
+struct TestStreamsSource:
+    var realm: Realm*
+    var stream: StreamsReadableStream*?
+    var pulls: usize
+    var cancels: usize
+    var reason: JsValue
+    var pending_pull: JsPromiseCapability*?  # when set, pulls answer this promise
+    var chunk_text: str  # what a pull enqueues ("" for nothing)
+
+## A test pull algorithm: counts the pull, enqueues the source's chunk, answers a promise.
+func test_streams_source_pull(context: void*?) -> JsPromiseCapability*:
+    let source = (TestStreamsSource*)(context else trap("no captures"))
+    source.pulls += 1
+    if source.chunk_text.length != 0:
+        test_streams_enqueue(source.stream else trap("a stream"), source.chunk_text)
+    if let pending = source.pending_pull:
+        return pending
+    return idl_create_resolved_promise(source.realm, js_undefined())
+
+## A test cancel algorithm: counts the cancel and remembers the reason.
+func test_streams_source_cancel(context: void*?, reason: JsValue) -> JsPromiseCapability*:
+    let source = (TestStreamsSource*)(context else trap("no captures"))
+    source.cancels += 1
+    source.reason = reason
+    return idl_create_resolved_promise(source.realm, js_undefined())
+
+## A byte stream of `source.realm` over the source's pull and cancel algorithms.
+func test_streams_sourced_stream(vm: Vm*, source: TestStreamsSource*) -> StreamsReadableStream*:
+    let heap = vm_heap(vm)
+    let stream = realm_create_streams_readable_stream(source.realm, source.realm)
+    source.stream = stream
+    let pull_algorithm = gc.create_function0(heap, ak.Function0[JsPromiseCapability*](call = test_streams_source_pull, context = source))
+    let cancel_algorithm = gc.create_function1(heap, ak.Function1[JsValue, JsPromiseCapability*](call = test_streams_source_cancel, context = source))
+    streams_readable_stream_set_up_with_byte_reading_support(stream, pull_algorithm, cancel_algorithm)
+    return stream
+
+# mark: Teeing ==================================================================================
+
+test "ReadableStream tee: both branches get the chunks, the second a copy, and close with the stream":
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    var first_log = TestStreamsReadLog(error_ = js_undefined())
+    var second_log = TestStreamsReadLog(error_ = js_undefined())
+
+    var settings = test_promise_enter(realm)
+    let stream = test_streams_byte_stream(realm)
+    test_streams_enqueue(stream, "abc")
+    let (branch1, branch2) = streams_readable_stream_tee(stream, none) else trap("tee")
+    assert(streams_readable_stream_is_locked(stream))
+    assert(streams_readable_stream_realm(branch1) == realm and streams_readable_stream_realm(branch2) == realm)
+    let reader1 = streams_readable_stream_get_a_reader(branch1) else trap("get_a_reader")
+    let reader2 = streams_readable_stream_get_a_reader(branch2) else trap("get_a_reader")
+
+    # A read of branch1 waits: the branches pull once they started (a microtask), then the chunk
+    # reaches both branches in a microtask of the tee's read request.
+    test_streams_read(realm, reader1, &first_log)
+    assert(first_log.chunks == 0)
+    test_promise_leave(settings)
+    assert(test_streams_log_is(&first_log, "abc|"))
+
+    # branch2 got a copy of it, queued; its bytes are equal and its buffer another.
+    settings = test_promise_enter(realm)
+    let branch2_controller = streams_readable_stream_byte_controller(branch2)
+    assert(ak.singly_linked_list_size(&branch2_controller.m_queue) == 1)
+    let queued = ak.singly_linked_list_first(&branch2_controller.m_queue)
+    assert(test_streams_bytes_are(js_array_buffer_buffer(queued.buffer), "abc"))
+    test_streams_read(realm, reader2, &second_log)
+    assert(test_streams_log_is(&second_log, "abc|"))
+
+    # More chunks while both branches read.
+    test_streams_read(realm, reader1, &first_log)
+    test_streams_read(realm, reader2, &second_log)
+    test_streams_enqueue(stream, "de")
+    test_promise_leave(settings)
+    assert(test_streams_log_is(&first_log, "abc|de|") and test_streams_log_is(&second_log, "abc|de|"))
+
+    # Closing the stream closes both branches when they next pull.
+    settings = test_promise_enter(realm)
+    test_streams_read(realm, reader1, &first_log)
+    streams_readable_stream_close(stream)
+    test_promise_leave(settings)
+    assert(first_log.closed == 1 and streams_readable_stream_is_closed(branch1) and streams_readable_stream_is_closed(branch2))
+    settings = test_promise_enter(realm)
+    test_streams_read(realm, reader2, &second_log)
+    test_promise_leave(settings)
+    assert(second_log.closed == 1 and first_log.chunks == 2 and second_log.chunks == 2)
+
+test "ReadableStream tee: an error of the stream errors both branches; a canceled branch stops receiving":
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    var first_log = TestStreamsReadLog(error_ = js_undefined())
+    var second_log = TestStreamsReadLog(error_ = js_undefined())
+
+    # The reader's closed promise is rejected; forwardReaderError errors both branches a microtask later.
+    var settings = test_promise_enter(realm)
+    let erroring = test_streams_byte_stream(realm)
+    let (error1, error2) = streams_readable_stream_tee(erroring, realm) else trap("tee")
+    let error_reader1 = streams_readable_stream_get_a_reader(error1) else trap("get_a_reader")
+    test_streams_read(realm, error_reader1, &first_log)
+    streams_readable_stream_error(erroring, js_value_from_f64(9.0))
+    assert(streams_readable_stream_is_readable(error1))
+    test_promise_leave(settings)
+    assert(streams_readable_stream_is_errored(error1) and streams_readable_stream_is_errored(error2))
+    assert(first_log.errors == 1 and test_promise_is_number(first_log.error_, 9.0))
+    assert(test_promise_is_number(streams_readable_stream_stored_error(error2), 9.0))
+
+    # Canceling branch1 closes it; the stream's chunks then go to branch2 alone, uncloned.
+    settings = test_promise_enter(realm)
+    let stream = test_streams_byte_stream(realm)
+    let (branch1, branch2) = streams_readable_stream_tee(stream, realm) else trap("tee")
+    let cancel_result = streams_readable_stream_cancel_2(branch1, js_value_from_f64(1.0))
+    assert(streams_readable_stream_is_closed(branch1) and streams_readable_stream_is_disturbed(branch1))
+    assert(streams_readable_stream_is_readable(stream))
+    let reader2 = streams_readable_stream_get_a_reader(branch2) else trap("get_a_reader")
+    test_streams_read(realm, reader2, &second_log)
+    test_streams_enqueue(stream, "solo")
+    test_promise_leave(settings)
+    assert(test_streams_log_is(&second_log, "solo|"))
+    # The cancel promise of one branch waits for the other branch (or the stream's end).
+    assert(test_streams_promise_state(cancel_result) == JsPromiseState.pending)
+    assert(ak.singly_linked_list_is_empty(&streams_readable_stream_byte_controller(branch1).m_queue))
+
+    # When the stream closes, the cancel promise resolves.
+    settings = test_promise_enter(realm)
+    test_streams_read(realm, reader2, &second_log)
+    streams_readable_stream_close(stream)
+    test_promise_leave(settings)
+    assert(second_log.closed == 1)
+    assert(test_streams_promise_state(cancel_result) == JsPromiseState.fulfilled)
+
+# mark: Canceling and pulling ===================================================================
+
+test "ReadableStream: canceling closes the waiting reads, empties the queue and calls the cancel algorithm once":
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    var log = TestStreamsReadLog(error_ = js_undefined())
+    var source = TestStreamsSource(realm = realm, reason = js_undefined())
+
+    let settings = test_promise_enter(realm)
+    let stream = test_streams_sourced_stream(vm, &source)
+    let reader = streams_readable_stream_get_a_reader(stream) else trap("get_a_reader")
+    test_streams_read(realm, reader, &log)
+    test_streams_read(realm, reader, &log)
+
+    # Through the reader (ReadableStreamGenericReaderMixin::cancel, ReadableStreamReaderGenericCancel).
+    let result = streams_readable_stream_generic_reader_mixin_cancel(&reader.generic_reader, js_value_from_f64(5.0))
+    assert(streams_readable_stream_is_closed(stream) and log.closed == 2)
+    assert(source.cancels == 1 and test_promise_is_number(source.reason, 5.0))
+    let controller = streams_readable_stream_byte_controller(stream)
+    assert(controller.m_pull_algorithm == none and controller.m_cancel_algorithm == none)
+    test_promise_leave(settings)
+    assert(test_streams_promise_state(result) == JsPromiseState.fulfilled)
+    assert(js_value_is_undefined(js_promise_result(as_js_promise((gc.Cell*)js_promise_capability_promise(result)))))
+
+    # Canceling a closed stream resolves at once; an errored one rejects with its error.
+    _ = test_promise_enter(realm)
+    let again = streams_readable_stream_cancel_2(stream, js_undefined())
+    assert(test_streams_promise_state(again) == JsPromiseState.fulfilled and source.cancels == 1)
+    let errored = test_streams_byte_stream(realm)
+    streams_readable_stream_error(errored, js_value_from_f64(2.0))
+    let rejected = streams_readable_stream_cancel_2(errored, js_undefined())
+    assert(test_streams_promise_state(rejected) == JsPromiseState.rejected)
+    idl_mark_promise_as_handled(rejected)
+    test_promise_leave(settings)
+
+test "ReadableStream: the pull algorithm runs once started with a read waiting, and again when asked while pulling":
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    var log = TestStreamsReadLog(error_ = js_undefined())
+    var source = TestStreamsSource(realm = realm, reason = js_undefined(), chunk_text = "pulled")
+
+    var settings = test_promise_enter(realm)
+    let stream = test_streams_sourced_stream(vm, &source)
+    let controller = streams_readable_stream_byte_controller(stream)
+    let reader = streams_readable_stream_get_a_reader(stream) else trap("get_a_reader")
+
+    # Not started yet: the read waits without a pull; the start microtask pulls, which enqueues.
+    test_streams_read(realm, reader, &log)
+    assert(source.pulls == 0 and not controller.m_started)
+    test_promise_leave(settings)
+    assert(controller.m_started and source.pulls == 1)
+    assert(test_streams_log_is(&log, "pulled|"))
+
+    # With a high water mark of 0 and no read waiting, nothing pulls.
+    settings = test_promise_enter(realm)
+    test_promise_leave(settings)
+    assert(source.pulls == 1)
+
+    # A pull that has not settled: a second read sets pullAgain; settling it pulls again.
+    settings = test_promise_enter(realm)
+    source.chunk_text = ""
+    let pending = idl_create_promise(realm)
+    source.pending_pull = pending
+    test_streams_read(realm, reader, &log)
+    assert(source.pulls == 2 and controller.m_pulling)
+    test_streams_read(realm, reader, &log)
+    assert(source.pulls == 2 and controller.m_pull_again)
+    source.pending_pull = none
+    idl_resolve_promise(realm, pending, js_undefined())
+    test_promise_leave(settings)
+    assert(source.pulls == 3 and not controller.m_pull_again)
+
+    # The two reads still wait (the last pulls enqueued nothing). A pull promise that rejects errors the
+    # stream and its waiting reads.
+    assert(streams_readable_stream_get_num_read_requests(stream) == 2)
+    settings = test_promise_enter(realm)
+    source.pending_pull = idl_create_rejected_promise(realm, js_value_from_f64(4.0))
+    test_streams_read(realm, reader, &log)
+    assert(source.pulls == 4)
+    test_promise_leave(settings)
+    assert(streams_readable_stream_is_errored(stream) and log.errors == 3)
+    assert(test_promise_is_number(streams_readable_stream_stored_error(stream), 4.0))
+
+# mark: Collections =============================================================================
+
+test "a reader keeps its stream, its controller and their queued chunks through a collection":
+    web_test_clobber_stack()
+    run_streams_collection()
+
+## What make_test_stream_graph made: the root of the reader and weak references to the rest.
+struct TestStreamsGraph:
+    var root: gc.Root[StreamsReadableStreamDefaultReader]
+    var stream: gc.Weak[StreamsReadableStream]
+    var controller: gc.Weak[StreamsReadableByteStreamController]
+    var chunk_buffer: gc.Weak[JsArrayBuffer]
+    var branch: gc.Weak[StreamsReadableStream]
+
+## A teed byte stream whose branch is read by a reader, with a chunk queued in the other branch,
+## made with managed memory as the current allocator.
+noinline func make_test_stream_graph(vm: Vm*, realm: Realm*) -> TestStreamsGraph:
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        let settings = test_promise_enter(realm)
+        let stream = test_streams_byte_stream(realm)
+        test_streams_enqueue(stream, "kept")
+        let (branch1, branch2) = streams_readable_stream_tee(stream, realm) else trap("tee")
+        let reader = streams_readable_stream_get_a_reader(branch1) else trap("get_a_reader")
+        var log = TestStreamsReadLog(error_ = js_undefined())
+        test_streams_read(realm, reader, &log)
+        test_promise_leave(settings)
+        assert(log.chunks == 1)
+        let controller2 = streams_readable_stream_byte_controller(branch2)
+        let chunk_buffer = ak.singly_linked_list_first(&controller2.m_queue).buffer
+        return TestStreamsGraph(root = gc.root_create(reader), stream = gc.make_weak(stream), controller = gc.make_weak(streams_readable_stream_byte_controller(branch1)), chunk_buffer = gc.make_weak(chunk_buffer), branch = gc.make_weak(branch2))
+
+## Run enough empty microtasks to overwrite the microtask queue's dequeued slots, which the conservative scan of its
+## buffer would otherwise still find (p1_seams' note).
+noinline func flush_test_streams_microtask_slots(vm: Vm*, realm: Realm*):
+    var log = TestHtmlLog()
+    let settings = test_promise_enter(realm)
+    for i in 0..<16:
+        html_queue_a_microtask(none, test_html_log_steps(vm, &log, 0))
+    test_promise_leave(settings)
+
+noinline func run_streams_collection():
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    var graph = make_test_stream_graph(vm, realm)
+    web_test_clobber_stack()
+    gc.heap_collect_garbage(vm_heap(vm))
+    # The reader keeps its branch and controller; the branch's pull algorithm keeps the tee's
+    # params, which keep the other branch, its queue and the original stream.
+    assert(web_test_alive(&graph.stream))
+    assert(web_test_alive(&graph.controller))
+    assert(web_test_alive(&graph.branch))
+    assert(web_test_alive(&graph.chunk_buffer))
+    let branch = gc.weak_ptr(&graph.branch) else trap("alive")
+    let queued = ak.singly_linked_list_first(&streams_readable_stream_byte_controller(branch).m_queue)
+    assert(test_streams_bytes_are(js_array_buffer_buffer(queued.buffer), "kept"))
+    gc.root_release(&graph.root)
+    flush_test_streams_microtask_slots(vm, realm)
+    web_test_clobber_stack()
+    gc.heap_collect_garbage(vm_heap(vm))
+    assert(not web_test_alive(&graph.stream))
+    assert(not web_test_alive(&graph.controller))
+    assert(not web_test_alive(&graph.branch))
+    assert(not web_test_alive(&graph.chunk_buffer))
+    web_test_destroy_vm(vm)

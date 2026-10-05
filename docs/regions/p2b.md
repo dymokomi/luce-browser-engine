@@ -70,6 +70,9 @@ status message and method, an opaque filtered response's method, a response's `B
 compared by `is_network_error`), a request's replaces-client id and integrity and nonce metadata. Ports of other
 cells holding these types should do the same.
 
+(Since region p2s a zeroed String, FlyString, ByteString, Utf16String or Utf16FlyString is the empty string, and these
+assignments are gone.)
+
 ### Streams and BodyInit (closure stubs)
 
 A body's stream is a `Streams::ReadableStream`, opaque until phase 4. What `Body` asks of it is a closure stub in
@@ -79,6 +82,8 @@ A body's stream is a `Streams::ReadableStream`, opaque until phase 4. What `Body
 `fetch_body_fully_read`, `incrementally_read`, `clone` and `fetch_byte_sequence_as_body` (srcdoc iframes) still trap
 there; reading bodies needs a minimal ReadableStream (or the byte-source path) before images and style sheets load.
 `Body::visit_edges` visits the stream and a Blob source through a cell cast, as r28 did for the opaque body.
+
+(Since region p2s these paths run over the ReadableStream stand-in of DESIGN.md §3.6; see `docs/regions/p2s.md`.)
 
 ### Allocation
 

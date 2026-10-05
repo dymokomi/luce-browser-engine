@@ -1,0 +1,223 @@
+#==============================================================================================
+#
+#   tests_fetch_http_3 - bodies over the ReadableStream stand-in: byte sequences as bodies,
+#   reading a body fully or incrementally, cloning a body
+#
+#   DESCRIPTION:
+#       Region p2s's tests of Fetch::Infrastructure::Body with real streams (DESIGN.md §3.6): a
+#       byte sequence extracted as a body (safely_extract_body, byte_sequence_as_body: srcdoc
+#       documents) is a closed stream holding the bytes, which fully_read hands to processBody;
+#       a body whose stream is fed as the network feeds it (Uint8Array chunks enqueued, then the
+#       stream closed or errored) reads fully, or incrementally chunk by chunk, with each step a
+#       fetch task on the global; a cloned body tees the stream and copies the source. Helpers
+#       are tests_streams_1's, tests_promise's and tests_fetch_infrastructure_2's.
+#
+#==============================================================================================
+
+# mark: Helpers =================================================================================
+
+## What a body test's processBody, processBodyChunk, processEndOfBody and processBodyError saw.
+struct FetchTestBodyLog:
+    var bytes: ak.ByteBuffer
+    var bodies: i32
+    var chunks: i32
+    var ends: i32
+    var errors: i32
+    var error_: JsValue
+
+## processBody / processBodyChunk of the body tests: append the bytes (and a `|` per chunk).
+func fetch_test_body_log_bytes(context: void*?, bytes: ak.ByteBuffer):
+    let log = (FetchTestBodyLog*)(context else trap("no log"))
+    ak.byte_buffer_append_span_u8(&log.bytes, ak.byte_buffer_bytes_const(&bytes))
+    log.bodies += 1
+
+## processBodyChunk of the body tests.
+func fetch_test_body_log_chunk(context: void*?, bytes: ak.ByteBuffer):
+    let log = (FetchTestBodyLog*)(context else trap("no log"))
+    ak.byte_buffer_append_span_u8(&log.bytes, ak.byte_buffer_bytes_const(&bytes))
+    ak.byte_buffer_append_u8(&log.bytes, '|')
+    log.chunks += 1
+
+## processEndOfBody of the body tests.
+func fetch_test_body_log_end(context: void*?):
+    let log = (FetchTestBodyLog*)(context else trap("no log"))
+    log.ends += 1
+
+## processBodyError of the body tests.
+func fetch_test_body_log_error(context: void*?, error_: JsValue):
+    let log = (FetchTestBodyLog*)(context else trap("no log"))
+    log.errors += 1
+    log.error_ = error_
+
+## A body log in managed memory (its callbacks run in later tasks).
+func fetch_test_body_log() -> FetchTestBodyLog*:
+    return new FetchTestBodyLog(error_ = js_undefined()) else trap("out of memory")
+
+## Fully read `body` into `log`, with the global of `realm` as the task destination.
+func fetch_test_fully_read(vm: Vm*, realm: Realm*, body: FetchBody*, log: FetchTestBodyLog*):
+    let heap = vm_heap(vm)
+    fetch_body_fully_read(body, realm, gc.create_function1(heap, ak.Function1[ak.ByteBuffer, unit](call = fetch_test_body_log_bytes, context = log)), gc.create_function1(heap, ak.Function1[JsValue, unit](call = fetch_test_body_log_error, context = log)), .js_object(realm_global_object(realm)))
+
+## Incrementally read `body` into `log`, with the global of `realm` as the task destination.
+func fetch_test_incrementally_read(vm: Vm*, realm: Realm*, body: FetchBody*, log: FetchTestBodyLog*):
+    let heap = vm_heap(vm)
+    fetch_body_incrementally_read(body, gc.create_function1(heap, ak.Function1[ak.ByteBuffer, unit](call = fetch_test_body_log_chunk, context = log)), gc.create_function0(heap, ak.Function0[unit](call = fetch_test_body_log_end, context = log)), gc.create_function1(heap, ak.Function1[JsValue, unit](call = fetch_test_body_log_error, context = log)), .js_object(realm_global_object(realm)))
+
+## Run the main thread event loop's tasks, with a microtask checkpoint after each, until none is
+## left; answers how many ran.
+func fetch_test_run_tasks() -> i32:
+    let queue = html_event_loop_task_queue(html_main_thread_event_loop())
+    var count: i32 = 0
+    while let task = html_task_queue_take_first_runnable(queue):
+        html_task_execute(task)
+        html_perform_a_microtask_checkpoint()
+        count += 1
+    return count
+
+## Whether a log's bytes are `text`.
+func fetch_test_body_log_is(log: const FetchTestBodyLog*, text: str) -> bool:
+    return ak.compare_bytes(ak.byte_buffer_bytes_const(&log.bytes), text.bytes) == 0
+
+## A body whose stream is a new byte stream of `realm`, fed by the test as the network feeds it (made in
+## the realm's execution context, as fetching makes it).
+func fetch_test_streamed_body(vm: Vm*, realm: Realm*) -> FetchBody*:
+    let settings = test_promise_enter(realm)
+    let body = fetch_body_create(vm, test_streams_byte_stream(realm))
+    test_promise_leave(settings)
+    return body
+
+# mark: Byte sequences as bodies ================================================================
+
+test "byte_sequence_as_body: a closed stream holding the bytes, with the bytes as source and length":
+    _ = install_test_event_loop()
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+    let log = fetch_test_body_log()
+
+    let body = fetch_byte_sequence_as_body(realm, "<p>srcdoc</p>".bytes)
+    assert(fetch_body_length(body) == 13)
+    let source = fetch_body_source_byte_buffer(body) else trap("a byte sequence source")
+    assert(ak.compare_bytes(ak.byte_buffer_bytes_const(source), "<p>srcdoc</p>".bytes) == 0)
+    let stream = fetch_body_stream(body)
+    # The close was requested with the chunk queued: the stream closes once it is read.
+    assert(streams_readable_stream_is_readable(stream) and streams_readable_stream_byte_controller(stream).m_close_requested)
+    assert(fetch_body_sniff_bytes_if_available(body) != none)
+
+    fetch_test_fully_read(vm, realm, body, log)
+    assert(log.bodies == 0)
+    assert(fetch_test_run_tasks() == 1)
+    assert(log.bodies == 1 and log.errors == 0 and fetch_test_body_log_is(log, "<p>srcdoc</p>"))
+    assert(streams_readable_stream_is_closed(stream))
+
+    # safely_extract_body of no bytes: an empty, closed stream; no type.
+    let empty = fetch_safely_extract_body_bytes(realm, b"")
+    assert(empty.type_ == none and fetch_body_length(empty.body) == 0)
+    assert(streams_readable_stream_is_closed(fetch_body_stream(empty.body)))
+    let empty_log = fetch_test_body_log()
+    fetch_test_fully_read(vm, realm, empty.body, empty_log)
+    assert(fetch_test_run_tasks() == 1)
+    assert(empty_log.bodies == 1 and ak.byte_buffer_size(&empty_log.bytes) == 0)
+
+# mark: Reading bodies ==========================================================================
+
+test "Body::fully_read: processBody gets every chunk once the stream closes; an error runs processBodyError":
+    _ = install_test_event_loop()
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+
+    let log = fetch_test_body_log()
+    let body = fetch_test_streamed_body(vm, realm)
+    let stream = fetch_body_stream(body)
+    fetch_test_fully_read(vm, realm, body, log)
+    assert(streams_readable_stream_is_locked(stream))
+
+    var settings = test_promise_enter(realm)
+    test_streams_enqueue(stream, "chunk one, ")
+    test_streams_enqueue(stream, "chunk two")
+    test_promise_leave(settings)
+    assert(fetch_test_run_tasks() == 0 and log.bodies == 0)
+    settings = test_promise_enter(realm)
+    streams_readable_stream_close(stream)
+    test_promise_leave(settings)
+    assert(fetch_test_run_tasks() == 1)
+    assert(log.bodies == 1 and fetch_test_body_log_is(log, "chunk one, chunk two"))
+
+    # An error of the stream: processBodyError with the error.
+    let error_log = fetch_test_body_log()
+    let failing = fetch_test_streamed_body(vm, realm)
+    fetch_test_fully_read(vm, realm, failing, error_log)
+    settings = test_promise_enter(realm)
+    test_streams_enqueue(fetch_body_stream(failing), "partial")
+    streams_readable_stream_error(fetch_body_stream(failing), js_value_from_f64(13.0))
+    test_promise_leave(settings)
+    # (The stream's error rejects the reader's closed promise, a handled rejection, whose notification is a
+    # second task that does nothing.)
+    assert(fetch_test_run_tasks() == 2)
+    assert(error_log.bodies == 0 and error_log.errors == 1 and test_promise_is_number(error_log.error_, 13.0))
+
+test "Body::incrementally_read: each chunk, then the end of the body, as fetch tasks":
+    _ = install_test_event_loop()
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+
+    let log = fetch_test_body_log()
+    let body = fetch_test_streamed_body(vm, realm)
+    let stream = fetch_body_stream(body)
+    fetch_test_incrementally_read(vm, realm, body, log)
+
+    var settings = test_promise_enter(realm)
+    test_streams_enqueue(stream, "first")
+    test_promise_leave(settings)
+    assert(fetch_test_run_tasks() == 1)
+    assert(log.chunks == 1 and fetch_test_body_log_is(log, "first|"))
+
+    # Chunks queued while no read waits are read one per task, in order.
+    settings = test_promise_enter(realm)
+    test_streams_enqueue(stream, "second")
+    test_streams_enqueue(stream, "third")
+    test_promise_leave(settings)
+    assert(fetch_test_run_tasks() == 2)
+    assert(log.chunks == 3 and fetch_test_body_log_is(log, "first|second|third|"))
+
+    settings = test_promise_enter(realm)
+    streams_readable_stream_close(stream)
+    test_promise_leave(settings)
+    assert(fetch_test_run_tasks() == 1)
+    assert(log.ends == 1 and log.errors == 0)
+
+    # An error: processBodyError.
+    let error_log = fetch_test_body_log()
+    let failing = fetch_test_streamed_body(vm, realm)
+    fetch_test_incrementally_read(vm, realm, failing, error_log)
+    settings = test_promise_enter(realm)
+    streams_readable_stream_error(fetch_body_stream(failing), js_value_from_f64(21.0))
+    test_promise_leave(settings)
+    assert(fetch_test_run_tasks() == 2)  # processBodyError's task and the handled rejection's notification
+    assert(error_log.errors == 1 and error_log.ends == 0 and test_promise_is_number(error_log.error_, 21.0))
+
+# mark: Cloning =================================================================================
+
+test "Body::clone: the stream is teed, both bodies read the same bytes, and the source is copied":
+    _ = install_test_event_loop()
+    let (vm, realm) = web_test_create_vm_and_settings_realm()
+    defer web_test_destroy_vm(vm)
+
+    let body = fetch_byte_sequence_as_body(realm, "cloned bytes".bytes)
+    let original_stream = fetch_body_stream(body)
+    let clone = fetch_body_clone(body, realm)
+    assert(fetch_body_stream(body) != original_stream and fetch_body_stream(clone) != original_stream)
+    assert(streams_readable_stream_is_locked(original_stream))
+    assert(fetch_body_length(clone) == 12)
+    let source = fetch_body_source_byte_buffer(body) else trap("source")
+    let clone_source = fetch_body_source_byte_buffer(clone) else trap("clone source")
+    assert(ak.byte_buffer_eq(source, clone_source))
+
+    let log = fetch_test_body_log()
+    let clone_log = fetch_test_body_log()
+    fetch_test_fully_read(vm, realm, body, log)
+    fetch_test_fully_read(vm, realm, clone, clone_log)
+    let settings = test_promise_enter(realm)
+    test_promise_leave(settings)
+    assert(fetch_test_run_tasks() == 2)
+    assert(log.bodies == 1 and fetch_test_body_log_is(log, "cloned bytes"))
+    assert(clone_log.bodies == 1 and fetch_test_body_log_is(clone_log, "cloned bytes"))
