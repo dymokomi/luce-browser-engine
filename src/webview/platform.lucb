@@ -1,0 +1,116 @@
+#==============================================================================================
+#
+#   platform - what a process sets up once before it shows pages
+#
+#   DESCRIPTION:
+#       WebContent's main (Services/WebContent/main.cpp) installs, before it serves a page: the
+#       Core event loop and Platform::EventLoopPlugin, the resource directory
+#       (Core::ResourceImplementationFile), the image decoder (ImageCodecPlugin), the fonts
+#       (Platform::FontPlugin over the system's font directories), the main thread VM
+#       (Bindings::initialize_main_thread_vm with a similar-origin window agent) and the
+#       ResourceLoader with its RequestClient. LibWebView's Application decides the options
+#       (here: the resource directory, and a font directory for layout-test mode). In process
+#       these are done once, by webview_initialize, on the thread that will run the pages: the
+#       VM's heap scans that thread's stack.
+#
+#       Differences from WebContent: the RequestClient is the engine's in-process client
+#       (file:, data:, http(s): on luce-std net and luce-tls, loader/in_process_request_client)
+#       instead of RequestServer's; the image decoder is the engine's plugin over the Luce
+#       codecs instead of the ImageDecoder process; there is no IPC, sandbox or process
+#       management. Layout-test mode (webview_initialize's test font directory) loads only the
+#       fonts of that directory, as web_test's worker does (DESIGN.md §6.1), so tests render
+#       the same on every machine.
+#
+#       Copyright (c) 2020-2026, the Ladybird developers.
+#       Copyright (c) 2026 the luce-browser authors.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: State ===================================================================================
+
+## The process's embedding: its VM and the loop the pages run on. Lives in the C heap.
+pub struct WebViewPlatform:
+    pub var vm: web.Vm*
+    pub var event_loop: WebViewEventLoop*
+
+## The initialized platform.
+var webview_platform_the: WebViewPlatform*?
+
+## Whether webview_initialize has run.
+pub func webview_is_initialized() -> bool:
+    return webview_platform_the != none
+
+## The initialized platform (webview_initialize first).
+pub func webview_platform() -> WebViewPlatform*:
+    return webview_platform_the else trap("webview: not initialized (webview.initialize)")
+
+## The heap of the main thread VM: the allocator every call into the engine runs with.
+pub func webview_heap() -> gc.Heap*:
+    return web.vm_heap(webview_platform().vm)
+
+# mark: Initializing ============================================================================
+
+## WebContent's main for this process: writes the engine's resources into
+## `resource_directory` and installs everything a page needs (see the header). With a
+## `test_font_directory`, the FontPlugin is in layout-test mode over that directory's fonts
+## only. Runs once; later calls do nothing.
+pub func webview_initialize(resource_directory: str, test_font_directory: str? = none) -> !:
+    if webview_is_initialized():
+        return
+    try webview_write_resources(resource_directory)
+
+    web.web_initialize_strings()
+    let event_loop = webview_event_loop_install()
+    if let directory = test_font_directory:
+        webview_install_test_fonts(directory)
+    else:
+        webview_install_system_fonts()
+    web.bind_initialize_main_thread_vm(web.BindAgentType.similar_origin_window)
+    let vm = web.bind_main_thread_vm()
+    webview_event_loop_root(event_loop, web.vm_heap(vm))
+    webview_install_loading(vm, resource_directory)
+
+    with memory.heap:
+        webview_platform_the = new WebViewPlatform(vm = vm, event_loop = event_loop) else trap("out of memory")
+
+## Platform::FontPlugin as WebContent makes it: the system's font directories through a
+## PathFontProvider (FontPlugin::FontPlugin), in the C heap as the plugin is.
+func webview_install_system_fonts():
+    with memory.heap:
+        let plugin = new web.PlatformFontPlugin(m_default_fixed_width_font = none, m_is_layout_test_mode = false) else trap("out of memory")
+        web.platform_font_plugin_construct(plugin, false)
+        web.platform_font_plugin_install(plugin)
+
+## Platform::FontPlugin in layout-test mode over the fonts of `directory` only (web_test's
+## worker_install_fonts): every generic family is SerenitySans, the symbol font Noto Emoji.
+func webview_install_test_fonts(directory: str):
+    let provider = web_fonts.path_font_provider_create()
+    _ = web_fonts.font_database_install_system_font_provider(web_fonts.font_database_the(), (web_fonts.SystemFontProvider*)provider)
+    var uri = ak.string_builder_new()
+    with memory.heap:
+        ak.string_builder_append(&uri, "file://")
+        ak.string_builder_append(&uri, directory)
+    web_fonts.path_font_provider_load_all_fonts_from_uri(provider, ak.string_builder_string_view(&uri))
+
+    let c_heap = web_fonts.font_allocators_c_heap()
+    let previous = web_fonts.font_allocators_enter(&c_heap)
+    defer web_fonts.font_allocators_leave(previous)
+    with memory.heap:
+        let plugin = new web.PlatformFontPlugin(m_default_fixed_width_font = none, m_is_layout_test_mode = true) else trap("out of memory")
+        web.platform_font_plugin_update_generic_fonts(plugin)
+        let fixed_width_name = web.platform_font_plugin_generic_font_name(plugin, web.PlatformGenericFont.ui_monospace, 400, 0)
+        plugin.m_default_fixed_width_font = web_fonts.font_database_get(web_fonts.font_database_the(), fixed_width_name, 12.0, 400, (u32)web_fonts.FontWidth.normal, 0)
+        assert(plugin.m_default_fixed_width_font != none, "the test fonts provide the default fixed-width font")
+        ak.vector_append_t(&plugin.m_symbol_font_names, ak.fly_string_from_str("Noto Emoji"))
+        web.platform_font_plugin_install(plugin)
+
+## What WebContent's main installs for loading: the resource directory, the image decoder and
+## the ResourceLoader over the engine's in-process RequestClient, whose requests are cells of
+## the VM's heap (the client and the plugin live in the C heap for the process).
+func webview_install_loading(vm: web.Vm*, resource_directory: str):
+    let heap = web.vm_heap(vm)
+    web.core_resource_implementation_install(web.core_resource_implementation_file_create(ak.sv(resource_directory)))
+    web.luce_image_codec_plugin_install()
+    let client = web.in_process_request_client_create(heap)
+    web.resource_loader_initialize(heap, &client.client)

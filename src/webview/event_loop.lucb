@@ -1,0 +1,279 @@
+#==============================================================================================
+#
+#   event_loop - the Core event loop over an embedder's run loop
+#
+#   DESCRIPTION:
+#       The adapter between the engine's Core event loop seam (web's
+#       external/lib_core/event_loop.lucb) and an application's own run loop, as Ladybird's
+#       UI/AppKit/Application/EventLoopImplementationMacOS.mm (and UI/Qt's
+#       EventLoopImplementationQt) puts LibCore's events on the platform's loop: there a
+#       Core::Timer becomes a CFRunLoopTimer and a deferred invocation signals a run loop
+#       source, so the platform loop sleeps until the engine has work and then runs it.
+#
+#       The platform loop here (luce-ui's Application over luce-window) has no timer or source
+#       of its own to hand out, so the adapter keeps LibCore's ThreadData (the timers and the
+#       queue of deferred invocations) and tells the embedder two things:
+#
+#         - a wake hook (webview_set_wake_hook), called whenever new work makes the earliest
+#           due moment earlier: a deferred invocation (due now), a timer registered (due at its
+#           first fire time) or Core::EventLoop::wake. The embedder makes its loop stop
+#           waiting (luce-window's window.wake()), as post_application_event does on macOS;
+#         - when the engine is next due (webview_event_loop_next_due), which the embedder
+#           folds into how long its loop may block, as the CFRunLoopTimers are.
+#
+#       Each turn of its loop the embedder calls webview_event_loop_process, which runs what
+#       is due without waiting (the work of the run loop source and the timers' handlers),
+#       never longer than a slice, so input and painting keep going while a page is busy.
+#       Core::EventLoop::spin_until (pump in wait_for_events mode) still blocks until a timer
+#       is due, as LibCore's nested loops do.
+#
+#       Socket notifiers (Core::Notifier, the in-process client's sockets): the loop keeps them in
+#       a CoreEventLoopNotifiers (web's external/lib_core/event_loop_notifiers.lucb), as
+#       web_test's WorkerEventLoop does. Each turn first looks at their descriptors without
+#       waiting and fires the ready ones after the deferred invocations and before the timers,
+#       LibCore's order (ThreadEventQueue::process after wait_for_events); and while any is
+#       registered the loop is next due within a poll interval, so the embedder's loop comes
+#       back to look (the macOS loop has the kernel watch them as CFSocket sources; a thread
+#       that polls them and calls the wake hook would replace the interval, see the module's
+#       follow-ups). Core::EventLoop::spin_until (pump in wait_for_events mode) waits on the
+#       descriptors until the next timer is due, as the worker does.
+#
+#       Copyright (c) 2018-2026, the Ladybird developers.
+#       Copyright (c) 2023-2025, Tim Flynn <trflynn89@ladybird.org>
+#       Copyright (c) 2026 the luce-browser authors.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: The loop ================================================================================
+
+## The longest webview_event_loop_process runs before it hands the thread back, in nanoseconds
+## (a frame at 120 Hz).
+pub let webview_event_loop_slice_nanoseconds: u64 = 8000000
+
+## How soon the loop is due again while sockets are watched, in nanoseconds.
+pub let webview_event_loop_poll_nanoseconds: u64 = 4000000
+
+## A registered timer (LibCore's EventLoopTimer): fires `timer` at `fire_time` (time.now()
+## nanoseconds), then every `interval_ms` while it stays registered.
+struct WebViewLoopTimer:
+    var timer: web.CoreTimer*
+    var id: isize
+    var interval_ms: i32
+    var should_reload: bool
+    var fire_time: u64
+
+## The embedder's wake-up: makes its run loop stop waiting. It may be called from the loop's
+## own thread while it runs; it must not reenter the engine.
+pub type WebViewWakeHook = func() -> unit
+
+## The process's event loop (web.CoreEventLoopImplementation). It lives in the C heap inside a
+## conservative root region (roots.lucb): its timer list and deferred queue are managed
+## memory that only it refers to.
+pub struct WebViewEventLoop: web.CoreEventLoopImplementation:
+    var timers: ak.Vector[WebViewLoopTimer]
+    var next_timer_id: isize
+    var deferred: ak.Vector[ak.Function0[unit]]
+    var notifiers: web.CoreEventLoopNotifiers
+    var exit_requested: bool
+    var exit_code: i32
+    var wake_hook: WebViewWakeHook?
+
+    ## EventLoopImplementation::pump (EventLoopImplementationUnix's). In wait_for_events mode with
+    ## nothing queued it waits until a watched descriptor is ready or the next timer is due
+    ## (spin_until's nested loop; with nothing that can ever happen, waiting would never end, so
+    ## it traps); then it runs a turn. Answers how many events it processed.
+    func pump(mode: web.CoreEventLoopPumpMode) -> usize:
+        let waiting = mode == web.CoreEventLoopPumpMode.wait_for_events and ak.vector_is_empty(&self.deferred)
+        if waiting and self.is_watching():
+            var deadline = net.Deadline()
+            if let next = self.next_fire_time():
+                deadline = net.Deadline.at(next)
+            _ = web.core_event_loop_notifiers_wait(&self.notifiers, deadline)
+            return self.run_turn()
+        if waiting:
+            let next = self.next_fire_time() else trap("webview: the event loop waits for an event that can never come")
+            let now = time.now()
+            if next > now:
+                thread.sleep((next - now + 999999) // 1000000)
+        return self.process_once()
+
+    ## Whether any notifier is registered.
+    func is_watching() -> bool:
+        return web.core_event_loop_notifiers_count(&self.notifiers) > 0
+
+    ## One turn without waiting: the watched descriptors looked at, then run_turn.
+    func process_once() -> usize:
+        if self.is_watching():
+            _ = web.core_event_loop_notifiers_wait(&self.notifiers, net.Deadline.at(0))
+        return self.run_turn()
+
+    ## The deferred invocations queued before the turn, the notifiers the last look found ready,
+    ## then the due timers by id, each looked up again before it fires (firing one may stop
+    ## another).
+    func run_turn() -> usize:
+        var processed: usize = 0
+        let pending = self.deferred
+        self.deferred = ak.Vector[ak.Function0[unit]]()
+        for index in 0..<ak.vector_size(&pending):
+            var function = *ak.vector_at_const(&pending, index)
+            ak.function0_call(&function)
+            processed += 1
+
+        processed += web.core_event_loop_notifiers_dispatch(&self.notifiers)
+
+        let now = time.now()
+        var due: ak.Vector[isize]
+        for index in 0..<ak.vector_size(&self.timers):
+            let entry = ak.vector_at_const(&self.timers, index)
+            if entry.fire_time <= now:
+                ak.vector_append_t(&due, entry.id)
+        for index in 0..<ak.vector_size(&due):
+            let id = *ak.vector_at_const(&due, index)
+            let slot = self.find_timer(id) else continue
+            let entry = ak.vector_at(&self.timers, slot)
+            let timer = entry.timer
+            if entry.should_reload:
+                entry.fire_time = now + (u64)entry.interval_ms * 1000000
+            else:
+                _ = ak.vector_take(&self.timers, slot)
+            web.core_timer_timer_event(timer)
+            processed += 1
+        return processed
+
+    func quit(code: i32):
+        self.exit_requested = true
+        self.exit_code = code
+
+    func was_exit_requested() -> bool:
+        return self.exit_requested
+
+    ## Core::EventLoop::wake: the embedder's loop stops waiting.
+    func wake():
+        self.call_wake_hook()
+
+    ## Core::deferred_invoke: queued, and the embedder's loop woken (the run loop source's
+    ## signal in EventLoopImplementationMacOS::post_event).
+    func deferred_invoke(function: ak.Function0[unit]):
+        let was_idle = ak.vector_is_empty(&self.deferred)
+        ak.vector_append_t(&self.deferred, function)
+        if was_idle:
+            self.call_wake_hook()
+
+    ## EventLoopManagerMacOS::register_timer: the timer's first fire time joins the loop's
+    ## deadlines; the embedder's loop is woken when it is now the earliest.
+    func register_timer(timer: web.CoreTimer*, milliseconds: i32, should_reload: bool) -> isize:
+        self.next_timer_id += 1
+        let interval = milliseconds if milliseconds > 0 else 0
+        let fire_time = time.now() + (u64)interval * 1000000
+        let earliest = self.next_fire_time()
+        ak.vector_append_t(&self.timers, WebViewLoopTimer(timer = timer, id = self.next_timer_id, interval_ms = interval, should_reload = should_reload, fire_time = fire_time))
+        if earliest == none or fire_time < (earliest else 0):
+            self.call_wake_hook()
+        return self.next_timer_id
+
+    func unregister_timer(timer_id: isize):
+        if let slot = self.find_timer(timer_id):
+            _ = ak.vector_take(&self.timers, slot)
+
+    ## EventLoopManager::register_notifier: watched from the next turn on; the embedder's loop is
+    ## woken so it comes back within the poll interval.
+    func register_notifier(notifier: web.CoreNotifier*):
+        let was_watching = self.is_watching()
+        web.core_event_loop_notifiers_register(&self.notifiers, notifier)
+        if not was_watching:
+            self.call_wake_hook()
+
+    ## EventLoopManager::unregister_notifier.
+    func unregister_notifier(notifier: web.CoreNotifier*):
+        web.core_event_loop_notifiers_unregister(&self.notifiers, notifier)
+
+    ## The index of the registered timer `id`, if it is registered.
+    func find_timer(id: isize) -> usize?:
+        for index in 0..<ak.vector_size(&self.timers):
+            if ak.vector_at_const(&self.timers, index).id == id:
+                return index
+        return none
+
+    ## When the next timer is due, if any is registered.
+    func next_fire_time() -> u64?:
+        var next: u64? = none
+        for index in 0..<ak.vector_size(&self.timers):
+            let fire_time = ak.vector_at_const(&self.timers, index).fire_time
+            if let earliest = next:
+                if fire_time < earliest:
+                    next = fire_time
+            else:
+                next = fire_time
+        return next
+
+    ## Whether anything is queued or due at `now`.
+    func has_due_work(now: u64) -> bool:
+        if not ak.vector_is_empty(&self.deferred):
+            return true
+        for index in 0..<ak.vector_size(&self.timers):
+            if ak.vector_at_const(&self.timers, index).fire_time <= now:
+                return true
+        return false
+
+    func call_wake_hook():
+        if let hook = self.wake_hook:
+            hook()
+
+# mark: The process's loop ======================================================================
+
+## The installed loop (one per process, as Core::EventLoopManager is).
+var webview_event_loop_the: WebViewEventLoop*?
+
+## Makes the process's loop in the C heap and installs it behind the Core seam with the
+## Platform::EventLoopPlugin over it (WebContent's main: Core::EventLoop and
+## `Web::Platform::EventLoopPlugin::install(*new Web::Platform::EventLoopPlugin)`).
+pub func webview_event_loop_install() -> WebViewEventLoop*:
+    assert(webview_event_loop_the == none, "webview: the event loop is installed once")
+    with memory.heap:
+        let event_loop = new WebViewEventLoop(next_timer_id = 0, notifiers = web.CoreEventLoopNotifiers(), exit_requested = false, exit_code = 0, wake_hook = none) else trap("out of memory")
+        web.core_event_loop_install(event_loop)
+        let plugin = new web.PlatformEventLoopPlugin else trap("out of memory")
+        web.platform_event_loop_plugin_install(plugin)
+        webview_event_loop_the = event_loop
+        return event_loop
+
+## Makes the loop a root region of `heap` once the VM exists: what it holds stays alive.
+pub func webview_event_loop_root(event_loop: WebViewEventLoop*, heap: gc.Heap*):
+    _ = webview_root_region_create(heap, (const void*)event_loop, memory.size_of(WebViewEventLoop))
+
+## The process's loop.
+pub func webview_event_loop() -> WebViewEventLoop*:
+    return webview_event_loop_the else trap("webview: not initialized (webview.initialize)")
+
+## Sets the embedder's wake hook (none: no wake-ups; the embedder polls).
+pub func webview_set_wake_hook(hook: WebViewWakeHook?):
+    webview_event_loop().wake_hook = hook
+
+## Runs what is due now (the watched descriptors are always looked at), turn after turn, until
+## nothing is or a slice has passed; never waits. Answers how many events ran.
+pub func webview_event_loop_process(event_loop: WebViewEventLoop*) -> usize:
+    let start = time.now()
+    var processed: usize = 0
+    if event_loop.is_watching() and not event_loop.has_due_work(start):
+        processed += event_loop.process_once()
+    while event_loop.has_due_work(time.now()):
+        processed += event_loop.process_once()
+        if time.now() - start >= webview_event_loop_slice_nanoseconds:
+            break
+    return processed
+
+## When the loop next has work (a time.now() moment): now while invocations are queued, else the
+## earliest timer, no later than a poll interval while sockets are watched; none when nothing
+## is registered.
+pub func webview_event_loop_next_due(event_loop: WebViewEventLoop*) -> u64?:
+    let now = time.now()
+    if not ak.vector_is_empty(&event_loop.deferred):
+        return now
+    let next = event_loop.next_fire_time()
+    if event_loop.is_watching():
+        let poll = now + webview_event_loop_poll_nanoseconds
+        if let timer = next:
+            return timer if timer < poll else poll
+        return poll
+    return next

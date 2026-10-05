@@ -1,0 +1,120 @@
+#==============================================================================================
+#
+#   view_input - input events from the application to the page
+#
+#   DESCRIPTION:
+#       How an event travels from Ladybird's UI to the page, in process:
+#
+#         - UI/AppKit/Interface/Event.mm (ns_event_to_mouse_event) and
+#           LadybirdWebViewBridge.cpp:73 (enqueue_input_event: widget points to device pixels,
+#           WebViewBridge::to_content_position) make the Web::MouseEvent;
+#         - ViewImplementation::enqueue_input_event (ViewImplementation.cpp:240) keeps it among
+#           the pending events and sends it to WebContent;
+#         - ConnectionFromClient::mouse_event and enqueue_input_event
+#           (ConnectionFromClient.cpp:214-269) coalesce consecutive moves and wheels and queue it
+#           for the page, then request a frame;
+#         - the HTML event loop handles the queue while it updates the rendering
+#           (EventLoop::process_input_events: Page::handle_mousedown and the others, through
+#           EventHandler, into DOM events, link activation, selection and scrolling), and each
+#           handled event is reported back (PageClient::report_finished_handling_input_event);
+#         - ViewImplementation::did_finish_handling_input_event (ViewImplementation.cpp:265)
+#           takes the oldest pending event and, when the page did not handle a key, hands it to
+#           the UI (on_finish_handling_key_event): webview_take_unhandled_key here.
+#
+#       Copyright (c) 2023, Linus Groh <linusg@serenityos.org>
+#       Copyright (c) 2023-2024, Tim Flynn <trflynn89@serenityos.org>
+#       Copyright (c) 2020-2023, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2026 the luce-browser authors.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Making events ===========================================================================
+
+## WebViewBridge::to_content_position: a widget point (logical points) in device pixels.
+func webview_to_content_position(view: const WebView*, x: f64, y: f64) -> gfx.IntPoint:
+    return gfx.IntPoint(m_x = (i32)(x * view.m_device_pixel_ratio), m_y = (i32)(y * view.m_device_pixel_ratio))
+
+## A Web::MouseEvent as ns_event_to_mouse_event makes it, at the widget point `x`, `y`, already in
+## content coordinates (WebViewBridge::enqueue_input_event). `buttons` and `modifiers` are
+## UIEvents::MouseButton and UIEvents::KeyModifier masks; wheel deltas are in device pixels.
+pub func webview_mouse_event(view: const WebView*, type_: web.MouseEventType, x: f64, y: f64, button: u32, buttons: u32, modifiers: u32,
+                             wheel_delta_x: i32, wheel_delta_y: i32, click_count: i32) -> web.MouseEvent:
+    let position = webview_to_content_position(view, x, y)
+    return web.MouseEvent(type_ = type_, position = position, screen_position = position, button = (web.UiEventsMouseButton)(u8)button,
+                          buttons = (web.UiEventsMouseButton)(u8)buttons, modifiers = (web.UiEventsKeyModifier)modifiers, wheel_delta_x = wheel_delta_x,
+                          wheel_delta_y = wheel_delta_y, click_count = click_count, browser_data = none)
+
+# mark: Sending events ==========================================================================
+
+## Ported from ViewImplementation.cpp:240 ViewImplementation::enqueue_input_event, with
+## ConnectionFromClient::mouse_event's coalescing and enqueue_input_event (see the header).
+pub func webview_enqueue_input_event(view: WebView*, event: web.InputEvent):
+    ak.queue_enqueue(&view.m_pending_input_events, event)
+    let client = webview_client(view)
+    match event:
+        .mouse_event(mouse_event):
+            webview_connection_mouse_event(client, mouse_event)
+        _:
+            webview_connection_enqueue_input_event(client, web.QueuedInputEvent(page_id = client.m_id, event = event, coalesced_event_count = 0))
+
+## Ported from ConnectionFromClient.cpp:219 WebContent::ConnectionFromClient::mouse_event.
+func webview_connection_mouse_event(client: WebViewPageClient*, event: web.MouseEvent):
+    var coalesced = event
+    # OPTIMIZATION: Coalesce consecutive unprocessed mouse move and wheel events.
+    if let last_mouse_event = webview_event_to_coalesce(client, &event):
+        coalesced.wheel_delta_x += last_mouse_event.wheel_delta_x
+        coalesced.wheel_delta_y += last_mouse_event.wheel_delta_y
+        let tail = ak.queue_tail(&client.m_input_event_queue)
+        tail.event = web.InputEvent.mouse_event(coalesced)
+        tail.coalesced_event_count += 1
+        web.page_client_request_frame(&client.page_client)
+        return
+
+    webview_connection_enqueue_input_event(client, web.QueuedInputEvent(page_id = client.m_id, event = web.InputEvent.mouse_event(coalesced), coalesced_event_count = 0))
+
+## ConnectionFromClient::mouse_event's event_to_coalesce lambda: the queue's last event when it is
+## an unprocessed mouse event of this page and of `event`'s type, a move or a wheel.
+func webview_event_to_coalesce(client: WebViewPageClient*, event: const web.MouseEvent*) -> web.MouseEvent?:
+    if ak.queue_is_empty(&client.m_input_event_queue):
+        return none
+    let tail = ak.queue_tail(&client.m_input_event_queue)
+    if tail.page_id != client.m_id:
+        return none
+    if event.type_ != web.MouseEventType.mouse_move and event.type_ != web.MouseEventType.mouse_wheel:
+        return none
+    match tail.event:
+        .mouse_event(mouse_event):
+            if mouse_event.type_ == event.type_:
+                return mouse_event
+        _:
+            return none
+    return none
+
+## Ported from ConnectionFromClient.cpp:265 WebContent::ConnectionFromClient::enqueue_input_event.
+func webview_connection_enqueue_input_event(client: WebViewPageClient*, event: web.QueuedInputEvent):
+    ak.queue_enqueue(&client.m_input_event_queue, event)
+    web.page_client_request_frame(&client.page_client)
+
+## Ported from ViewImplementation.cpp:265 ViewImplementation::did_finish_handling_input_event.
+func webview_did_finish_handling_input_event(view: WebView*, event_result: web.EventResult):
+    if ak.queue_is_empty(&view.m_pending_input_events):
+        return
+    let event = ak.queue_dequeue(&view.m_pending_input_events)
+
+    if event_result == web.EventResult.handled:
+        return
+
+    # Here we handle events that were not consumed or cancelled by the WebContent. Propagate the event back
+    # to the concrete view implementation.
+    match event:
+        .key_event(key_event):
+            ak.queue_enqueue(&view.m_unhandled_key_events, key_event)
+        _:
+            return
+
+## The next key event the page did not handle (on_finish_handling_key_event), if any.
+pub func webview_take_unhandled_key(view: WebView*) -> web.KeyEvent?:
+    if ak.queue_is_empty(&view.m_unhandled_key_events):
+        return none
+    return ak.queue_dequeue(&view.m_unhandled_key_events)

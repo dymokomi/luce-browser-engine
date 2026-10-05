@@ -1,0 +1,329 @@
+#==============================================================================================
+#
+#   page_client - WebContent's PageClient, in process
+#
+#   DESCRIPTION:
+#       Port of the parts of Services/WebContent/PageClient.cpp (lines 67-800) that a page
+#       without script, devtools or WebDriver reaches, and of PageHost.cpp (lines 18-23, the
+#       client and its fresh top-level traversable). Ladybird's PageClient forwards what the
+#       page reports to the UI process (`client().async_did_*`), where WebContentClient hands it
+#       to the ViewImplementation; here each report is a direct call on the view (view.lucb).
+#       The palette is WebContent's (setup_palette: a zeroed theme with magenta and cyan window
+#       colors). The input event queue is ConnectionFromClient's (one client per view here).
+#       The frame timer is WebContent's: request_frame queues "update the rendering" at most
+#       maximum_frames_per_second times a second.
+#
+#       Copyright (c) 2020-2023, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2021-2022, Linus Groh <linusg@serenityos.org>
+#       Copyright (c) 2023, Andrew Kaster <akaster@serenityos.org>
+#       Copyright (c) 2024, Sam Atkins <sam@ladybird.org>
+#       Copyright (c) 2026 the luce-browser authors.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: The client ==============================================================================
+
+## WebContent::PageClient: a cell, as the C++ one is (its class id is PageClient's).
+pub struct WebViewPageClient: gc.IsCell:
+    var page_client: web.PageClient
+    var m_page: web.Page*?
+    var m_id: u64
+    var m_view: WebView*?
+    var m_palette_impl: gfx.PaletteImpl*?
+    var m_screen_rect: gfx.DevicePixelRect
+    var m_viewport_size: gfx.IntSize
+    var m_device_pixel_ratio: f64
+    var m_zoom_level: f64
+    var m_maximum_frames_per_second: f64
+    var m_preferred_color_scheme: web.CssPreferredColorScheme
+    var m_frame_timer: web.CoreTimer*?
+    var m_last_frame_dispatch_time: f64?
+    ## ConnectionFromClient's m_input_event_queue.
+    var m_input_event_queue: ak.Queue[web.QueuedInputEvent]
+
+    func cell() -> gc.Cell*: return (gc.Cell*)&self
+
+## The client of a PageClient this file made.
+func webview_page_client_of(base: web.PageClient*) -> WebViewPageClient*:
+    return (WebViewPageClient*)base
+
+## The view of a client, none once the view is destroyed (WebContentClient's view_for_page_id: a
+## report for a view that is gone is dropped).
+func webview_client_view(base: web.PageClient*) -> WebView*?:
+    return webview_page_client_of(base).m_view
+
+## Ported from Services/WebContent/PageClient.cpp:86 WebContent::PageClient::visit_edges.
+func webview_page_client_visit_edges(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (WebViewPageClient*)base
+    gc.cell_visit_edges_impl(base, visitor)
+    gc.cell_visitor_visit_t(visitor, this.m_page)
+
+func webview_page_client_id(this: web.PageClient*) -> u64:
+    return webview_page_client_of(this).m_id
+
+func webview_page_client_page(this: web.PageClient*) -> web.Page*:
+    return webview_page_client_of(this).m_page else trap("webview: the PageClient has no page")
+
+## In process the connection to the UI is the view, open while the client exists.
+func webview_page_client_is_connection_open(this: web.PageClient*) -> bool:
+    return true
+
+## WebView::is_url_suitable_for_same_process_navigation: there is one process.
+func webview_page_client_is_url_suitable_for_same_process_navigation(this: web.PageClient*, current_url: web_url.Url, target_url: web_url.Url) -> bool:
+    return true
+
+## Ported from Services/WebContent/PageClient.cpp:127 WebContent::PageClient::palette.
+func webview_page_client_palette(this: web.PageClient*) -> gfx.Palette:
+    var palette: gfx.Palette = ---
+    gfx.palette_construct(&palette, webview_page_client_of(this).m_palette_impl else trap("webview: no palette"))
+    return palette
+
+func webview_page_client_screen_rect(this: web.PageClient*) -> gfx.DevicePixelRect:
+    return webview_page_client_of(this).m_screen_rect
+
+func webview_page_client_zoom_level(this: web.PageClient*) -> f64:
+    return webview_page_client_of(this).m_zoom_level
+
+func webview_page_client_device_pixel_ratio(this: web.PageClient*) -> f64:
+    return webview_page_client_of(this).m_device_pixel_ratio
+
+## Ported from Services/WebContent/PageClient.h:62 WebContent::PageClient::device_pixels_per_css_pixel.
+func webview_page_client_device_pixels_per_css_pixel(this: web.PageClient*) -> f64:
+    let client = webview_page_client_of(this)
+    return client.m_device_pixel_ratio * client.m_zoom_level
+
+func webview_page_client_preferred_color_scheme(this: web.PageClient*) -> web.CssPreferredColorScheme:
+    return webview_page_client_of(this).m_preferred_color_scheme
+
+func webview_page_client_preferred_contrast(this: web.PageClient*) -> web.CssPreferredContrast:
+    return web.CssPreferredContrast.auto
+
+func webview_page_client_preferred_motion(this: web.PageClient*) -> web.CssPreferredMotion:
+    return web.CssPreferredMotion.auto
+
+func webview_page_client_screen_count(this: web.PageClient*) -> usize:
+    return 1
+
+## Ported from Services/WebContent/PageClient.cpp:196 WebContent::PageClient::input_event_queue.
+func webview_page_client_input_event_queue(this: web.PageClient*) -> ak.Queue[web.QueuedInputEvent]*:
+    return &webview_page_client_of(this).m_input_event_queue
+
+## Ported from Services/WebContent/PageClient.cpp:201 WebContent::PageClient::report_finished_handling_input_event.
+func webview_page_client_report_finished_handling_input_event(this: web.PageClient*, page_id: u64, event_was_handled: web.EventResult):
+    let view = webview_client_view(this) else return
+    webview_did_finish_handling_input_event(view, event_was_handled)
+
+## The lambda of PageClient::PageClient's frame timer: the rendering is updated on the next turn.
+func webview_page_client_frame_timer_fired(context: void*?):
+    let client = (WebViewPageClient*)(context else trap("webview: a frame timer without its client"))
+    client.m_last_frame_dispatch_time = web.high_resolution_time_unsafe_shared_current_time()
+    web.html_event_loop_queue_task_to_update_the_rendering(web.html_main_thread_event_loop())
+
+## Ported from Services/WebContent/PageClient.cpp:225 WebContent::PageClient::request_frame.
+func webview_page_client_request_frame(this: web.PageClient*):
+    let client = webview_page_client_of(this)
+    let frame_timer = client.m_frame_timer else trap("webview: no frame timer")
+    if web.core_timer_is_active(frame_timer):
+        return
+
+    var delay = 0.0
+    if let last_frame_dispatch_time = client.m_last_frame_dispatch_time:
+        let now = web.high_resolution_time_unsafe_shared_current_time()
+        let minimum_frame_interval = 1000.0 / client.m_maximum_frames_per_second
+        delay = math.max(0.0, last_frame_dispatch_time + minimum_frame_interval - now)
+
+    web.core_timer_restart_i32(frame_timer, (i32)math.ceil(delay))
+
+# mark: What the page reports ===================================================================
+
+## PageClient::page_did_request_cursor_change (WebContentClient::did_request_cursor_change).
+func webview_page_client_page_did_request_cursor_change(this: web.PageClient*, cursor: gfx.Cursor):
+    let view = webview_client_view(this) else return
+    webview_did_request_cursor_change(view, cursor)
+
+## PageClient::page_did_change_title (WebContentClient::did_change_title).
+func webview_page_client_page_did_change_title(this: web.PageClient*, title: ak.Utf16String):
+    let view = webview_client_view(this) else return
+    webview_did_change_title(view, title)
+
+## PageClient::page_did_change_url (WebContentClient::did_change_url).
+func webview_page_client_page_did_change_url(this: web.PageClient*, url: web_url.Url):
+    let view = webview_client_view(this) else return
+    webview_did_change_url(view, url)
+
+## PageClient::page_did_request_refresh (WebContentClient::did_request_refresh: the view reloads).
+func webview_page_client_page_did_request_refresh(this: web.PageClient*):
+    let view = webview_client_view(this) else return
+    webview_reload(view)
+
+## PageClient::page_did_hover_link (WebContentClient::did_hover_link).
+func webview_page_client_page_did_hover_link(this: web.PageClient*, url: web_url.Url):
+    let view = webview_client_view(this) else return
+    webview_did_hover_link(view, url)
+
+## PageClient::page_did_unhover_link (WebContentClient::did_unhover_link).
+func webview_page_client_page_did_unhover_link(this: web.PageClient*):
+    let view = webview_client_view(this) else return
+    webview_did_unhover_link(view)
+
+## PageClient::page_did_start_loading (WebContentClient::did_start_loading).
+func webview_page_client_page_did_start_loading(this: web.PageClient*, url: web_url.Url, is_redirect: bool):
+    let view = webview_client_view(this) else return
+    webview_did_start_loading(view, url, is_redirect)
+
+## PageClient::page_did_finish_loading (WebContentClient::did_finish_loading).
+func webview_page_client_page_did_finish_loading(this: web.PageClient*, url: web_url.Url):
+    let view = webview_client_view(this) else return
+    webview_did_finish_loading(view, url)
+
+## PageClient::page_did_update_navigation_buttons_state (WebContentClient::did_update_navigation_buttons_state).
+func webview_page_client_page_did_update_navigation_buttons_state(this: web.PageClient*, back_enabled: bool, forward_enabled: bool):
+    let view = webview_client_view(this) else return
+    webview_did_update_navigation_buttons_state(view, back_enabled, forward_enabled)
+
+## PageClient::page_did_paint (WebContentClient::did_paint).
+func webview_page_client_page_did_paint(this: web.PageClient*, content_rect: gfx.DevicePixelRect, bitmap_id: i32):
+    let view = webview_client_view(this) else return
+    webview_server_did_paint(view, bitmap_id, gfx.device_pixel_rect_size(&content_rect))
+
+## PageClient::page_did_take_screenshot (WebContentClient::did_take_screenshot).
+func webview_page_client_page_did_take_screenshot(this: web.PageClient*, screenshot: gfx.ShareableBitmap):
+    let view = webview_client_view(this) else return
+    webview_did_receive_screenshot(view, screenshot)
+
+## PageClient::request_file: WebContent asks the UI process to open the file
+## (ViewImplementation's on_request_file); in process the engine opens it on the next turn.
+func webview_page_client_request_file(this: web.PageClient*, request: web.FileRequest):
+    web.in_process_request_file(request)
+
+## The painter WebContent picks without a GPU backend: the CPU player.
+func webview_page_client_display_list_player_type(this: web.PageClient*) -> web.DisplayListPlayerType:
+    return web.DisplayListPlayerType.skia_cpu
+
+func webview_page_client_is_headless(this: web.PageClient*) -> bool:
+    return false
+
+func webview_page_client_is_svg_page_client(this: web.PageClient*) -> bool:
+    return false
+
+## The client's vtable: PageClient's, with WebContent's overrides of what the page reaches.
+let webview_page_client_vtable: web.PageClientVTable = web.PageClientVTable(
+    cell_vtable = web.JsCellVTable(cell_vtable = gc.CellVTable(class_info = &webview_page_client_class, visit_edges = webview_page_client_visit_edges)),
+    id = webview_page_client_id,
+    page = webview_page_client_page,
+    page_const = webview_page_client_page,
+    is_connection_open = webview_page_client_is_connection_open,
+    is_url_suitable_for_same_process_navigation = webview_page_client_is_url_suitable_for_same_process_navigation,
+    palette = webview_page_client_palette,
+    screen_rect = webview_page_client_screen_rect,
+    zoom_level = webview_page_client_zoom_level,
+    device_pixel_ratio = webview_page_client_device_pixel_ratio,
+    device_pixels_per_css_pixel = webview_page_client_device_pixels_per_css_pixel,
+    preferred_color_scheme = webview_page_client_preferred_color_scheme,
+    preferred_contrast = webview_page_client_preferred_contrast,
+    preferred_motion = webview_page_client_preferred_motion,
+    screen_count = webview_page_client_screen_count,
+    input_event_queue = webview_page_client_input_event_queue,
+    report_finished_handling_input_event = webview_page_client_report_finished_handling_input_event,
+    request_frame = webview_page_client_request_frame,
+    page_did_change_title = webview_page_client_page_did_change_title,
+    page_did_change_url = webview_page_client_page_did_change_url,
+    page_did_request_refresh = webview_page_client_page_did_request_refresh,
+    page_did_start_loading = webview_page_client_page_did_start_loading,
+    page_did_finish_loading = webview_page_client_page_did_finish_loading,
+    page_did_request_cursor_change = webview_page_client_page_did_request_cursor_change,
+    page_did_hover_link = webview_page_client_page_did_hover_link,
+    page_did_unhover_link = webview_page_client_page_did_unhover_link,
+    page_did_update_navigation_buttons_state = webview_page_client_page_did_update_navigation_buttons_state,
+    request_file = webview_page_client_request_file,
+    page_did_paint = webview_page_client_page_did_paint,
+    page_did_take_screenshot = webview_page_client_page_did_take_screenshot,
+    display_list_player_type = webview_page_client_display_list_player_type,
+    is_headless = webview_page_client_is_headless,
+    is_svg_page_client = webview_page_client_is_svg_page_client,
+)
+
+## The class of the client: a PageClient (its class id; a constant expression cannot read
+## web.page_client_class's ids, so webview_page_client_create checks they agree).
+let webview_page_client_class: ak.ClassInfo = ak.ClassInfo(name = "WebViewPageClient", first_id = 316, last_id = 316, size = memory.size_of(WebViewPageClient),
+                                                           vtable = (const void*)&webview_page_client_vtable)
+
+# mark: Creating the client =====================================================================
+
+## Ported from Services/WebContent/PageClient.cpp:67 WebContent::PageClient::create (with
+## PageClient::PageClient: the page by Page::create, the palette, the frame timer), for `view`.
+## Runs with the VM's heap current.
+pub func webview_page_client_create(vm: web.Vm*, view: WebView*, id: u64) -> WebViewPageClient*:
+    assert(webview_page_client_class.first_id == web.page_client_class.first_id and webview_page_client_class.last_id == web.page_client_class.last_id,
+           "the view's PageClient has PageClient's class id")
+    let heap = web.vm_heap(vm)
+    gc.heap_defer_gc(heap)
+    let client = (WebViewPageClient*)web.web_heap_allocate_cell(heap, &webview_page_client_class)
+    client.m_id = id
+    client.m_view = view
+    client.m_device_pixel_ratio = 1.0
+    client.m_zoom_level = 1.0
+    client.m_maximum_frames_per_second = 60.0
+    client.m_preferred_color_scheme = web.CssPreferredColorScheme.auto
+    client.m_page = web.page_create(vm, &client.page_client)
+    webview_page_client_setup_palette(client)
+    client.m_frame_timer = web.core_timer_create_single_shot(0, ak.Function0[unit](call = webview_page_client_frame_timer_fired, context = client))
+    gc.heap_undefer_gc(heap)
+    client.m_screen_rect = gfx.DevicePixelRect(m_location = gfx.IntPoint(m_x = 0, m_y = 0), m_size = gfx.IntSize(m_width = 1920, m_height = 1080))
+    return client
+
+## Ported from Services/WebContent/PageClient.cpp:110 WebContent::PageClient::setup_palette.
+func webview_page_client_setup_palette(client: WebViewPageClient*):
+    let buffer = gfx.core_anonymous_buffer_create_with_size(memory.size_of(gfx.SystemTheme)) else trap("VERIFY: the theme buffer")
+    let theme = (gfx.SystemTheme*)(gfx.core_anonymous_buffer_data(&buffer) else trap("VERIFY: the theme buffer"))
+    let magenta = gfx.color_new_named_color(gfx.ColorNamedColor.magenta)
+    let cyan = gfx.color_new_named_color(gfx.ColorNamedColor.cyan)
+    theme.color[(i32)gfx.ColorRole.window] = gfx.color_value(&magenta)
+    theme.color[(i32)gfx.ColorRole.window_text] = gfx.color_value(&cyan)
+    client.m_palette_impl = gfx.palette_impl_create_with_anonymous_buffer(buffer)
+
+## Ported from Services/WebContent/PageClient.cpp:206 WebContent::PageClient::set_viewport: the
+## top-level traversable's viewport in CSS pixels, its display list invalidated when the
+## device pixel ratio changed.
+pub func webview_page_client_set_viewport(client: WebViewPageClient*, size: gfx.IntSize, device_pixel_ratio: f64):
+    let invalidate = web.InvalidateDisplayList.yes if client.m_device_pixel_ratio != device_pixel_ratio else web.InvalidateDisplayList.no
+    client.m_viewport_size = size
+    client.m_device_pixel_ratio = device_pixel_ratio
+    let page = client.m_page else trap("webview: no page")
+    let traversable = web.page_top_level_traversable(page)
+    web.html_navigable_set_viewport_size((web.HtmlNavigable*)traversable, web.page_device_to_css_size(page, size), invalidate)
+
+## Ported from Services/WebContent/PageClient.cpp:217 WebContent::PageClient::set_zoom_level.
+pub func webview_page_client_set_zoom_level(client: WebViewPageClient*, zoom_level: f64):
+    client.m_zoom_level = zoom_level
+    let page = client.m_page else trap("webview: no page")
+    let traversable = web.page_top_level_traversable(page)
+    web.html_navigable_set_viewport_size((web.HtmlNavigable*)traversable, web.page_device_to_css_size(page, client.m_viewport_size), web.InvalidateDisplayList.yes)
+
+## Ported from Services/WebContent/PageClient.cpp:191 WebContent::PageClient::ready_to_paint.
+pub func webview_page_client_ready_to_paint(client: WebViewPageClient*):
+    let page = client.m_page else trap("webview: no page")
+    web.html_navigable_ready_to_paint((web.HtmlNavigable*)web.page_top_level_traversable(page))
+
+# mark: PageHost ================================================================================
+
+## The lambda of create_a_fresh_top_level_traversable that finishes the initial about:blank
+## document.
+func webview_initial_document_the_end(context: void*?):
+    let traversable = (web.HtmlTraversableNavigable*)(context else trap("webview: no traversable"))
+    let document = web.html_navigable_active_document((web.HtmlNavigable*)traversable) else trap("webview: no initial document")
+    web.html_parser_the_end(document)
+
+## Ported from Services/WebContent/PageHost.cpp:18 WebContent::PageHost::PageHost: the client's
+## page gets TraversableNavigable::create_a_fresh_top_level_traversable(page, about:blank), without
+## that function's AD-HOC emulated geolocation position (Geolocation is phase 4; web_test's
+## worker does the same): a new top-level traversable set as the page's, its initial about:blank
+## document marked as finished parsing on the event loop.
+pub func webview_page_host_create_top_level_traversable(page: web.Page*) -> web.HtmlTraversableNavigable*:
+    let traversable = web.html_traversable_navigable_create_a_new_top_level_traversable(page, none, ak.string_from_str(""))
+    web.page_set_top_level_traversable(page, traversable)
+    let heap = gc.cell_heap((gc.Cell*)traversable)
+    web.platform_event_loop_plugin_deferred_invoke(web.platform_event_loop_plugin_the(),
+                                                   gc.create_function0(heap, ak.Function0[unit](call = webview_initial_document_the_end, context = traversable)))
+    return traversable

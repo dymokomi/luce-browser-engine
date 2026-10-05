@@ -1,0 +1,299 @@
+#==============================================================================================
+#
+#   view - a page as an application holds it: ViewImplementation and WebContentClient
+#
+#   DESCRIPTION:
+#       Port of the parts of Libraries/LibWebView/ViewImplementation.cpp (lines 31-300 and
+#       631-669) and WebContentClient.cpp (lines 106-345, 843-850) that a view without devtools,
+#       history store, bookmarks or context menus has: creating the view's page (the client's
+#       initialize_client steps: zoom, viewport, frame rate, system visibility), loading a URL
+#       or text, reloading, traversing the history, the viewport and device pixel ratio, and
+#       what the page reported (URL, title, loading, cursor, hovered link, navigation buttons).
+#
+#       Ladybird's view learns these through callbacks (on_load_start, on_title_change, ...)
+#       that its UI sets; a Luce application cannot hand Base a closure, so each report also
+#       queues a WebViewEvent the application takes once a turn (webview_take_event), and the
+#       state stays readable (webview_title, webview_url, ...).
+#
+#       Stop: the pinned LibWebView has no stop; a view stops as window.stop() does, by the
+#       HTML "stop loading" steps on its top-level traversable (Navigable::stop_loading).
+#
+#       A view lives in the C heap as a root region (roots.lucb): its page client, URL, title
+#       and queues are managed values only it refers to. Every function here that reaches the
+#       engine expects the VM's heap to be the current allocator (api.lucb arranges it).
+#
+#       Copyright (c) 2022-2023, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2023, Linus Groh <linusg@serenityos.org>
+#       Copyright (c) 2023-2025, Tim Flynn <trflynn89@ladybird.org>
+#       Copyright (c) 2026 the luce-browser authors.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: The view ================================================================================
+
+## What a view reports to its application, one at a time (the callbacks of ViewImplementation).
+pub enum WebViewEvent as u8:
+    none_ = 0
+    ## on_load_start: a navigation began (webview_url is its URL).
+    load_started = 1
+    ## on_load_finish: the document finished loading.
+    load_finished = 2
+    ## on_title_change.
+    title_changed = 3
+    ## on_url_change.
+    url_changed = 4
+    ## on_cursor_change.
+    cursor_changed = 5
+    ## on_link_hover (webview_hovered_link is the link).
+    link_hovered = 6
+    ## on_link_unhover.
+    link_unhovered = 7
+    ## did_update_navigation_buttons_state: webview_can_go_back or _forward changed.
+    navigation_buttons_changed = 8
+    ## on_ready_to_paint: a new frame is presented (webview_copy_frame).
+    frame_ready = 9
+
+## ViewImplementation, in process. See the header for where it lives.
+pub struct WebView:
+    var m_view_id: u64
+    var m_client: WebViewPageClient*?
+    var m_region: WebViewRootRegion*?
+    var m_url: web_url.Url
+    var m_title: ak.Utf16String
+    var m_viewport_size: gfx.IntSize
+    var m_device_pixel_ratio: f64
+    var m_zoom_level: f64
+    var m_maximum_frames_per_second: f64
+    ## ViewImplementation::m_pending_input_events: sent, not yet handled.
+    var m_pending_input_events: ak.Queue[web.InputEvent]
+    ## Keys the page did not handle (on_finish_handling_key_event), for the application.
+    var m_unhandled_key_events: ak.Queue[web.KeyEvent]
+    var m_is_loading: bool
+    var m_back_enabled: bool
+    var m_forward_enabled: bool
+    var m_cursor: gfx.StandardCursor
+    var m_hovered_link: web_url.Url?
+    var m_events: ak.Queue[WebViewEvent]
+    ## The presented frame (view_pixels.lucb).
+    var m_frame: WebViewFrame
+    ## The screenshot the page took last (view_pixels.lucb).
+    var m_screenshot: gfx.Bitmap*?
+
+## The next view id (ViewImplementation's s_view_count, from 1).
+var webview_view_count: u64 = 1
+
+## A new view of `size` device pixels at `device_pixel_ratio` on about:blank: the view, then
+## its page as PageHost makes one (its client and a fresh top-level traversable), then
+## initialize_client's steps. Runs with the VM's heap current.
+pub func webview_create(size: gfx.IntSize, device_pixel_ratio: f64) -> WebView*:
+    let platform = webview_platform()
+    var view: WebView* = ---
+    with memory.heap:
+        view = new WebView(m_view_id = webview_view_count, m_client = none, m_region = none, m_url = web_url.about_blank(), m_title = ak.Utf16String(),
+                           m_viewport_size = size, m_device_pixel_ratio = device_pixel_ratio, m_zoom_level = 1.0, m_maximum_frames_per_second = 60.0,
+                           m_is_loading = false, m_back_enabled = false, m_forward_enabled = false, m_cursor = gfx.StandardCursor.arrow,
+                           m_hovered_link = none, m_frame = WebViewFrame(), m_screenshot = none) else trap("out of memory")
+    webview_view_count += 1
+    view.m_region = webview_root_region_create(webview_heap(), (const void*)view, memory.size_of(WebView))
+
+    let client = webview_page_client_create(platform.vm, view, view.m_view_id)
+    view.m_client = client
+    let page = client.m_page else trap("webview: no page")
+    let traversable = webview_page_host_create_top_level_traversable(page)
+
+    # ViewImplementation::initialize_client.
+    client.m_zoom_level = view.m_zoom_level
+    webview_page_client_set_viewport(client, size, device_pixel_ratio)
+    web.page_set_viewport_is_fullscreen(page, web.ViewportIsFullscreen.no)
+    client.m_maximum_frames_per_second = view.m_maximum_frames_per_second
+    web.html_traversable_navigable_set_system_visibility_state(traversable, web.HtmlVisibilityState.visible)
+    web.page_set_window_size(page, size)
+    # JavaScript (luce-js) is phase 3: pages run as Page::set_is_scripting_enabled(false) has them,
+    # as SVG-as-image documents and web_test's pages do (<noscript> content shows).
+    web.page_set_is_scripting_enabled(page, false)
+    return view
+
+## Ends the view: its page is left to the collector (PageHost::remove_page), its frame and
+## state go.
+pub func webview_destroy(view: WebView*):
+    if let client = view.m_client:
+        if let page = client.m_page:
+            let traversable = web.page_top_level_traversable(page)
+            web.html_traversable_navigable_set_system_visibility_state(traversable, web.HtmlVisibilityState.hidden)
+        if let frame_timer = client.m_frame_timer:
+            web.core_timer_stop(frame_timer)
+        client.m_view = none
+    view.m_client = none
+    webview_frame_release(&view.m_frame)
+    if let region = view.m_region:
+        webview_root_region_destroy(region)
+    free(view) in memory.heap
+
+## The view's page client.
+pub func webview_client(view: const WebView*) -> WebViewPageClient*:
+    return view.m_client else trap("webview: the view is destroyed")
+
+## The view's page.
+pub func webview_page(view: const WebView*) -> web.Page*:
+    return webview_client(view).m_page else trap("webview: no page")
+
+## Queues `event` for the application.
+func webview_post(view: WebView*, event: WebViewEvent):
+    ak.queue_enqueue(&view.m_events, event)
+
+## The next event the view reported, none_ when there is none.
+pub func webview_take_event(view: WebView*) -> WebViewEvent:
+    if ak.queue_is_empty(&view.m_events):
+        return WebViewEvent.none_
+    return ak.queue_dequeue(&view.m_events)
+
+# mark: Loading and history =====================================================================
+
+## Ported from ViewImplementation.cpp:182 ViewImplementation::load (with ConnectionFromClient::load_url).
+pub func webview_load(view: WebView*, url: web_url.Url):
+    webview_set_url(view, url)
+    web.page_load(webview_page(view), url)
+
+## Ported from ViewImplementation.cpp:188 ViewImplementation::load_html (ConnectionFromClient::load_html).
+pub func webview_load_html(view: WebView*, html: ak.StringView):
+    web.page_load_html(webview_page(view), html)
+
+## Ported from ViewImplementation.cpp:193 ViewImplementation::load_navigation_error_page.
+pub func webview_load_navigation_error_page(view: WebView*, text: ak.StringView):
+    let html = webview_navigation_error_page_html(text)
+    webview_load_html(view, ak.string_bytes_as_string_view(&html))
+
+## Ported from ViewImplementation.cpp:204 ViewImplementation::reload (ConnectionFromClient::reload).
+pub func webview_reload(view: WebView*):
+    web.page_reload(webview_page(view))
+
+## Ported from ViewImplementation.cpp:209 ViewImplementation::traverse_the_history_by_delta.
+pub func webview_traverse_the_history_by_delta(view: WebView*, delta: i32):
+    web.page_traverse_the_history_by_delta(webview_page(view), delta)
+
+## Stops loading (see the header): the HTML "stop loading" steps of the top-level traversable.
+pub func webview_stop(view: WebView*):
+    let traversable = web.page_top_level_traversable(webview_page(view))
+    web.html_navigable_stop_loading((web.HtmlNavigable*)traversable)
+    if view.m_is_loading:
+        view.m_is_loading = false
+        webview_post(view, WebViewEvent.load_finished)
+
+## Ported from ViewImplementation.cpp:93 ViewImplementation::set_url.
+func webview_set_url(view: WebView*, url: web_url.Url):
+    if web_url.url_equals(&view.m_url, url):
+        return
+    view.m_url = url
+
+# mark: Viewport ================================================================================
+
+## Ported from ViewImplementation.cpp:631 ViewImplementation::handle_resize, for a viewport of
+## `size` device pixels at `device_pixel_ratio` (ConnectionFromClient::set_viewport).
+pub func webview_set_viewport(view: WebView*, size: gfx.IntSize, device_pixel_ratio: f64):
+    if size == view.m_viewport_size and device_pixel_ratio == view.m_device_pixel_ratio:
+        return
+    view.m_viewport_size = size
+    view.m_device_pixel_ratio = device_pixel_ratio
+    let page = webview_page(view)
+    webview_page_client_set_viewport(webview_client(view), size, device_pixel_ratio)
+    web.page_set_viewport_is_fullscreen(page, web.ViewportIsFullscreen.no)
+    web.page_set_window_size(page, size)
+
+## Ported from ViewImplementation.cpp:222 ViewImplementation::set_zoom (with update_zoom: the
+## client's zoom level), within ZOOM_MIN_LEVEL..ZOOM_MAX_LEVEL.
+pub func webview_set_zoom(view: WebView*, zoom_level: f64):
+    view.m_zoom_level = math.max(0.3, math.min(zoom_level, 5.0))
+    webview_page_client_set_zoom_level(webview_client(view), view.m_zoom_level)
+
+# mark: What the page reported (WebContentClient) ===============================================
+
+## WebContentClient::did_start_loading: the URL, then on_load_start.
+func webview_did_start_loading(view: WebView*, url: web_url.Url, is_redirect: bool):
+    webview_set_url(view, url)
+    view.m_is_loading = true
+    webview_post(view, WebViewEvent.load_started)
+
+## WebContentClient::did_finish_loading: the URL, then on_load_finish.
+func webview_did_finish_loading(view: WebView*, url: web_url.Url):
+    webview_set_url(view, url)
+    view.m_is_loading = false
+    webview_post(view, WebViewEvent.load_finished)
+
+## WebContentClient::did_change_title: the view's title (ViewImplementation::set_title), then
+## on_title_change.
+func webview_did_change_title(view: WebView*, title: ak.Utf16String):
+    view.m_title = title
+    webview_post(view, WebViewEvent.title_changed)
+
+## WebContentClient::did_change_url: the view's URL, then on_url_change.
+func webview_did_change_url(view: WebView*, url: web_url.Url):
+    webview_set_url(view, url)
+    webview_post(view, WebViewEvent.url_changed)
+
+## WebContentClient::did_request_cursor_change: on_cursor_change. An image cursor (CSS
+## `cursor: url(...)`) is shown as the arrow: the application's window has standard cursors.
+func webview_did_request_cursor_change(view: WebView*, cursor: gfx.Cursor):
+    let standard = match cursor:
+        .standard_cursor(value) => value
+        .image_cursor(_) => gfx.StandardCursor.arrow
+    if standard == view.m_cursor:
+        return
+    view.m_cursor = standard
+    webview_post(view, WebViewEvent.cursor_changed)
+
+## WebContentClient::did_hover_link: on_link_hover.
+func webview_did_hover_link(view: WebView*, url: web_url.Url):
+    view.m_hovered_link = url
+    webview_post(view, WebViewEvent.link_hovered)
+
+## WebContentClient::did_unhover_link: on_link_unhover.
+func webview_did_unhover_link(view: WebView*):
+    view.m_hovered_link = none
+    webview_post(view, WebViewEvent.link_unhovered)
+
+## ViewImplementation::did_update_navigation_buttons_state: the back and forward actions'
+## enabled states.
+func webview_did_update_navigation_buttons_state(view: WebView*, back_enabled: bool, forward_enabled: bool):
+    view.m_back_enabled = back_enabled
+    view.m_forward_enabled = forward_enabled
+    webview_post(view, WebViewEvent.navigation_buttons_changed)
+
+# mark: State ===================================================================================
+
+## ViewImplementation::url.
+pub func webview_url(view: const WebView*) -> web_url.Url:
+    return view.m_url
+
+## ViewImplementation::title.
+pub func webview_title(view: const WebView*) -> ak.Utf16String:
+    return view.m_title
+
+## Whether a load started and has not finished.
+pub func webview_is_loading(view: const WebView*) -> bool:
+    return view.m_is_loading
+
+## The back action's enabled state.
+pub func webview_can_go_back(view: const WebView*) -> bool:
+    return view.m_back_enabled
+
+## The forward action's enabled state.
+pub func webview_can_go_forward(view: const WebView*) -> bool:
+    return view.m_forward_enabled
+
+## The cursor the page asked for.
+pub func webview_cursor(view: const WebView*) -> gfx.StandardCursor:
+    return view.m_cursor
+
+## The link under the pointer, if any.
+pub func webview_hovered_link(view: const WebView*) -> web_url.Url?:
+    return view.m_hovered_link
+
+## Ported from ViewImplementation.cpp ViewImplementation::selected_text
+## (ConnectionFromClient::get_selected_text): the focused navigable's selected text.
+pub func webview_selected_text(view: WebView*) -> ak.String:
+    return web.html_navigable_selected_text(web.page_focused_navigable(webview_page(view)))
+
+## Ported from ViewImplementation.cpp ViewImplementation::select_all (ConnectionFromClient::select_all).
+pub func webview_select_all(view: WebView*):
+    web.html_navigable_select_all(web.page_focused_navigable(webview_page(view)))

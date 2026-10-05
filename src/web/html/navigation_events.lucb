@@ -1,0 +1,480 @@
+#==============================================================================================
+#
+#   navigation_events - HTML::Navigation: firing navigate events, aborting them
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibWeb/HTML/Navigation.cpp lines 747-1395: abort_the_ongoing_navigation,
+#       abort_a_navigate_event, promote_an_upcoming_api_method_tracker_to_ongoing, clean_up,
+#       the inner navigate event firing algorithm, fire_a_traverse_navigate_event and
+#       fire_a_push_replace_reload_navigate_event (region shell: every navigation a link or the
+#       history makes fires one). The navigate event is dispatched at the page's Navigation as in
+#       the donor; without script nobody listens, cancels or intercepts it.
+#
+#       Phase 3 (traps where reached): the navigation API method trackers (made by script's
+#       navigation.navigate(), reload(), traverseTo(), back(), forward(): the tracker fields hold
+#       none until then), an intercepted navigation (only a script's NavigateEvent.intercept()
+#       leaves the interception state "none": the NavigationTransition and its promises), and
+#       invoking the navigation handlers intercept() collects.
+#
+#       Copyright (c) 2023, Andrew Kaster <akaster@serenityos.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Aborting ================================================================================
+
+## Ported from Navigation.cpp:747 Web::HTML::Navigation::abort_the_ongoing_navigation.
+## https://html.spec.whatwg.org/multipage/nav-history-apis.html#abort-the-ongoing-navigation
+pub func html_navigation_abort_the_ongoing_navigation(this: HtmlNavigation*, error_: IdlDomException*? = none):
+    let realm = html_relevant_realm((JsObject*)this)
+
+    # To abort the ongoing navigation given a Navigation navigation and an optional DOMException error:
+
+    # 1. Let event be navigation's ongoing navigate event.
+    # 2. Assert: event is not null.
+    let event = html_navigation_ongoing_navigate_event(this) else trap("VERIFY: event != nullptr")
+
+    # 3. Set navigation's focus changed during ongoing navigation to false.
+    this.m_focus_changed_during_ongoing_navigation = false
+
+    # 4. Set navigation's suppress normal scroll restoration during ongoing navigation to false.
+    this.m_suppress_scroll_restoration_during_ongoing_navigation = false
+
+    # 5. If error was not given, then let error be a new "AbortError" DOMException created in navigation's relevant realm.
+    let error_value = error_ else idl_abort_error_create(realm, ak.utf16_string_from_str("Navigation aborted"))
+
+    # 6. If event's dispatch flag is set, then set event's canceled flag to true.
+    if dom_event_dispatched(event.dom_event()):
+        dom_event_set_cancelled(event.dom_event(), true)
+
+    # 7. Abort event given error.
+    html_navigation_abort_a_navigate_event(this, event, error_value)
+
+## Ported from Navigation.cpp:780 Web::HTML::Navigation::abort_a_navigate_event.
+## https://html.spec.whatwg.org/multipage/nav-history-apis.html#abort-a-navigateevent
+pub func html_navigation_abort_a_navigate_event(this: HtmlNavigation*, event: HtmlNavigateEvent*, reason: IdlDomException*):
+    # 1. Let navigation be event's relevant global object's navigation API.
+    # NB: Navigation is `this`.
+
+    # 2. Signal abort on event's abort controller given reason.
+    let reason_value = js_value_from_object((JsObject*)reason)
+    dom_abort_controller_abort(html_navigate_event_abort_controller(event), reason_value)
+
+    # 3. Let errorInfo be the result of extracting error information from reason.
+    let realm = bind_platform_object_realm(this.bind_platform_object())
+    let error_info = html_extract_error_information(realm_vm(realm), reason_value)
+
+    # 4. Set navigation's ongoing navigate event to null.
+    this.m_ongoing_navigate_event = none
+
+    # 5. If navigation's ongoing API method tracker is non-null, then reject the finished promise for apiMethodTracker
+    #    with reason.
+    if this.m_ongoing_api_method_tracker != none:
+        trap("unported (P3): Web::HTML::Navigation::reject_the_finished_promise (navigation API method trackers)")
+
+    # 6. Fire an event named navigateerror at navigation using ErrorEvent, with additional attributes initialized
+    #    according to errorInfo.
+    var event_init = html_error_event_init_default()
+    event_init.filename = error_info.filename
+    event_init.message = error_info.message
+    event_init.lineno = error_info.lineno
+    event_init.colno = error_info.colno
+    event_init.error_ = error_info.error_
+
+    _ = dom_event_target_dispatch_event(this.dom_event_target(), html_error_event_create(realm, html_event_names_navigateerror, event_init).dom_event())
+
+    # 7. If navigation's transition is null, then return.
+    if this.m_transition == none:
+        return
+
+    # 8.-10. Reject the transition's committed and finished promises, and set the transition to null.
+    trap("unported (P3): the NavigationTransition of an intercepted navigation")
+
+## Ported from Navigation.cpp:825 Web::HTML::Navigation::promote_an_upcoming_api_method_tracker_to_ongoing.
+## https://html.spec.whatwg.org/multipage/nav-history-apis.html#promote-an-upcoming-api-method-tracker-to-ongoing
+func html_navigation_promote_an_upcoming_api_method_tracker_to_ongoing(this: HtmlNavigation*, destination_key: ak.String?):
+    # 1. Assert: navigation's ongoing API method tracker is null.
+    assert(this.m_ongoing_api_method_tracker == none)
+
+    # 2. If destinationKey is not null, then:
+    if let key = destination_key:
+        # 1. Assert: navigation's upcoming non-traverse API method tracker is null.
+        assert(this.m_upcoming_non_traverse_api_method_tracker == none)
+
+        # 2. If navigation's upcoming traverse API method trackers[destinationKey] exists, then:
+        if let tracker = ak.hash_map_get_k(&this.m_upcoming_traverse_api_method_trackers, key):
+            # 1. Set navigation's ongoing API method tracker to navigation's upcoming traverse API method trackers[destinationKey].
+            this.m_ongoing_api_method_tracker = *tracker
+
+            # 2. Remove navigation's upcoming traverse API method trackers[destinationKey].
+            _ = ak.hash_map_remove_k(&this.m_upcoming_traverse_api_method_trackers, key)
+    else:
+        # 3. Otherwise:
+        # 1. Set navigation's ongoing API method tracker to navigation's upcoming non-traverse API method tracker.
+        this.m_ongoing_api_method_tracker = this.m_upcoming_non_traverse_api_method_tracker
+
+        # 2. Set navigation's upcoming non-traverse API method tracker to null.
+        this.m_upcoming_non_traverse_api_method_tracker = none
+
+# mark: The inner navigate event firing algorithm ===============================================
+
+## The captures of the inner algorithm's wait-for-all steps.
+struct HtmlNavigationNavigateEventCaptures:
+    var navigation: HtmlNavigation*
+    var event: HtmlNavigateEvent*
+
+## The inner algorithm's step 34.4 success steps.
+func html_navigation_navigate_event_success_steps(context: void*?, results: const ak.Vector[JsValue]*):
+    let captures = (HtmlNavigationNavigateEventCaptures*)(context else trap("no captures"))
+    let this = captures.navigation
+    let event = captures.event
+
+    # 1. If event's relevant global object's associated Document is not fully active, then abort these steps.
+    let relevant_global_object = (HtmlWindow*)html_relevant_global_object((JsObject*)event)
+    let realm = bind_platform_object_realm(event.bind_platform_object())
+    if not dom_document_is_fully_active(html_window_associated_document(relevant_global_object)):
+        return
+
+    # 2. If event's abort controller's signal is aborted, then abort these steps.
+    if dom_abort_signal_aborted(dom_abort_controller_signal(html_navigate_event_abort_controller(event))):
+        return
+
+    # 3. Assert: event equals navigation's ongoing navigate event.
+    assert(this.m_ongoing_navigate_event == (HtmlNavigateEvent*?)event)
+
+    # 4. Set navigation's ongoing navigate event to null.
+    this.m_ongoing_navigate_event = none
+
+    # 5. Finish event given true.
+    html_navigate_event_finish(event, true)
+
+    # 6. If apiMethodTracker is non-null, then resolve the finished promise for apiMethodTracker.
+    # (apiMethodTracker is null before phase 3, see the header.)
+
+    # FIXME: Implement https://dom.spec.whatwg.org/#concept-event-fire somewhere
+    # 7. Fire an event named navigatesuccess at navigation.
+    _ = dom_event_target_dispatch_event(this.dom_event_target(), dom_event_create(realm, html_event_names_navigatesuccess))
+
+    # 8. If navigation's transition is not null, then resolve navigation's transition's finished promise with undefined.
+    if this.m_transition != none:
+        trap("unported (P3): the NavigationTransition of an intercepted navigation")
+
+    # 9. Set navigation's transition to null.
+    this.m_transition = none
+
+## The inner algorithm's step 34.4 failure steps (a rejected navigation handler's promise: phase 3).
+func html_navigation_navigate_event_failure_steps(context: void*?, rejection_reason: JsValue):
+    trap("unported (P3): a navigation handler's rejected promise (Navigation::inner_navigate_event_firing_algorithm)")
+
+## Ported from Navigation.cpp:936 Web::HTML::Navigation::inner_navigate_event_firing_algorithm.
+## https://html.spec.whatwg.org/multipage/nav-history-apis.html#inner-navigate-event-firing-algorithm
+func html_navigation_inner_navigate_event_firing_algorithm(this: HtmlNavigation*, navigation_type: BindNavigationType, destination: HtmlNavigationDestination*, user_involvement: HtmlUserNavigationInvolvement,
+                                                           source_element: DomElement*?, form_data_entry_list: ak.Vector[XhrFormDataEntry]?, download_request_filename: ak.String?,
+                                                           classic_history_api_state: ak.Vector[u8]?) -> bool:
+    # NOTE: Specification assumes that ongoing navigation event is cancelled before dispatching next navigation event.
+    if this.m_ongoing_navigate_event != none:
+        html_navigation_abort_the_ongoing_navigation(this)
+
+    let realm = html_relevant_realm((JsObject*)this)
+
+    # 1. If navigation has entries and events disabled, then:
+    # NOTE: These assertions holds because traverseTo(), back(), and forward() will immediately fail when entries and events are disabled
+    #       (since there are no entries to traverse to), and if our starting point is instead navigate() or reload(),
+    #       then we avoided setting the upcoming non-traverse API method tracker in the first place.
+    if html_navigation_has_entries_and_events_disabled(this):
+        # 1. Assert: navigation's ongoing API method tracker is null.
+        assert(this.m_ongoing_api_method_tracker == none)
+
+        # 2. Assert: navigation's upcoming non-traverse API method tracker is null.
+        assert(this.m_upcoming_non_traverse_api_method_tracker == none)
+
+        # 3. Assert: navigation's upcoming traverse API method trackers is empty.
+        assert(ak.hash_map_is_empty(&this.m_upcoming_traverse_api_method_trackers))
+
+        # 4. Return true.
+        return true
+
+    # 2. Let destinationKey be null.
+    var destination_key: ak.String? = none
+
+    # 3. If destination's entry is non-null, then set destinationKey to destination's entry's key.
+    if let entry = html_navigation_destination_navigation_history_entry(destination):
+        destination_key = html_navigation_history_entry_key(entry)
+
+    # 4. Assert: destinationKey is not the empty string.
+    if let key = destination_key:
+        assert(not ak.string_is_empty(&key))
+
+    # 5. Promote an upcoming API method tracker to ongoing given navigation and destinationKey.
+    html_navigation_promote_an_upcoming_api_method_tracker_to_ongoing(this, destination_key)
+
+    # 6. Let apiMethodTracker be navigation's ongoing API method tracker.
+    if this.m_ongoing_api_method_tracker != none:
+        trap("unported (P3): navigation API method trackers (Navigation::inner_navigate_event_firing_algorithm)")
+
+    # 7. Let navigable be navigation's relevant global object's navigable.
+    let relevant_global_object = as_html_window((gc.Cell*)html_relevant_global_object((JsObject*)this))
+    let navigable = html_window_navigable(relevant_global_object) else trap("VERIFY: navigable")
+
+    # 8. Let document be navigation's relevant global object's associated Document.
+    let document = html_window_associated_document(relevant_global_object)
+
+    # Note: We create the Event in this algorithm instead of passing it in,
+    #       and have all the following "initialize" steps set up the event init
+    var event_init = HtmlNavigateEventInit()
+
+    # 9.  If document can have its URL rewritten to destination's URL,
+    #     and either destination's is same document is true or navigationType is not "traverse",
+    #     then initialize event's canIntercept to true. Otherwise, initialize it to false.
+    let destination_url = html_navigation_destination_raw_url(destination)
+    event_init.can_intercept = html_can_have_its_url_rewritten(document, destination_url) and (html_navigation_destination_same_document(destination) or navigation_type != BindNavigationType.traverse)
+
+    # 10. Let traverseCanBeCanceled be true if all of the following are true:
+    #      - navigable is a top-level traversable;
+    #      - destination's is same document is true; and
+    #      - either userInvolvement is not "browser UI", or navigation's relevant global object has history-action activation.
+    #     Otherwise, let it be false.
+    let top_level_and_same_document = html_navigable_is_top_level_traversable(navigable) and html_navigation_destination_same_document(destination)
+    let traverse_can_be_canceled = top_level_and_same_document and (user_involvement != HtmlUserNavigationInvolvement.browser_ui or html_window_has_history_action_activation(relevant_global_object))
+
+    # 11. If either:
+    #      - navigationType is not "traverse"; or
+    #      - traverseCanBeCanceled is true
+    #     then initialize event's cancelable to true. Otherwise, initialize it to false.
+    event_init.event_init.cancelable = navigation_type != BindNavigationType.traverse or traverse_can_be_canceled
+
+    # 12. Initialize event's type to "navigate".
+    # AD-HOC: Happens later, when calling the factory function
+
+    # 13. Initialize event's navigationType to navigationType.
+    event_init.navigation_type = navigation_type
+
+    # 14. Initialize event's destination to destination.
+    event_init.destination = destination
+
+    # 15. Initialize event's downloadRequest to downloadRequestFilename.
+    event_init.download_request = download_request_filename
+
+    # 16. If apiMethodTracker is not null, then initialize event's info to apiMethodTracker's info. Otherwise, initialize it to undefined.
+    event_init.info = js_undefined()
+
+    # FIXME: 17: Initialize event's hasUAVisualTransition to true if a visual transition, to display a cached rendered state
+    #     of the document's latest entry, was done by the user agent. Otherwise, initialize it to false.
+    event_init.has_ua_visual_transition = false
+
+    # 18. Initialize event's sourceElement to sourceElement.
+    event_init.source_element = source_element
+
+    # 19. Set event's abort controller to a new AbortController created in navigation's relevant realm.
+    # AD-HOC: Set on the NavigateEvent later after construction
+    let abort_controller = dom_abort_controller_construct_impl(realm) else trap("MUST: AbortController::construct_impl")
+
+    # 20. Initialize event's signal to event's abort controller's signal.
+    event_init.signal = dom_abort_controller_signal(abort_controller)
+
+    # 21. Let currentURL be document's URL.
+    let current_url = dom_document_url(document)
+
+    # 22. If all of the following are true:
+    #  - event's classic history API state is null;
+    #  - destination's is same document is true;
+    #  - destination's URL equals currentURL with exclude fragments set to true; and
+    #  - destination's URL's fragment is not identical to currentURL's fragment,
+    #  then initialize event's hashChange to true. Otherwise, initialize it to false.
+    let same_document_without_state = classic_history_api_state == none and html_navigation_destination_same_document(destination)
+    let fragment_differs = not html_optional_strings_identical(web_url.url_fragment(&destination_url), web_url.url_fragment(&current_url))
+    event_init.hash_change = same_document_without_state and web_url.url_equals(&destination_url, current_url, web_url.ExcludeFragment.yes) and fragment_differs
+
+    # 23. If userInvolvement is not "none", then initialize event's userInitiated to true. Otherwise, initialize it to false.
+    event_init.user_initiated = user_involvement != HtmlUserNavigationInvolvement.none_
+
+    # 24. If formDataEntryList is not null, then initialize event's formData to a new FormData created in navigation's relevant realm,
+    #     associated to formDataEntryList. Otherwise, initialize it to null.
+    if let entry_list = form_data_entry_list:
+        event_init.form_data = xhr_form_data_construct_impl(realm, entry_list) else trap("MUST: XHR::FormData::construct_impl")
+    else:
+        event_init.form_data = none
+
+    # AD-HOC: *Now* we have all the info required to create the event
+    let event = html_navigate_event_create(realm, html_event_names_navigate, event_init)
+    event.m_abort_controller = abort_controller
+
+    # AD-HOC: This is supposed to be set in "fire a <type> navigate event", and is only non-null when
+    #         we're doing a push or replace. We set it here because we create the event here
+    event.m_classic_history_api_state = classic_history_api_state
+
+    # 25. Assert: navigation's ongoing navigate event is null.
+    assert(this.m_ongoing_navigate_event == none)
+
+    # 26. Set navigation's ongoing navigate event to event.
+    this.m_ongoing_navigate_event = event
+
+    # 27. Set navigation's focus changed during ongoing navigation to false.
+    this.m_focus_changed_during_ongoing_navigation = false
+
+    # 28. Set navigation's suppress normal scroll restoration during ongoing navigation to false.
+    this.m_suppress_scroll_restoration_during_ongoing_navigation = false
+
+    # 29. Let dispatchResult be the result of dispatching event at navigation.
+    let dispatch_result = dom_event_target_dispatch_event(this.dom_event_target(), event.dom_event())
+
+    # 30. If dispatchResult is false:
+    if not dispatch_result:
+        # 1. If navigationType is "traverse", then consume history-action user activation given navigation's relevant global object.
+        if navigation_type == BindNavigationType.traverse:
+            html_window_consume_history_action_user_activation(relevant_global_object)
+
+        # 2. If event's abort controller's signal is not aborted, then abort the ongoing navigation given navigation.
+        if not dom_abort_signal_aborted(dom_abort_controller_signal(html_navigate_event_abort_controller(event))):
+            html_navigation_abort_the_ongoing_navigation(this)
+
+        # 3. Return false.
+        return false
+
+    # 31. Let endResultIsSameDocument be true if event's interception state
+    #     is not "none" or event's destination's is same document is true.
+    let end_result_is_same_document = event.m_interception_state != HtmlNavigateEventInterceptionState.none_ or html_navigation_destination_same_document(event.m_destination)
+
+    # 32. Prepare to run script given navigation's relevant settings object.
+    # NOTE: There's a massive spec note here
+    var execution_context: HtmlTemporaryExecutionContext = ---
+    html_temporary_execution_context_construct_realm(&execution_context, realm, HtmlTemporaryExecutionContextCallbacksEnabled.yes)
+    defer html_temporary_execution_context_destruct(&execution_context)
+
+    # 33. If event's interception state is not "none": (only a script's intercept() sets it)
+    if event.m_interception_state != HtmlNavigateEventInterceptionState.none_:
+        trap("unported (P3): an intercepted navigation (NavigationTransition, Navigation::inner_navigate_event_firing_algorithm step 33)")
+
+    # 34. If endResultIsSameDocument is true:
+    if end_result_is_same_document:
+        # 1. Let promisesList be an empty list.
+        var promises_list: ak.Vector[const JsPromiseCapability*]
+
+        # 2. For each handler of event's navigation handler list: (invoking a handler is phase 3; only intercept() adds one)
+        if not ak.vector_is_empty(&event.m_navigation_handler_list):
+            trap("unported (P3): invoking a navigation handler (Navigation::inner_navigate_event_firing_algorithm step 34.2)")
+
+        # 3. If promisesList's size is 0, then set promisesList to « a promise resolved with undefined ».
+        if ak.vector_is_empty(&promises_list):
+            ak.vector_append_t(&promises_list, idl_create_resolved_promise(realm, js_undefined()))
+
+        # 4. Wait for all of promisesList, with the following success steps and failure steps.
+        let captures = new HtmlNavigationNavigateEventCaptures(navigation = this, event = event) else trap("out of memory")
+        idl_wait_for_all(realm, ak.vector_span(&promises_list), ak.Function1[const ak.Vector[JsValue]*, unit](call = html_navigation_navigate_event_success_steps, context = captures),
+                         ak.Function1[JsValue, unit](call = html_navigation_navigate_event_failure_steps, context = captures))
+
+    # 35. Otherwise, if apiMethodTracker is non-null, then clean up apiMethodTracker. (It is null, see step 6.)
+
+    # 36. Clean up after running script given navigation's relevant settings object.
+    # Handled by TemporaryExecutionContext destructor from step 31
+
+    # 37. If event's interception state is "none", then return true.
+    # 38. Return false.
+    return event.m_interception_state == HtmlNavigateEventInterceptionState.none_
+
+## `a.fragment() != b.fragment()` of two Optional<String>s, inverted: both null, or both the same string.
+func html_optional_strings_identical(a: ak.String?, b: ak.String?) -> bool:
+    if let first = a:
+        if let second = b:
+            return ak.string_equals(&first, &second)
+        return false
+    return b == none
+
+# mark: Firing navigate events ==================================================================
+
+## Ported from Navigation.cpp:1294 Web::HTML::Navigation::fire_a_traverse_navigate_event.
+## https://html.spec.whatwg.org/multipage/nav-history-apis.html#fire-a-traverse-navigate-event
+pub func html_navigation_fire_a_traverse_navigate_event(this: HtmlNavigation*, destination_she: HtmlSessionHistoryEntry*, user_involvement: HtmlUserNavigationInvolvement) -> bool:
+    let realm = html_relevant_realm((JsObject*)this)
+    let vm = realm_vm(realm)
+
+    # 1. Let event be the result of creating an event given NavigateEvent, in navigation's relevant realm.
+    # 2. Set event's classic history API state to null.
+    # AD-HOC: These are handled in the inner algorithm
+
+    # 3. Let destination be a new NavigationDestination created in navigation's relevant realm.
+    let destination = html_navigation_destination_create(realm)
+
+    # 4. Set destination's URL to destinationSHE's URL.
+    html_navigation_destination_set_url(destination, html_session_history_entry_url(destination_she))
+
+    # 5. Let destinationNHE be the NavigationHistoryEntry in navigation's entry list whose session history entry is destinationSHE,
+    #    or null if no such NavigationHistoryEntry exists.
+    var destination_nhe: HtmlNavigationHistoryEntry*? = none
+    for nhe in ak.vector_span(&this.m_entry_list):
+        if html_navigation_history_entry_session_history_entry(nhe) == destination_she:
+            destination_nhe = nhe
+            break
+
+    # 6. If destinationNHE is non-null, then:
+    if let found = destination_nhe:
+        # 1. Set destination's entry to destinationNHE.
+        html_navigation_destination_set_entry(destination, found)
+
+        # 2. Set destination's state to destinationSHE's navigation API state.
+        html_navigation_destination_set_state(destination, html_session_history_entry_navigation_api_state(destination_she))
+    else:
+        # 7. Otherwise:
+        # 1. Set destination's entry to null.
+        html_navigation_destination_set_entry(destination, none)
+
+        # 2. Set destination's state to StructuredSerializeForStorage(null).
+        html_navigation_destination_set_state(destination, html_structured_serialize_for_storage(vm, js_null()) else trap("MUST: structured_serialize_for_storage"))
+
+    # 8. Set destination's is same document to true if destinationSHE's document is equal to
+    #    navigation's relevant global object's associated Document; otherwise false.
+    let associated_document = html_window_associated_document(as_html_window((gc.Cell*)html_relevant_global_object((JsObject*)this)))
+    let document_state = html_session_history_entry_document_state(destination_she) else trap("no document state")
+    var is_same_document = false
+    if let document_id = html_document_state_document_id(document_state):
+        is_same_document = document_id == dom_node_unique_id(associated_document.dom_node())
+    html_navigation_destination_set_is_same_document(destination, is_same_document)
+
+    # 9. Return the result of performing the inner navigate event firing algorithm given navigation, "traverse",
+    #    event, destination, userInvolvement, sourceElement, null, and null.
+    # AD-HOC: We don't pass the event, but we do pass the classic_history_api state at the end to be set later
+    return html_navigation_inner_navigate_event_firing_algorithm(this, BindNavigationType.traverse, destination, user_involvement, none, none, none, none)
+
+## Ported from Navigation.cpp:1345 Web::HTML::Navigation::fire_a_push_replace_reload_navigate_event.
+## https://html.spec.whatwg.org/multipage/nav-history-apis.html#fire-a-push/replace/reload-navigate-event
+pub func html_navigation_fire_a_push_replace_reload_navigate_event(this: HtmlNavigation*, navigation_type: BindNavigationType, destination_url: web_url.Url, is_same_document: bool, user_involvement: HtmlUserNavigationInvolvement,
+                                                                   source_element: DomElement*?, form_data_entry_list: ak.Vector[XhrFormDataEntry]?, a_navigation_api_state: ak.Vector[u8]?,
+                                                                   classic_history_api_state: ak.Vector[u8]? = none) -> bool:
+    let realm = html_relevant_realm((JsObject*)this)
+    let vm = realm_vm(realm)
+
+    # This fulfills the entry requirement: an optional serialized state navigationAPIState (default StructuredSerializeForStorage(null))
+    var navigation_api_state = a_navigation_api_state
+    if navigation_api_state == none:
+        navigation_api_state = html_structured_serialize_for_storage(vm, js_null()) else trap("MUST: structured_serialize_for_storage")
+
+    # 1. If isSameDocument is true:
+    if is_same_document:
+        # 1. While navigation's ongoing navigate event is not null:
+        while this.m_ongoing_navigate_event != none:
+            # 1. Abort the ongoing navigation given navigation.
+            html_navigation_abort_the_ongoing_navigation(this)
+
+    # 2. Let event be the result of creating an event given NavigateEvent, in navigation's relevant realm.
+    # 3. Set event's classic history API state to classicHistoryAPIState.
+    # AD-HOC: These are handled in the inner algorithm
+
+    # 4. Let destination be a new NavigationDestination created in navigation's relevant realm.
+    let destination = html_navigation_destination_create(realm)
+
+    # 5. Set destination's URL to destinationURL.
+    html_navigation_destination_set_url(destination, destination_url)
+
+    # 6. Set destination's entry to null.
+    html_navigation_destination_set_entry(destination, none)
+
+    # 7. Set destination's state to navigationAPIState.
+    html_navigation_destination_set_state(destination, navigation_api_state else trap("unreachable: set above"))
+
+    # 8. Set destination's is same document to isSameDocument.
+    html_navigation_destination_set_is_same_document(destination, is_same_document)
+
+    # 9. Return the result of performing the inner navigate event firing algorithm given navigation,
+    #    navigationType, event, destination, userInvolvement, sourceElement, formDataEntryList, and null.
+    # AD-HOC: We don't pass the event, but we do pass the classic_history_api state at the end to be set later
+    return html_navigation_inner_navigate_event_firing_algorithm(this, navigation_type, destination, user_involvement, source_element, form_data_entry_list, none, classic_history_api_state)

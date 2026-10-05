@@ -1,0 +1,143 @@
+#==============================================================================================
+#
+#   view_pixels - the presented frame and its pixels
+#
+#   DESCRIPTION:
+#       The page paints on its own schedule: "update the rendering" records a display list
+#       when the page changed (Navigable's needs-repaint), the rendering thread (on the main
+#       thread in this port, html/rendering_thread.lucb) plays it into the back store of the
+#       navigable's backing store pair, swaps the pair and presents the new front store to the
+#       client (PageClient::page_did_paint with its bitmap id), and it holds further frames back
+#       until the client says it is ready for the next one (Navigable::ready_to_paint).
+#
+#       Ladybird's UI gets the pair as shared images when the stores are allocated
+#       (page_did_allocate_backing_stores) and, on did_paint, swaps its front and back bitmaps
+#       when the id is the back one's (ViewImplementation::server_did_paint), tells its widget
+#       (on_ready_to_paint) and answers ready_to_paint. In process there is nothing to share
+#       (BackingStoreManager's create_shareable_bitmap_backing_stores keeps plain bitmaps,
+#       region r51b), so the view finds the presented store by its id in the rendering
+#       thread's stores, keeps it as its front frame, and answers ready_to_paint the same way.
+#       The application copies the frame out when it draws (webview_copy_frame): straight RGBA
+#       bytes, the format a texture upload takes.
+#
+#       Copyright (c) 2022-2023, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2023, Linus Groh <linusg@serenityos.org>
+#       Copyright (c) 2026 the luce-browser authors.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: The frame ===============================================================================
+
+## The view's front frame (ViewImplementation's front_bitmap and has_usable_bitmap).
+pub struct WebViewFrame:
+    ## The backing store presented last, none before the first frame.
+    var surface: gfx.PaintingSurface*? = none
+    var bitmap_id: i32 = -1
+    ## SharedBitmap::last_painted_size: the part of the store the frame covers.
+    var last_painted_size: gfx.IntSize = gfx.IntSize()
+    ## Counts presented frames; the application compares it to the frame it copied last.
+    var serial: u64 = 0
+
+## Forgets the frame (the store belongs to the navigable).
+func webview_frame_release(frame: WebViewFrame*):
+    frame.surface = none
+    frame.bitmap_id = -1
+
+## Ported from ViewImplementation.cpp:144 ViewImplementation::server_did_paint (see the header):
+## the store presented with `bitmap_id` becomes the front frame, on_ready_to_paint, then
+## ready_to_paint (ConnectionFromClient::ready_to_paint).
+func webview_server_did_paint(view: WebView*, bitmap_id: i32, size: gfx.IntSize):
+    let client = webview_client(view)
+    let page = client.m_page else trap("webview: no page")
+    let traversable = web.page_top_level_traversable(page)
+    let stores = &web.html_navigable_rendering_thread((web.HtmlNavigable*)traversable).m_thread_data.m_backing_stores
+    var surface: gfx.PaintingSurface*? = none
+    if stores.front_bitmap_id == bitmap_id:
+        surface = stores.front_store
+    elif stores.back_bitmap_id == bitmap_id:
+        surface = stores.back_store
+    if surface != none:
+        view.m_frame.surface = surface
+        view.m_frame.bitmap_id = bitmap_id
+        view.m_frame.last_painted_size = size
+        view.m_frame.serial += 1
+        webview_post(view, WebViewEvent.frame_ready)
+    webview_page_client_ready_to_paint(client)
+
+## Whether the view has presented a frame.
+pub func webview_has_frame(view: const WebView*) -> bool:
+    return view.m_frame.surface != none
+
+## The size of the presented frame in device pixels.
+pub func webview_frame_size(view: const WebView*) -> gfx.IntSize:
+    return view.m_frame.last_painted_size
+
+## The serial number of the presented frame (0 before the first).
+pub func webview_frame_serial(view: const WebView*) -> u64:
+    return view.m_frame.serial
+
+# mark: Pixels ==================================================================================
+
+## Copies the presented frame into `pixels`, `width` by `height` straight-alpha RGBA bytes,
+## tightly packed and top-down: the frame's top-left part when it is larger, transparent black
+## where it is smaller. Answers whether there was a frame.
+pub func webview_copy_frame(view: const WebView*, pixels: u8[], width: i32, height: i32) -> bool:
+    assert(width >= 0 and height >= 0 and pixels.length >= (usize)width * (usize)height * 4, "webview: the pixel buffer is too small")
+    let surface = view.m_frame.surface else return false
+    let bitmap = gfx.painting_surface_bitmap(surface)
+    let painted = view.m_frame.last_painted_size
+    let rows = webview_min(webview_min(height, painted.m_height), gfx.bitmap_height(bitmap))
+    let columns = webview_min(webview_min(width, painted.m_width), gfx.bitmap_width(bitmap))
+    let stride = (usize)width * 4
+    for y in 0..<height:
+        let row = pixels[(usize)y * stride..<(usize)(y + 1) * stride]
+        if y >= rows:
+            memory.set(row, 0)
+            continue
+        let source = gfx.bitmap_scanline_const(bitmap, y) else trap("webview: a bitmap without its scanline")
+        for x in 0..<columns:
+            webview_store_straight_rgba(row[(usize)x * 4..], source[x])
+        if columns < width:
+            memory.set(row[(usize)columns * 4..], 0)
+    return true
+
+## One BGRA8888 premultiplied pixel (0xAARRGGBB) as straight RGBA bytes at the start of `out`.
+func webview_store_straight_rgba(out: u8[], pixel: u32):
+    let alpha = pixel >> 24
+    var red = (pixel >> 16) & 255
+    var green = (pixel >> 8) & 255
+    var blue = pixel & 255
+    if alpha != 255 and alpha != 0:
+        red = (red * 255 + alpha // 2) // alpha
+        red = red if red < 255 else 255
+        green = (green * 255 + alpha // 2) // alpha
+        green = green if green < 255 else 255
+        blue = (blue * 255 + alpha // 2) // alpha
+        blue = blue if blue < 255 else 255
+    out[0] = (u8)red
+    out[1] = (u8)green
+    out[2] = (u8)blue
+    out[3] = (u8)alpha
+
+## The smaller of two counts.
+func webview_min(a: i32, b: i32) -> i32:
+    return a if a < b else b
+
+# mark: Screenshots =============================================================================
+
+## Ported from ViewImplementation::take_screenshot (ScreenshotType::Visible, WebContent's
+## take_document_screenshot): the top-level traversable's screenshot task, whose bitmap reaches
+## the view (webview_screenshot) when the page next updates its rendering. Instead of writing a
+## PNG file, the view keeps the bitmap.
+pub func webview_take_screenshot(view: WebView*):
+    view.m_screenshot = none
+    web.html_traversable_navigable_queue_screenshot_task(web.page_top_level_traversable(webview_page(view)), none)
+
+## ViewImplementation::did_receive_screenshot: the bitmap kept for webview_screenshot.
+func webview_did_receive_screenshot(view: WebView*, screenshot: gfx.ShareableBitmap):
+    view.m_screenshot = screenshot.m_bitmap
+
+## The screenshot the page took last, none before one arrives.
+pub func webview_screenshot(view: const WebView*) -> gfx.Bitmap*?:
+    return view.m_screenshot

@@ -1,0 +1,145 @@
+#==============================================================================================
+#
+#   tests_webview_platform - the process's parts: resources, the event loop, sanitize_url, and
+#   the pixels a view presents
+#
+#   DESCRIPTION:
+#       The embedded resources are data/res's templates; the event loop fires deferred
+#       invocations first, timers in order and wakes its embedder; sanitize_url answers as
+#       LibWebView's (the cases of Tests/LibWebView/TestWebViewURL.cpp the module covers: files,
+#       URLs, guessed hosts, searches); and the frame a view presents is the page's own paint
+#       (its screenshot, played by the same display list player), pixel for pixel.
+#
+#       Copyright (c) 2026 the luce-browser authors.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Resources ===============================================================================
+
+test "the embedded resources are data/res's, and are written where the loader reads them":
+    for resource in webview_resources:
+        let path = strings.join(["data/res/", resource.path], "") catch failure: trap("out of memory")
+        defer strings.release(path)
+        let found = files.read_text(path) catch failure: trap(f"cannot read {path}")
+        defer found.release()
+        assert(found.value == resource.text, "the resource differs from data/res")
+    test_webview_platform()
+    for resource in webview_resources:
+        let path = strings.join(["build/webview_res/", resource.path], "") catch failure: trap("out of memory")
+        defer strings.release(path)
+        assert(webview_file_has_text(path, resource.text), "the resource was written")
+
+# mark: The event loop ==========================================================================
+
+## How often the test wake hook ran.
+var test_webview_wakes: i32 = 0
+
+func test_webview_count_wake():
+    test_webview_wakes += 1
+
+## A timer's handler appending its number to the order.
+struct TestWebViewTimerOrder:
+    var fired: ak.Vector[i32]
+    var number: i32
+
+func test_webview_record(context: void*?):
+    let order = (TestWebViewTimerOrder*)(context else trap("no order"))
+    ak.vector_append_t(&order.fired, order.number)
+
+test "the event loop runs deferred invocations, then due timers, and wakes its embedder":
+    test_webview_platform()
+    let allocator: memory.Allocator = webview_heap()
+    with allocator:
+        let event_loop = webview_event_loop()
+        test_webview_wakes = 0
+        webview_set_wake_hook(test_webview_count_wake)
+        defer webview_set_wake_hook(none)
+        _ = webview_event_loop_process(event_loop)
+        var order = TestWebViewTimerOrder(fired = ak.Vector[i32](), number = 0)
+        let timer = web.core_timer_create_single_shot(0, ak.Function0[unit](call = test_webview_record, context = &order))
+        let wakes_before = test_webview_wakes
+        web.core_timer_start(timer)
+        assert(test_webview_wakes > wakes_before, "a timer due now wakes the embedder")
+        assert(webview_event_loop_next_due(event_loop) != none, "the loop is due")
+        let start = time.now()
+        while ak.vector_is_empty(&order.fired):
+            _ = webview_event_loop_process(event_loop)
+            assert(time.now() - start < 5000000000, "the timer fires")
+        assert(*ak.vector_at_const(&order.fired, 0) == 0, "the timer fired once")
+        _ = webview_event_loop_process(event_loop)
+        assert(ak.vector_size(&order.fired) == 1, "a single-shot timer fires once")
+
+# mark: sanitize_url ============================================================================
+
+## The serialization of what `location` sanitizes to ("" when it does not).
+func test_sanitize(location: str, engine: str = "", append_tld: WebViewAppendTld = WebViewAppendTld.no) -> ak.String:
+    let found = webview_find_search_engine(engine)
+    var search: const WebViewSearchEngine*? = none
+    if let chosen = found:
+        search = &chosen
+    let url = webview_sanitize_url(ak.sv(location), search, append_tld) else return ak.string_new()
+    return web_url.url_serialize(&url)
+
+## Whether `location` sanitizes to `expected`.
+func test_sanitizes_to(location: str, expected: str, engine: str = "", append_tld: WebViewAppendTld = WebViewAppendTld.no) -> bool:
+    let found = test_sanitize(location, engine, append_tld)
+    return ak.string_eq_string_view(&found, ak.sv(expected))
+
+test "sanitize_url: URLs, guessed hosts, reserved names, searches":
+    test_webview_platform()
+    let allocator: memory.Allocator = webview_heap()
+    with allocator:
+        assert(test_sanitizes_to("https://ladybird.org", "https://ladybird.org/"), "a URL")
+        assert(test_sanitizes_to("  https://ladybird.org/a?b#c  ", "https://ladybird.org/a?b#c"), "whitespace is trimmed")
+        assert(test_sanitizes_to("ladybird.org", "https://ladybird.org/"), "a host gets https")
+        assert(test_sanitizes_to("localhost:8000", "https://localhost:8000/"), "localhost is a host")
+        assert(test_sanitizes_to("foo.test", "https://foo.test/"), "reserved TLDs are hosts")
+        assert(test_sanitizes_to("data:text/html,hi", "data:text/html,hi"), "data: is supported")
+        assert(test_sanitizes_to("about:blank", "about:blank"), "about: is supported")
+        assert(test_sanitizes_to("ladybird", ""), "a word without a search engine is nothing")
+        assert(test_sanitizes_to("ladybird", "https://duckduckgo.com/?q=ladybird", "DuckDuckGo"), "a word with a search engine is a search")
+        assert(test_sanitizes_to("web browsers", "https://duckduckgo.com/?q=web%20browsers", "DuckDuckGo"), "a search is percent-encoded")
+        assert(test_sanitizes_to("mailto:a@b.c", "https://www.google.com/search?q=mailto%3Aa%40b.c", "Google"), "an unsupported scheme searches")
+        assert(test_sanitizes_to("ladybird", "https://ladybird.com/", "", WebViewAppendTld.yes), "AppendTLD appends .com")
+        assert(webview_location_looks_like_url(ak.sv("example.com")), "a host looks like a URL")
+        assert(not webview_location_looks_like_url(ak.sv("example")), "a word does not")
+        let error_page = webview_navigation_error_page_html(ak.sv("nonsense"))
+        assert(ak.string_contains_string_view(&error_page, ak.sv("Failed to load \"nonsense\"")), "the error page names the text")
+
+# mark: Pixels ==================================================================================
+
+test "the presented frame is the page's own paint, pixel for pixel":
+    test_webview_platform()
+    let allocator: memory.Allocator = webview_heap()
+    with allocator:
+        let view = test_webview_open()
+        defer webview_destroy(view)
+        var log = TestWebViewLog()
+        webview_load(view, test_webview_file_url("plain.html"))
+        test_webview_wait_for_load(view, &log, 1)
+        webview_take_screenshot(view)
+        let start = time.now()
+        while webview_screenshot(view) == none:
+            test_webview_turn()
+            test_webview_take_events(view, &log)
+            assert(time.now() - start < test_webview_timeout, "the screenshot arrives")
+        let screenshot = webview_screenshot(view) else trap("unreachable")
+        let size = webview_frame_size(view)
+        let pixels = new u8[(usize)size.m_width * (usize)size.m_height * 4] --- in memory.heap catch failure: trap("out of memory")
+        defer free(pixels) in memory.heap
+        assert(webview_copy_frame(view, pixels, size.m_width, size.m_height), "the view has a frame")
+        assert(gfx.bitmap_width(screenshot) >= size.m_width and gfx.bitmap_height(screenshot) >= size.m_height, "the screenshot covers the viewport")
+        var differing = 0
+        for y in 0..<size.m_height:
+            let row = gfx.bitmap_scanline_const(screenshot, y) else trap("no scanline")
+            for x in 0..<size.m_width:
+                var expected: u8[4]
+                webview_store_straight_rgba(expected, row[x])
+                let at = ((usize)y * (usize)size.m_width + (usize)x) * 4
+                if pixels[at] != expected[0] or pixels[at + 1] != expected[1] or pixels[at + 2] != expected[2] or pixels[at + 3] != expected[3]:
+                    differing += 1
+        assert(differing == 0, "no pixel differs from the page's screenshot")
+        # The box: rgb(200, 100, 50) at (10, 10)-(110, 60) on white.
+        assert(test_webview_pixel(view, 50, 30) == 0xc86432ff, "the box is painted")
+        assert(test_webview_pixel(view, 5, 5) == 0xffffffff, "the margin is the page's white")
