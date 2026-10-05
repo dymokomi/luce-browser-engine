@@ -1,0 +1,226 @@
+#==============================================================================================
+#
+#   in_process_http_encoding - the in-process client's Content-Encoding: what curl decodes
+#   for RequestServer
+#
+#   DESCRIPTION:
+#       Ladybird's RequestServer sets CURLOPT_ACCEPT_ENCODING to "" (Request.cpp), so curl
+#       advertises every coding it was built with and decodes the response's Content-Encoding
+#       (curl 8.19 lib/content_encoding.c). This fragment does the same with luce-compress:
+#
+#       - Accept-Encoding: "deflate, gzip, br" when the request names none (curl's list,
+#         Curl_get_content_encodings, without zstd, which luce-compress does not decode);
+#       - every Content-Encoding field's comma-separated codings stacked in order and
+#         decoded last-applied first (Curl_build_unencoding_stack), at most four of them;
+#         a bodiless response (1xx, 204, 304, HEAD) ignores them;
+#       - identity (and its alias none) passes the body on; deflate is a zlib stream, or
+#         raw DEFLATE (with up to four trailing bytes) when the zlib stream fails before
+#         giving any output; gzip (and x-gzip) is a gzip member or a zlib stream, as zlib's
+#         automatic header detection reads it; br is Brotli;
+#       - an unknown coding fails only once body bytes reach it; damaged data fails with
+#         InvalidContentEncoding (CURLE_BAD_CONTENT_ENCODING), bytes after a stream's end
+#         with Unknown (CURLE_WRITE_ERROR); a stream cut short gives what it decoded.
+#
+#       The body is decoded once it is complete, through luce-compress's incremental decoders
+#       (native's zlib and raw DEFLATE, gzip's member decoder, brotli's decoder), and a decoded
+#       body over 1 GiB fails (curl has no bound; this one keeps a small hostile response
+#       from exhausting memory).
+#
+#       Copyright (c) 2026 the luce-browser authors.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: The codings =============================================================================
+
+## A Content-Encoding coding curl knows (its general_unencoders), or one it does not.
+enum InProcessHttpCoding:
+    identity
+    deflate
+    gzip
+    br
+    unknown
+
+## The Accept-Encoding the client sends when the request names none.
+let in_process_http_accept_encoding: str = "deflate, gzip, br"
+
+## curl's MAX_ENCODE_STACK: a fifth coding is refused.
+let in_process_http_max_codings: usize = 4
+
+## The largest decoded body.
+let in_process_http_max_decoded: usize = 1073741824
+
+## The codings of a response, in the order they were applied.
+struct InProcessHttpCodings:
+    var items: InProcessHttpCoding[4]
+    var count: usize
+    var too_many: bool
+
+## The coding named `name` (ASCII case-insensitively, as find_unencode_writer matches).
+func in_process_http_coding_named(name: str) -> InProcessHttpCoding:
+    if net.http_equal(name, "identity") or net.http_equal(name, "none"):
+        return InProcessHttpCoding.identity
+    if net.http_equal(name, "deflate"):
+        return InProcessHttpCoding.deflate
+    if net.http_equal(name, "gzip") or net.http_equal(name, "x-gzip"):
+        return InProcessHttpCoding.gzip
+    if net.http_equal(name, "br"):
+        return InProcessHttpCoding.br
+    return InProcessHttpCoding.unknown
+
+## The codings of every Content-Encoding field of `response` (Curl_build_unencoding_stack):
+## names between commas, leading blanks skipped and trailing whitespace dropped.
+func in_process_http_codings(response: const net.HttpHead*) -> InProcessHttpCodings:
+    var codings = InProcessHttpCodings()
+    for field in response.fields:
+        if not net.http_equal(field.name, "content-encoding"):
+            continue
+        let text = field.value.bytes
+        var at: usize = 0
+        while at < text.length:
+            while at < text.length and (text[at] == ' ' or text[at] == '\t' or text[at] == ','):
+                at += 1
+            let start = at
+            var end = at
+            while at < text.length and text[at] != ',':
+                if text[at] > ' ':
+                    end = at + 1
+                at += 1
+            if end == start:
+                continue
+            if codings.count == in_process_http_max_codings:
+                codings.too_many = true
+                return codings
+            codings.items[codings.count] = in_process_http_coding_named((str)text[start..<end])
+            codings.count += 1
+    return codings
+
+# mark: Decoding ================================================================================
+
+## Which luce-compress decoder an InProcessHttpDecoder runs.
+enum InProcessHttpDecoderKind:
+    zlib
+    raw
+    gzip
+    brotli
+
+## One coding's incremental decoder.
+struct InProcessHttpDecoder:
+    var kind: InProcessHttpDecoderKind
+    var inflater: compress_native.Decoder
+    var member: compress_gzip.Decoder
+    var brotli: compress_brotli.Decoder
+
+    ## A decoder of `kind`.
+    static func open(kind: InProcessHttpDecoderKind) -> InProcessHttpDecoder!:
+        var made = InProcessHttpDecoder(kind = kind)
+        if kind == InProcessHttpDecoderKind.zlib or kind == InProcessHttpDecoderKind.raw:
+            let framing = "zlib" if kind == InProcessHttpDecoderKind.zlib else "raw"
+            made.inflater = try compress_native.make_decoder(framing, 0x7FFFFFFFFFFFFFFF, 0x7FFFFFFFFFFFFFFF)
+        elif kind == InProcessHttpDecoderKind.gzip:
+            made.member = compress_gzip.Decoder.open(multiple = false)
+        else:
+            made.brotli = compress_brotli.Decoder.open()
+        return made
+
+    ## One step: some of `input` into `output`.
+    func step(input: const u8[], output: u8[]) -> compress_native.Step!:
+        if self.kind == InProcessHttpDecoderKind.gzip:
+            return try self.member.step(input, output)
+        if self.kind == InProcessHttpDecoderKind.brotli:
+            return try self.brotli.step(input, output)
+        return try self.inflater.step(input, output)
+
+    ## Release what the decoder holds (Brotli's window and prefix codes).
+    func close():
+        if self.kind == InProcessHttpDecoderKind.gzip:
+            self.member.close()
+        elif self.kind == InProcessHttpDecoderKind.brotli:
+            self.brotli.close()
+        else:
+            self.inflater.close()
+
+## What a decoder made of a body: the input bytes its stream took and whether the stream ended.
+struct InProcessHttpDecoded:
+    var consumed: usize
+    var finished: bool
+
+## All of `input` through a decoder of `kind`, its output appended to `output`. Fails with
+## the decoder's error, or with limit past in_process_http_max_decoded.
+func in_process_http_run_decoder(kind: InProcessHttpDecoderKind, input: const u8[], output: ak.ByteBuffer*) -> InProcessHttpDecoded!:
+    var state = try InProcessHttpDecoder.open(kind)
+    defer state.close()
+    var chunk: u8[16384] = ---
+    var at: usize = 0
+    while true:
+        let step = try state.step(input[at..], chunk)
+        at += (usize)step.consumed
+        let produced = (usize)step.produced
+        if produced > in_process_http_max_decoded - ak.byte_buffer_size(output):
+            error(ak.ak_error, "the decoded body is too large")
+        ak.byte_buffer_append_span_u8(output, chunk[..<produced])
+        if step.status == compress_native.finished:
+            return InProcessHttpDecoded(consumed = at, finished = true)
+        if step.status == compress_native.need_input:
+            return InProcessHttpDecoded(consumed = at, finished = false)
+        if step.status == compress_native.need_output and step.consumed == 0 and produced == 0:
+            error(ak.ak_error, "the decoder makes no progress")
+
+## A decoding failure as the network error curl's writer answers: luce-compress's failures
+## (damaged data) are a bad content encoding, a body too large is Unknown
+## (CURLE_OUT_OF_MEMORY).
+func in_process_http_decode_error(code: ErrorCode) -> RequestsNetworkError:
+    if code == ak.ak_error:
+        return RequestsNetworkError.unknown
+    return RequestsNetworkError.invalid_content_encoding
+
+## `data` decoded through one `coding` into `output`; the network error, if any.
+func in_process_http_unencode_one(coding: InProcessHttpCoding, data: const u8[], output: ak.ByteBuffer*) -> RequestsNetworkError?:
+    if data.length == 0:
+        # No body bytes reach the writer: nothing to decode, nothing to fail.
+        return none
+    var kind = InProcessHttpDecoderKind.brotli
+    var tolerated: usize = 0
+    match coding:
+        .identity:
+            ak.byte_buffer_append_span_u8(output, data)
+            return none
+        .unknown:
+            # The deferred error writer: "Unrecognized content encoding type".
+            return RequestsNetworkError.invalid_content_encoding
+        .deflate:
+            kind = InProcessHttpDecoderKind.zlib
+        .gzip:
+            # inflateInit2(MAX_WBITS + 32): a gzip header, or else a zlib one.
+            kind = InProcessHttpDecoderKind.gzip if data.length >= 2 and data[0] == 0x1F and data[1] == 0x8B else InProcessHttpDecoderKind.zlib
+        .br:
+            kind = InProcessHttpDecoderKind.brotli
+    var raw_retry = false
+    var decoded = in_process_http_run_decoder(kind, data, output) catch failure:
+        # "some servers seem to not generate zlib headers": a deflate body whose zlib stream
+        # fails before any output is read again as raw DEFLATE, tolerating 4 trailing bytes.
+        if coding != InProcessHttpCoding.deflate or ak.byte_buffer_size(output) != 0:
+            return in_process_http_decode_error(failure.code)
+        raw_retry = true
+        recover InProcessHttpDecoded(consumed = 0, finished = false)
+    if raw_retry:
+        tolerated = 4
+        decoded = in_process_http_run_decoder(InProcessHttpDecoderKind.raw, data, output) catch failure:
+            return in_process_http_decode_error(failure.code)
+    # Bytes after the end of the stream: process_trailer's (and brotli's) write error.
+    if decoded.finished and data.length - decoded.consumed > tolerated:
+        return RequestsNetworkError.unknown
+    return none
+
+## The body `data` decoded through `codings`, the last applied first, into `output`.
+func in_process_http_unencode(codings: const InProcessHttpCodings*, data: const u8[], output: ak.ByteBuffer*) -> RequestsNetworkError?:
+    var current = ak.byte_buffer_copy_span_u8(data) else trap("out of memory")
+    var index = codings.count
+    while index > 0:
+        index -= 1
+        var next = ak.ByteBuffer()
+        if let failure = in_process_http_unencode_one(codings.items[index], ak.byte_buffer_bytes_const(&current), &next):
+            return failure
+        current = next
+    *output = current
+    return none
