@@ -652,12 +652,12 @@ int`, `CSSPixels < float`) are spelled with an explicit conversion of the other 
 pub struct CssPixels:                                  # PixelUnits.h
     pub var m_value: i32                               # fixed point, 6 fractional bits
 
-    func from_raw(value: i32) -> CssPixels: return CssPixels(m_value = value)
-    func from_int(value: i64) -> CssPixels:    # template<Signed I> CSSPixels(I)
+    static func from_raw(value: i32) -> CssPixels: return CssPixels(m_value = value)
+    static func from_int(value: i64) -> CssPixels:    # template<Signed I> CSSPixels(I)
         if value > (i64)css_pixels_max_integer_value: return CssPixels(m_value = i32_max)
         if value < (i64)css_pixels_min_integer_value: return CssPixels(m_value = i32_min)
         return CssPixels(m_value = (i32)value << css_pixels_fractional_bits)
-    func nearest_value_for(value: f64) -> CssPixels: ...
+    static func nearest_value_for(value: f64) -> CssPixels: ...
 
     func add(other: CssPixels) -> CssPixels:
         return CssPixels.from_raw(ak.saturating_add(self.m_value, other.m_value))
