@@ -100,4 +100,5 @@ image reaches the plugin.
   that turn while it runs.
 - `on_animation_decode_failed` is reported only if luce-gif fails to render a frame, which cannot happen for a session
   it opened (frames are checked when the animation opens).
-- ICC profiles, cICP and EXIF resolution scaling are not read (sRGB, scale 1), as in p2d.
+- EXIF resolution scaling is not read (scale 1), as in p2d. ICC profiles and cICP are read since
+  p2/icc (see DESIGN.md §7.1, *Color management*).
