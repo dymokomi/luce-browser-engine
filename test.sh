@@ -11,7 +11,7 @@ for file in $(git ls-files '*.lucb' | grep -v -e '/types_' -e '/stubs/' -e '/gen
     luce-base fmt "$file" --check > /dev/null || { echo "$file is not formatted (luce-base fmt $file --write)"; exit 1; }
 done
 
-for module in src/web src/webview src/webview_api tools/gen_css_values tools/embed_css tools/gen_dom_tree tools/gen_aria_roles tests/web_test; do
+for module in src/web src/webview src/webview_api tools/gen_css_values tools/embed_css tools/gen_dom_tree tools/gen_aria_roles tools/site_sweep tests/web_test; do
     echo "== luce-base check $module -W"
     # -W makes any warning fail the check, so any output at all fails the run, except warnings in
     # the code of another package (luce-png and luce-raster, which web_test uses, have some at

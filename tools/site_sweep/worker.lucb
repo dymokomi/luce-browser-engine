@@ -1,0 +1,125 @@
+#==============================================================================================
+#
+#   worker - one site in one process: load it as luced-browser does and say how it went
+#
+#   DESCRIPTION:
+#       The worker pumps the engine as an application's loop does (process the due work, sleep
+#       until the next is due, at most 5 ms), with the engine watching its own sockets. It
+#       reports its stages on standard output ("site_sweep: stage NAME"), so a trap's place is
+#       known, and ends with one result line.
+#
+#       Waiting for the page is what webview's tests do: the load is told by its URL (a new
+#       view first reports its about:blank's load), then a screenshot is queued, which marks
+#       the page for repaint and requests a frame, and the frame that follows is the loaded
+#       page's.
+#
+#       Copyright (c) 2026 the luce-browser authors.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+## How long the worker waits for the load, then for the frame, in nanoseconds.
+let worker_wait: u64 = 60000000000
+
+## How long the worker lets a loaded page run before judging it, in milliseconds.
+let worker_settle_milliseconds: u64 = 2000
+
+## Reports a stage.
+func worker_stage(name: str):
+    print(f"site_sweep: stage {name}")
+
+## One turn of the loop: the engine's due work, then a sleep until it next has work (at most
+## 5 ms).
+func worker_turn():
+    _ = webview_api.process_events()
+    let due = webview_api.next_due()
+    if due < 0.0 or due > 0.005:
+        thread.sleep(5)
+    elif due > 0.0:
+        thread.sleep((u64)(due * 1000.0) + 1)
+
+## What the view reported since the last call: whether the load of a page other than
+## about:blank finished, and how many frames were presented.
+struct WorkerLog:
+    var loaded: bool
+    var frames: u64
+
+## Takes the view's events into `log`.
+func worker_take_events(view: webview_api.View, log: WorkerLog*):
+    while true:
+        match webview_api.take_event(view):
+            .none_: return
+            .load_finished:
+                let url = webview_api.finished_load_url(view)
+                if url.length > 0 and url != "about:blank":
+                    log.loaded = true
+            .frame_ready: log.frames += 1
+            _: _ = 0
+
+## The webview behind a webview_api handle (the handle is the view's address).
+func worker_web_view(view: webview_api.View) -> webview.WebView*:
+    return (webview.WebView*)(void*)view
+
+## Prints the result line and answers the exit status.
+func worker_result(outcome: str, detail: str) -> i32:
+    print(f"site_sweep: result {outcome} {detail}")
+    return 0
+
+## Whether the presented frame is one color (or there is none).
+func worker_frame_is_blank(view: webview_api.View) -> bool:
+    let width = (i32)webview_api.frame_width(view)
+    let height = (i32)webview_api.frame_height(view)
+    if width <= 0 or height <= 0:
+        return true
+    let pixels = new u8[(usize)width * (usize)height * 4] --- in memory.heap catch failure: trap("out of memory")
+    defer free(pixels) in memory.heap
+    if not webview_api.copy_frame(view, pixels, width, height):
+        return true
+    var at: usize = 4
+    while at < pixels.length:
+        if pixels[at] != pixels[0] or pixels[at + 1] != pixels[1] or pixels[at + 2] != pixels[2] or pixels[at + 3] != pixels[3]:
+            return false
+        at += 4
+    return true
+
+## Loads `url` and reports how it went (see the header).
+func worker_main(url: str, options: const Options*) -> i32:
+    worker_stage("initialize")
+    webview_api.initialize(options.resources) catch failure: return worker_result("error", cat(["the engine did not initialize: ", failure.message]))
+    let view = webview_api.open(options.width, options.height, options.scale)
+    defer webview_api.close(view)
+
+    worker_stage("load")
+    if not webview_api.load(view, url):
+        return worker_result("error", "not a location")
+    var log = WorkerLog()
+    let start = time.now()
+    while not log.loaded:
+        worker_turn()
+        worker_take_events(view, &log)
+        if time.now() - start > worker_wait:
+            return worker_result("timeout", "the load did not finish")
+
+    worker_stage("render")
+    let frames = log.frames
+    let allocator: memory.Allocator = webview.webview_heap()
+    with allocator:
+        webview.webview_take_screenshot(worker_web_view(view))
+    let rendered = time.now()
+    while webview.webview_screenshot(worker_web_view(view)) == none or log.frames == frames:
+        worker_turn()
+        worker_take_events(view, &log)
+        if time.now() - rendered > worker_wait:
+            return worker_result("timeout", "loaded, but no frame was presented")
+
+    worker_stage("settle")
+    let settle_end = time.now() + worker_settle_milliseconds * 1000000
+    while time.now() < settle_end:
+        worker_turn()
+        worker_take_events(view, &log)
+
+    let title = webview_api.page_title(view)
+    let final_url = webview_api.page_url(view)
+    if worker_frame_is_blank(view):
+        return worker_result("blank", cat([final_url, " \"", title, "\""]))
+    return worker_result("ok", cat([final_url, " \"", title, "\""]))

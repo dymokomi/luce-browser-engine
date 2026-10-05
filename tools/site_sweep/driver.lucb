@@ -1,0 +1,186 @@
+#==============================================================================================
+#
+#   driver - runs a worker per site, a few at a time, and summarizes the outcomes
+#
+#   DESCRIPTION:
+#       Each worker is this program with `--one URL`, run through luce-std's process.Command,
+#       which captures its output. A worker that prints a result line is judged by it; one that
+#       trapped by its trap line (and the stage it reached); one that ran out of time is
+#       stopped. The summary lists every site in order, then the traps grouped by message,
+#       the most frequent first.
+#
+#       Copyright (c) 2026 the luce-browser authors.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Sites ===================================================================================
+
+## The sites to visit: the URLs on the command line, else the lines of the sites file.
+func driver_sites(options: const Options*) -> ak.Vector[str]:
+    if not ak.vector_is_empty(&options.urls):
+        return options.urls
+    var sites: ak.Vector[str]
+    let data = files.read(c_path(options.sites)) catch failure: trap(f"site_sweep: cannot read {options.sites}: {failure.message}")
+    var lines = strings.SplitIterator.over((str)data.value, "\n") catch failure: trap("out of memory")
+    while let line = lines.next():
+        var text = line
+        if let comment = strings.find(text, "#"):
+            text = (str)text.bytes[..<comment]
+        text = strings.trim(text)
+        if text.length > 0:
+            ak.vector_append_t(&sites, text)
+    return sites
+
+# mark: Workers =================================================================================
+
+## A running worker.
+struct Running:
+    var index: usize
+    var command: process.Command
+    var started: u64
+
+## How a site went.
+struct SiteResult:
+    var outcome: str
+    var detail: str
+
+## The value after `prefix` on the last line of `log` that starts with it, if any.
+func last_line_value(log: str, prefix: str) -> str?:
+    var value: str? = none
+    var lines = strings.SplitIterator.over(log, "\n") catch failure: return none
+    while let line = lines.next():
+        if strings.starts_with(line, prefix):
+            value = (str)line.bytes[prefix.length..]
+    return value
+
+## The message of the trap `log` reports ("trap: FILE:LINE:COLUMN: MESSAGE"), if any.
+func trap_message(log: str) -> str?:
+    let location_and_message = last_line_value(log, "trap: ") else return none
+    if let parts = strings.split_once(location_and_message, ": "):
+        return parts.1
+    return location_and_message
+
+## The captured output of a finished command.
+func command_output(command: const process.Command*) -> str:
+    let owned = command.output() catch failure: return ""
+    let text = strings.copy(owned.value) catch failure: trap("out of memory")
+    owned.release()
+    return text
+
+## How a finished worker went, from its output.
+func judge(log: str, exit_code: i64?) -> SiteResult:
+    let stage = last_line_value(log, "site_sweep: stage ") else "start"
+    if let message = trap_message(log):
+        return SiteResult(outcome = "trap", detail = cat([message, " (stage ", stage, ")"]))
+    if let result = last_line_value(log, "site_sweep: result "):
+        if let parts = strings.split_once(result, " "):
+            return SiteResult(outcome = parts.0, detail = parts.1)
+        return SiteResult(outcome = result, detail = "")
+    if let code = exit_code:
+        return SiteResult(outcome = "crash", detail = cat(["exit status ", decimal((u64)code), " at stage ", stage]))
+    return SiteResult(outcome = "crash", detail = cat(["died at stage ", stage]))
+
+## Runs a worker per site, `options.jobs` at a time, and answers their results in site order.
+func run_sites(options: const Options*, sites: const ak.Vector[str]*) -> ak.Vector[SiteResult]:
+    let program = os.executable() catch failure: trap("site_sweep: cannot find its own executable")
+    var results: ak.Vector[SiteResult]
+    for index in 0..<ak.vector_size(sites):
+        ak.vector_append_t(&results, SiteResult(outcome = "", detail = ""))
+    let timeout = options.timeout_seconds * 1000000000
+    var running: ak.Vector[Running]
+    var next: usize = 0
+    while next < ak.vector_size(sites) or not ak.vector_is_empty(&running):
+        while next < ak.vector_size(sites) and ak.vector_size(&running) < options.jobs:
+            var arguments: str[4] = ["--one", *ak.vector_at_const(sites, next), "--resources", options.resources]
+            let command = process.Command(program, arguments, output_limit = 4194304) catch failure: trap(f"site_sweep: cannot start a worker: {failure.message}")
+            ak.vector_append_t(&running, Running(index = next, command = command, started = time.now()))
+            next += 1
+        var slot: usize = 0
+        var progressed = false
+        while slot < ak.vector_size(&running):
+            let worker = ak.vector_at(&running, slot)
+            let timed_out = time.since(worker.started) > timeout
+            if not worker.command.is_finished() and not timed_out:
+                slot += 1
+                continue
+            progressed = true
+            var done = ak.vector_take(&running, slot)
+            var result: SiteResult = ---
+            if not done.command.is_finished():
+                done.command.cancel()
+                let log = command_output(&done.command)
+                let stage = last_line_value(log, "site_sweep: stage ") else "start"
+                result = SiteResult(outcome = "timeout", detail = cat(["stopped after ", decimal(options.timeout_seconds), " s at stage ", stage]))
+            else:
+                let log = command_output(&done.command)
+                result = judge(log, done.command.exit_code())
+            done.command.close()
+            let site = *ak.vector_at_const(sites, done.index)
+            print(f"{site}: {result.outcome} {result.detail}")
+            *ak.vector_at(&results, done.index) = result
+        if not progressed:
+            thread.sleep(20)
+    return results
+
+# mark: The summary =============================================================================
+
+## A trap message and how many sites hit it.
+struct TrapCount:
+    var message: str
+    var count: usize
+
+## Prints every site's outcome, then the traps by count.
+func print_summary(sites: const ak.Vector[str]*, results: const ak.Vector[SiteResult]*):
+    print("")
+    print("== sites")
+    var traps: ak.Vector[TrapCount]
+    var outcome_counts: ak.Vector[TrapCount]
+    for index in 0..<ak.vector_size(sites):
+        let site = *ak.vector_at_const(sites, index)
+        let result = ak.vector_at_const(results, index)
+        print(f"{site} | {result.outcome} | {result.detail}")
+        count_key(&outcome_counts, result.outcome)
+        if result.outcome == "trap":
+            var message = result.detail
+            if let parts = strings.split_once(result.detail, " (stage "):
+                message = parts.0
+            count_key(&traps, message)
+    print("")
+    print("== outcomes")
+    sort_counts(&traps)
+    sort_counts(&outcome_counts)
+    for entry in ak.vector_span(&outcome_counts):
+        print(f"{entry.count} {entry.message}")
+    print("")
+    print("== traps by count")
+    for entry in ak.vector_span(&traps):
+        print(f"{entry.count} {entry.message}")
+
+## Counts one more `key` in `counts`.
+func count_key(counts: ak.Vector[TrapCount]*, key: str):
+    for entry in &ak.vector_span(counts):
+        if entry.message == key:
+            entry.count += 1
+            return
+    ak.vector_append_t(counts, TrapCount(message = key, count = 1))
+
+## Sorts `counts` by count, the largest first, ties in first-seen order (an insertion sort: the
+## lists are short).
+func sort_counts(counts: ak.Vector[TrapCount]*):
+    let entries = ak.vector_span(counts)
+    for index in 1..<entries.length:
+        let entry = entries[index]
+        var at = index
+        while at > 0 and entries[at - 1].count < entry.count:
+            entries[at] = entries[at - 1]
+            at -= 1
+        entries[at] = entry
+
+## Visits every site and prints the summary. Answers 0: the sweep is a survey, not a test.
+func driver_main(options: const Options*) -> i32:
+    let sites = driver_sites(options)
+    print(f"site_sweep: {ak.vector_size(&sites)} sites, {options.jobs} at a time")
+    let results = run_sites(options, &sites)
+    print_summary(&sites, &results)
+    return 0
