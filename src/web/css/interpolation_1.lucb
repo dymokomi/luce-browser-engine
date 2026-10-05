@@ -1,0 +1,576 @@
+#==============================================================================================
+#
+#   interpolation_1 - CSS interpolation: raw values, keywords, discrete values, scale,
+#                     filters, translate and rotate
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibWeb/CSS/Interpolation.cpp (lines 1-532), by region p4a: the
+#       interpolation of raw numbers, integers and vectors (interpolate_raw's instantiations),
+#       resolving initial/unset/inherit before interpolating, discrete interpolation, and the
+#       interpolation of the scale property, of filter functions and filter value lists, of
+#       the translate property, quaternion slerp and the rotate property. The C++ function-
+#       local statics (the identity scale, translate and rotate values) are made once in the
+#       C heap (DESIGN.md §3.3 rule 7). Parts 2-6 have the grid tracks and interpolate_property,
+#       the transforms, box shadows and numeric mixes, interpolate_value_impl, and composition.
+#
+#       Copyright (c) 2018-2023, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2021, the SerenityOS developers.
+#       Copyright (c) 2021-2025, Sam Atkins <sam@ladybird.org>
+#       Copyright (c) 2024, Matthew Olsson <mattco@serenityos.org>
+#       Copyright (c) 2025-2026, Tim Ledbetter <tim.ledbetter@ladybird.org>
+#       Copyright (c) 2025, Jelle Raaijmakers <jelle@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Raw values ==============================================================================
+
+## AK::clamp(value, min, max) over doubles.
+func css_interpolation_clamp_f64(value: f64, min: f64, max: f64) -> f64:
+    assert(max >= min)
+    if value > max:
+        return max
+    if value < min:
+        return min
+    return value
+
+## AK::clamp(value, min, max) over floats.
+func css_interpolation_clamp_f32(value: f32, min: f32, max: f32) -> f32:
+    assert(max >= min)
+    if value > max:
+        return max
+    if value < min:
+        return min
+    return value
+
+## Ported from Libraries/LibWeb/CSS/Interpolation.cpp:54 Web::CSS::interpolate_raw<double>.
+func css_interpolate_raw_f64(from_: f64, to: f64, delta: f32, accepted_range: CssNumericRange? = none) -> f64:
+    if let range = accepted_range:
+        return css_interpolation_clamp_f64(from_ + (to - from_) * f64(delta), range.min, range.max)
+    return from_ + (to - from_) * f64(delta)
+
+## Ported from Libraries/LibWeb/CSS/Interpolation.cpp:54 Web::CSS::interpolate_raw<i32> (an integral T).
+func css_interpolate_raw_i32(from_: i32, to: i32, delta: f32, accepted_range: CssNumericRange? = none) -> i32:
+    let from_float = f32(from_)
+    let to_float = f32(to)
+    var min = f64(ak.i32_min)
+    var max = f64(ak.i32_max)
+    if let range = accepted_range:
+        min = range.min
+        max = range.max
+    let unclamped_result = math32.round(from_float + (to_float - from_float) * delta)
+    return (i32)css_interpolation_clamp_f32(unclamped_result, f32(min), f32(max))
+
+## Ported from Libraries/LibWeb/CSS/Interpolation.cpp:54 Web::CSS::interpolate_raw<FloatVector3>.
+func css_interpolate_raw_float_vector3(from_: gfx.FloatVector3, to: gfx.FloatVector3, delta: f32) -> gfx.FloatVector3:
+    return gfx_float_vector3_add(from_, gfx_float_vector3_mul(gfx_float_vector3_sub(to, from_), delta))
+
+## Ported from Libraries/LibWeb/CSS/Interpolation.cpp:54 Web::CSS::interpolate_raw<FloatVector4>.
+func css_interpolate_raw_float_vector4(from_: gfx.FloatVector4, to: gfx.FloatVector4, delta: f32) -> gfx.FloatVector4:
+    return gfx_float_vector4_add(from_, gfx_float_vector4_mul(gfx_float_vector4_sub(to, from_), delta))
+
+## `calculation_context.accepted_ranges_by_type.get(type)`.
+func css_interpolation_accepted_range(calculation_context: const CssCalculationContext*, type_: CssValueType) -> CssNumericRange?:
+    let range = ak.hash_map_get_k_const(&calculation_context.accepted_ranges_by_type, type_) else return none
+    return *range
+
+## A copy of a CalculationContext (C++ copies it by value, with its map of accepted ranges).
+func css_interpolation_copy_calculation_context(calculation_context: const CssCalculationContext*) -> CssCalculationContext:
+    var copy = *calculation_context
+    copy.accepted_ranges_by_type = ak.hash_map_clone(&calculation_context.accepted_ranges_by_type) else trap("out of memory")
+    return copy
+
+# mark: Function-local statics ==================================================================
+
+## A C++ function-local static style value of this file, made on first use in the C heap with ak's atomic allocator
+## unset (DESIGN.md §3.3 rule 7), by `make`.
+func css_interpolation_static_value(slot: (CssStyleValue*?)*, make: func() -> CssStyleValue*) -> CssStyleValue*:
+    if let value = *slot:
+        return value
+    let saved_atomic_allocator = ak.atomic_allocator
+    ak.atomic_allocator = none
+    defer ak.atomic_allocator = saved_atomic_allocator
+    with memory.heap:
+        let value = make()
+        *slot = value
+        return value
+
+## interpolate_scale's `static auto one`.
+var css_interpolate_scale_one: CssStyleValue*?
+
+## interpolate_scale's `static auto one_value`.
+var css_interpolate_scale_one_value: CssStyleValue*?
+
+## interpolate_translate's `static auto zero_px`.
+var css_interpolate_translate_zero_px: CssStyleValue*?
+
+## interpolate_translate's `static auto zero`.
+var css_interpolate_translate_zero: CssStyleValue*?
+
+## interpolate_rotate's `static auto zero_degrees_value`.
+var css_interpolate_rotate_zero_degrees_value: CssStyleValue*?
+
+## interpolate_rotate's `static auto zero`.
+var css_interpolate_rotate_zero: CssStyleValue*?
+
+## `TransformationStyleValue::create(PropertyID::Scale, TransformFunction::Scale, { NumberStyleValue::create(1), NumberStyleValue::create(1) })`.
+func css_interpolate_scale_make_one() -> CssStyleValue*:
+    var values: ak.Vector[CssStyleValue*]
+    ak.vector_append_t(&values, css_number_style_value_create(1.0).css_style_value())
+    ak.vector_append_t(&values, css_number_style_value_create(1.0).css_style_value())
+    return css_transformation_style_value_create(css_data.PropertyId.scale, css_data.TransformFunction.scale, values).css_style_value()
+
+## `NumberStyleValue::create(1)`.
+func css_interpolate_scale_make_one_value() -> CssStyleValue*:
+    return css_number_style_value_create(1.0).css_style_value()
+
+## `LengthStyleValue::create(Length::make_px(0))`.
+func css_interpolate_translate_make_zero_px() -> CssStyleValue*:
+    return css_length_style_value_create(css_length_make_px_f64(0.0)).css_style_value()
+
+## `TransformationStyleValue::create(PropertyID::Translate, TransformFunction::Translate, { zero_px, zero_px })`.
+func css_interpolate_translate_make_zero() -> CssStyleValue*:
+    let zero_px = css_interpolation_static_value(&css_interpolate_translate_zero_px, css_interpolate_translate_make_zero_px)
+    var values: ak.Vector[CssStyleValue*]
+    ak.vector_append_t(&values, zero_px)
+    ak.vector_append_t(&values, zero_px)
+    return css_transformation_style_value_create(css_data.PropertyId.translate, css_data.TransformFunction.translate, values).css_style_value()
+
+## `AngleStyleValue::create(Angle::make_degrees(0))`.
+func css_interpolate_rotate_make_zero_degrees_value() -> CssStyleValue*:
+    return css_angle_style_value_create(css_angle_make_degrees(0.0)).css_style_value()
+
+## `TransformationStyleValue::create(PropertyID::Rotate, TransformFunction::Rotate, { zero_degrees_value })`.
+func css_interpolate_rotate_make_zero() -> CssStyleValue*:
+    var values: ak.Vector[CssStyleValue*]
+    ak.vector_append_t(&values, css_interpolation_static_value(&css_interpolate_rotate_zero_degrees_value, css_interpolate_rotate_make_zero_degrees_value))
+    return css_transformation_style_value_create(css_data.PropertyId.rotate, css_data.TransformFunction.rotate, values).css_style_value()
+
+# mark: Keywords and discrete values ============================================================
+
+## Ported from Libraries/LibWeb/CSS/Interpolation.cpp:72 Web::CSS::with_keyword_values_resolved.
+func css_with_keyword_values_resolved(element: DomElement*, property_id: css_data.PropertyId, value: CssStyleValue*) -> CssStyleValue*:
+    if css_style_value_is_guaranteed_invalid(value):
+        # At the moment, we're only dealing with "real" properties, so this behaves the same as `unset`.
+        # https://drafts.csswg.org/css-values-5/#invalid-at-computed-value-time
+        return css_property_initial_value(property_id)
+
+    if not css_style_value_is_keyword(value):
+        return value
+    match css_keyword_style_value_keyword(css_style_value_as_keyword(value)):
+        .initial, .unset:
+            return css_property_initial_value(property_id)
+        .inherit:
+            var abstract_element: DomAbstractElement = ---
+            dom_abstract_element_construct(&abstract_element, element)
+            return css_style_computer_get_non_animated_inherit_value(property_id, abstract_element)
+        _:
+            return value
+
+## Ported from Libraries/LibWeb/CSS/Interpolation.cpp:94 Web::CSS::interpolate_discrete.
+func css_interpolate_discrete(from_: CssStyleValue*, to: CssStyleValue*, delta: f32, allow_discrete: CssAllowDiscrete) -> CssStyleValue*?:
+    if css_style_value_equals(from_, to):
+        return from_
+    if allow_discrete == CssAllowDiscrete.no:
+        return none
+    return to if delta >= 0.5 else from_
+
+# mark: Scale ===================================================================================
+
+## Ported from Libraries/LibWeb/CSS/Interpolation.cpp:103 Web::CSS::interpolate_scale.
+func css_interpolate_scale(element: DomElement*, calculation_context: const CssCalculationContext*, a_from: CssStyleValue*, a_to: CssStyleValue*, delta: f32, allow_discrete: CssAllowDiscrete) -> CssStyleValue*?:
+    if css_style_value_to_keyword(a_from) == css_data.Keyword.none_ and css_style_value_to_keyword(a_to) == css_data.Keyword.none_:
+        return a_from
+
+    let one = css_interpolation_static_value(&css_interpolate_scale_one, css_interpolate_scale_make_one)
+
+    let from_ = one if css_style_value_to_keyword(a_from) == css_data.Keyword.none_ else a_from
+    let to = one if css_style_value_to_keyword(a_to) == css_data.Keyword.none_ else a_to
+
+    let from_values = css_transformation_style_value_values(css_style_value_as_transformation(from_))
+    let to_values = css_transformation_style_value_values(css_style_value_as_transformation(to))
+
+    let interpolated_x = css_interpolate_value(element, calculation_context, *ak.vector_at_const(&from_values, 0), *ak.vector_at_const(&to_values, 0), delta, allow_discrete) else return none
+    let interpolated_y = css_interpolate_value(element, calculation_context, *ak.vector_at_const(&from_values, 1), *ak.vector_at_const(&to_values, 1), delta, allow_discrete) else return none
+    var interpolated_z: CssStyleValue*? = none
+
+    if ak.vector_size(&from_values) == 3 or ak.vector_size(&to_values) == 3:
+        let one_value = css_interpolation_static_value(&css_interpolate_scale_one_value, css_interpolate_scale_make_one_value)
+        let from_z = *ak.vector_at_const(&from_values, 2) if ak.vector_size(&from_values) == 3 else one_value
+        let to_z = *ak.vector_at_const(&to_values, 2) if ak.vector_size(&to_values) == 3 else one_value
+        interpolated_z = css_interpolate_value(element, calculation_context, from_z, to_z, delta, allow_discrete)
+        if interpolated_z == none:
+            return none
+
+    var new_values: ak.Vector[CssStyleValue*]
+    ak.vector_append_t(&new_values, interpolated_x)
+    ak.vector_append_t(&new_values, interpolated_y)
+    if let z = interpolated_z:
+        ak.vector_append_t(&new_values, z)
+
+    let function = css_data.TransformFunction.scale3_d if ak.vector_size(&new_values) == 3 else css_data.TransformFunction.scale
+    return css_transformation_style_value_create(css_data.PropertyId.scale, function, new_values).css_style_value()
+
+# mark: Filters =================================================================================
+
+## A FilterValue's alternative index (C++'s Variant::index()).
+func css_filter_value_index(value: const CssFilterValue*) -> u8:
+    match *value:
+        .css_blur(blur):
+            _ = blur
+            return 0
+        .css_drop_shadow(drop_shadow):
+            _ = drop_shadow
+            return 1
+        .css_hue_rotate(hue_rotate):
+            _ = hue_rotate
+            return 2
+        .css_color(color):
+            _ = color
+            return 3
+        .css_url(url):
+            _ = url
+            return 4
+
+## interpolate_filter_function's `drop_shadow_to_shadow_style_value` lambda.
+func css_drop_shadow_to_shadow_style_value(drop_shadow: const CssDropShadow*) -> CssStyleValue*:
+    return css_shadow_style_value_create(CssShadowStyleValueShadowType.normal, drop_shadow.color, drop_shadow.offset_x, drop_shadow.offset_y, drop_shadow.radius, css_length_style_value_create(css_length_make_px_f64(0.0)).css_style_value(), CssShadowPlacement.outer).css_style_value()
+
+## Ported from Libraries/LibWeb/CSS/Interpolation.cpp:144 Web::CSS::interpolate_filter_function.
+# https://drafts.fxtf.org/filter-effects/#interpolation-of-filter-functions
+func css_interpolate_filter_function(element: DomElement*, calculation_context: const CssCalculationContext*, from_: const CssFilterValue*, to: const CssFilterValue*, delta: f32, allow_discrete: CssAllowDiscrete) -> CssFilterValue?:
+    assert(css_filter_value_index(from_) != 4)
+    assert(css_filter_value_index(to) != 4)
+
+    if css_filter_value_index(from_) != css_filter_value_index(to):
+        return none
+
+    match *from_:
+        .css_blur(from_value):
+            let to_value = match *to:
+                .css_blur(value) => value
+                _ => trap("VERIFY: Variant::get<Blur>()")
+
+            var blur_calculation_context = css_interpolation_copy_calculation_context(calculation_context)
+            _ = ak.hash_map_set(&blur_calculation_context.accepted_ranges_by_type, CssValueType.length, CssNumericRange(min = 0.0, max = f64(ak.f32_max)))
+            if let interpolated_style_value = css_interpolate_value(element, &blur_calculation_context, from_value.radius, to_value.radius, delta, allow_discrete):
+                return CssFilterValue.css_blur(CssBlur(radius = interpolated_style_value))
+            return none
+        .css_hue_rotate(from_value):
+            let to_value = match *to:
+                .css_hue_rotate(value) => value
+                _ => trap("VERIFY: Variant::get<HueRotate>()")
+            if let interpolated_style_value = css_interpolate_value(element, calculation_context, from_value.angle, to_value.angle, delta, allow_discrete):
+                return CssFilterValue.css_hue_rotate(CssHueRotate(angle = interpolated_style_value))
+            return none
+        .css_color(from_value):
+            let to_value = match *to:
+                .css_color(value) => value
+                _ => trap("VERIFY: Variant::get<Color>()")
+            let operation = to_value.operation if delta >= 0.5 else from_value.operation
+
+            var filter_function_calculation_context = css_interpolation_copy_calculation_context(calculation_context)
+            match operation:
+                .grayscale, .invert, .opacity, .sepia:
+                    _ = ak.hash_map_set(&filter_function_calculation_context.accepted_ranges_by_type, CssValueType.number, CssNumericRange(min = 0.0, max = 1.0))
+                .brightness, .contrast, .saturate:
+                    _ = ak.hash_map_set(&filter_function_calculation_context.accepted_ranges_by_type, CssValueType.number, CssNumericRange(min = 0.0, max = f64(ak.f32_max)))
+                _:
+                    _ = operation
+
+            if let interpolated_style_value = css_interpolate_value(element, &filter_function_calculation_context, from_value.amount, to_value.amount, delta, allow_discrete):
+                return CssFilterValue.css_color(CssColor(operation = operation, amount = interpolated_style_value))
+            return none
+        .css_drop_shadow(from_value):
+            let to_value = match *to:
+                .css_drop_shadow(value) => value
+                _ => trap("VERIFY: Variant::get<DropShadow>()")
+
+            var from_shadows: ak.Vector[CssStyleValue*]
+            ak.vector_append_t(&from_shadows, css_drop_shadow_to_shadow_style_value(&from_value))
+            var to_shadows: ak.Vector[CssStyleValue*]
+            ak.vector_append_t(&to_shadows, css_drop_shadow_to_shadow_style_value(&to_value))
+            let from_list = css_style_value_list_create(from_shadows, CssStyleValueListSeparator.comma)
+            let to_list = css_style_value_list_create(to_shadows, CssStyleValueListSeparator.comma)
+
+            let result = css_interpolate_box_shadow(element, calculation_context, from_list.css_style_value(), to_list.css_style_value(), delta, allow_discrete) else return none
+
+            let result_shadow = css_style_value_as_shadow(css_style_value_list_value_at(css_style_value_as_value_list(result), 0, false))
+
+            var result_radius: CssStyleValue*? = none
+            let radius_has_value = to_value.radius if delta >= 0.5 else from_value.radius
+            if radius_has_value != none:
+                result_radius = css_shadow_style_value_blur_radius(result_shadow)
+
+            # FIXME: We shouldn't apply the default color here
+            return CssFilterValue.css_drop_shadow(CssDropShadow(offset_x = css_shadow_style_value_offset_x(result_shadow), offset_y = css_shadow_style_value_offset_y(result_shadow), radius = result_radius, color = css_shadow_style_value_color(result_shadow)))
+        .css_url(url):
+            # URL filters cannot be interpolated
+            _ = url
+            return none
+
+## interpolate_filter_value_list's `is_filter_value_list_without_url` lambda.
+func css_is_filter_value_list_without_url(value: CssStyleValue*) -> bool:
+    if not css_style_value_is_filter_value_list(value):
+        return false
+    let filter_value_list = css_style_value_as_filter_value_list(value)
+    return not css_filter_value_list_style_value_contains_url(filter_value_list)
+
+## interpolate_filter_value_list's `initial_value_for` lambda.
+func css_filter_initial_value_for_interpolation(value: const CssFilterValue*) -> CssFilterValue:
+    match *value:
+        .css_blur(blur):
+            _ = blur
+            return CssFilterValue.css_blur(CssBlur(radius = css_length_style_value_create(css_length_make_px_f64(0.0)).css_style_value()))
+        .css_drop_shadow(drop_shadow):
+            _ = drop_shadow
+            return CssFilterValue.css_drop_shadow(CssDropShadow(offset_x = css_length_style_value_create(css_length_make_px_f64(0.0)).css_style_value(), offset_y = css_length_style_value_create(css_length_make_px_f64(0.0)).css_style_value(), radius = css_length_style_value_create(css_length_make_px_f64(0.0)).css_style_value(), color = css_color_style_value_create_from_color(gfx.color_new_named_color(gfx.ColorNamedColor.transparent), CssColorSyntax.legacy).css_style_value()))
+        .css_hue_rotate(hue_rotate):
+            _ = hue_rotate
+            return CssFilterValue.css_hue_rotate(CssHueRotate(angle = css_angle_style_value_create(css_angle_make_degrees(0.0)).css_style_value()))
+        .css_color(color):
+            var default_value_for_interpolation = 0.0
+            match color.operation:
+                .grayscale, .invert, .sepia:
+                    default_value_for_interpolation = 0.0
+                .brightness, .contrast, .opacity, .saturate:
+                    default_value_for_interpolation = 1.0
+                _:
+                    trap("VERIFY_NOT_REACHED")
+            return CssFilterValue.css_color(CssColor(operation = color.operation, amount = css_number_style_value_create(default_value_for_interpolation).css_style_value()))
+        .css_url(url):
+            _ = url
+            trap("VERIFY_NOT_REACHED")
+
+## interpolate_filter_value_list's `interpolate_filter_values` lambda.
+func css_interpolate_filter_values(element: DomElement*, calculation_context: const CssCalculationContext*, from_: CssStyleValue*, to: CssStyleValue*, delta: f32, allow_discrete: CssAllowDiscrete) -> CssStyleValue*?:
+    let from_filter_values = css_filter_value_list_style_value_filter_value_list(css_style_value_as_filter_value_list(from_))
+    let to_filter_values = css_filter_value_list_style_value_filter_value_list(css_style_value_as_filter_value_list(to))
+    var interpolated_filter_values: ak.Vector[CssFilterValue]
+    for i in 0..<css_filter_value_list_style_value_size(css_style_value_as_filter_value_list(from_)):
+        let from_value = ak.vector_at_const(&from_filter_values, i)
+        let to_value = ak.vector_at_const(&to_filter_values, i)
+
+        let interpolated_value = css_interpolate_filter_function(element, calculation_context, from_value, to_value, delta, allow_discrete) else return none
+        ak.vector_append_t(&interpolated_filter_values, interpolated_value)
+    return css_filter_value_list_style_value_create(interpolated_filter_values).css_style_value()
+
+## interpolate_filter_value_list's `append_missing_values_to` lambda.
+func css_filter_append_missing_values_to(short_list: CssFilterValueListStyleValue*, longer_list: CssFilterValueListStyleValue*) -> CssStyleValue*:
+    var new_filter_list = ak.vector_clone(&short_list.m_filter_value_list)
+    for i in ak.vector_size(&new_filter_list)..<css_filter_value_list_style_value_size(longer_list):
+        let filter_value = ak.vector_at_const(&longer_list.m_filter_value_list, i)
+        ak.vector_append_t(&new_filter_list, css_filter_initial_value_for_interpolation(filter_value))
+    return css_filter_value_list_style_value_create(new_filter_list).css_style_value()
+
+## interpolate_filter_value_list's `replace_none_with_initial_filter_list_values` lambda.
+func css_filter_replace_none_with_initial_filter_list_values(filter_value_list: CssFilterValueListStyleValue*) -> CssStyleValue*:
+    var initial_values: ak.Vector[CssFilterValue]
+    for filter_value in ak.vector_span_const(&filter_value_list.m_filter_value_list):
+        ak.vector_append_t(&initial_values, css_filter_initial_value_for_interpolation(&filter_value))
+    return css_filter_value_list_style_value_create(initial_values).css_style_value()
+
+## Ported from Libraries/LibWeb/CSS/Interpolation.cpp:249 Web::CSS::interpolate_filter_value_list.
+# https://drafts.fxtf.org/filter-effects/#interpolation-of-filters
+func css_interpolate_filter_value_list(element: DomElement*, calculation_context: const CssCalculationContext*, a_from: CssStyleValue*, a_to: CssStyleValue*, delta: f32, allow_discrete: CssAllowDiscrete) -> CssStyleValue*?:
+    if css_is_filter_value_list_without_url(a_from) and css_is_filter_value_list_without_url(a_to):
+        let from_list = css_style_value_as_filter_value_list(a_from)
+        let to_list = css_style_value_as_filter_value_list(a_to)
+        # If both filters have a <filter-value-list> of same length without <url> and for each <filter-function> for which there is a corresponding item in each list
+        if css_filter_value_list_style_value_size(from_list) == css_filter_value_list_style_value_size(to_list):
+            # Interpolate each <filter-function> pair following the rules in section Interpolation of Filter Functions.
+            return css_interpolate_filter_values(element, calculation_context, a_from, a_to, delta, allow_discrete)
+
+        # If both filters have a <filter-value-list> of different length without <url> and for each <filter-function> for which there is a corresponding item in each list
+
+        # 1. Append the missing equivalent <filter-function>s from the longer list to the end of the shorter list. The new added <filter-function>s must be initialized to their initial values for interpolation.
+        let from_ = css_filter_append_missing_values_to(from_list, to_list) if css_filter_value_list_style_value_size(from_list) < css_filter_value_list_style_value_size(to_list) else a_from
+        let to = css_filter_append_missing_values_to(to_list, from_list) if css_filter_value_list_style_value_size(to_list) < css_filter_value_list_style_value_size(from_list) else a_to
+
+        # 2. Interpolate each <filter-function> pair following the rules in section Interpolation of Filter Functions.
+        return css_interpolate_filter_values(element, calculation_context, from_, to, delta, allow_discrete)
+
+    # If one filter is none and the other is a <filter-value-list> without <url>
+    if (css_is_filter_value_list_without_url(a_from) and css_style_value_to_keyword(a_to) == css_data.Keyword.none_) or (css_is_filter_value_list_without_url(a_to) and css_style_value_to_keyword(a_from) == css_data.Keyword.none_):
+        # 1. Replace none with the corresponding <filter-value-list> of the other filter. The new <filter-function>s must be initialized to their initial values for interpolation.
+        var from_ = a_from
+        if css_style_value_is_keyword(a_from):
+            from_ = css_filter_replace_none_with_initial_filter_list_values(css_style_value_as_filter_value_list(a_to))
+        var to = a_to
+        if css_style_value_is_keyword(a_to):
+            to = css_filter_replace_none_with_initial_filter_list_values(css_style_value_as_filter_value_list(a_from))
+
+        # 2. Interpolate each <filter-function> pair following the rules in section Interpolation of Filter Functions.
+        return css_interpolate_filter_values(element, calculation_context, from_, to, delta, allow_discrete)
+
+    # Otherwise:
+    # Use discrete interpolation
+    return none
+
+# mark: Translate ===============================================================================
+
+## Ported from Libraries/LibWeb/CSS/Interpolation.cpp:360 Web::CSS::interpolate_translate.
+func css_interpolate_translate(element: DomElement*, calculation_context: const CssCalculationContext*, a_from: CssStyleValue*, a_to: CssStyleValue*, delta: f32, allow_discrete: CssAllowDiscrete) -> CssStyleValue*?:
+    if css_style_value_to_keyword(a_from) == css_data.Keyword.none_ and css_style_value_to_keyword(a_to) == css_data.Keyword.none_:
+        return a_from
+
+    let zero_px = css_interpolation_static_value(&css_interpolate_translate_zero_px, css_interpolate_translate_make_zero_px)
+    let zero = css_interpolation_static_value(&css_interpolate_translate_zero, css_interpolate_translate_make_zero)
+
+    let from_ = zero if css_style_value_to_keyword(a_from) == css_data.Keyword.none_ else a_from
+    let to = zero if css_style_value_to_keyword(a_to) == css_data.Keyword.none_ else a_to
+
+    let from_values = css_transformation_style_value_values(css_style_value_as_transformation(from_))
+    let to_values = css_transformation_style_value_values(css_style_value_as_transformation(to))
+
+    let interpolated_x = css_interpolate_value(element, calculation_context, *ak.vector_at_const(&from_values, 0), *ak.vector_at_const(&to_values, 0), delta, allow_discrete) else return none
+    let interpolated_y = css_interpolate_value(element, calculation_context, *ak.vector_at_const(&from_values, 1), *ak.vector_at_const(&to_values, 1), delta, allow_discrete) else return none
+
+    var interpolated_z: CssStyleValue*? = none
+
+    if ak.vector_size(&from_values) == 3 or ak.vector_size(&to_values) == 3:
+        let from_z = *ak.vector_at_const(&from_values, 2) if ak.vector_size(&from_values) == 3 else zero_px
+        let to_z = *ak.vector_at_const(&to_values, 2) if ak.vector_size(&to_values) == 3 else zero_px
+        interpolated_z = css_interpolate_value(element, calculation_context, from_z, to_z, delta, allow_discrete)
+        if interpolated_z == none:
+            return none
+
+    var new_values: ak.Vector[CssStyleValue*]
+    ak.vector_append_t(&new_values, interpolated_x)
+    ak.vector_append_t(&new_values, interpolated_y)
+    if let z = interpolated_z:
+        ak.vector_append_t(&new_values, z)
+
+    let function = css_data.TransformFunction.translate3_d if ak.vector_size(&new_values) == 3 else css_data.TransformFunction.translate
+    return css_transformation_style_value_create(css_data.PropertyId.translate, function, new_values).css_style_value()
+
+# mark: Rotate ==================================================================================
+
+## Ported from Libraries/LibWeb/CSS/Interpolation.cpp:403 Web::CSS::slerp.
+# https://drafts.csswg.org/css-transforms-2/#interpolation-of-decomposed-3d-matrix-values
+func css_slerp(from_: gfx.FloatVector4, to: gfx.FloatVector4, delta: f32) -> gfx.FloatVector4:
+    var product = gfx_float_vector4_dot(from_, to)
+
+    product = css_interpolation_clamp_f32(product, -1.0, 1.0)
+    if math32.abs(product) >= 1.0:
+        return from_
+
+    let theta = math32.acos(product)
+    let w = math32.sin(delta * theta) / math32.sqrt(1.0 - (product * product))
+    let from_multiplier = math32.cos(delta * theta) - (product * w)
+
+    if math32.abs(w) < ak.f32_epsilon:
+        return gfx_float_vector4_mul(from_, from_multiplier)
+
+    if math32.abs(from_multiplier) < ak.f32_epsilon:
+        return gfx_float_vector4_mul(to, w)
+
+    return gfx_float_vector4_add(gfx_float_vector4_mul(from_, from_multiplier), gfx_float_vector4_mul(to, w))
+
+## interpolate_rotate's `from_axis_angle` lambda: an axis and an angle as a quaternion.
+func css_rotate_from_axis_angle(axis: gfx.FloatVector3, angle: f32) -> gfx.FloatVector4:
+    let normalized = gfx_float_vector3_normalized(axis)
+    let half_angle = angle / 2.0
+    let sin_half_angle = math32.sin(half_angle)
+    return gfx_float_vector4_new(normalized.m_data[0] * sin_half_angle, normalized.m_data[1] * sin_half_angle, normalized.m_data[2] * sin_half_angle, math32.cos(half_angle))
+
+## interpolate_rotate's `AxisAngle`.
+struct CssRotateAxisAngle:
+    var axis: gfx.FloatVector3
+    var angle: f32
+
+## interpolate_rotate's `quaternion_to_axis_angle` lambda.
+func css_rotate_quaternion_to_axis_angle(quaternion: gfx.FloatVector4) -> CssRotateAxisAngle:
+    var axis = gfx_float_vector3_new(quaternion.m_data[0], quaternion.m_data[1], quaternion.m_data[2])
+    let epsilon: f32 = 1e-5
+    let one_minus_w_squared = 1.0 - quaternion.m_data[3] * quaternion.m_data[3]
+    let sin_half_angle = math32.sqrt(one_minus_w_squared if 0.0 < one_minus_w_squared else 0.0)  # max(0.0f, ...)
+    let angle = 2.0 * math32.acos(css_interpolation_clamp_f32(quaternion.m_data[3], -1.0, 1.0))
+    if sin_half_angle < epsilon:
+        return CssRotateAxisAngle(axis = axis, angle = angle)
+    axis = gfx_float_vector3_mul(axis, 1.0 / sin_half_angle)
+    return CssRotateAxisAngle(axis = axis, angle = angle)
+
+## AK::to_degrees over a float: `radians * 180 / Pi<float>`.
+func css_interpolation_to_degrees(radians: f32) -> f32:
+    return radians * 180.0 / math32.pi
+
+## The axis and angle of a rotate() or rotate3d() value (interpolate_rotate's reading of from and to).
+func css_rotate_axis_and_angle(transform: CssTransformationStyleValue*) -> CssRotateAxisAngle:
+    let values = css_transformation_style_value_values(transform)
+    var axis = gfx_float_vector3_new(0.0, 0.0, 1.0)
+    var angle_value = *ak.vector_at_const(&values, 0)
+    if ak.vector_size(&values) == 4:
+        axis.m_data[0] = (f32)css_number_style_value_number(css_style_value_as_number(*ak.vector_at_const(&values, 0)))
+        axis.m_data[1] = (f32)css_number_style_value_number(css_style_value_as_number(*ak.vector_at_const(&values, 1)))
+        axis.m_data[2] = (f32)css_number_style_value_number(css_style_value_as_number(*ak.vector_at_const(&values, 2)))
+        angle_value = *ak.vector_at_const(&values, 3)
+    let angle = css_angle_from_style_value(angle_value, none)
+    return CssRotateAxisAngle(axis = axis, angle = (f32)css_angle_to_radians(&angle))
+
+## A rotate3d() TransformationStyleValue of the Rotate property from an axis and an angle in radians.
+func css_rotate3d_value(axis: gfx.FloatVector3, angle: f32) -> CssStyleValue*:
+    var values: ak.Vector[CssStyleValue*]
+    ak.vector_append_t(&values, css_number_style_value_create(f64(axis.m_data[0])).css_style_value())
+    ak.vector_append_t(&values, css_number_style_value_create(f64(axis.m_data[1])).css_style_value())
+    ak.vector_append_t(&values, css_number_style_value_create(f64(axis.m_data[2])).css_style_value())
+    ak.vector_append_t(&values, css_angle_style_value_create(css_angle_make_degrees(f64(css_interpolation_to_degrees(angle)))).css_style_value())
+    return css_transformation_style_value_create(css_data.PropertyId.rotate, css_data.TransformFunction.rotate3_d, values).css_style_value()
+
+## Ported from Libraries/LibWeb/CSS/Interpolation.cpp:424 Web::CSS::interpolate_rotate.
+func css_interpolate_rotate(element: DomElement*, calculation_context: const CssCalculationContext*, a_from: CssStyleValue*, a_to: CssStyleValue*, delta: f32, allow_discrete: CssAllowDiscrete) -> CssStyleValue*?:
+    if css_style_value_to_keyword(a_from) == css_data.Keyword.none_ and css_style_value_to_keyword(a_to) == css_data.Keyword.none_:
+        return a_from
+
+    let zero = css_interpolation_static_value(&css_interpolate_rotate_zero, css_interpolate_rotate_make_zero)
+
+    let from_ = zero if css_style_value_to_keyword(a_from) == css_data.Keyword.none_ else a_from
+    let to = zero if css_style_value_to_keyword(a_to) == css_data.Keyword.none_ else a_to
+
+    let from_transform = css_style_value_as_transformation(from_)
+    let to_transform = css_style_value_as_transformation(to)
+
+    let from_transform_type = css_transformation_style_value_transform_function(from_transform)
+    let to_transform_type = css_transformation_style_value_transform_function(to_transform)
+
+    let from_values = css_transformation_style_value_values(from_transform)
+    let to_values = css_transformation_style_value_values(to_transform)
+    if from_transform_type == to_transform_type and ak.vector_size(&from_values) == 1:
+        let interpolated_angle = css_interpolate_value(element, calculation_context, *ak.vector_at_const(&from_values, 0), *ak.vector_at_const(&to_values, 0), delta, allow_discrete) else return none
+        var values: ak.Vector[CssStyleValue*]
+        ak.vector_append_t(&values, interpolated_angle)
+        return css_transformation_style_value_create(css_data.PropertyId.rotate, from_transform_type, values).css_style_value()
+
+    let from_axis_angle = css_rotate_axis_and_angle(from_transform)
+    let from_axis = from_axis_angle.axis
+    let from_angle = from_axis_angle.angle
+
+    let to_axis_angle = css_rotate_axis_and_angle(to_transform)
+    let to_axis = to_axis_angle.axis
+    let to_angle = to_axis_angle.angle
+
+    # https://drafts.csswg.org/css-transforms-2/#interpolation-of-transform-functions
+    # If the normalized vectors are equal, or if one of the angles is zero, interpolate the angle
+    # numerically and use the rotation vector of the non-zero angle (or (0, 0, 1) if both are zero).
+    let epsilon: f32 = 1e-5
+    let from_axis_normalized = gfx_float_vector3_normalized(from_axis) if gfx_float_vector3_length(from_axis) > epsilon else gfx_float_vector3_new(0.0, 0.0, 1.0)
+    let to_axis_normalized = gfx_float_vector3_normalized(to_axis) if gfx_float_vector3_length(to_axis) > epsilon else gfx_float_vector3_new(0.0, 0.0, 1.0)
+    let axes_are_equal = gfx_float_vector3_length(gfx_float_vector3_sub(from_axis_normalized, to_axis_normalized)) < epsilon
+    if axes_are_equal or from_angle == 0.0 or to_angle == 0.0:
+        let result_angle = from_angle + (to_angle - from_angle) * delta
+        var result_axis = gfx_float_vector3_new(0.0, 0.0, 1.0)
+        if to_angle != 0.0:
+            result_axis = to_axis_normalized
+        elif from_angle != 0.0:
+            result_axis = from_axis_normalized
+
+        return css_rotate3d_value(result_axis, result_angle)
+
+    # If the normalized vectors are not equal and both rotation angles are non-zero, convert to
+    # 4x4 matrices and interpolate as defined in Interpolation of Matrices.
+    let from_quaternion = css_rotate_from_axis_angle(from_axis, from_angle)
+    let to_quaternion = css_rotate_from_axis_angle(to_axis, to_angle)
+
+    let interpolated_quaternion = css_slerp(from_quaternion, to_quaternion, delta)
+    let interpolated_axis_angle = css_rotate_quaternion_to_axis_angle(interpolated_quaternion)
+    return css_rotate3d_value(interpolated_axis_angle.axis, interpolated_axis_angle.angle)

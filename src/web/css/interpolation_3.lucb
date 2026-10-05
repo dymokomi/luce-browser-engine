@@ -1,0 +1,499 @@
+#==============================================================================================
+#
+#   interpolation_3 - CSS interpolation: 4x4 matrices and transform lists
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibWeb/CSS/Interpolation.cpp (lines 835-1376), by region p4a:
+#       decomposing a 3D matrix into translation, scale, skew, rotation (a quaternion) and
+#       perspective, interpolating the decomposed values and recomposing them; a matrix as
+#       matrix3d() values; and the interpolation of transform lists (padding the shorter list
+#       with identity functions, converting each pair to its common 2D or 3D primitive, and
+#       interpolating the remaining functions as matrices).
+#
+#       Copyright (c) 2024, Matthew Olsson <mattco@serenityos.org>
+#       Copyright (c) 2025-2026, Tim Ledbetter <tim.ledbetter@ladybird.org>
+#       Copyright (c) 2025, Jelle Raaijmakers <jelle@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Interpolation of matrices ===============================================================
+
+## interpolate_matrices' `DecomposedValues`.
+struct CssDecomposedValues:
+    var translation: gfx.FloatVector3
+    var scale: gfx.FloatVector3
+    var skew: gfx.FloatVector3
+    var rotation: gfx.FloatVector4
+    var perspective: gfx.FloatVector4
+
+## AK::max(a, b) over floats: `a < b ? b : a`.
+func css_interpolation_max_f32(a: f32, b: f32) -> f32:
+    return b if a < b else a
+
+## interpolate_matrices' `combine` lambda.
+# https://drafts.csswg.org/css-transforms-1/#supporting-functions
+func css_decompose_combine(a: gfx.FloatVector3, b: gfx.FloatVector3, ascl: f32, bscl: f32) -> gfx.FloatVector3:
+    return gfx_float_vector3_new(ascl * a.m_data[0] + bscl * b.m_data[0], ascl * a.m_data[1] + bscl * b.m_data[1], ascl * a.m_data[2] + bscl * b.m_data[2])
+
+## interpolate_matrices' `decompose` lambda.
+# https://drafts.csswg.org/css-transforms-2/#decomposing-a-3d-matrix
+func css_decompose_matrix(original: gfx.FloatMatrix4X4) -> CssDecomposedValues?:
+    var matrix = original
+
+    # Normalize the matrix.
+    if matrix.m_elements[3][3] == 0.0:
+        return none
+
+    for i in 0..<4:
+        for j in 0..<4:
+            matrix.m_elements[i][j] /= matrix.m_elements[3][3]
+
+    # perspectiveMatrix is used to solve for perspective, but it also provides
+    # an easy way to test for singularity of the upper 3x3 component.
+    var perspective_matrix = matrix
+    for i in 0..<3:
+        perspective_matrix.m_elements[3][i] = 0.0
+    perspective_matrix.m_elements[3][3] = 1.0
+
+    if not gfx.float_matrix4_x4_is_invertible(&perspective_matrix):
+        return none
+
+    let zero3 = gfx_float_vector3_new(0.0, 0.0, 0.0)
+    var values = CssDecomposedValues(translation = zero3, scale = zero3, skew = zero3, rotation = gfx_float_vector4_new(0.0, 0.0, 0.0, 0.0), perspective = gfx_float_vector4_new(0.0, 0.0, 0.0, 0.0))
+
+    # First, isolate perspective.
+    if matrix.m_elements[3][0] != 0.0 or matrix.m_elements[3][1] != 0.0 or matrix.m_elements[3][2] != 0.0:
+        # rightHandSide is the right hand side of the equation.
+        # Note: It is the bottom side in a row-major matrix
+        let bottom_side = gfx_float_vector4_new(matrix.m_elements[3][0], matrix.m_elements[3][1], matrix.m_elements[3][2], matrix.m_elements[3][3])
+
+        # Solve the equation by inverting perspectiveMatrix and multiplying
+        # rightHandSide by the inverse.
+        let inverse_perspective_matrix = gfx.float_matrix4_x4_inverse(&perspective_matrix)
+        let transposed_inverse_perspective_matrix = gfx.float_matrix4_x4_transpose(&inverse_perspective_matrix)
+        values.perspective = gfx.mul_float_matrix4_x4_float_vector4(transposed_inverse_perspective_matrix, bottom_side)
+    else:
+        # No perspective.
+        values.perspective = gfx_float_vector4_new(0.0, 0.0, 0.0, 1.0)
+
+    # Next take care of translation
+    for i in 0..<3:
+        values.translation.m_data[i] = matrix.m_elements[i][3]
+
+    # Now get scale and shear. 'row' is a 3 element array of 3 component vectors
+    var row: gfx.FloatVector3[3] = [zero3, zero3, zero3]
+    for i in 0..<3:
+        row[i] = gfx_float_vector3_new(matrix.m_elements[0][i], matrix.m_elements[1][i], matrix.m_elements[2][i])
+
+    # Compute X scale factor and normalize first row.
+    values.scale.m_data[0] = gfx_float_vector3_length(row[0])
+    gfx_float_vector3_normalize(&row[0])
+
+    # Compute XY shear factor and make 2nd row orthogonal to 1st.
+    values.skew.m_data[0] = gfx_float_vector3_dot(row[0], row[1])
+    row[1] = css_decompose_combine(row[1], row[0], 1.0, -values.skew.m_data[0])
+
+    # Now, compute Y scale and normalize 2nd row.
+    values.scale.m_data[1] = gfx_float_vector3_length(row[1])
+    gfx_float_vector3_normalize(&row[1])
+    values.skew.m_data[0] /= values.scale.m_data[1]
+
+    # Compute XZ and YZ shears, orthogonalize 3rd row
+    values.skew.m_data[1] = gfx_float_vector3_dot(row[0], row[2])
+    row[2] = css_decompose_combine(row[2], row[0], 1.0, -values.skew.m_data[1])
+    values.skew.m_data[2] = gfx_float_vector3_dot(row[1], row[2])
+    row[2] = css_decompose_combine(row[2], row[1], 1.0, -values.skew.m_data[2])
+
+    # Next, get Z scale and normalize 3rd row.
+    values.scale.m_data[2] = gfx_float_vector3_length(row[2])
+    gfx_float_vector3_normalize(&row[2])
+    values.skew.m_data[1] /= values.scale.m_data[2]
+    values.skew.m_data[2] /= values.scale.m_data[2]
+
+    # At this point, the matrix (in rows) is orthonormal.
+    # Check for a coordinate system flip.  If the determinant
+    # is -1, then negate the matrix and the scaling factors.
+    let pdum3 = gfx_float_vector3_cross(row[1], row[2])
+    if gfx_float_vector3_dot(row[0], pdum3) < 0.0:
+        for i in 0..<3:
+            values.scale.m_data[i] *= -1.0
+            row[i].m_data[0] *= -1.0
+            row[i].m_data[1] *= -1.0
+            row[i].m_data[2] *= -1.0
+
+    # Now, get the rotations out
+    values.rotation.m_data[0] = 0.5 * math32.sqrt(css_interpolation_max_f32(1.0 + row[0].m_data[0] - row[1].m_data[1] - row[2].m_data[2], 0.0))
+    values.rotation.m_data[1] = 0.5 * math32.sqrt(css_interpolation_max_f32(1.0 - row[0].m_data[0] + row[1].m_data[1] - row[2].m_data[2], 0.0))
+    values.rotation.m_data[2] = 0.5 * math32.sqrt(css_interpolation_max_f32(1.0 - row[0].m_data[0] - row[1].m_data[1] + row[2].m_data[2], 0.0))
+    values.rotation.m_data[3] = 0.5 * math32.sqrt(css_interpolation_max_f32(1.0 + row[0].m_data[0] + row[1].m_data[1] + row[2].m_data[2], 0.0))
+
+    if row[2].m_data[1] > row[1].m_data[2]:
+        values.rotation.m_data[0] = -values.rotation.m_data[0]
+    if row[0].m_data[2] > row[2].m_data[0]:
+        values.rotation.m_data[1] = -values.rotation.m_data[1]
+    if row[1].m_data[0] > row[0].m_data[1]:
+        values.rotation.m_data[2] = -values.rotation.m_data[2]
+
+    # FIXME: This accounts for the fact that the browser coordinate system is left-handed instead of right-handed.
+    #        The reason for this is that the positive Y-axis direction points down instead of up. To fix this, we
+    #        invert the Y axis. However, it feels like the spec pseudo-code above should have taken something like
+    #        this into account, so we're probably doing something else wrong.
+    values.rotation.m_data[2] *= -1.0
+
+    return values
+
+## interpolate_matrices' `recompose` lambda.
+# https://drafts.csswg.org/css-transforms-2/#recomposing-to-a-3d-matrix
+func css_recompose_matrix(values: const CssDecomposedValues*) -> gfx.FloatMatrix4X4:
+    var matrix = gfx.float_matrix4_x4_identity()
+
+    # apply perspective
+    for i in 0..<4:
+        matrix.m_elements[3][i] = values.perspective.m_data[i]
+
+    # apply translation
+    for i in 0..<4:
+        for j in 0..<3:
+            matrix.m_elements[i][3] += values.translation.m_data[j] * matrix.m_elements[i][j]
+
+    # apply rotation
+    let x = values.rotation.m_data[0]
+    let y = values.rotation.m_data[1]
+    let z = values.rotation.m_data[2]
+    let w = values.rotation.m_data[3]
+
+    # Construct a composite rotation matrix from the quaternion values
+    # rotationMatrix is a identity 4x4 matrix initially
+    var rotation_matrix = gfx.float_matrix4_x4_identity()
+    rotation_matrix.m_elements[0][0] = 1.0 - 2.0 * (y * y + z * z)
+    rotation_matrix.m_elements[1][0] = 2.0 * (x * y - z * w)
+    rotation_matrix.m_elements[2][0] = 2.0 * (x * z + y * w)
+    rotation_matrix.m_elements[0][1] = 2.0 * (x * y + z * w)
+    rotation_matrix.m_elements[1][1] = 1.0 - 2.0 * (x * x + z * z)
+    rotation_matrix.m_elements[2][1] = 2.0 * (y * z - x * w)
+    rotation_matrix.m_elements[0][2] = 2.0 * (x * z - y * w)
+    rotation_matrix.m_elements[1][2] = 2.0 * (y * z + x * w)
+    rotation_matrix.m_elements[2][2] = 1.0 - 2.0 * (x * x + y * y)
+
+    matrix = gfx.float_matrix4_x4_mul(&matrix, rotation_matrix)
+
+    # apply skew
+    # temp is a identity 4x4 matrix initially
+    var temp = gfx.float_matrix4_x4_identity()
+    if values.skew.m_data[2] != 0.0:
+        temp.m_elements[1][2] = values.skew.m_data[2]
+        matrix = gfx.float_matrix4_x4_mul(&matrix, temp)
+
+    if values.skew.m_data[1] != 0.0:
+        temp.m_elements[1][2] = 0.0
+        temp.m_elements[0][2] = values.skew.m_data[1]
+        matrix = gfx.float_matrix4_x4_mul(&matrix, temp)
+
+    if values.skew.m_data[0] != 0.0:
+        temp.m_elements[0][2] = 0.0
+        temp.m_elements[0][1] = values.skew.m_data[0]
+        matrix = gfx.float_matrix4_x4_mul(&matrix, temp)
+
+    # apply scale
+    for i in 0..<3:
+        for j in 0..<4:
+            matrix.m_elements[j][i] *= values.scale.m_data[i]
+
+    return matrix
+
+## Ported from Libraries/LibWeb/CSS/Interpolation.cpp:835 Web::CSS::interpolate_matrices.
+func css_interpolate_matrices(from_: gfx.FloatMatrix4X4, to: gfx.FloatMatrix4X4, delta: f32) -> gfx.FloatMatrix4X4?:
+    let from_decomposed = css_decompose_matrix(from_) else return none
+    let to_decomposed = css_decompose_matrix(to) else return none
+
+    # https://drafts.csswg.org/css-transforms-2/#interpolation-of-decomposed-3d-matrix-values
+    # (the `interpolate` lambda)
+    let interpolated_rotation = css_slerp(from_decomposed.rotation, to_decomposed.rotation, delta)
+    let interpolated_decomposed = CssDecomposedValues(translation = css_interpolate_raw_float_vector3(from_decomposed.translation, to_decomposed.translation, delta), scale = css_interpolate_raw_float_vector3(from_decomposed.scale, to_decomposed.scale, delta), skew = css_interpolate_raw_float_vector3(from_decomposed.skew, to_decomposed.skew, delta), rotation = interpolated_rotation, perspective = css_interpolate_raw_float_vector4(from_decomposed.perspective, to_decomposed.perspective, delta))
+    return css_recompose_matrix(&interpolated_decomposed)
+
+## Ported from Libraries/LibWeb/CSS/Interpolation.cpp:1049 Web::CSS::matrix_to_style_value_vector.
+func css_matrix_to_style_value_vector(matrix: const gfx.FloatMatrix4X4*) -> ak.Vector[CssStyleValue*]:
+    var values: ak.Vector[CssStyleValue*]
+    ak.vector_ensure_capacity(&values, 16)
+    for i in 0..<16:
+        ak.vector_append_t(&values, css_number_style_value_create(f64(matrix.m_elements[i % 4][i // 4])).css_style_value())
+    return values
+
+# mark: Interpolation of transforms =============================================================
+
+## interpolate_transform's `style_value_to_transformations` lambda.
+func css_style_value_to_transformations(style_value: CssStyleValue*) -> ak.Vector[CssTransformationStyleValue*]:
+    var result: ak.Vector[CssTransformationStyleValue*]
+    if css_style_value_is_transformation(style_value):
+        ak.vector_append_t(&result, css_style_value_as_transformation(style_value))
+        return result
+
+    # NB: This encompasses both the allowed value "none" and any invalid values.
+    if not css_style_value_is_value_list(style_value):
+        return result
+
+    let values = css_style_value_list_values(css_style_value_as_value_list(style_value))
+    for value in ak.vector_span_const(&values):
+        assert(css_style_value_is_transformation(value))
+        ak.vector_append_t(&result, css_style_value_as_transformation(value))
+    return result
+
+## interpolate_transform's `is_2d_primitive` lambda.
+# https://drafts.csswg.org/css-transforms-1/#transform-primitives
+func css_transform_is_2d_primitive(function: css_data.TransformFunction) -> bool:
+    return function == css_data.TransformFunction.rotate or function == css_data.TransformFunction.scale or function == css_data.TransformFunction.translate
+
+## interpolate_transform's `is_2d_transform` lambda.
+func css_transform_is_2d_transform(function: css_data.TransformFunction) -> bool:
+    return css_transform_is_2d_primitive(function) or function == css_data.TransformFunction.scale_x or function == css_data.TransformFunction.scale_y or function == css_data.TransformFunction.translate_x or function == css_data.TransformFunction.translate_y
+
+## interpolate_transform's `is_3d_primitive` lambda.
+# https://drafts.csswg.org/css-transforms-2/#transform-primitives
+func css_transform_is_3d_primitive(function: css_data.TransformFunction) -> bool:
+    return function == css_data.TransformFunction.rotate3_d or function == css_data.TransformFunction.scale3_d or function == css_data.TransformFunction.translate3_d
+
+## interpolate_transform's `is_3d_transform` lambda.
+func css_transform_is_3d_transform(function: css_data.TransformFunction) -> bool:
+    if css_transform_is_2d_transform(function) or css_transform_is_3d_primitive(function):
+        return true
+    match function:
+        .rotate_x, .rotate_y, .rotate_z, .scale_z, .translate_z:
+            return true
+        _:
+            return false
+
+## `NumberStyleValue::create(value)` as a StyleValue.
+func css_interpolation_number(value: f64) -> CssStyleValue*:
+    return css_number_style_value_create(value).css_style_value()
+
+## `LengthStyleValue::create(Length::make_px(0.))` as a StyleValue.
+func css_interpolation_zero_px() -> CssStyleValue*:
+    return css_length_style_value_create(css_length_make_px_f64(0.0)).css_style_value()
+
+## interpolate_transform's `convert_2d_transform_to_primitive` lambda.
+func css_convert_2d_transform_to_primitive(transform: CssTransformationStyleValue*) -> CssTransformationStyleValue*:
+    let values = css_transformation_style_value_values(transform)
+    let first = *ak.vector_at_const(&values, 0)
+    var generic_function = css_data.TransformFunction.scale
+    var parameters: ak.Vector[CssStyleValue*]
+    match css_transformation_style_value_transform_function(transform):
+        .scale:
+            generic_function = css_data.TransformFunction.scale
+            ak.vector_append_t(&parameters, first)
+            ak.vector_append_t(&parameters, *ak.vector_at_const(&values, 1) if ak.vector_size(&values) > 1 else first)
+        .scale_x:
+            generic_function = css_data.TransformFunction.scale
+            ak.vector_append_t(&parameters, first)
+            ak.vector_append_t(&parameters, css_interpolation_number(1.0))
+        .scale_y:
+            generic_function = css_data.TransformFunction.scale
+            ak.vector_append_t(&parameters, css_interpolation_number(1.0))
+            ak.vector_append_t(&parameters, first)
+        .rotate:
+            generic_function = css_data.TransformFunction.rotate
+            ak.vector_append_t(&parameters, first)
+        .translate:
+            generic_function = css_data.TransformFunction.translate
+            ak.vector_append_t(&parameters, first)
+            ak.vector_append_t(&parameters, *ak.vector_at_const(&values, 1) if ak.vector_size(&values) > 1 else css_interpolation_zero_px())
+        .translate_x:
+            generic_function = css_data.TransformFunction.translate
+            ak.vector_append_t(&parameters, first)
+            ak.vector_append_t(&parameters, css_interpolation_zero_px())
+        .translate_y:
+            generic_function = css_data.TransformFunction.translate
+            ak.vector_append_t(&parameters, css_interpolation_zero_px())
+            ak.vector_append_t(&parameters, first)
+        _:
+            trap("VERIFY_NOT_REACHED")
+    return css_transformation_style_value_create(css_data.PropertyId.transform, generic_function, parameters)
+
+## interpolate_transform's `convert_3d_transform_to_primitive` lambda.
+func css_convert_3d_transform_to_primitive(element: DomElement*, original: CssTransformationStyleValue*) -> CssTransformationStyleValue*:
+    var transform = original
+    # NB: Convert to 2D primitive if possible so we don't have to deal with scale/translate X/Y separately.
+    if css_transform_is_2d_transform(css_transformation_style_value_transform_function(transform)):
+        transform = css_convert_2d_transform_to_primitive(transform)
+
+    let values = css_transformation_style_value_values(transform)
+    let first = *ak.vector_at_const(&values, 0)
+    var generic_function = css_data.TransformFunction.matrix3_d
+    var parameters: ak.Vector[CssStyleValue*]
+    match css_transformation_style_value_transform_function(transform):
+        .rotate, .rotate_z:
+            generic_function = css_data.TransformFunction.rotate3_d
+            ak.vector_append_t(&parameters, css_interpolation_number(0.0))
+            ak.vector_append_t(&parameters, css_interpolation_number(0.0))
+            ak.vector_append_t(&parameters, css_interpolation_number(1.0))
+            ak.vector_append_t(&parameters, first)
+        .rotate_x:
+            generic_function = css_data.TransformFunction.rotate3_d
+            ak.vector_append_t(&parameters, css_interpolation_number(1.0))
+            ak.vector_append_t(&parameters, css_interpolation_number(0.0))
+            ak.vector_append_t(&parameters, css_interpolation_number(0.0))
+            ak.vector_append_t(&parameters, first)
+        .rotate_y:
+            generic_function = css_data.TransformFunction.rotate3_d
+            ak.vector_append_t(&parameters, css_interpolation_number(0.0))
+            ak.vector_append_t(&parameters, css_interpolation_number(1.0))
+            ak.vector_append_t(&parameters, css_interpolation_number(0.0))
+            ak.vector_append_t(&parameters, first)
+        .scale:
+            generic_function = css_data.TransformFunction.scale3_d
+            ak.vector_append_t(&parameters, first)
+            ak.vector_append_t(&parameters, *ak.vector_at_const(&values, 1) if ak.vector_size(&values) > 1 else first)
+            ak.vector_append_t(&parameters, css_interpolation_number(1.0))
+        .scale_z:
+            generic_function = css_data.TransformFunction.scale3_d
+            ak.vector_append_t(&parameters, css_interpolation_number(1.0))
+            ak.vector_append_t(&parameters, css_interpolation_number(1.0))
+            ak.vector_append_t(&parameters, first)
+        .translate:
+            generic_function = css_data.TransformFunction.translate3_d
+            ak.vector_append_t(&parameters, first)
+            ak.vector_append_t(&parameters, *ak.vector_at_const(&values, 1) if ak.vector_size(&values) > 1 else css_interpolation_zero_px())
+            ak.vector_append_t(&parameters, css_interpolation_zero_px())
+        .translate_z:
+            generic_function = css_data.TransformFunction.translate3_d
+            ak.vector_append_t(&parameters, css_interpolation_zero_px())
+            ak.vector_append_t(&parameters, css_interpolation_zero_px())
+            ak.vector_append_t(&parameters, first)
+        _:
+            generic_function = css_data.TransformFunction.matrix3_d
+            # NB: Called during animation interpolation.
+            let paintable_box = dom_node_unsafe_paintable_box(element.dom_node())
+            let matrix = css_transformation_style_value_to_matrix(transform, paintable_box) else trap("MUST: TransformationStyleValue::to_matrix")
+            parameters = css_matrix_to_style_value_vector(&matrix)
+    return css_transformation_style_value_create(css_data.PropertyId.transform, generic_function, parameters)
+
+## interpolate_transform's `post_multiply_remaining_transformations` lambda.
+func css_post_multiply_remaining_transformations(paintable_box: PaintPaintableBox*?, start_index: usize, transformations: const ak.Vector[CssTransformationStyleValue*]*) -> gfx.FloatMatrix4X4?:
+    var result = gfx.float_matrix4_x4_identity()
+    for index in start_index..<ak.vector_size(transformations):
+        let transformation_matrix = css_transformation_style_value_to_matrix(*ak.vector_at_const(transformations, index), paintable_box) else return none
+        result = gfx.float_matrix4_x4_mul(&result, transformation_matrix)
+    return result
+
+## Ported from Libraries/LibWeb/CSS/Interpolation.cpp:1059 Web::CSS::interpolate_transform.
+# https://drafts.csswg.org/css-transforms-1/#interpolation-of-transforms
+pub func css_interpolate_transform(element: DomElement*, calculation_context: const CssCalculationContext*, from_: CssStyleValue*, to: CssStyleValue*, delta: f32, allow_discrete: CssAllowDiscrete) -> CssStyleValue*?:
+    # * If both Va and Vb are none:
+    #   * Vresult is none.
+    if css_style_value_is_keyword(from_) and css_keyword_style_value_keyword(css_style_value_as_keyword(from_)) == css_data.Keyword.none_ and css_style_value_is_keyword(to) and css_keyword_style_value_keyword(css_style_value_as_keyword(to)) == css_data.Keyword.none_:
+        return css_keyword_style_value_create(css_data.Keyword.none_).css_style_value()
+
+    # * Treating none as a list of zero length, if Va or Vb differ in length:
+    var from_transformations = css_style_value_to_transformations(from_)
+    var to_transformations = css_style_value_to_transformations(to)
+    if ak.vector_size(&from_transformations) != ak.vector_size(&to_transformations):
+        #   * extend the shorter list to the length of the longer list, setting the function at each additional
+        #     position to the identity transform function matching the function at the corresponding position in the
+        #     longer list. Both transform function lists are then interpolated following the next rule.
+        let from_is_shorter = ak.vector_size(&from_transformations) < ak.vector_size(&to_transformations)
+        let shorter_list = &from_transformations if from_is_shorter else &to_transformations
+        let longer_list = &to_transformations if from_is_shorter else &from_transformations
+        for i in ak.vector_size(shorter_list)..<ak.vector_size(longer_list):
+            let transformation = *ak.vector_at_const(longer_list, i)
+            ak.vector_append_t(shorter_list, css_transformation_style_value_identity_transformation(css_transformation_style_value_transform_function(transformation)))
+
+    # *  Let Vresult be an empty list. Beginning at the start of Va and Vb, compare the corresponding functions at each
+    #    position:
+    var result: ak.Vector[CssStyleValue*]
+    ak.vector_ensure_capacity(&result, ak.vector_size(&from_transformations))
+    var index: usize = 0
+    while index < ak.vector_size(&from_transformations):
+        var from_transformation = *ak.vector_at_const(&from_transformations, index)
+        var to_transformation = *ak.vector_at_const(&to_transformations, index)
+
+        var from_function = css_transformation_style_value_transform_function(from_transformation)
+        var to_function = css_transformation_style_value_transform_function(to_transformation)
+
+        #   * While the functions have either the same name, or are derivatives of the same primitive transform
+        #     function, interpolate the corresponding pair of functions as described in § 10 Interpolation of
+        #     primitives and derived transform functions and append the result to Vresult.
+
+        # https://drafts.csswg.org/css-transforms-2/#interpolation-of-transform-functions
+        # Two different types of transform functions that share the same primitive, or transform functions of the same
+        # type with different number of arguments can be interpolated. Both transform functions need a former
+        # conversion to the common primitive first and get interpolated numerically afterwards. The computed value will
+        # be the primitive with the resulting interpolated arguments.
+
+        # The transform functions <matrix()>, matrix3d() and perspective() get converted into 4x4 matrices first and
+        # interpolated as defined in section Interpolation of Matrices afterwards.
+        if from_function == css_data.TransformFunction.matrix or to_function == css_data.TransformFunction.matrix or from_function == css_data.TransformFunction.matrix3_d or to_function == css_data.TransformFunction.matrix3_d or from_function == css_data.TransformFunction.perspective or to_function == css_data.TransformFunction.perspective:
+            break
+
+        # If both transform functions share a primitive in the two-dimensional space, both transform functions get
+        # converted to the two-dimensional primitive. If one or both transform functions are three-dimensional
+        # transform functions, the common three-dimensional primitive is used.
+        if css_transform_is_2d_transform(from_function) and css_transform_is_2d_transform(to_function):
+            from_transformation = css_convert_2d_transform_to_primitive(from_transformation)
+            to_transformation = css_convert_2d_transform_to_primitive(to_transformation)
+        elif css_transform_is_3d_transform(from_function) or css_transform_is_3d_transform(to_function):
+            # NB: 3D primitives do not support value expansion like their 2D counterparts do (e.g. scale(1.5) ->
+            #     scale(1.5, 1.5), so we check if they are already a primitive first.
+            if not css_transform_is_3d_primitive(from_function):
+                from_transformation = css_convert_3d_transform_to_primitive(element, from_transformation)
+            if not css_transform_is_3d_primitive(to_function):
+                to_transformation = css_convert_3d_transform_to_primitive(element, to_transformation)
+        from_function = css_transformation_style_value_transform_function(from_transformation)
+        to_function = css_transformation_style_value_transform_function(to_transformation)
+
+        # NB: We converted both functions to their primitives. But if they're different primitives or if they have a
+        #     different number of values, we can't interpolate numerically between them. Break here so the next loop
+        #     can take care of the remaining functions.
+        let from_values = css_transformation_style_value_values(from_transformation)
+        let to_values = css_transformation_style_value_values(to_transformation)
+        if from_function != to_function or ak.vector_size(&from_values) != ak.vector_size(&to_values):
+            break
+
+        # https://drafts.csswg.org/css-transforms-2/#interpolation-of-transform-functions
+        if from_function == css_data.TransformFunction.rotate3_d:
+            # FIXME: For interpolations with the primitive rotate3d(), the direction vectors of the transform functions get
+            # normalized first. If the normalized vectors are not equal and both rotation angles are non-zero the
+            # transform functions get converted into 4x4 matrices first and interpolated as defined in section
+            # Interpolation of Matrices afterwards. Otherwise the rotation angle gets interpolated numerically and the
+            # rotation vector of the non-zero angle is used or (0, 0, 1) if both angles are zero.
+
+            let interpolated_rotation = css_interpolate_rotate(element, calculation_context, from_transformation.css_style_value(), to_transformation.css_style_value(), delta, CssAllowDiscrete.no) else break
+            ak.vector_append_t(&result, interpolated_rotation)
+        else:
+            var interpolated: ak.Vector[CssStyleValue*]
+            ak.vector_ensure_capacity(&interpolated, ak.vector_size(&from_values))
+            for i in 0..<ak.vector_size(&from_values):
+                let interpolated_value = css_interpolate_value(element, calculation_context, *ak.vector_at_const(&from_values, i), *ak.vector_at_const(&to_values, i), delta, CssAllowDiscrete.no) else break
+                ak.vector_append_t(&interpolated, interpolated_value)
+            if ak.vector_size(&interpolated) != ak.vector_size(&from_values):
+                break
+            ak.vector_append_t(&result, css_transformation_style_value_create(css_data.PropertyId.transform, from_function, interpolated).css_style_value())
+        index += 1
+
+    # NB: Return if we're done.
+    if index == ak.vector_size(&from_transformations):
+        return css_style_value_list_create(result, CssStyleValueListSeparator.space).css_style_value()
+
+    #   * If the pair do not have a common name or primitive transform function, post-multiply the remaining
+    #     transform functions in each of Va and Vb respectively to produce two 4x4 matrices. Interpolate these two
+    #     matrices as described in § 11 Interpolation of Matrices, append the result to Vresult, and cease
+    #     iterating over Va and Vb.
+    # NB: Called during animation interpolation.
+    var paintable_box: PaintPaintableBox*? = none
+    if let paintable = dom_node_unsafe_paintable(element.dom_node()):
+        paintable_box = as_if_paint_paintable_box(paintable)
+
+    let from_matrix = css_post_multiply_remaining_transformations(paintable_box, index, &from_transformations)
+    let to_matrix = css_post_multiply_remaining_transformations(paintable_box, index, &to_transformations)
+
+    # https://drafts.csswg.org/css-transforms-1/#interpolation-of-transforms
+    # If one of the matrices for interpolation is non-invertible, the used animation function must
+    # fall-back to a discrete animation according to the rules of the respective animation specification.
+    let from_m = from_matrix else return css_interpolate_discrete(from_, to, delta, allow_discrete)
+    let to_m = to_matrix else return css_interpolate_discrete(from_, to, delta, allow_discrete)
+
+    let interpolated_matrix = css_interpolate_matrices(from_m, to_m, delta) else return css_interpolate_discrete(from_, to, delta, allow_discrete)
+
+    ak.vector_append_t(&result, css_transformation_style_value_create(css_data.PropertyId.transform, css_data.TransformFunction.matrix3_d, css_matrix_to_style_value_vector(&interpolated_matrix)).css_style_value())
+
+    return css_style_value_list_create(result, CssStyleValueListSeparator.space).css_style_value()
