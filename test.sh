@@ -77,5 +77,7 @@ cmp "$generated/aria/aria_roles.lucb" src/web/generated/aria/aria_roles.lucb
 # unexpected pass fails the run (DESIGN.md §6). After a change that makes tests pass or fail,
 # review build/web_test_results and run `build/web_test --update-failures`.
 echo "== web_test layout ref crash screenshot"
-luce-base build tests/web_test -o build/web_test
+# The diagnostic profile fills `---` storage with 0xaa and checks frees, so a read of a field nobody
+# wrote fails every time its path runs instead of depending on what the stack held (5141632).
+luce-base build tests/web_test -o build/web_test --profile diagnostic
 build/web_test layout ref crash screenshot

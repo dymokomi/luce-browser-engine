@@ -1630,7 +1630,7 @@ Ladybird's implementation, so the work benefits the whole ecosystem. Decisions:
 | JS | LibJS | §3.6 | types only | luce-js | luce-js |
 | Rasterization | Skia (`DisplayListPlayerSkia`, `PainterSkia`, `PathSkia`, `PaintingSurface`) | `display_list.DisplayListPlayer` (ported abstract class, 32 pure virtuals) | CPU player (§7.3) | GPU player on luce-gpu | luce-browser-render |
 | Event loop, timers | `Platform::EventLoopPlugin`, `Core::Timer`, `Core::Promise` | ported plugin interfaces | the runner's loop | luce-window's loop in the browser | luce-window |
-| Color management | LibGfx `ColorSpace`, Skia color spaces | `gfx.ColorSpace` | sRGB only (ported `Color`, `ColorConversion` for CSS math) | ICC via luce-color | luce-color |
+| Color management | LibGfx `ColorSpace`, Skia color spaces | `gfx.ColorSpace` | sRGB only (ported `Color`, `ColorConversion` for CSS math) | p2/icc: ICC and CICP via luce-color's `icc` (skcms and SkColorSpace ported); PNG cICP/iCCP (luce-png) and JPEG APP2 profiles (luce-jpeg) give a decoded image its color space as ImageDecoder::color_space does; the CPU player converts image pixels to sRGB after sampling with Skia's SkColorSpaceXformSteps (raster `color_xform`) | luce-color |
 
 ### 7.2 LibGfx: ported, replaced, dropped
 
