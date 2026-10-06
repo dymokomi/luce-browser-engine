@@ -1,0 +1,125 @@
+#==============================================================================================
+#
+#   ordinary_object - ordinary JS objects before luce-js
+#
+#   DESIGN.md §3.6's phase-1 stand-ins: Infra serializes its maps to JSON through JavaScript
+#   objects (the reports a Content-Security-Policy's report-uri receives, among them), whether
+#   scripting is enabled or not, so before phase 3 an ordinary object is a cell of the engine.
+#
+#   DESCRIPTION:
+#       Port of the parts of Libraries/LibJS/Runtime/Object.cpp that make and fill an object
+#       and list its keys: Object::create with a null prototype (OrdinaryObjectCreate),
+#       create_data_property_or_throw (CreateDataPropertyOrThrow, for an ordinary object and
+#       for the Array stand-in), get of an own property, and
+#       enumerable_own_property_names(Key) (EnumerableOwnPropertyNames over
+#       OrdinaryOwnPropertyKeys: array indices ascending, then the other strings in creation
+#       order). Prototypes, symbols, accessors and property attributes are phase 3.
+#
+#       Copyright (c) 2020, Andreas Kling <andreas@ladybird.org>
+#       Copyright (c) 2020-2022, Linus Groh <linusg@serenityos.org>
+#       Copyright (c) 2026 the luce-browser authors.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+## JS_OBJECT(Object, Cell)'s class_name.
+func js_ordinary_object_class_name_impl(this: gc.Cell*) -> ak.StringView:
+    _ = this
+    return ak.sv("Object")
+
+## Ported from Libraries/LibJS/Runtime/Object.cpp:91 JS::Object::create(Realm&, Object* prototype) with a null
+## prototype: 10.1.12 OrdinaryObjectCreate ( proto [ , additionalInternalSlotsList ] ),
+## https://tc39.es/ecma262/#sec-ordinaryobjectcreate. A prototype is a JS object (phase 3).
+pub func js_object_create(realm: Realm*) -> JsOrdinaryObject*:
+    let this = (JsOrdinaryObject*)web_allocate_cell(realm, &js_ordinary_object_class)
+    this.m_realm = realm
+    web_initialize_cell(this.cell(), realm)
+    return this
+
+## The ordinary object's visit_edges (Object::visit_edges): its shape's realm and its property values.
+pub func js_ordinary_object_visit_edges_impl(base: gc.Cell*, visitor: gc.CellVisitor*):
+    let this = (JsOrdinaryObject*)base
+    gc.cell_visit_edges_impl(base, visitor)
+    gc.cell_visitor_visit_t_2(visitor, this.m_realm)
+    for property in ak.vector_span(&this.m_properties):
+        js_visit_value(visitor, property.value)
+
+## `as_if<ordinary JS::Object>(object)`.
+func as_if_js_ordinary_object(object: JsObject*) -> JsOrdinaryObject*?:
+    let cell = (gc.Cell*)object
+    if cell.vtable.class_info == &js_ordinary_object_class:
+        return (JsOrdinaryObject*)object
+    return none
+
+## Ported from Libraries/LibJS/Runtime/Object.cpp:271 JS::Object::create_data_property_or_throw, for a string key:
+## 7.3.7 CreateDataPropertyOrThrow ( O, P, V ), https://tc39.es/ecma262/#sec-createdatapropertyorthrow. An
+## ordinary object always accepts the property (CreateDataProperty answers true): it replaces the value of an
+## existing key in place, or adds the key last. An array index key on an Array goes to its indexed properties.
+pub func js_object_create_data_property_or_throw(this: JsObject*, key: ak.String, value: JsValue):
+    if let object = as_if_js_ordinary_object(this):
+        for property in &ak.vector_span(&object.m_properties):
+            if ak.string_equals(&property.key, &key):
+                property.value = value
+                return
+        ak.vector_append_t(&object.m_properties, JsOrdinaryObjectProperty(key = key, value = value))
+        return
+    if let array = as_if_js_array_object(this):
+        let index = js_canonical_array_index(&key) else trap("unported (P3): a named property of an Array")
+        js_array_create_data_property_or_throw(array, index, value)
+        return
+    trap("unported (P3): JS::Object::create_data_property_or_throw on an object that is not ordinary")
+
+## Ported from Libraries/LibJS/Runtime/Object.cpp JS::Object::get, for an own data property of an ordinary
+## object or an Array: its value, undefined when there is none.
+pub func js_object_get_own_data_property(this: JsObject*, key: const ak.String*) -> JsValue:
+    if let object = as_if_js_ordinary_object(this):
+        for property in ak.vector_span(&object.m_properties):
+            if ak.string_equals(&property.key, key):
+                return property.value
+        return js_undefined()
+    if let array = as_if_js_array_object(this):
+        if let index = js_canonical_array_index(key):
+            return js_object_get_without_side_effects_index(this, (usize)index)
+        if ak.string_eq_string_view(key, ak.sv("length")):
+            return js_value_from_f64((f64)ak.vector_size(&array.m_indexed_properties))
+        return js_undefined()
+    trap("unported (P3): JS::Object::get on an object that is not ordinary")
+
+## Whether `key` is an array index (CanonicalNumericIndexString's integers below 2^32 - 1): its value.
+func js_canonical_array_index(key: const ak.String*) -> u32?:
+    let view = ak.string_bytes_as_string_view(key)
+    let bytes = ak.string_view_bytes(&view)
+    if bytes.length == 0 or bytes.length > 10 or (bytes.length > 1 and bytes[0] == '0'):
+        return none
+    var value: u64 = 0
+    for byte in bytes:
+        if byte < '0' or byte > '9':
+            return none
+        value = value * 10 + (u64)(byte - '0')
+    if value >= 4294967295:
+        return none
+    return (u32)value
+
+## Ported from Libraries/LibJS/Runtime/Object.cpp JS::Object::enumerable_own_property_names(PropertyKind::Key):
+## 7.3.23 EnumerableOwnPropertyNames ( O, kind ) over 10.1.11.1 OrdinaryOwnPropertyKeys ( O ): the array index keys
+## in ascending numeric order, then the other string keys in property creation order.
+pub func js_object_enumerable_own_property_keys(this: JsObject*) -> ak.Vector[ak.String]:
+    var keys: ak.Vector[ak.String]
+    if let array = as_if_js_array_object(this):
+        for index in 0..<ak.vector_size(&array.m_indexed_properties):
+            ak.vector_append_t(&keys, ak.string_number_u64((u64)index))
+        return keys
+    let object = as_if_js_ordinary_object(this) else trap("unported (P3): the own property keys of an object that is not ordinary")
+    var indices: ak.Vector[u32]
+    for property in ak.vector_span(&object.m_properties):
+        if let index = js_canonical_array_index(&property.key):
+            var at = ak.vector_size(&indices)
+            while at > 0 and *ak.vector_at(&indices, at - 1) > index:
+                at -= 1
+            ak.vector_insert(&indices, at, index)
+    for index in ak.vector_span(&indices):
+        ak.vector_append_t(&keys, ak.string_number_u64((u64)index))
+    for property in ak.vector_span(&object.m_properties):
+        if js_canonical_array_index(&property.key) == none:
+            ak.vector_append_t(&keys, property.key)
+    return keys

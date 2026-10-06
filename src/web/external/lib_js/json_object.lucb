@@ -1,0 +1,259 @@
+#==============================================================================================
+#
+#   json_object - JSON.stringify before luce-js
+#
+#   DESIGN.md §3.6's phase-1 stand-ins: Infra serializes values to JSON by calling
+#   %JSON.stringify% (Infra/JSON.cpp), with scripting disabled too, so before phase 3 the
+#   steps run over the stand-in values: strings, numbers, booleans, null, ordinary objects and
+#   Arrays.
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibJS/Runtime/JSONObject.cpp lines 54-121 (stringify_impl without a
+#       replacer or a space, as Infra calls it) and 142-428 (serialize_json_property,
+#       serialize_json_object, serialize_json_array, quote_json_string). toJSON methods, a
+#       replacer, the wrapper objects (Number, String, Boolean, BigInt) and raw JSON are JS
+#       (phase 3): the stand-in values have none of them.
+#
+#       Copyright (c) 2020, Matthew Olsson <mattco@serenityos.org>
+#       Copyright (c) 2022, Linus Groh <linusg@serenityos.org>
+#       Copyright (c) 2026 the luce-browser authors.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+## JSONObject::StringifyState (Libraries/LibJS/Runtime/JSONObject.h:29), without a replacer.
+struct JsJsonStringifyState:
+    var builder: ak.StringBuilder
+    var seen_objects: ak.Vector[JsObject*]
+    var indent_depth: usize
+    var gap: ak.String
+
+## Ported from Libraries/LibJS/Runtime/JSONObject.cpp:54 JS::JSONObject::stringify_impl with an undefined replacer
+## and space: calling `realm`'s %JSON.stringify% (its realm is then the current one), the string of `value`, or
+## none when it serializes to undefined.
+pub func js_json_stringify(realm: Realm*, value: JsValue) -> ak.String?!:
+    let vm = realm_vm(realm)
+    var state = JsJsonStringifyState(builder = ak.string_builder_new(), indent_depth = 0, gap = ak.String())
+
+    let wrapper = js_object_create(realm)
+    js_object_create_data_property_or_throw((JsObject*)wrapper, ak.String(), value)
+
+    let wrote_value = try js_json_serialize_json_property(vm, &state, ak.String(), (JsObject*)wrapper)
+    if not wrote_value:
+        return none
+
+    return ak.string_from_string_builder_without_validation(&state.builder)
+
+## Ported from Libraries/LibJS/Runtime/JSONObject.cpp:142 JS::JSONObject::serialize_json_property:
+## 25.5.2 JSON.stringify ( value [ , replacer [ , space ] ] ), https://tc39.es/ecma262/#sec-json.stringify
+func js_json_serialize_json_property(vm: Vm*, state: JsJsonStringifyState*, key: ak.String, holder: JsObject*) -> bool!:
+    # 1. Let value be ? Get(holder, key).
+    let value = js_object_get_own_data_property(holder, &key)
+
+    # 2. If Type(value) is Object or BigInt, then a. Let toJSON be ? GetV(value, "toJSON"). b. ...
+    #    (The stand-in objects have no toJSON.)
+    # 3. If state.[[ReplacerFunction]] is not undefined, then ... (none here.)
+    # 4. If Type(value) is Object, then a.-e. ... (The stand-ins are neither raw JSON nor wrapper objects.)
+
+    # 5. If value is null, return "null".
+    if js_value_is_null(value):
+        ak.string_builder_append(&state.builder, "null")
+        return true
+
+    # 6. If value is true, return "true".
+    # 7. If value is false, return "false".
+    if js_value_is_boolean(value):
+        ak.string_builder_append(&state.builder, "true" if js_value_as_bool(value) else "false")
+        return true
+
+    # 8. If Type(value) is String, return QuoteJSONString(value).
+    if js_value_is_string(value):
+        let string = js_value_as_string_utf8_string(value)
+        js_json_quote_json_string(&state.builder, &string)
+        return true
+
+    # 9. If Type(value) is Number, then
+    if js_value_is_number(value):
+        # a. If value is finite, return ! ToString(value).
+        let number = js_value_as_double(value)
+        if not math.is_nan(number) and not math.is_infinite(number):
+            let text = js_number_to_string(number)
+            ak.string_builder_append(&state.builder, ak.string_view_text(ak.string_bytes_as_string_view(&text)))
+            return true
+
+        # b. Return "null".
+        ak.string_builder_append(&state.builder, "null")
+        return true
+
+    # 10. If Type(value) is BigInt, throw a TypeError exception. (No BigInts before phase 3.)
+
+    # 11. If Type(value) is Object and IsCallable(value) is false, then
+    if js_value_is_object(value) and not js_object_is_function(js_value_as_object(value)):
+        let object = js_value_as_object(value)
+        # a. Let isArray be ? IsArray(value).
+        # b. If isArray is true, return ? SerializeJSONArray(state, value).
+        if as_if_js_array_object(object) != none:
+            try js_json_serialize_json_array(vm, state, object)
+            return true
+
+        # c. Return ? SerializeJSONObject(state, value).
+        try js_json_serialize_json_object(vm, state, object)
+        return true
+
+    # 12. Return undefined.
+    return false
+
+## Ported from Libraries/LibJS/Runtime/JSONObject.cpp:255 write_indent (static).
+func js_json_write_indent(builder: ak.StringBuilder*, gap: const ak.String*, depth: usize):
+    for _ in 0..<depth:
+        ak.string_builder_append(builder, ak.string_view_text(ak.string_bytes_as_string_view(gap)))
+
+## Whether `object` is being serialized (state.seen_objects.contains).
+func js_json_has_seen(state: const JsJsonStringifyState*, object: JsObject*) -> bool:
+    for seen in ak.vector_span_const(&state.seen_objects):
+        if seen == object:
+            return true
+    return false
+
+## state.seen_objects.remove(&object): it was the last one added.
+func js_json_forget(state: JsJsonStringifyState*, object: JsObject*):
+    let last = ak.vector_size(&state.seen_objects) - 1
+    assert(*ak.vector_at(&state.seen_objects, last) == object)
+    ak.vector_remove(&state.seen_objects, last)
+
+## Ported from Libraries/LibJS/Runtime/JSONObject.cpp:262 JS::JSONObject::serialize_json_object:
+## 25.5.2.4 SerializeJSONObject ( state, value ), https://tc39.es/ecma262/#sec-serializejsonobject
+func js_json_serialize_json_object(vm: Vm*, state: JsJsonStringifyState*, object: JsObject*) -> !:
+    if js_json_has_seen(state, object):
+        trap("unported (P3): JSON.stringify of a circular structure (a TypeError)")
+
+    ak.vector_append_t(&state.seen_objects, object)
+    state.indent_depth += 1
+
+    ak.string_builder_append(&state.builder, "{")
+    let position_after_open_brace = ak.string_builder_length(&state.builder)
+    var first = true
+    let has_gap = not ak.string_is_empty(&state.gap)
+
+    var property_list = js_object_enumerable_own_property_keys(object)
+    for key in ak.vector_span(&property_list):
+        # Mark position before writing anything for this property
+        let mark = ak.string_builder_length(&state.builder)
+
+        # Write separator (comma and possibly newline/indent)
+        if not first:
+            ak.string_builder_append(&state.builder, ",")
+            if has_gap:
+                ak.string_builder_append(&state.builder, "\n")
+                js_json_write_indent(&state.builder, &state.gap, state.indent_depth)
+        elif has_gap:
+            ak.string_builder_append(&state.builder, "\n")
+            js_json_write_indent(&state.builder, &state.gap, state.indent_depth)
+
+        # Write key and colon
+        js_json_quote_json_string(&state.builder, &key)
+        ak.string_builder_append(&state.builder, ":")
+        if has_gap:
+            ak.string_builder_append(&state.builder, " ")
+
+        # Serialize value
+        let wrote_value = try js_json_serialize_json_property(vm, state, key, object)
+
+        if wrote_value:
+            first = false
+        else:
+            # Rollback - value was undefined, remove everything we wrote for this property
+            ak.string_builder_trim(&state.builder, ak.string_builder_length(&state.builder) - mark)
+
+    # Close the object
+    state.indent_depth -= 1
+    if ak.string_builder_length(&state.builder) > position_after_open_brace and has_gap:
+        ak.string_builder_append(&state.builder, "\n")
+        js_json_write_indent(&state.builder, &state.gap, state.indent_depth)
+    ak.string_builder_append(&state.builder, "}")
+
+    js_json_forget(state, object)
+
+## Ported from Libraries/LibJS/Runtime/JSONObject.cpp:335 JS::JSONObject::serialize_json_array:
+## 25.5.2.5 SerializeJSONArray ( state, value ), https://tc39.es/ecma262/#sec-serializejsonarray
+func js_json_serialize_json_array(vm: Vm*, state: JsJsonStringifyState*, object: JsObject*) -> !:
+    if js_json_has_seen(state, object):
+        trap("unported (P3): JSON.stringify of a circular structure (a TypeError)")
+
+    ak.vector_append_t(&state.seen_objects, object)
+    state.indent_depth += 1
+    let has_gap = not ak.string_is_empty(&state.gap)
+
+    let length = try js_value_to_length(try js_object_get_length(object), vm)
+
+    ak.string_builder_append(&state.builder, "[")
+
+    for i in 0..<length:
+        # Write separator
+        if i > 0:
+            ak.string_builder_append(&state.builder, ",")
+            if has_gap:
+                ak.string_builder_append(&state.builder, "\n")
+                js_json_write_indent(&state.builder, &state.gap, state.indent_depth)
+        elif has_gap:
+            ak.string_builder_append(&state.builder, "\n")
+            js_json_write_indent(&state.builder, &state.gap, state.indent_depth)
+
+        # Serialize value (undefined becomes null for arrays)
+        let wrote_value = try js_json_serialize_json_property(vm, state, ak.string_number_u64(i), object)
+        if not wrote_value:
+            ak.string_builder_append(&state.builder, "null")
+
+    # Close the array
+    state.indent_depth -= 1
+    if length > 0 and has_gap:
+        ak.string_builder_append(&state.builder, "\n")
+        js_json_write_indent(&state.builder, &state.gap, state.indent_depth)
+    ak.string_builder_append(&state.builder, "]")
+
+    js_json_forget(state, object)
+
+## Ported from Libraries/LibJS/Runtime/JSONObject.cpp:380 JS::JSONObject::quote_json_string:
+## 25.5.2.2 QuoteJSONString ( value ), https://tc39.es/ecma262/#sec-quotejsonstring. The stand-in strings are
+## UTF-8, so they hold no lone surrogates.
+func js_json_quote_json_string(builder: ak.StringBuilder*, string: const ak.String*):
+    # 1. Let product be the String value consisting solely of the code unit 0x0022 (QUOTATION MARK).
+    ak.string_builder_append(builder, "\"")
+
+    # 2. For each code point C of StringToCodePoints(value), do
+    let code_points = ak.string_code_points(string)
+    var it = ak.utf8_view_begin(&code_points)
+    while not ak.utf8_code_point_iterator_done(&it):
+        let code_point = ak.utf8_code_point_iterator_deref(&it)
+        _ = ak.utf8_code_point_iterator_inc(&it)
+        # a. If C is listed in the "Code Point" column of Table 70, then
+        # i. Set product to the string-concatenation of product and the escape sequence for C as specified in the "Escape Sequence" column of the corresponding row.
+        if code_point == 0x08:
+            ak.string_builder_append(builder, "\\b")
+        elif code_point == 0x09:
+            ak.string_builder_append(builder, "\\t")
+        elif code_point == 0x0a:
+            ak.string_builder_append(builder, "\\n")
+        elif code_point == 0x0c:
+            ak.string_builder_append(builder, "\\f")
+        elif code_point == 0x0d:
+            ak.string_builder_append(builder, "\\r")
+        elif code_point == 0x22:
+            ak.string_builder_append(builder, "\\\"")
+        elif code_point == 0x5c:
+            ak.string_builder_append(builder, "\\\\")
+        # b. Else if C has a numeric value less than 0x0020 (SPACE), or if C has the same numeric value as a leading surrogate or trailing surrogate, then
+        elif code_point < 0x20:
+            # i. Let unit be the code unit whose numeric value is that of C.
+            # ii. Set product to the string-concatenation of product and UnicodeEscape(unit).
+            let hex = "0123456789abcdef"
+            ak.string_builder_append(builder, "\\u00")
+            ak.string_builder_append_code_point(builder, (u32)hex.bytes[(usize)(code_point >> 4)])
+            ak.string_builder_append_code_point(builder, (u32)hex.bytes[(usize)(code_point & 15)])
+        # c. Else,
+        else:
+            # i. Set product to the string-concatenation of product and UTF16EncodeCodePoint(C).
+            ak.string_builder_append_code_point(builder, code_point)
+
+    # 3. Set product to the string-concatenation of product and the code unit 0x0022 (QUOTATION MARK).
+    ak.string_builder_append(builder, "\"")
