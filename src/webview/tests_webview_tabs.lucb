@@ -1,0 +1,334 @@
+#==============================================================================================
+#
+#   tests_webview_tabs - views as a tabbed browser's tabs: hidden ones paused, closed ones gone
+#
+#   DESCRIPTION:
+#       A hidden view (webview_set_system_visibility_state, as the UI hides a tab it switched
+#       from) gets no rendering task when the event loop updates the rendering, its document
+#       reports visibilityState "hidden", its loads go on, and shown again it paints at once.
+#       A destroyed view (a closed tab) leaves nothing of its page on the event loop: no task,
+#       timer, deferred invocation or socket, not even with a load waiting on a server that
+#       never answers, and the other views keep rendering.
+#
+#       Copyright (c) 2026 the luce-browser authors.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Helpers =================================================================================
+
+## The rendering tasks queued for `view`'s page.
+func test_webview_rendering_tasks_of(view: WebView*) -> i32:
+    let page = webview_page(view)
+    let task_queue = web.html_event_loop_task_queue(web.html_main_thread_event_loop())
+    var count: i32 = 0
+    for task in ak.vector_span(&task_queue.m_tasks):
+        if web.html_task_source(task) != web.HtmlTaskSource.rendering:
+            continue
+        let document = web.html_task_document(task) else continue
+        if web.dom_document_page(document) == page:
+            count += 1
+    return count
+
+## The tasks queued for documents of `page` (which may be gone: only compared).
+func test_webview_tasks_of_page(page: const void*) -> i32:
+    let task_queue = web.html_event_loop_task_queue(web.html_main_thread_event_loop())
+    var count: i32 = 0
+    for task in ak.vector_span(&task_queue.m_tasks):
+        let document = web.html_task_document(task) else continue
+        if (const void*)web.dom_document_page(document) == page:
+            count += 1
+    return count
+
+## The view's active document.
+func test_webview_document(view: WebView*) -> web.DomDocument*:
+    let traversable = web.page_top_level_traversable(webview_page(view))
+    return web.html_navigable_active_document((web.HtmlNavigable*)traversable) else trap("webview tests: no document")
+
+## Pumps until the view's document's visibility state is `state` (the update is a queued task).
+func test_webview_wait_for_visibility(view: WebView*, log: TestWebViewLog*, state: web.HtmlVisibilityState):
+    let start = time.now()
+    while web.dom_document_visibility_state_value(test_webview_document(view)) != state:
+        test_webview_turn()
+        test_webview_take_events(view, log)
+        if time.now() - start > test_webview_timeout:
+            trap("webview tests: the document's visibility state did not change")
+
+## Pumps until the view reports that the load of tests/webview/PAGE finished, without waiting for
+## a frame (a hidden view presents none).
+func test_webview_wait_for_load_only(view: WebView*, log: TestWebViewLog*, page: str):
+    let start = time.now()
+    log.awaited_page = page
+    log.awaited_page_loaded = false
+    while not log.awaited_page_loaded:
+        test_webview_turn()
+        test_webview_take_events(view, log)
+        if time.now() - start > test_webview_timeout:
+            trap(f"webview tests: {page} did not finish loading")
+    log.awaited_page = ""
+
+## The registered timers of the process's event loop.
+func test_webview_timers() -> ak.Vector[web.CoreTimer*]:
+    let event_loop = webview_event_loop()
+    var timers: ak.Vector[web.CoreTimer*]
+    for index in 0..<ak.vector_size(&event_loop.timers):
+        ak.vector_append_t(&timers, ak.vector_at_const(&event_loop.timers, index).timer)
+    return timers
+
+## Whether `timer` is among `timers`.
+func test_webview_has_timer(timers: const ak.Vector[web.CoreTimer*]*, timer: web.CoreTimer*) -> bool:
+    for index in 0..<ak.vector_size(timers):
+        if *ak.vector_at_const(timers, index) == timer:
+            return true
+    return false
+
+# mark: A server that never answers =============================================================
+
+## How many connections the silent server holds at most.
+let test_silent_server_capacity: usize = 8
+
+## A server on 127.0.0.1 that accepts connections, reads them and never answers, each on a
+## thread of its own until its client closes it: it counts the connections it accepted and
+## those their clients closed. In the C heap.
+struct TestSilentServer:
+    var listener: net.Listener
+    var port: u16
+    var stopping: @u64
+    var accepted: @u64
+    var closed: @u64
+    var accept_thread: thread.Handle
+    var connections: net.Connection[8]
+    var readers: thread.Handle[8]
+
+## A connection's reader: reads until the client closes it.
+struct TestSilentReader:
+    var server: TestSilentServer*
+    var index: usize
+
+func test_silent_server_read(context: void*?):
+    let reader = (TestSilentReader*)(context else trap("no reader"))
+    let server = reader.server
+    var buffer: u8[1024] = ---
+    while true:
+        let count = server.connections[reader.index].read(buffer[0..]) catch: break
+        if count == 0:
+            break
+    _ = server.closed.add(1, .acq_rel)
+    free(reader) in memory.heap
+
+func test_silent_server_accept(context: void*?):
+    let server = (TestSilentServer*)(context else trap("no server"))
+    while server.stopping.load(.acquire) == 0:
+        var connection = server.listener.accept() catch: return
+        if server.stopping.load(.acquire) != 0:
+            connection.destroy()
+            return
+        let index = (usize)server.accepted.load(.acquire)
+        if index >= test_silent_server_capacity:
+            connection.destroy()
+            continue
+        server.connections[index] = connection
+        with memory.heap:
+            let reader = new TestSilentReader(server = server, index = index) else trap("out of memory")
+            server.readers[index] = thread.spawn(test_silent_server_read, reader, name = "silent-reader") else trap("the reader's thread")
+        _ = server.accepted.add(1, .acq_rel)
+
+func test_silent_server_start() -> TestSilentServer*:
+    with memory.heap:
+        let listener = net.Listener.bind(net.SocketAddress.loopback(0)) else trap("the server's listener")
+        let port = listener.port() else trap("the server's port")
+        let server = new TestSilentServer(listener = listener, port = port) else trap("out of memory")
+        server.accept_thread = thread.spawn(test_silent_server_accept, server, name = "silent-server") else trap("the server's thread")
+        return server
+
+## Stops accepting and joins every thread (the readers end as their clients closed).
+func test_silent_server_stop(server: TestSilentServer*):
+    server.stopping.store(1, .release)
+    with memory.heap:
+        var wake = net.Connection.connect(net.SocketAddress.loopback(server.port)) catch: recover net.Connection()
+        wake.destroy()
+    var joined = server.accept_thread
+    joined.join() else trap("the server's thread joins")
+    # A connection the client keeps (an idle one in its pool, the process's as RequestServer's
+    # are) ends here.
+    for index in 0..<(usize)server.accepted.load(.acquire):
+        server.connections[index].shutdown() catch failure:
+            _ = failure
+    for index in 0..<(usize)server.accepted.load(.acquire):
+        var reader = server.readers[index]
+        reader.join() else trap("a reader's thread joins")
+        server.connections[index].destroy()
+    server.listener.destroy()
+    free(server) in memory.heap
+
+## Appends `port` in decimal.
+func test_silent_server_append_port(builder: ak.StringBuilder*, port: u16):
+    var digits: u8[5] = ---
+    var count: usize = 0
+    var rest = port
+    while true:
+        digits[4 - count] = (u8)(rest % 10) + 48
+        count += 1
+        rest = rest // 10
+        if rest == 0:
+            break
+    ak.string_builder_append(builder, (str)digits[5 - count..])
+
+## The server's URL for `path`.
+func test_silent_server_url(server: const TestSilentServer*, path: str) -> web_url.Url:
+    var builder = ak.string_builder_new()
+    ak.string_builder_append(&builder, "http://127.0.0.1:")
+    test_silent_server_append_port(&builder, server.port)
+    ak.string_builder_append(&builder, path)
+    return web_url.parser_basic_parse(ak.string_builder_string_view(&builder)) else trap("webview tests: not a URL")
+
+## Pumps until the server accepted `count` connections.
+func test_silent_server_wait_for(server: TestSilentServer*, count: u64):
+    let start = time.now()
+    while server.accepted.load(.acquire) < count:
+        test_webview_turn()
+        if time.now() - start > test_webview_timeout:
+            trap("webview tests: the request did not reach the server")
+
+# mark: Hidden views ============================================================================
+
+test "hidden views get no rendering task and report a hidden document; the visible one renders":
+    test_webview_platform()
+    let allocator: memory.Allocator = webview_heap()
+    with allocator:
+        let shown = test_webview_open()
+        defer webview_destroy(shown)
+        let first_hidden = test_webview_open()
+        defer webview_destroy(first_hidden)
+        let second_hidden = test_webview_open()
+        defer webview_destroy(second_hidden)
+        var shown_log = TestWebViewLog()
+        var hidden_log = TestWebViewLog()
+        webview_load(shown, test_webview_file_url("first.html"))
+        webview_load(first_hidden, test_webview_file_url("first.html"))
+        webview_load(second_hidden, test_webview_file_url("second.html"))
+        test_webview_wait_for_load(shown, &shown_log, "first.html")
+        test_webview_wait_for_load(first_hidden, &hidden_log, "first.html")
+        hidden_log = TestWebViewLog()
+        test_webview_wait_for_load(second_hidden, &hidden_log, "second.html")
+
+        webview_set_system_visibility_state(first_hidden, web.HtmlVisibilityState.hidden)
+        webview_set_system_visibility_state(second_hidden, web.HtmlVisibilityState.hidden)
+        test_webview_wait_for_visibility(first_hidden, &hidden_log, web.HtmlVisibilityState.hidden)
+        test_webview_wait_for_visibility(second_hidden, &hidden_log, web.HtmlVisibilityState.hidden)
+        assert(web.dom_document_hidden(test_webview_document(first_hidden)), "the hidden view's document is hidden")
+        let hidden_state = web.dom_document_visibility_state(test_webview_document(second_hidden))
+        let visible_state = web.dom_document_visibility_state(test_webview_document(shown))
+        assert(ak.string_view_eq_string_view(&hidden_state, ak.sv("hidden")), "visibilityState is \"hidden\"")
+        assert(ak.string_view_eq_string_view(&visible_state, ak.sv("visible")), "the shown view's is \"visible\"")
+
+        # Once the queue holds no rendering task, the event loop's next update of the rendering
+        # queues one for the shown view only.
+        let start = time.now()
+        let task_queue = web.html_event_loop_task_queue(web.html_main_thread_event_loop())
+        while web.html_task_queue_has_rendering_tasks(task_queue):
+            test_webview_turn()
+            if time.now() - start > test_webview_timeout:
+                trap("webview tests: a rendering task stays queued")
+        web.html_event_loop_queue_task_to_update_the_rendering(web.html_main_thread_event_loop())
+        assert(test_webview_rendering_tasks_of(shown) == 1, "the shown view gets a rendering task")
+        assert(test_webview_rendering_tasks_of(first_hidden) == 0, "a hidden view gets none")
+        assert(test_webview_rendering_tasks_of(second_hidden) == 0, "a hidden view gets none")
+        test_webview_sync_rendering(shown, &shown_log)
+
+test "a hidden view keeps loading, presents nothing, and paints at once when shown":
+    test_webview_platform()
+    let allocator: memory.Allocator = webview_heap()
+    with allocator:
+        let shown = test_webview_open()
+        defer webview_destroy(shown)
+        let view = test_webview_open()
+        defer webview_destroy(view)
+        var log = TestWebViewLog()
+        webview_load(view, test_webview_file_url("first.html"))
+        test_webview_wait_for_load(view, &log, "first.html")
+        assert(test_webview_pixel(view, 5, 5) == 0x0000ffff, "the first page is presented")
+
+        webview_set_system_visibility_state(view, web.HtmlVisibilityState.hidden)
+        test_webview_wait_for_visibility(view, &log, web.HtmlVisibilityState.hidden)
+        let frames = log.frames
+        webview_load(view, test_webview_file_url("second.html"))
+        test_webview_wait_for_load_only(view, &log, "second.html")
+        test_webview_settle(view, &log, 100)
+        assert(web.dom_document_hidden(test_webview_document(view)), "the document loaded in the background is hidden")
+        assert(log.frames == frames, "a hidden view presents no frame")
+        assert(test_webview_pixel(view, 5, 5) == 0x0000ffff, "the hidden view still shows the first page")
+
+        webview_set_system_visibility_state(view, web.HtmlVisibilityState.visible)
+        test_webview_wait_for_frame(view, &log)
+        assert(not web.dom_document_hidden(test_webview_document(view)), "the shown view's document is visible")
+        assert(test_webview_pixel(view, 5, 5) == 0x008000ff, "the page loaded in the background is painted")
+
+# mark: Destroyed views =========================================================================
+
+test "a destroyed view leaves no task, timer or socket of its page, and the others keep rendering":
+    test_webview_platform()
+    let allocator: memory.Allocator = webview_heap()
+    with allocator:
+        let server = test_silent_server_start()
+        defer test_silent_server_stop(server)
+        let other = test_webview_open()
+        defer webview_destroy(other)
+        var other_log = TestWebViewLog()
+        webview_load(other, test_webview_file_url("first.html"))
+        test_webview_wait_for_load(other, &other_log, "first.html")
+        test_webview_wait_for_idle(other, &other_log)
+        let timers_before = test_webview_timers()
+
+        # A busy page: a running animation (a frame each turn) and a refresh timer; then a
+        # navigation to the server, which never answers.
+        let busy = test_webview_open()
+        var busy_log = TestWebViewLog()
+        webview_load(busy, test_webview_file_url("busy.html"))
+        test_webview_wait_for_load(busy, &busy_log, "busy.html")
+        let busy_document = test_webview_document(busy)
+        assert(busy_document.m_active_refresh_timer != none, "the refresh timer is set")
+        webview_load(busy, test_silent_server_url(server, "/never"))
+        test_silent_server_wait_for(server, 1)
+
+        # A page whose image never arrives: its load waits on it.
+        let slow = test_webview_open()
+        var page_html = ak.string_builder_new()
+        ak.string_builder_append(&page_html, "<!DOCTYPE html><title>Slow</title><img src=\"http://127.0.0.1:")
+        test_silent_server_append_port(&page_html, server.port)
+        ak.string_builder_append(&page_html, "/image\">")
+        webview_load_html(slow, ak.string_builder_string_view(&page_html))
+        test_silent_server_wait_for(server, 2)
+        assert(web.dom_document_readiness(test_webview_document(slow)) != web.HtmlDocumentReadyState.complete, "the slow page waits for its image")
+
+        # A task queued for each, then both destroyed.
+        webview_set_system_visibility_state(busy, web.HtmlVisibilityState.hidden)
+        webview_set_system_visibility_state(slow, web.HtmlVisibilityState.hidden)
+        let busy_page = (const void*)webview_page(busy)
+        let slow_page = (const void*)webview_page(slow)
+        assert(test_webview_tasks_of_page(busy_page) > 0, "a task is queued for the busy page")
+        webview_destroy(busy)
+        webview_destroy(slow)
+        assert(test_webview_tasks_of_page(busy_page) == 0 and test_webview_tasks_of_page(slow_page) == 0,
+               "no task of a destroyed page is left")
+
+        # The server sees both connections closed; the loop runs out of work.
+        let start = time.now()
+        while server.closed.load(.acquire) < 2:
+            test_webview_turn()
+            if time.now() - start > test_webview_timeout:
+                trap(f"webview tests: a destroyed view request stayed open ({server.accepted.load(.acquire)} accepted, {server.closed.load(.acquire)} closed)")
+        test_webview_wait_for_idle(other, &other_log)
+        test_webview_settle(other, &other_log, 50)
+        let event_loop = webview_event_loop()
+        assert(ak.vector_is_empty(&event_loop.deferred), "no deferred invocation is left")
+        assert(web.core_event_loop_notifiers_count(&event_loop.notifiers) == 0, "no socket is watched")
+        var timers_after = test_webview_timers()
+        for index in 0..<ak.vector_size(&timers_after):
+            assert(test_webview_has_timer(&timers_before, *ak.vector_at(&timers_after, index)), "no timer of a destroyed page is left")
+
+        # The collector takes the pages (finalizing what they held); the other view renders on.
+        gc.heap_collect_garbage(web.vm_heap(webview_platform().vm))
+        webview_load(other, test_webview_file_url("second.html"))
+        test_webview_wait_for_load(other, &other_log, "second.html")
+        assert(test_webview_pixel(other, 5, 5) == 0x008000ff, "the other view renders its new page")

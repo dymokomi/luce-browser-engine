@@ -41,6 +41,9 @@ pub struct WebViewPageClient: gc.IsCell:
     var m_last_frame_dispatch_time: f64?
     ## ConnectionFromClient's m_input_event_queue.
     var m_input_event_queue: ak.Queue[web.QueuedInputEvent]
+    ## The ids of the page's network requests in flight (page_did_start_network_request, which
+    ## WebContent forwards to the UI's devtools), which closing the page ends.
+    var m_network_requests: ak.Vector[u64]
 
     func cell() -> gc.Cell*: return (gc.Cell*)&self
 
@@ -121,10 +124,17 @@ func webview_page_client_frame_timer_fired(context: void*?):
     web.html_event_loop_queue_task_to_update_the_rendering(web.html_main_thread_event_loop())
 
 ## Ported from Services/WebContent/PageClient.cpp:225 WebContent::PageClient::request_frame.
+## A hidden page asks for none: in Ladybird its WebContent process would queue the update of the
+## rendering for its own navigables only, none of which has a rendering opportunity while hidden,
+## so the frame would do nothing; here the event loop is every page's, and the frame would update
+## the rendering of the visible ones. Showing the page asks for a frame (webview_page_client_set_system_visibility_state).
 func webview_page_client_request_frame(this: web.PageClient*):
     let client = webview_page_client_of(this)
     let frame_timer = client.m_frame_timer else trap("webview: no frame timer")
     if web.core_timer_is_active(frame_timer):
+        return
+    let page = client.m_page else return
+    if web.html_traversable_navigable_system_visibility_state(web.page_top_level_traversable(page)) == web.HtmlVisibilityState.hidden:
         return
 
     var delay = 0.0
@@ -192,6 +202,17 @@ func webview_page_client_page_did_take_screenshot(this: web.PageClient*, screens
     let view = webview_client_view(this) else return
     webview_did_receive_screenshot(view, screenshot)
 
+## PageClient::page_did_start_network_request: the request is the page's until it finishes.
+func webview_page_client_page_did_start_network_request(this: web.PageClient*, request_id: u64, url: web_url.Url, method: ak.ByteString, request_headers: ak.Vector[web.HttpHeader],
+                                                        request_body: const u8[], initiator_type: ak.String?):
+    ak.vector_append_t(&webview_page_client_of(this).m_network_requests, request_id)
+
+## PageClient::page_did_finish_network_request.
+func webview_page_client_page_did_finish_network_request(this: web.PageClient*, request_id: u64, body_size: u64, timing_info: web.RequestsRequestTimingInfo, network_error: web.RequestsNetworkError?):
+    let client = webview_page_client_of(this)
+    if let index = ak.vector_find_first_index(&client.m_network_requests, request_id):
+        _ = ak.vector_take(&client.m_network_requests, index)
+
 ## PageClient::request_file: WebContent asks the UI process to open the file
 ## (ViewImplementation's on_request_file); in process the engine opens it on the next turn.
 func webview_page_client_request_file(this: web.PageClient*, request: web.FileRequest):
@@ -237,6 +258,8 @@ let webview_page_client_vtable: web.PageClientVTable = web.PageClientVTable(
     page_did_unhover_link = webview_page_client_page_did_unhover_link,
     page_did_update_navigation_buttons_state = webview_page_client_page_did_update_navigation_buttons_state,
     request_file = webview_page_client_request_file,
+    page_did_start_network_request = webview_page_client_page_did_start_network_request,
+    page_did_finish_network_request = webview_page_client_page_did_finish_network_request,
     page_did_paint = webview_page_client_page_did_paint,
     page_did_take_screenshot = webview_page_client_page_did_take_screenshot,
     display_list_player_type = webview_page_client_display_list_player_type,
@@ -301,6 +324,18 @@ pub func webview_page_client_set_zoom_level(client: WebViewPageClient*, zoom_lev
     let traversable = web.page_top_level_traversable(page)
     web.html_navigable_set_viewport_size((web.HtmlNavigable*)traversable, web.page_device_to_css_size(page, client.m_viewport_size), web.InvalidateDisplayList.yes)
 
+## Ported from Services/WebContent/ConnectionFromClient.cpp:1266
+## WebContent::ConnectionFromClient::set_system_visibility_state: the top-level traversable's
+## system visibility state, which queues the update of its documents' visibility state (they fire
+## visibilitychange) and decides whether it has a rendering opportunity
+## (Navigable::has_a_rendering_opportunity). A page made visible asks for a frame, so what changed
+## while it was hidden is painted at once: its frame requests were dropped meanwhile.
+pub func webview_page_client_set_system_visibility_state(client: WebViewPageClient*, visibility_state: web.HtmlVisibilityState):
+    let page = client.m_page else trap("webview: no page")
+    web.html_traversable_navigable_set_system_visibility_state(web.page_top_level_traversable(page), visibility_state)
+    if visibility_state == web.HtmlVisibilityState.visible:
+        webview_page_client_request_frame(&client.page_client)
+
 ## Ported from Services/WebContent/PageClient.cpp:191 WebContent::PageClient::ready_to_paint.
 pub func webview_page_client_ready_to_paint(client: WebViewPageClient*):
     let page = client.m_page else trap("webview: no page")
@@ -312,6 +347,9 @@ pub func webview_page_client_ready_to_paint(client: WebViewPageClient*):
 ## document.
 func webview_initial_document_the_end(context: void*?):
     let traversable = (web.HtmlTraversableNavigable*)(context else trap("webview: no traversable"))
+    # A view destroyed before this turn took its page's documents with it (webview_page_host_remove_page).
+    if web.html_navigable_has_been_destroyed((web.HtmlNavigable*)traversable):
+        return
     let document = web.html_navigable_active_document((web.HtmlNavigable*)traversable) else trap("webview: no initial document")
     web.html_parser_the_end(document)
 
@@ -327,3 +365,94 @@ pub func webview_page_host_create_top_level_traversable(page: web.Page*) -> web.
     web.platform_event_loop_plugin_deferred_invoke(web.platform_event_loop_plugin_the(),
                                                    gc.create_function0(heap, ak.Function0[unit](call = webview_initial_document_the_end, context = traversable)))
     return traversable
+
+# mark: Removing the page =======================================================================
+
+## The filter of the page's documents: those whose page is `context`.
+func webview_is_document_of_page(context: void*?, document: web.DomDocument*) -> bool:
+    let page = (web.Page*)(context else trap("webview: no page"))
+    return web.dom_document_page(document) == page
+
+## The filter of the page's tasks: those whose document's page is `context`.
+func webview_is_task_of_page(context: void*?, task: web.HtmlTask*) -> bool:
+    let page = (web.Page*)(context else trap("webview: no page"))
+    let document = web.html_task_document(task) else return false
+    return web.dom_document_page(document) == page
+
+## Ends the page's network requests still in flight (RequestServer, when a WebContent process
+## exits, ends every request of that client): each is stopped (Requests::Request::stop: nothing more
+## is delivered, its connection closes or leaves the pool's queue) and leaves the process's
+## ResourceLoader as finish_network_request has a finished one leave it.
+func webview_stop_network_requests(client: WebViewPageClient*):
+    let loader = web.s_resource_loader else return
+    while not ak.vector_is_empty(&client.m_network_requests):
+        let request_id = ak.vector_take_last(&client.m_network_requests)
+        var removed: gc.Root[web.RequestsRequest]? = none
+        with memory.heap:
+            removed = ak.hash_map_take_k(&loader.m_active_requests, request_id)
+        var root = removed else continue
+        if let request = gc.root_ptr(&root):
+            _ = web.requests_request_stop(request)
+        gc.root_release(&root)
+        loader.m_pending_loads -= 1
+        if ak.function0_is_set(&loader.on_load_counter_change):
+            ak.function0_call(&loader.on_load_counter_change)
+
+## Stops the timers a document holds itself (its cursor blink and its refresh); Ladybird's are
+## stopped by the Document's destructor (~EventReceiver).
+func webview_stop_document_timers(document: web.DomDocument*):
+    if let cursor_blink_timer = document.m_cursor_blink_timer:
+        web.core_timer_stop(cursor_blink_timer)
+    if let refresh_timer = document.m_active_refresh_timer:
+        web.core_timer_stop(refresh_timer)
+
+## Closes the client's page as a tab of Ladybird closes: the UI drops its view, the WebContent
+## process hosting the page exits, and RequestServer ends that client's requests. In process,
+## nothing of the page may outlive the view, or wait on a turn of the shared event loop:
+##   1. the page's network requests stop (RequestServer's connection closing);
+##   2. the top-level traversable is destroyed (TraversableNavigable::destroy_top_level_traversable,
+##      as close_top_level_traversable's afterAllUnloads does, without the unload: the process
+##      would exit). It queues the destruction of the documents as tasks that can no longer run
+##      once the traversable left all navigables (the documents have no navigable), so the active
+##      documents are destroyed at once, deepest first (Document::destroy: aborted, became
+##      inactive, their tasks removed, marked destroyed);
+##   3. the tasks still queued for any document of the page (the documents left behind by its
+##      navigations) are removed, and the timers its documents and navigables hold and the
+##      client's frame timer stop.
+## The client keeps its page: what the client is rooted by (the view) goes, and the collector
+## takes the rest later (PageHost::remove_page). Runs with the VM's heap current.
+pub func webview_page_host_remove_page(client: WebViewPageClient*):
+    if let frame_timer = client.m_frame_timer:
+        web.core_timer_stop(frame_timer)
+    let page = client.m_page else return
+    let traversable = web.page_top_level_traversable(page)
+    let event_loop = web.html_main_thread_event_loop()
+    var documents = web.html_event_loop_documents_in_this_event_loop_matching(event_loop, ak.Function1[web.DomDocument*, bool](call = webview_is_document_of_page, context = page))
+
+    # 1. The page's network requests stop.
+    webview_stop_network_requests(client)
+
+    # 2. The top-level traversable is destroyed, then the documents it would destroy on later turns.
+    if not web.html_navigable_has_been_destroyed((web.HtmlNavigable*)traversable):
+        var active_documents: ak.Vector[web.DomDocument*]
+        if let top = web.html_navigable_active_document((web.HtmlNavigable*)traversable):
+            var navigables = web.dom_document_inclusive_descendant_navigables(top)
+            for entry in ak.vector_span(&navigables):
+                let navigable = entry else trap("webview: a null navigable")
+                if let document = web.html_navigable_active_document(navigable):
+                    ak.vector_append_t(&active_documents, document)
+                # The navigable's backing store shrink timer (~BackingStoreManager stops Ladybird's).
+                if let shrink_timer = navigable.m_backing_store_manager.m_backing_store_shrink_timer:
+                    web.core_timer_stop(shrink_timer)
+        web.html_traversable_navigable_destroy_top_level_traversable(traversable)
+        var index = ak.vector_size(&active_documents)
+        while index > 0:
+            index -= 1
+            let document = *ak.vector_at(&active_documents, index)
+            if not web.dom_document_has_been_destroyed(document):
+                web.dom_document_destroy(document)
+
+    # 3. What is left of the page's documents on the event loop.
+    web.html_task_queue_remove_tasks_matching(web.html_event_loop_task_queue(event_loop), ak.Function1[web.HtmlTask*, bool](call = webview_is_task_of_page, context = page))
+    for document in ak.vector_span(&documents):
+        webview_stop_document_timers(document else trap("webview: a null document"))
