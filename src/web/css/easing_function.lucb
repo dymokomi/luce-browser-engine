@@ -1,0 +1,400 @@
+#==============================================================================================
+#
+#   easing_function - CSS::EasingFunction: linear(), cubic-bezier() and steps() easing, the
+#                     easing keywords, and their evaluation
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibWeb/CSS/EasingFunction.cpp (lines 1-375) with the declarations
+#       of EasingFunction.h, by region p4a (animations and transitions): the output progress
+#       of a linear easing function (with its control points), a cubic Bézier curve (Newton-
+#       Raphson, then bisection) and a step function; linear() canonicalization; the five
+#       keyword functions; resolving an EasingStyleValue or keyword into an EasingFunction;
+#       and its string. C++'s visit over the variant is a match.
+#
+#       Copyright (c) 2025, Callum Law <callumlaw1709@outlook.com>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: Evaluation ==============================================================================
+
+## Ported from Libraries/LibWeb/CSS/EasingFunction.cpp:19 Web::CSS::LinearEasingFunction::evaluate_at.
+# https://drafts.csswg.org/css-easing/#linear-easing-function-output
+pub func css_linear_easing_function_evaluate_at(this: const CssLinearEasingFunction*, input_progress: f64, before_flag: bool) -> f64:
+    # To calculate linear easing output progress for a given linear easing function func,
+    # an input progress value inputProgress, and an optional before flag (defaulting to false),
+    # perform the following:
+
+    # 1. Let points be func’s control points.
+    let control_points = ak.vector_span_const(&this.control_points)
+
+    # 2. If points holds only a single item, return the output progress value of that item.
+    if control_points.length == 1:
+        return control_points[0].output
+
+    # 3. If inputProgress matches the input progress value of the first point in points,
+    # and the before flag is true, return the first point’s output progress value.
+    if input_progress == (control_points[0].input else trap("VERIFY: a canonicalized input")) and before_flag:
+        return control_points[0].output
+
+    # 4. If inputProgress matches the input progress value of at least one point in points,
+    # return the output progress value of the last such point.
+    # (control_points.last_matching([&](auto& stop) { return input_progress == stop.input; }))
+    var index = control_points.length
+    while index > 0:
+        index -= 1
+        if control_points[index].input == input_progress:
+            return control_points[index].output
+
+    # 5. Otherwise, find two control points in points, A and B, which will be used for interpolation:
+    var a = CssLinearEasingFunctionControlPoint(input = none, output = 0.0)
+    var b = CssLinearEasingFunctionControlPoint(input = none, output = 0.0)
+
+    if input_progress < (control_points[0].input else trap("VERIFY: a canonicalized input")):
+        # 1. If inputProgress is smaller than any input progress value in points,
+        # let A and B be the first two items in points.
+        # If A and B have the same input progress value, return A’s output progress value.
+        a = control_points[0]
+        b = control_points[1]
+        if a.input == (b.input else trap("VERIFY: a canonicalized input")):
+            return a.output
+    elif input_progress > (control_points[control_points.length - 1].input else trap("VERIFY: a canonicalized input")):
+        # 2. If inputProgress is larger than any input progress value in points,
+        # let A and B be the last two items in points.
+        # If A and B have the same input progress value, return B’s output progress value.
+        a = control_points[control_points.length - 2]
+        b = control_points[control_points.length - 1]
+        if a.input == (b.input else trap("VERIFY: a canonicalized input")):
+            return b.output
+    else:
+        # 3. Otherwise, let A be the last control point whose input progress value is smaller than inputProgress,
+        # and let B be the first control point whose input progress value is larger than inputProgress.
+        var found_a = false
+        index = control_points.length
+        while index > 0:
+            index -= 1
+            if (control_points[index].input else trap("VERIFY: a canonicalized input")) < input_progress:
+                a = control_points[index]
+                found_a = true
+                break
+        assert(found_a)
+        var found_b = false
+        for stop in control_points:
+            if (stop.input else trap("VERIFY: a canonicalized input")) > input_progress:
+                b = stop
+                found_b = true
+                break
+        assert(found_b)
+
+    # 6. Linearly interpolate (or extrapolate) inputProgress along the line defined by A and B, and return the result.
+    let a_input = a.input else trap("VERIFY: a canonicalized input")
+    let b_input = b.input else trap("VERIFY: a canonicalized input")
+    let factor = (input_progress - a_input) / (b_input - a_input)
+    return a.output + factor * (b.output - a.output)
+
+## CubicBezierEasingFunction::evaluate_at's `cubic_bezier_at` lambda.
+func css_cubic_bezier_at(x1: f64, x2: f64, t: f64) -> f64:
+    let a = 1.0 - 3.0 * x2 + 3.0 * x1
+    let b = 3.0 * x2 - 6.0 * x1
+    let c = 3.0 * x1
+
+    let t2 = t * t
+    let t3 = t2 * t
+
+    return (a * t3) + (b * t2) + (c * t)
+
+## CubicBezierEasingFunction::evaluate_at's `cubic_bezier_derivative_at` lambda.
+func css_cubic_bezier_derivative_at(x1: f64, x2: f64, t: f64) -> f64:
+    let a = 1.0 - 3.0 * x2 + 3.0 * x1
+    let b = 3.0 * x2 - 6.0 * x1
+    let c = 3.0 * x1
+    return 3.0 * a * t * t + 2.0 * b * t + c
+
+## Ported from Libraries/LibWeb/CSS/EasingFunction.cpp:73 Web::CSS::CubicBezierEasingFunction::evaluate_at.
+# https://www.w3.org/TR/css-easing-1/#cubic-bezier-algo
+pub func css_cubic_bezier_easing_function_evaluate_at(this: const CssCubicBezierEasingFunction*, input_progress: f64, before_flag: bool) -> f64:
+    _ = before_flag
+    let x1 = this.x1
+    let y1 = this.y1
+    let x2 = this.x2
+    let y2 = this.y2
+
+    # For input progress values outside the range [0, 1], the curve is extended infinitely using tangent of the curve
+    # at the closest endpoint as follows:
+
+    # - For input progress values less than zero,
+    if input_progress < 0.0:
+        # 1. If the x value of P1 is greater than zero, use a straight line that passes through P1 and P0 as the
+        #    tangent.
+        if x1 > 0.0:
+            return y1 / x1 * input_progress
+
+        # 2. Otherwise, if the x value of P2 is greater than zero, use a straight line that passes through P2 and P0 as
+        #    the tangent.
+        if x2 > 0.0:
+            return y2 / x2 * input_progress
+
+        # 3. Otherwise, let the output progress value be zero for all input progress values in the range [-∞, 0).
+        return 0.0
+
+    # - For input progress values greater than one,
+    if input_progress > 1.0:
+        # 1. If the x value of P2 is less than one, use a straight line that passes through P2 and P3 as the tangent.
+        if x2 < 1.0:
+            return (1.0 - y2) / (1.0 - x2) * (input_progress - 1.0) + 1.0
+
+        # 2. Otherwise, if the x value of P1 is less than one, use a straight line that passes through P1 and P3 as the
+        #    tangent.
+        if x1 < 1.0:
+            return (1.0 - y1) / (1.0 - x1) * (input_progress - 1.0) + 1.0
+
+        # 3. Otherwise, let the output progress value be one for all input progress values in the range (1, ∞].
+        return 1.0
+
+    # Note: The spec does not specify the precise algorithm for calculating values in the range [0, 1]:
+    #       "The evaluation of this curve is covered in many sources such as [FUND-COMP-GRAPHICS]."
+
+    # We use Newton-Raphson iteration to solve for the parameter t where x(t) = input_progress,
+    # then return y(t). Falls back to bisection when Newton-Raphson doesn't converge.
+
+    let epsilon = 1e-7
+    let x = input_progress
+
+    # Newton-Raphson iteration.
+    var t = x
+    for i in 0..<8:
+        _ = i
+        let x_at_t = css_cubic_bezier_at(x1, x2, t) - x
+        if math.abs(x_at_t) < epsilon:
+            return css_cubic_bezier_at(y1, y2, t)
+        let dx = css_cubic_bezier_derivative_at(x1, x2, t)
+        if math.abs(dx) < 1e-12:
+            break
+        t -= x_at_t / dx
+
+    # Bisection fallback.
+    var lo = 0.0
+    var hi = 1.0
+    t = x
+    for i in 0..<64:
+        _ = i
+        let x_at_t = css_cubic_bezier_at(x1, x2, t)
+        if math.abs(x_at_t - x) < epsilon:
+            return css_cubic_bezier_at(y1, y2, t)
+        if x > x_at_t:
+            lo = t
+        else:
+            hi = t
+        t = (lo + hi) / 2.0
+
+    return css_cubic_bezier_at(y1, y2, t)
+
+## Ported from Libraries/LibWeb/CSS/EasingFunction.cpp:162 Web::CSS::StepsEasingFunction::evaluate_at.
+# https://www.w3.org/TR/css-easing-1/#step-easing-algo
+pub func css_steps_easing_function_evaluate_at(this: const CssStepsEasingFunction*, input_progress: f64, before_flag: bool) -> f64:
+    var current_step = math.floor(input_progress * f64(this.interval_count))
+
+    # 2. If the step position property is one of:
+    #    - jump-start,
+    #    - jump-both,
+    #    increment current step by one.
+    if this.position == css_data.StepPosition.jump_start or this.position == css_data.StepPosition.start or this.position == css_data.StepPosition.jump_both:
+        current_step += 1.0
+
+    # 3. If both of the following conditions are true:
+    #    - the before flag is set, and
+    #    - input progress value × steps mod 1 equals zero (that is, if input progress value × steps is integral), then
+    #    decrement current step by one.
+    let step_progress = input_progress * f64(this.interval_count)
+    if before_flag and math.trunc(step_progress) == step_progress:
+        current_step -= 1.0
+
+    # 4. If input progress value ≥ 0 and current step < 0, let current step be zero.
+    if input_progress >= 0.0 and current_step < 0.0:
+        current_step = 0.0
+
+    # 5. Calculate jumps based on the step position as follows:
+
+    #    jump-start or jump-end -> steps
+    #    jump-none -> steps - 1
+    #    jump-both -> steps + 1
+    var jumps = this.interval_count
+    if this.position == css_data.StepPosition.jump_none:
+        jumps -= 1
+    elif this.position == css_data.StepPosition.jump_both:
+        jumps += 1
+
+    # 6. If input progress value ≤ 1 and current step > jumps, let current step be jumps.
+    if input_progress <= 1.0 and current_step > f64(jumps):
+        current_step = f64(jumps)
+
+    # 7. The output progress value is current step / jumps.
+    return current_step / f64(jumps)
+
+# mark: linear() canonicalization ===============================================================
+
+## Ported from Libraries/LibWeb/CSS/EasingFunction.cpp:206 Web::CSS::canonicalize_linear_easing_function_control_points.
+# https://drafts.csswg.org/css-easing/#linear-canonicalization
+func css_canonicalize_linear_easing_function_control_points(control_points: const ak.Vector[CssLinearEasingFunctionControlPoint]*) -> ak.Vector[CssLinearEasingFunctionControlPoint]:
+    # To canonicalize a linear() function’s control points, perform the following:
+    var canonicalized_control_points = ak.vector_clone(control_points)
+    let points = ak.vector_span(&canonicalized_control_points)
+
+    # 1. If the first control point lacks an input progress value, set its input progress value to 0.
+    if points[0].input == none:
+        points[0].input = 0.0
+
+    # 2. If the last control point lacks an input progress value, set its input progress value to 1.
+    if points[points.length - 1].input == none:
+        points[points.length - 1].input = 1.0
+
+    # 3. If any control point has an input progress value that is less than
+    # the input progress value of any preceding control point,
+    # set its input progress value to the largest input progress value of any preceding control point.
+    var largest_input = 0.0
+    for i in 0..<points.length:
+        if let input = points[i].input:
+            if input < largest_input:
+                points[i].input = largest_input
+            else:
+                largest_input = input
+
+    # 4. If any control point still lacks an input progress value,
+    # then for each contiguous run of such control points,
+    # set their input progress values so that they are evenly spaced
+    # between the preceding and following control points with input progress values.
+    var run_start_idx: usize? = none
+    for idx in 0..<points.length:
+        let has_input = points[idx].input != none
+        if has_input and run_start_idx != none:
+            let start = run_start_idx else trap("unreachable: checked above")
+            # Note: this stop is immediately after a run
+            #       set inputs of [start, idx-1] stops to be evenly spaced between start-1 and idx
+            let start_input = points[start - 1].input else trap("VERIFY: the stop before a run has an input")
+            let end_input = points[idx].input else trap("unreachable: checked above")
+            let run_stop_count = idx - start + 1
+            let delta = (end_input - start_input) / f64(run_stop_count)
+            for run_idx in 0..<run_stop_count:
+                points[run_idx + start - 1].input = start_input + delta * f64(run_idx)
+            run_start_idx = none
+        elif not has_input and run_start_idx == none:
+            # Note: this stop is the start of a run
+            run_start_idx = idx
+
+    return canonicalized_control_points
+
+# mark: The keyword functions ===================================================================
+
+## Ported from Libraries/LibWeb/CSS/EasingFunction.cpp:261 Web::CSS::EasingFunction::linear.
+# https://drafts.csswg.org/css-easing-2/#linear-easing-function
+pub func css_easing_function_linear() -> CssEasingFunction:
+    # Equivalent to linear(0, 1)
+    var control_points: ak.Vector[CssLinearEasingFunctionControlPoint]
+    ak.vector_append_t(&control_points, CssLinearEasingFunctionControlPoint(input = 0.0, output = 0.0))
+    ak.vector_append_t(&control_points, CssLinearEasingFunctionControlPoint(input = 1.0, output = 1.0))
+    return CssEasingFunction(variant = CssLinearEasingFunctionOrCssCubicBezierEasingFunctionOrCssStepsEasingFunction.css_linear_easing_function(CssLinearEasingFunction(control_points = control_points, stringified = ak.string_from_str("linear"))))
+
+## A CubicBezierEasingFunction as an EasingFunction.
+func css_easing_function_cubic_bezier(x1: f64, y1: f64, x2: f64, y2: f64, stringified: str) -> CssEasingFunction:
+    return CssEasingFunction(variant = CssLinearEasingFunctionOrCssCubicBezierEasingFunctionOrCssStepsEasingFunction.css_cubic_bezier_easing_function(CssCubicBezierEasingFunction(x1 = x1, y1 = y1, x2 = x2, y2 = y2, stringified = ak.string_from_str(stringified))))
+
+## Ported from Libraries/LibWeb/CSS/EasingFunction.cpp:268 Web::CSS::EasingFunction::ease_in.
+# https://drafts.csswg.org/css-easing-2/#valdef-cubic-bezier-easing-function-ease-in
+pub func css_easing_function_ease_in() -> CssEasingFunction:
+    # Equivalent to cubic-bezier(0.42, 0, 1, 1).
+    return css_easing_function_cubic_bezier(0.42, 0.0, 1.0, 1.0, "ease-in")
+
+## Ported from Libraries/LibWeb/CSS/EasingFunction.cpp:275 Web::CSS::EasingFunction::ease_out.
+# https://drafts.csswg.org/css-easing-2/#valdef-cubic-bezier-easing-function-ease-out
+pub func css_easing_function_ease_out() -> CssEasingFunction:
+    # Equivalent to cubic-bezier(0, 0, 0.58, 1).
+    return css_easing_function_cubic_bezier(0.0, 0.0, 0.58, 1.0, "ease-out")
+
+## Ported from Libraries/LibWeb/CSS/EasingFunction.cpp:282 Web::CSS::EasingFunction::ease_in_out.
+# https://drafts.csswg.org/css-easing-2/#valdef-cubic-bezier-easing-function-ease-in-out
+pub func css_easing_function_ease_in_out() -> CssEasingFunction:
+    # Equivalent to cubic-bezier(0.42, 0, 0.58, 1).
+    return css_easing_function_cubic_bezier(0.42, 0.0, 0.58, 1.0, "ease-in-out")
+
+## Ported from Libraries/LibWeb/CSS/EasingFunction.cpp:289 Web::CSS::EasingFunction::ease.
+# https://drafts.csswg.org/css-easing-2/#valdef-cubic-bezier-easing-function-ease
+pub func css_easing_function_ease() -> CssEasingFunction:
+    # Equivalent to cubic-bezier(0.25, 0.1, 0.25, 1).
+    return css_easing_function_cubic_bezier(0.25, 0.1, 0.25, 1.0, "ease")
+
+# mark: From a style value, evaluation and serialization ========================================
+
+## from_style_value's visitor for EasingStyleValue::Linear.
+func css_easing_function_from_linear(linear: const CssEasingStyleValueLinear*) -> CssEasingFunction:
+    var resolved_control_points: ak.Vector[CssLinearEasingFunctionControlPoint]
+
+    for control_point in ak.vector_span_const(&linear.stops):
+        let output = css_number_from_style_value(control_point.output, none)
+
+        var input: f64? = none
+        if let input_value = control_point.input:
+            let percentage = css_percentage_from_style_value(input_value)
+            input = css_percentage_as_fraction(&percentage)
+
+        ak.vector_append_t(&resolved_control_points, CssLinearEasingFunctionControlPoint(input = input, output = output))
+
+    # https://drafts.csswg.org/css-easing-2/#funcdef-linear
+    # If an argument lacks a <percentage>, its input progress value is initially empty. This is corrected
+    # at used value time by linear() canonicalization.
+    resolved_control_points = css_canonicalize_linear_easing_function_control_points(&resolved_control_points)
+
+    let stringified = css_easing_style_value_linear_to_string(linear, css_syntax.SerializationMode.resolved_value)
+    return CssEasingFunction(variant = CssLinearEasingFunctionOrCssCubicBezierEasingFunctionOrCssStepsEasingFunction.css_linear_easing_function(CssLinearEasingFunction(control_points = resolved_control_points, stringified = stringified)))
+
+## Ported from Libraries/LibWeb/CSS/EasingFunction.cpp:303 Web::CSS::EasingFunction::from_style_value.
+pub func css_easing_function_from_style_value(style_value: CssStyleValue*) -> CssEasingFunction:
+    if css_style_value_is_easing(style_value):
+        let function = css_easing_style_value_function(css_style_value_as_easing(style_value))
+        match function.variant:
+            .css_easing_style_value_linear(linear):
+                return css_easing_function_from_linear(&linear)
+            .css_easing_style_value_cubic_bezier(cubic_bezier):
+                let resolved_x1 = css_number_from_style_value(cubic_bezier.x1, none)
+                let resolved_y1 = css_number_from_style_value(cubic_bezier.y1, none)
+                let resolved_x2 = css_number_from_style_value(cubic_bezier.x2, none)
+                let resolved_y2 = css_number_from_style_value(cubic_bezier.y2, none)
+
+                let stringified = css_easing_style_value_cubic_bezier_to_string(&cubic_bezier, css_syntax.SerializationMode.normal)
+                return CssEasingFunction(variant = CssLinearEasingFunctionOrCssCubicBezierEasingFunctionOrCssStepsEasingFunction.css_cubic_bezier_easing_function(CssCubicBezierEasingFunction(x1 = resolved_x1, y1 = resolved_y1, x2 = resolved_x2, y2 = resolved_y2, stringified = stringified)))
+            .css_easing_style_value_steps(steps):
+                let stringified = css_easing_style_value_steps_to_string(&steps, css_syntax.SerializationMode.resolved_value)
+                return CssEasingFunction(variant = CssLinearEasingFunctionOrCssCubicBezierEasingFunctionOrCssStepsEasingFunction.css_steps_easing_function(CssStepsEasingFunction(interval_count = css_int_from_style_value(steps.number_of_intervals), position = steps.position, stringified = stringified)))
+
+    match css_style_value_to_keyword(style_value):
+        .linear:
+            return css_easing_function_linear()
+        .ease_in:
+            return css_easing_function_ease_in()
+        .ease_out:
+            return css_easing_function_ease_out()
+        .ease_in_out:
+            return css_easing_function_ease_in_out()
+        .ease:
+            return css_easing_function_ease()
+        _:
+            trap("VERIFY_NOT_REACHED")
+
+## Ported from Libraries/LibWeb/CSS/EasingFunction.cpp:359 Web::CSS::EasingFunction::evaluate_at.
+pub func css_easing_function_evaluate_at(this: const CssEasingFunction*, input_progress: f64, before_flag: bool) -> f64:
+    match this.variant:
+        .css_linear_easing_function(function):
+            return css_linear_easing_function_evaluate_at(&function, input_progress, before_flag)
+        .css_cubic_bezier_easing_function(function):
+            return css_cubic_bezier_easing_function_evaluate_at(&function, input_progress, before_flag)
+        .css_steps_easing_function(function):
+            return css_steps_easing_function_evaluate_at(&function, input_progress, before_flag)
+
+## Ported from Libraries/LibWeb/CSS/EasingFunction.cpp:367 Web::CSS::EasingFunction::to_string.
+pub func css_easing_function_to_string(this: const CssEasingFunction*) -> ak.String:
+    match this.variant:
+        .css_linear_easing_function(function):
+            return function.stringified
+        .css_cubic_bezier_easing_function(function):
+            return function.stringified
+        .css_steps_easing_function(function):
+            return function.stringified

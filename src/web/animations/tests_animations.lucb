@@ -1,0 +1,198 @@
+#==============================================================================================
+#
+#   tests_animations - CSS animations and transitions on a document's timeline
+#
+#   DESCRIPTION:
+#       Ladybird tests animations with script (Text tests, phase 3); these tests drive a document
+#       the way the HTML event loop's update the rendering does, frame by frame: the style
+#       computation makes the CSSAnimation of an element's `animation` (or a CSSTransition when
+#       a transitioned property changes), Document::update_animations_and_send_events advances
+#       the document timeline, runs the pending play task and dispatches the animation and
+#       transition events at the element, and Document::update_animated_style_if_needed applies
+#       the interpolated keyframe values to the element's computed properties. The documents are
+#       built as tests_layout_tree builds them; the event listeners are tests_events' recording
+#       native functions.
+#
+#==============================================================================================
+
+# mark: Documents and events ====================================================================
+
+## Builds the layout tree of `html` with `css` (tests_layout_tree's build, the user-agent sheets installed) and runs
+## `check` on its document.
+func test_animations_with_document(html: str, css: str, check: func(DomDocument*) -> unit):
+    web_initialize_strings()
+    test_fonts_setup()
+    let vm = web_test_create_vm()
+    defer web_test_destroy_vm(vm)
+    var (realm, realm_root) = test_layout_tree_window_realm(vm)
+    defer gc.root_release(&realm_root)
+    let allocator: memory.Allocator = vm_heap(vm)
+    with allocator:
+        test_media_invalidation_install_user_agent_sheets(realm)
+        defer test_style_computer_release_user_agent_sheets()
+        var (document, navigable) = test_layout_tree_build(vm_heap(vm), realm, html, css)
+        defer gc.root_release(&navigable)
+        check(document)
+
+## The element with id `id`.
+func test_animations_element(document: DomDocument*, id: str) -> DomElement*:
+    return dom_parent_node_get_element_by_id(document.dom_parent_node(), ak.fly_string_from_str(id)) else trap("no such element")
+
+## Listens for `type_` events at `element`, recording them into `seen` (tests_events' recording native function, as a
+## callback whose context is the realm's principal settings object, which running it prepares).
+func test_animations_listen(element: DomElement*, type_: str, seen: TestNativeCall*):
+    let realm = dom_element_realm(element)
+    let function = js_native_function_create(realm, JsNativeFunctionBehaviour(call = test_native_behaviour, context = seen), 1, ak.utf16_fly_string_new(), realm)
+    let callback = (IdlCallbackType*)web_allocate_cell(realm, &idl_callback_type_class)
+    idl_callback_type_construct_html_environment_settings_obje(callback, (JsObject*)function, html_principal_realm_settings_object(realm))
+    web_initialize_cell(callback.cell(), realm)
+    dom_event_target_add_event_listener(element.dom_event_target(), ak.fly_string_from_str(type_), dom_idl_event_listener_create(realm, callback), .bool_(false))
+
+## The event a recording listener saw last.
+func test_animations_seen_event(seen: const TestNativeCall*) -> DomEvent*:
+    return (DomEvent*)js_value_as_object(seen.argument)
+
+## The computed width of `element` with the animations applied, in px.
+func test_animations_width(element: DomElement*) -> f64:
+    let computed_properties = dom_element_computed_properties(element) else trap("no computed properties")
+    let width = css_computed_properties_property(computed_properties, css_data.PropertyId.width)
+    let length = css_length_style_value_length(css_style_value_as_length(width))
+    assert(css_length_unit(&length) == css_data.LengthUnit.px)
+    return css_length_raw_value(&length)
+
+## One animation frame at `timestamp` (milliseconds): update the animations and send the events, then the animated
+## style (HTML's update the rendering, steps 11 and 16).
+func test_animations_frame(document: DomDocument*, timestamp: f64):
+    dom_document_update_animations_and_send_events(document, timestamp)
+    dom_document_update_animated_style_if_needed(document)
+
+# mark: CSS animations ==========================================================================
+
+## #a animates its width from 0px to 100px over a second, linearly; the frames start at 1000ms.
+func test_animations_check_css_animation(document: DomDocument*):
+    let element = test_animations_element(document, "a")
+    let animations = animations_animatable_css_defined_animations(&element.animatable, none) else trap("no CSS-defined animations")
+    let css_animation = *(ak.hash_map_get_k(animations, ak.fly_string_from_str("grow")) else trap("no animation named grow"))
+    let animation = css_animation.animations_animation()
+    assert(animations_animation_is_css_animation(animation))
+    assert(animations_animation_animation_class(animation) == AnimationsAnimationClass.css_animation_with_owning_element)
+    assert(animations_animation_timeline(animation) == dom_document_timeline(document).animations_animation_timeline())
+    # play() scheduled the pending play task: running, but not started yet.
+    assert(animations_animation_pending(animation))
+    assert(animations_animation_play_state(animation) == BindAnimationPlayState.running)
+
+    var started = TestNativeCall()
+    var ended = TestNativeCall()
+    test_animations_listen(element, "animationstart", &started)
+    test_animations_listen(element, "animationend", &ended)
+
+    # The first frame runs the pending play task: the animation starts at the frame's time.
+    test_animations_frame(document, 1000.0)
+    assert(not animations_animation_pending(animation))
+    let start_time = animations_animation_start_time(animation) else trap("no start time")
+    assert(start_time.value == 1000.0)
+    let current_time = animations_animation_current_time(animation) else trap("no current time")
+    assert(current_time.value == 0.0)
+    assert(started.calls == 1)
+    let start_event = test_animations_seen_event(&started)
+    assert(is_css_animation_event(start_event))
+    assert(css_animation_event_elapsed_time((CssAnimationEvent*)start_event) == 0.0)
+    let grow = ak.fly_string_from_str("grow")
+    let start_name = css_animation_event_animation_name((CssAnimationEvent*)start_event)
+    assert(ak.fly_string_eq_fly_string(&start_name, &grow))
+    assert(test_animations_width(element) == 0.0)
+
+    # A quarter of the way.
+    test_animations_frame(document, 1250.0)
+    let effect = animations_animation_effect(animation) else trap("no effect")
+    assert(animations_animation_effect_phase(effect) == AnimationsAnimationEffectPhase.active)
+    assert((animations_animation_effect_transformed_progress(effect) else trap("no progress")) == 0.25)
+    assert(test_animations_width(element) == 25.0)
+
+    # Three quarters.
+    test_animations_frame(document, 1750.0)
+    assert(test_animations_width(element) == 75.0)
+    assert(ended.calls == 0)
+
+    # Past its end the animation is finished and its effect no longer applies (fill-mode none).
+    test_animations_frame(document, 2100.0)
+    assert(animations_animation_play_state(animation) == BindAnimationPlayState.finished)
+    assert(animations_animation_is_finished(animation))
+    assert(animations_animation_effect_phase(effect) == AnimationsAnimationEffectPhase.after)
+    assert(ended.calls == 1)
+    assert(css_animation_event_elapsed_time((CssAnimationEvent*)test_animations_seen_event(&ended)) == 1.0)
+    assert(test_animations_width(element) == 200.0)
+    assert(started.calls == 1)
+
+test "a CSS animation starts on the document timeline, interpolates its keyframes and ends":
+    test_animations_with_document("<body><div id=a>x</div></body>", "@keyframes grow { from { width: 0px } to { width: 100px } } #a { width: 200px; animation: grow 1000ms linear; }", test_animations_check_css_animation)
+
+## #a's animation is paused half way (a negative delay): the animated width stays at the middle of its keyframes.
+func test_animations_check_paused_animation(document: DomDocument*):
+    let element = test_animations_element(document, "a")
+    let animations = animations_animatable_css_defined_animations(&element.animatable, none) else trap("no CSS-defined animations")
+    let animation = (*(ak.hash_map_get_k(animations, ak.fly_string_from_str("grow")) else trap("no animation named grow"))).animations_animation()
+    test_animations_frame(document, 1000.0)
+    assert(animations_animation_play_state(animation) == BindAnimationPlayState.paused)
+    assert(test_animations_width(element) == 50.0)
+    test_animations_frame(document, 5000.0)
+    assert(test_animations_width(element) == 50.0)
+
+test "a paused CSS animation with a negative delay holds its value":
+    test_animations_with_document("<body><div id=a>x</div></body>", "@keyframes grow { from { width: 0px } to { width: 100px } } #a { animation: grow 4s linear -2s paused; }", test_animations_check_paused_animation)
+
+## #a's animation runs twice, alternating: an animationiteration event, then the reverse direction.
+func test_animations_check_iterations(document: DomDocument*):
+    let element = test_animations_element(document, "a")
+    var iterated = TestNativeCall()
+    test_animations_listen(element, "animationiteration", &iterated)
+    test_animations_frame(document, 0.0)
+    test_animations_frame(document, 500.0)
+    assert(test_animations_width(element) == 50.0)
+    test_animations_frame(document, 1250.0)
+    assert(iterated.calls == 1)
+    assert(css_animation_event_elapsed_time((CssAnimationEvent*)test_animations_seen_event(&iterated)) == 1.0)
+    # The second iteration runs backwards: 250ms into it the width is at 75%.
+    assert(test_animations_width(element) == 75.0)
+
+test "an alternating CSS animation fires animationiteration and runs backwards":
+    test_animations_with_document("<body><div id=a>x</div></body>", "@keyframes grow { from { width: 0px } to { width: 100px } } #a { animation: grow 1s linear 2 alternate; }", test_animations_check_iterations)
+
+# mark: CSS transitions =========================================================================
+
+## #a transitions its width over a second when it changes: transitionrun, transitionstart and transitionend.
+func test_animations_check_transition(document: DomDocument*):
+    let element = test_animations_element(document, "a")
+    var run = TestNativeCall()
+    var started = TestNativeCall()
+    var ended = TestNativeCall()
+    test_animations_listen(element, "transitionrun", &run)
+    test_animations_listen(element, "transitionstart", &started)
+    test_animations_listen(element, "transitionend", &ended)
+
+    # The timeline's time when the style changes is the transition's start time.
+    test_animations_frame(document, 1000.0)
+    dom_element_set_attribute_value(element, ak.fly_string_from_str("style"), ak.string_from_str("width: 100px"))
+    test_layout_tree_update_style(document)
+    let transition = animations_animatable_property_transition(&element.animatable, none, css_data.PropertyId.width) else trap("no transition of width")
+    let animation = transition.animations_animation()
+    assert(animations_animation_is_css_transition(animation))
+    assert(css_transition_transition_start_time(transition) == 1000.0)
+    assert(css_transition_transition_end_time(transition) == 2000.0)
+
+    test_animations_frame(document, 1000.0)
+    assert(run.calls == 1)
+    assert(started.calls == 1)
+    test_animations_frame(document, 1500.0)
+    assert(test_animations_width(element) == 50.0)
+    test_animations_frame(document, 2500.0)
+    assert(ended.calls == 1)
+    let end_event = test_animations_seen_event(&ended)
+    assert(is_css_transition_event(end_event))
+    let property_name = css_transition_event_property_name((CssTransitionEvent*)end_event)
+    assert(ak.string_eq_string_view(&property_name, ak.sv("width")))
+    assert(css_transition_event_elapsed_time((CssTransitionEvent*)end_event) == 1.0)
+    assert(test_animations_width(element) == 100.0)
+
+test "a CSS transition runs on the document timeline and fires its events":
+    test_animations_with_document("<body><div id=a>x</div></body>", "#a { width: 0px; transition: width 1s linear; }", test_animations_check_transition)

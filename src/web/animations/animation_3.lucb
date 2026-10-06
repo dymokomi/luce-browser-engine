@@ -1,0 +1,470 @@
+#==============================================================================================
+#
+#   animation_3 - Animations::Animation: cancel, finish, play, pause, the playback rate and
+#                 reverse
+#
+#   DESCRIPTION:
+#       Port of Libraries/LibWeb/Animations/Animation.cpp (lines 627-1061), by region p4a:
+#       cancel(), finish(), play() and the procedure to play an animation, pause(),
+#       updatePlaybackRate(), reverse() and persist().
+#
+#       Copyright (c) 2023-2024, Matthew Olsson <mattco@serenityos.org>.
+#       Copyright (c) 2025, Jelle Raaijmakers <jelle@ladybird.org>
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+# mark: cancel() ================================================================================
+
+## The captures of cancel()'s queued task: `[this, cancel_event]`.
+struct AnimationsAnimationCancelDispatch:
+    var this: AnimationsAnimation*
+    var cancel_event: AnimationsAnimationPlaybackEvent*
+
+## cancel()'s queued task: dispatch cancelEvent at the animation.
+func animations_animation_cancel_dispatch(context: void*?):
+    let captures = (AnimationsAnimationCancelDispatch*)(context else trap("no captures"))
+    _ = dom_event_target_dispatch_event(captures.this.dom_event_target(), captures.cancel_event.dom_event())
+
+## cancel()'s steps under its TemporaryExecutionContext (step 1's body).
+func animations_animation_cancel_in_execution_context(this: AnimationsAnimation*, realm: Realm*):
+    var execution_context: HtmlTemporaryExecutionContext = ---
+    html_temporary_execution_context_construct_realm(&execution_context, realm)
+    defer html_temporary_execution_context_destruct(&execution_context)
+
+    # 1. Run the procedure to reset an animation’s pending tasks on animation.
+    animations_animation_reset_an_animations_pending_tasks(this)
+
+    # 2. Reject the current finished promise with a DOMException named "AbortError".
+    let dom_exception = idl_abort_error_create(realm, ak.utf16_string_from_str("Animation was cancelled"))
+    idl_reject_promise(realm, animations_animation_current_finished_promise(this), bind_platform_object_wrapper(dom_exception.bind_platform_object()))
+
+    # 3. Set the [[PromiseIsHandled]] internal slot of the current finished promise to true.
+    idl_mark_promise_as_handled(animations_animation_current_finished_promise(this))
+
+    # 4. Let current finished promise be a new promise in the relevant Realm of animation.
+    this.m_current_finished_promise = idl_create_promise(realm)
+    this.m_is_finished = false
+
+    # 5. Create an AnimationPlaybackEvent, cancelEvent.
+    # 6. Set cancelEvent’s type attribute to cancel.
+    # 7. Set cancelEvent’s currentTime to null.
+    # 8. Let timeline time be the current time of the timeline with which animation is associated. If animation is
+    #    not associated with an active timeline, let timeline time be an unresolved time value.
+    # 9. Set cancelEvent’s timelineTime to timeline time. If timeline time is unresolved, set it to null.
+    var init = animations_animation_playback_event_init_new()
+    if let timeline = this.m_timeline:
+        if not animations_animation_timeline_is_inactive(timeline):
+            let current_time = animations_animation_timeline_current_time(timeline) else trap("VERIFY: Optional::value()")
+            init.timeline_time = animations_nullable_css_numberish_from_css_numberish(animations_time_value_as_css_numberish(current_time, realm))
+    let cancel_event = animations_animation_playback_event_create(realm, html_event_names_cancel, &init)
+
+    # 10. If animation has a document for timing, then append cancelEvent to its document for timing's pending
+    #     animation event queue along with its target, animation. If animation is associated with an active
+    #     timeline that defines a procedure to convert timeline times to origin-relative time, let the scheduled
+    #     event time be the result of applying that procedure to timeline time. Otherwise, the scheduled event time
+    #     is an unresolved time value.
+    #     Otherwise, queue a task to dispatch cancelEvent at animation. The task source for this task is the DOM
+    #     manipulation task source.
+    if let document = animations_animation_document_for_timing(this):
+        var scheduled_event_time: f64? = none
+        if let timeline = this.m_timeline:
+            if not animations_animation_timeline_is_inactive(timeline) and animations_animation_timeline_can_convert_a_timeline_time_to_an_origin_relative_time(timeline):
+                scheduled_event_time = animations_animation_timeline_convert_a_timeline_time_to_an_origin_relative_time(timeline, animations_animation_timeline_current_time(timeline))
+        dom_document_append_pending_animation_event(document, DomDocumentPendingAnimationEvent(event = cancel_event.dom_event(), animation = this, target = this.dom_event_target(), scheduled_event_time = scheduled_event_time))
+    else:
+        let captures = new AnimationsAnimationCancelDispatch(this = this, cancel_event = cancel_event) else trap("out of memory")
+        _ = html_queue_global_task(HtmlTaskSource.dom_manipulation, realm_global_object(realm), gc.create_function0(gc.cell_heap(this.cell()), ak.Function0[unit](call = animations_animation_cancel_dispatch, context = captures)))
+
+## Ported from Libraries/LibWeb/Animations/Animation.cpp:627 Web::Animations::Animation::cancel.
+# https://www.w3.org/TR/web-animations-1/#dom-animation-cancel
+pub func animations_animation_cancel(this: AnimationsAnimation*, should_invalidate: AnimationsAnimationShouldInvalidate = AnimationsAnimationShouldInvalidate.yes):
+    # Note: When called from JS, we always want to invalidate the animation target's style. However, this method is
+    #       also called from the StyleComputer when the animation-name CSS property changes. That happens in the
+    #       middle of a cascade, and importantly, _before_ computing the animation effect stack, so there is no
+    #       need for another invalidation. And in fact, if we did invalidate, it would lead to a crash, as the element
+    #       would not have it's "m_needs_style_update" flag cleared.
+
+    let realm = bind_platform_object_realm(this.bind_platform_object())
+
+    # 1. If animation’s play state is not idle, perform the following steps:
+    if animations_animation_play_state(this) != BindAnimationPlayState.idle:
+        animations_animation_cancel_in_execution_context(this, realm)
+
+    # 2. Make animation’s hold time unresolved.
+    this.m_hold_time = none
+
+    # 3. Make animation’s start time unresolved.
+    this.m_start_time = none
+
+    # This time is needed for dispatching the animationcancel DOM event
+    if let effect = this.m_effect:
+        this.m_saved_cancel_time = animations_animation_effect_active_time_using_fill(effect, BindFillMode.both)
+
+    if should_invalidate == AnimationsAnimationShouldInvalidate.yes:
+        animations_animation_invalidate_effect(this)
+
+# mark: finish() ================================================================================
+
+## Resolve the animation's current ready promise with the animation, under a TemporaryExecutionContext.
+func animations_animation_resolve_ready_promise_in_execution_context(this: AnimationsAnimation*):
+    let realm = bind_platform_object_realm(this.bind_platform_object())
+    var execution_context: HtmlTemporaryExecutionContext = ---
+    html_temporary_execution_context_construct_realm(&execution_context, realm)
+    defer html_temporary_execution_context_destruct(&execution_context)
+    idl_resolve_promise(realm, animations_animation_current_ready_promise(this), bind_platform_object_wrapper(this.bind_platform_object()))
+
+## Ported from Libraries/LibWeb/Animations/Animation.cpp:699 Web::Animations::Animation::finish.
+# https://www.w3.org/TR/web-animations-1/#dom-animation-finish
+pub func animations_animation_finish(this: AnimationsAnimation*) -> !:
+    let realm = bind_platform_object_realm(this.bind_platform_object())
+
+    # 1. If animation’s effective playback rate is zero, or if animation’s effective playback rate > 0 and associated
+    #    effect end is infinity, throw an "InvalidStateError" DOMException and abort these steps.
+    let effective_playback_rate = animations_animation_effective_playback_rate(this)
+    if effective_playback_rate == 0.0:
+        return try idl_throw(.idl_dom_exception(idl_invalid_state_error_create(realm, ak.utf16_string_from_str("Animation with a playback rate of 0 cannot be finished"))))
+    if effective_playback_rate > 0.0 and math.is_infinite(animations_animation_associated_effect_end(this).value):
+        return try idl_throw(.idl_dom_exception(idl_invalid_state_error_create(realm, ak.utf16_string_from_str("Animation with no end cannot be finished"))))
+
+    # 2. Apply any pending playback rate to animation.
+    animations_animation_apply_any_pending_playback_rate(this)
+
+    # 3. Set limit as follows:
+    #    -> If playback rate > 0,
+    #       Let limit be associated effect end.
+    #    -> Otherwise,
+    #       Let limit be zero.
+    let playback_rate = animations_animation_playback_rate(this)
+    let limit = animations_animation_associated_effect_end(this) if playback_rate > 0.0 else animations_time_value_create_zero(this.m_timeline)
+
+    # 4. Silently set the current time to limit.
+    try animations_animation_silently_set_current_time(this, limit)
+
+    # 5. If animation’s start time is unresolved and animation has an associated active timeline, let the start time be
+    #    the result of evaluating timeline time - (limit / playback rate) where timeline time is the current time value
+    #    of the associated timeline.
+    if this.m_start_time == none:
+        if let timeline = this.m_timeline:
+            if not animations_animation_timeline_is_inactive(timeline):
+                let timeline_time = animations_animation_timeline_current_time(timeline) else trap("VERIFY: Optional::value()")
+                this.m_start_time = animations_time_value_sub(timeline_time, animations_time_value_div(limit, playback_rate))
+
+    # 6. If there is a pending pause task and start time is resolved,
+    var should_resolve_ready_promise = false
+    if this.m_pending_pause_task == AnimationsAnimationTaskState.scheduled and this.m_start_time != none:
+        # 1. Let the hold time be unresolved.
+        # Note: Typically the hold time will already be unresolved except in the case when the animation was previously
+        #       idle.
+        this.m_hold_time = none
+
+        # 2. Cancel the pending pause task.
+        this.m_pending_pause_task = AnimationsAnimationTaskState.none_
+
+        # 3. Resolve the current ready promise of animation with animation.
+        should_resolve_ready_promise = true
+
+    # 7. If there is a pending play task and start time is resolved, cancel that task and resolve the current ready
+    #    promise of animation with animation.
+    if this.m_pending_play_task == AnimationsAnimationTaskState.scheduled and this.m_start_time != none:
+        this.m_pending_play_task = AnimationsAnimationTaskState.none_
+        should_resolve_ready_promise = true
+
+    if should_resolve_ready_promise:
+        animations_animation_resolve_ready_promise_in_execution_context(this)
+
+    # 8. Run the procedure to update an animation’s finished state for animation with the did seek flag set to true,
+    #    and the synchronously notify flag set to true.
+    animations_animation_update_finished_state(this, AnimationsAnimationDidSeek.yes, AnimationsAnimationSynchronouslyNotify.yes)
+
+# mark: play() ==================================================================================
+
+## Ported from Libraries/LibWeb/Animations/Animation.cpp:764 Web::Animations::Animation::play.
+# https://www.w3.org/TR/web-animations-1/#dom-animation-play
+pub func animations_animation_play(this: AnimationsAnimation*) -> !:
+    # Begins or resumes playback of the animation by running the procedure to play an animation passing true as the
+    # value of the auto-rewind flag.
+    try animations_animation_play_an_animation(this, AnimationsAnimationAutoRewind.yes)
+
+## Whether the animation has an associated timeline that is not monotonically increasing ("has finite timeline").
+func animations_animation_has_finite_timeline(this: AnimationsAnimation*) -> bool:
+    let timeline = this.m_timeline else return false
+    return not animations_animation_timeline_is_monotonically_increasing(timeline)
+
+## play_an_animation's first condition on the previous current time: unresolved, < zero, or ≥ associated effect end.
+func animations_animation_play_rewinds_forwards(previous_current_time: AnimationsTimeValue?, associated_effect_end: AnimationsTimeValue) -> bool:
+    let time = previous_current_time else return true
+    return time.value < 0.0 or animations_time_value_ge(time, associated_effect_end)
+
+## play_an_animation's second condition on the previous current time: unresolved, ≤ zero, or > associated effect end.
+func animations_animation_play_rewinds_backwards(previous_current_time: AnimationsTimeValue?, associated_effect_end: AnimationsTimeValue) -> bool:
+    let time = previous_current_time else return true
+    return time.value <= 0.0 or animations_time_value_gt(time, associated_effect_end)
+
+## Ported from Libraries/LibWeb/Animations/Animation.cpp:773 Web::Animations::Animation::play_an_animation.
+# https://drafts.csswg.org/web-animations-1/#playing-an-animation-section
+# https://drafts.csswg.org/web-animations-2/#play-an-animation
+pub func animations_animation_play_an_animation(this: AnimationsAnimation*, auto_rewind: AnimationsAnimationAutoRewind) -> !:
+    # 1. Let aborted pause be a boolean flag that is true if animation has a pending pause task, and false otherwise.
+    let aborted_pause = this.m_pending_pause_task == AnimationsAnimationTaskState.scheduled
+
+    # 2. Let has pending ready promise be a boolean flag that is initially false.
+    var has_pending_ready_promise = false
+
+    # 3. Let has finite timeline be true if animation has an associated timeline that is not monotonically increasing.
+    let has_finite_timeline = animations_animation_has_finite_timeline(this)
+
+    # 4. Let previous current time be the animation’s current time
+    let previous_current_time = animations_animation_current_time(this)
+
+    # 5. Let enable seek be true if the auto-rewind flag is true and has finite timeline is false. Otherwise,
+    #    initialize to false.
+    let enable_seek = auto_rewind == AnimationsAnimationAutoRewind.yes and not has_finite_timeline
+
+    # 6. Perform the steps corresponding to the first matching condition from the following, if any:
+    let effective_playback_rate = animations_animation_effective_playback_rate(this)
+    let associated_effect_end = animations_animation_associated_effect_end(this)
+
+    # -> If animation’s effective playback rate > 0, enable seek is true and either animation’s:
+    #    - previous current time is unresolved, or
+    #    - previous current time < zero, or
+    #    - previous current time ≥ associated effect end,
+    if effective_playback_rate > 0.0 and enable_seek and animations_animation_play_rewinds_forwards(previous_current_time, associated_effect_end):
+        # Set the animation’s hold time to zero.
+        this.m_hold_time = animations_time_value_create_zero(this.m_timeline)
+
+    # -> If animation’s effective playback rate < 0, enable seek is true and either animation’s:
+    #    - previous current time is unresolved, or
+    #    - previous current time ≤ zero, or
+    #    - previous current time > associated effect end,
+    elif effective_playback_rate < 0.0 and enable_seek and animations_animation_play_rewinds_backwards(previous_current_time, associated_effect_end):
+        # -> If associated effect end is positive infinity,
+        if math.is_infinite(associated_effect_end.value) and associated_effect_end.value > 0.0:
+            # throw an "InvalidStateError" DOMException and abort these steps.
+            let realm = bind_platform_object_realm(this.bind_platform_object())
+            return try idl_throw(.idl_dom_exception(idl_invalid_state_error_create(realm, ak.utf16_string_from_str("Cannot rewind an animation with an infinite effect end"))))
+
+        # -> Otherwise,
+        #    Set the animation’s hold time to the animation’s associated effect end.
+        this.m_hold_time = associated_effect_end
+
+    # -> If animation’s effective playback rate = 0 and animation’s current time is unresolved,
+    elif effective_playback_rate == 0.0 and previous_current_time == none:
+        # Set the animation’s hold time to zero.
+        this.m_hold_time = animations_time_value_create_zero(this.m_timeline)
+
+    # 7. If has finite timeline and previous current time is unresolved:
+    if has_finite_timeline and previous_current_time == none:
+        # Set the flag auto align start time to true.
+        this.m_auto_align_start_time = true
+
+    # 8. If animation’s hold time is resolved, let its start time be unresolved.
+    if this.m_hold_time != none:
+        this.m_start_time = none
+
+    # 9. If animation has a pending play task or a pending pause task,
+    if animations_animation_pending(this):
+        # 1. Cancel that task.
+        this.m_pending_play_task = AnimationsAnimationTaskState.none_
+        this.m_pending_pause_task = AnimationsAnimationTaskState.none_
+
+        # 2. Set has pending ready promise to true.
+        has_pending_ready_promise = true
+
+    # 10. If the following three conditions are all satisfied:
+    #     - animation’s hold time is unresolved, and
+    #     - aborted pause is false, and
+    #     - animation does not have a pending playback rate,
+    # AD-HOC: We also don't abort if we have a pending auto-alignment of the start time, see
+    #         https://github.com/w3c/csswg-drafts/issues/13236
+    let pending_auto_aligned_start_time = this.m_auto_align_start_time and this.m_start_time == none
+    if this.m_hold_time == none and not aborted_pause and this.m_pending_playback_rate == none and not pending_auto_aligned_start_time:
+        # abort this procedure.
+        return
+
+    # 11. If has pending ready promise is false, let animation’s current ready promise be a new promise in the relevant
+    #     Realm of animation.
+    if not has_pending_ready_promise:
+        this.m_current_ready_promise = idl_create_promise(bind_platform_object_realm(this.bind_platform_object()))
+
+    # 12. Schedule a task to run as soon as animation is ready. The task shall perform the following steps:
+    #
+    #         Note: Steps omitted, see run_pending_play_task()
+    #
+    #     So long as the above task is scheduled but has yet to run, animation is described as having a pending play
+    #     task. While the task is running, however, animation does not have a pending play task.
+    #
+    #     If a user agent determines that animation is immediately ready, it may schedule the above task as a microtask
+    #     such that it runs at the next microtask checkpoint, but it must not perform the task synchronously.
+    this.m_pending_play_task = AnimationsAnimationTaskState.scheduled
+
+    # 13. Run the procedure to update an animation’s finished state for animation with the did seek flag set to false,
+    #     and the synchronously notify flag set to false.
+    animations_animation_update_finished_state(this, AnimationsAnimationDidSeek.no, AnimationsAnimationSynchronouslyNotify.no)
+
+# mark: pause() =================================================================================
+
+## Ported from Libraries/LibWeb/Animations/Animation.cpp:882 Web::Animations::Animation::pause.
+# https://www.w3.org/TR/web-animations-1/#dom-animation-pause
+pub func animations_animation_pause(this: AnimationsAnimation*) -> !:
+    # 1. If animation has a pending pause task, abort these steps.
+    if this.m_pending_pause_task == AnimationsAnimationTaskState.scheduled:
+        return
+
+    # 2. If the play state of animation is paused, abort these steps.
+    if animations_animation_play_state(this) == BindAnimationPlayState.paused:
+        return
+
+    # 3. Let seek time be a time value that is initially unresolved.
+    var seek_time: AnimationsTimeValue? = none
+
+    # 4. Let has finite timeline be true if animation has an associated timeline that is not monotonically increasing.
+    let has_finite_timeline = animations_animation_has_finite_timeline(this)
+
+    # 5. If the animation’s current time is unresolved, perform the steps according to the first matching condition
+    #    from below:
+    if animations_animation_current_time(this) == none:
+        # -> If animation’s playback rate is ≥ 0,
+        if animations_animation_playback_rate(this) >= 0.0:
+            # Set seek time to zero.
+            seek_time = animations_time_value_create_zero(this.m_timeline)
+        # -> Otherwise
+        else:
+            # If associated effect end for animation is positive infinity,
+            let associated_effect_end = animations_animation_associated_effect_end(this)
+            if math.is_infinite(associated_effect_end.value) and associated_effect_end.value > 0.0:
+                # throw an "InvalidStateError" DOMException and abort these steps.
+                let realm = bind_platform_object_realm(this.bind_platform_object())
+                return try idl_throw(.idl_dom_exception(idl_invalid_state_error_create(realm, ak.utf16_string_from_str("Cannot pause an animation with an infinite effect end"))))
+
+            # Otherwise,
+            #     Set seek time to animation’s associated effect end.
+            seek_time = associated_effect_end
+
+    # 6. If seek time is resolved,
+    if seek_time != none:
+        # If has finite timeline is true,
+        if has_finite_timeline:
+            # Set animation’s start time to seek time.
+            this.m_start_time = seek_time
+        # Otherwise,
+        else:
+            # Set animation’s hold time to seek time.
+            this.m_hold_time = seek_time
+
+    # 7. Let has pending ready promise be a boolean flag that is initially false.
+    var has_pending_ready_promise = false
+
+    # 8. If animation has a pending play task, cancel that task and let has pending ready promise be true.
+    if this.m_pending_play_task == AnimationsAnimationTaskState.scheduled:
+        this.m_pending_play_task = AnimationsAnimationTaskState.none_
+        has_pending_ready_promise = true
+
+    # 9. If has pending ready promise is false, set animation’s current ready promise to a new promise in the relevant
+    #    Realm of animation.
+    if not has_pending_ready_promise:
+        this.m_current_ready_promise = idl_create_promise(bind_platform_object_realm(this.bind_platform_object()))
+
+    # 10. Schedule a task to be executed at the first possible moment where both of the following conditions are true:
+    # NB: Criteria has been listed out in is_ready_to_run_pending_pause_task()
+    # NB: This is run_pending_pause_task()
+    this.m_pending_pause_task = AnimationsAnimationTaskState.scheduled
+
+    # 11. Run the procedure to update an animation’s finished state for animation with the did seek flag set to false,
+    #     and the synchronously notify flag set to false.
+    animations_animation_update_finished_state(this, AnimationsAnimationDidSeek.no, AnimationsAnimationSynchronouslyNotify.no)
+
+# mark: Playback rate, reverse() and persist() ==================================================
+
+## Ported from Libraries/LibWeb/Animations/Animation.cpp:962 Web::Animations::Animation::update_playback_rate.
+# https://www.w3.org/TR/web-animations-1/#dom-animation-updateplaybackrate
+pub func animations_animation_update_playback_rate(this: AnimationsAnimation*, new_playback_rate: f64) -> !:
+    # 1. Let previous play state be animation’s play state.
+    # Note: It is necessary to record the play state before updating animation’s effective playback rate since, in the
+    #       following logic, we want to immediately apply the pending playback rate of animation if it is currently
+    #       finished regardless of whether or not it will still be finished after we apply the pending playback rate.
+    let previous_play_state = animations_animation_play_state(this)
+
+    # 2. Let animation’s pending playback rate be new playback rate.
+    this.m_pending_playback_rate = new_playback_rate
+
+    # 3. Perform the steps corresponding to the first matching condition from below:
+
+    # -> If animation has a pending play task or a pending pause task,
+    if animations_animation_pending(this):
+        # Abort these steps.
+        # Note: The different types of pending tasks will apply the pending playback rate when they run so there is no
+        #       further action required in this case.
+        return
+
+    # -> If previous play state is idle or paused, or animation’s current time is unresolved,
+    if previous_play_state == BindAnimationPlayState.idle or previous_play_state == BindAnimationPlayState.paused or animations_animation_current_time(this) == none:
+        # Apply any pending playback rate on animation.
+        # Note: the second condition above is required so that if we have a running animation with an unresolved
+        #       current time and no pending play task, we do not attempt to play it below.
+        animations_animation_apply_any_pending_playback_rate(this)
+    # -> If previous play state is finished,
+    elif previous_play_state == BindAnimationPlayState.finished:
+        # 1. Let the unconstrained current time be the result of calculating the current time of animation
+        #    substituting an unresolved time value for the hold time.
+        let saved_hold_time = this.m_hold_time
+        this.m_hold_time = none
+        let unconstrained_current_time = animations_animation_current_time(this)
+        this.m_hold_time = saved_hold_time
+
+        # 2. Let animation’s start time be the result of evaluating the following expression:
+        #        timeline time - (unconstrained current time / pending playback rate)
+        #    Where timeline time is the current time value of the timeline associated with animation.
+        #    If pending playback rate is zero, let animation’s start time be timeline time.
+        let timeline = this.m_timeline else trap("a null timeline: m_timeline->current_time()")
+        let timeline_time = animations_animation_timeline_current_time(timeline) else trap("VERIFY: Optional::value()")
+        let pending_playback_rate = this.m_pending_playback_rate else trap("VERIFY: Optional::value()")
+        if pending_playback_rate == 0.0:
+            this.m_start_time = timeline_time
+        else:
+            let current_time = unconstrained_current_time else trap("VERIFY: Optional::value()")
+            this.m_start_time = animations_time_value_sub(timeline_time, animations_time_value_div(current_time, pending_playback_rate))
+
+        # 3. Apply any pending playback rate on animation.
+        animations_animation_apply_any_pending_playback_rate(this)
+
+        # 4. Run the procedure to update an animation’s finished state for animation with the did seek flag set to
+        #    false, and the synchronously notify flag set to false.
+        animations_animation_update_finished_state(this, AnimationsAnimationDidSeek.no, AnimationsAnimationSynchronouslyNotify.no)
+    # -> Otherwise,
+    else:
+        # Run the procedure to play an animation for animation with the auto-rewind flag set to false.
+        try animations_animation_play_an_animation(this, AnimationsAnimationAutoRewind.no)
+
+## Ported from Libraries/LibWeb/Animations/Animation.cpp:1027 Web::Animations::Animation::reverse.
+# https://www.w3.org/TR/web-animations-1/#dom-animation-reverse
+pub func animations_animation_reverse(this: AnimationsAnimation*) -> !:
+    let realm = bind_platform_object_realm(this.bind_platform_object())
+
+    # 1. If there is no timeline associated with animation, or the associated timeline is inactive throw an
+    #    "InvalidStateError" DOMException and abort these steps.
+    var has_active_timeline = false
+    if let timeline = this.m_timeline:
+        has_active_timeline = not animations_animation_timeline_is_inactive(timeline)
+    if not has_active_timeline:
+        return try idl_throw(.idl_dom_exception(idl_invalid_state_error_create(realm, ak.utf16_string_from_str("Cannot reverse an animation with an inactive timeline"))))
+
+    # 2. Let original pending playback rate be animation’s pending playback rate.
+    let original_pending_playback_rate = this.m_pending_playback_rate
+
+    # 3. Let animation’s pending playback rate be the additive inverse of its effective playback rate (i.e.
+    #    -effective playback rate).
+    this.m_pending_playback_rate = -animations_animation_effective_playback_rate(this)
+
+    # 4. Run the steps to play an animation for animation with the auto-rewind flag set to true.
+    #    If the steps to play an animation throw an exception, set animation’s pending playback rate to original
+    #    pending playback rate and propagate the exception.
+    animations_animation_play_an_animation(this, AnimationsAnimationAutoRewind.yes) catch failure:
+        this.m_pending_playback_rate = original_pending_playback_rate
+        error(failure.code, failure.message)
+
+## Ported from Libraries/LibWeb/Animations/Animation.cpp:1056 Web::Animations::Animation::persist.
+# https://www.w3.org/TR/web-animations-1/#dom-animation-persist
+pub func animations_animation_persist(this: AnimationsAnimation*):
+    # Sets this animation’s replace state to persisted.
+    animations_animation_set_replace_state(this, BindAnimationReplaceState.persisted)

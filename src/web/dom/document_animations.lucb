@@ -1,0 +1,441 @@
+#==============================================================================================
+#
+#   document_animations - DOM::Document: the animation timelines and the animation events
+#
+#   DESCRIPTION:
+#       Port of LibWeb/DOM/Document.cpp (lines 3101-3357 and 5994-6198): the events of CSS
+#       transitions and CSS animations (transitionrun/start/end/cancel, animationstart/end/
+#       iteration/cancel), the default document timeline and the associated timelines, the
+#       pending animation event queue, updating animations and sending events, removing
+#       replaced animations, and getAnimations(). Split out of document_6 and document_11 by
+#       region p4a, which ported the event dispatch and the replaced animations.
+#
+#==============================================================================================
+
+# mark: Transition and animation events =========================================================
+
+## dispatch_events_for_transition's `Interval`.
+enum DomDocumentTransitionInterval as u8:
+    start = 0
+    end = 1
+    active_time = 2
+
+## dispatch_events_for_transition's and dispatch_events_for_animation_if_necessary's `::{pseudo-element name}`, or
+## the empty string without a pseudo-element.
+func dom_document_pseudo_element_text(owning_element: const DomAbstractElement*) -> ak.String:
+    let pseudo_element = dom_abstract_element_pseudo_element(owning_element) else return ak.String()
+    var builder = ak.string_builder_new()
+    ak.string_builder_append(&builder, "::")
+    ak.string_builder_append_string_view(&builder, css_data.pseudo_element_name(pseudo_element))
+    return ak.string_builder_to_string(&builder) else trap("MUST: String::formatted")
+
+## A TimeValue as an event's elapsed time in seconds.
+func dom_document_elapsed_time_output(elapsed_time: AnimationsTimeValue) -> f64:
+    match elapsed_time.type_:
+        .milliseconds:
+            return elapsed_time.value / 1000.0
+        .percentage:
+            # FIXME: The spec doesn't specify how to handle this case
+            return 0.0
+        _:
+            trap("VERIFY_NOT_REACHED")
+
+## dispatch_events_for_transition's `dispatch_event` lambda.
+func dom_document_dispatch_transition_event(this: DomDocument*, transition: CssTransition*, type_: ak.FlyString, interval: DomDocumentTransitionInterval):
+    let animation = transition.animations_animation()
+
+    # The target for a transition event is the transition’s owning element. If there is no owning element,
+    # no transition events are dispatched.
+    let effect = animations_animation_effect(animation) else return
+    var owning_element = animations_animation_owning_element(animation) else return
+
+    let zero = animations_time_value_create_zero(animations_animation_timeline(animation))
+    var elapsed_time = zero
+    match interval:
+        .start:
+            elapsed_time = animations_time_value_max(animations_time_value_min(animations_time_value_neg(animations_animation_effect_start_delay(effect)), animations_animation_effect_active_duration(effect)), zero)
+        .end:
+            elapsed_time = animations_time_value_max(animations_time_value_min(animations_time_value_sub(animations_animation_associated_effect_end(animation), animations_animation_effect_start_delay(effect)), animations_animation_effect_active_duration(effect)), zero)
+        .active_time:
+            # The active time of the animation at the moment it was canceled calculated using a fill mode of both.
+            # FIXME: Compute this properly.
+            elapsed_time = zero
+        _:
+            trap("VERIFY_NOT_REACHED")
+
+    let elapsed_time_output = dom_document_elapsed_time_output(elapsed_time)
+
+    let element = dom_abstract_element_element(&owning_element)
+    let property = css_transition_transition_property(transition)
+    let init = CssTransitionEventInit(event_init = DomEventInit(bubbles = true), property_name = ak.string_from_utf8(ak.fly_string_bytes_as_string_view(&property)) else trap("MUST: String::from_utf8"), elapsed_time = elapsed_time_output, pseudo_element = dom_document_pseudo_element_text(&owning_element))
+    dom_document_append_pending_animation_event(this, DomDocumentPendingAnimationEvent(event = css_transition_event_create(dom_element_realm(element), type_, &init).dom_event(), animation = animation, target = element.dom_event_target(), scheduled_event_time = high_resolution_time_unsafe_shared_current_time()))
+
+## Ported from Document.cpp:3101 Web::DOM::Document::dispatch_events_for_transition (private).
+# https://drafts.csswg.org/css-transitions-2/#event-dispatch
+func dom_document_dispatch_events_for_transition(this: DomDocument*, transition: CssTransition*):
+    let animation = transition.animations_animation()
+    let previous_phase = css_transition_previous_phase(transition)
+
+    # The transition phase of a transition is initially ‘idle’ and is updated on each
+    # animation frame according to the first matching condition from below:
+    var transition_phase = CssTransitionPhase.idle
+
+    if let effect = animations_animation_effect(animation):
+        if animations_animation_pending(animation) and (previous_phase == CssTransitionPhase.idle or previous_phase == CssTransitionPhase.pending):
+            # If the transition has a pending play task or a pending pause task
+            # and its phase was previously ‘idle’ or ‘pending’,
+            #   The transition phase is ‘pending’.
+            transition_phase = CssTransitionPhase.pending
+        else:
+            # Otherwise,
+            #   The transition phase is the phase of its associated effect.
+            transition_phase = (CssTransitionPhase)(u8)(i32)animations_animation_effect_phase(effect)
+    else:
+        # If the transition has no associated effect,
+        if let current_time = animations_animation_current_time(animation):
+            if current_time.value < 0.0:
+                # If the transition has a current time < 0,
+                #   The transition phase is ‘before’.
+                transition_phase = CssTransitionPhase.before
+            else:
+                # Otherwise,
+                #   The transition phase is ‘after’.
+                transition_phase = CssTransitionPhase.after
+        # If the transition has an unresolved current time,
+        #   The transition phase is ‘idle’.
+
+    if previous_phase == CssTransitionPhase.idle:
+        if transition_phase == CssTransitionPhase.pending or transition_phase == CssTransitionPhase.before:
+            dom_document_dispatch_transition_event(this, transition, html_event_names_transitionrun, .start)
+
+        if transition_phase == CssTransitionPhase.active:
+            dom_document_dispatch_transition_event(this, transition, html_event_names_transitionrun, .start)
+            dom_document_dispatch_transition_event(this, transition, html_event_names_transitionstart, .start)
+
+        if transition_phase == CssTransitionPhase.after:
+            dom_document_dispatch_transition_event(this, transition, html_event_names_transitionrun, .start)
+            dom_document_dispatch_transition_event(this, transition, html_event_names_transitionstart, .start)
+            dom_document_dispatch_transition_event(this, transition, html_event_names_transitionend, .end)
+    elif previous_phase == CssTransitionPhase.pending or previous_phase == CssTransitionPhase.before:
+        if transition_phase == CssTransitionPhase.active:
+            dom_document_dispatch_transition_event(this, transition, html_event_names_transitionstart, .start)
+
+        if transition_phase == CssTransitionPhase.after:
+            dom_document_dispatch_transition_event(this, transition, html_event_names_transitionstart, .start)
+            dom_document_dispatch_transition_event(this, transition, html_event_names_transitionend, .end)
+    elif previous_phase == CssTransitionPhase.active:
+        if transition_phase == CssTransitionPhase.after:
+            dom_document_dispatch_transition_event(this, transition, html_event_names_transitionend, .end)
+
+        if transition_phase == CssTransitionPhase.before:
+            dom_document_dispatch_transition_event(this, transition, html_event_names_transitionend, .start)
+    elif previous_phase == CssTransitionPhase.after:
+        if transition_phase == CssTransitionPhase.active:
+            dom_document_dispatch_transition_event(this, transition, html_event_names_transitionstart, .end)
+
+        if transition_phase == CssTransitionPhase.before:
+            dom_document_dispatch_transition_event(this, transition, html_event_names_transitionstart, .end)
+            dom_document_dispatch_transition_event(this, transition, html_event_names_transitionend, .start)
+
+    if transition_phase == CssTransitionPhase.idle:
+        if previous_phase != CssTransitionPhase.idle and previous_phase != CssTransitionPhase.after:
+            dom_document_dispatch_transition_event(this, transition, html_event_names_animationstart, .active_time)
+
+    css_transition_set_previous_phase(transition, transition_phase)
+
+## dispatch_events_for_animation_if_necessary's `dispatch_event` lambda.
+func dom_document_dispatch_animation_event(this: DomDocument*, css_animation: CssAnimation*, target: DomElement*, name: ak.FlyString, elapsed_time: AnimationsTimeValue):
+    let elapsed_time_output = dom_document_elapsed_time_output(elapsed_time)
+
+    var owning_element = animations_animation_owning_element(css_animation.animations_animation()) else trap("VERIFY: Optional::value()")
+    let realm = dom_element_realm(dom_abstract_element_element(&owning_element))
+    let pseudo_element = dom_document_pseudo_element_text(&owning_element)
+    let init = CssAnimationEventInit(event_init = DomEventInit(bubbles = true), animation_name = css_animation_animation_name(css_animation), elapsed_time = elapsed_time_output, pseudo_element = ak.fly_string_from_string(pseudo_element))
+    dom_document_append_pending_animation_event(this, DomDocumentPendingAnimationEvent(event = css_animation_event_create(realm, name, &init).dom_event(), animation = css_animation.animations_animation(), target = target.dom_event_target(), scheduled_event_time = high_resolution_time_unsafe_shared_current_time()))
+
+## Ported from Document.cpp:3240 Web::DOM::Document::dispatch_events_for_animation_if_necessary (private).
+# https://www.w3.org/TR/css-animations-2/#event-dispatch
+func dom_document_dispatch_events_for_animation_if_necessary(this: DomDocument*, animation: AnimationsAnimation*):
+    if animations_animation_is_css_transition(animation):
+        dom_document_dispatch_events_for_transition(this, as_css_transition(animation))
+        return
+
+    # Each time a new animation frame is established and the animation does not have a pending play task or pending
+    # pause task, the events to dispatch are determined by comparing the animation’s phase before and after
+    # establishing the new animation frame as follows:
+    let effect = animations_animation_effect(animation) else return
+    if not animations_animation_effect_is_keyframe_effect(effect) or not animations_animation_is_css_animation(animation) or animations_animation_pending(animation):
+        return
+
+    let css_animation = as_css_animation(animation)
+
+    let target = animations_animation_effect_target(effect) else return
+
+    let previous_phase = animations_animation_effect_previous_phase(effect)
+    let current_phase = animations_animation_effect_phase(effect)
+    let current_iteration = animations_animation_effect_current_iteration(effect) else 0.0
+
+    # For calculating the elapsedTime of each event, the following definitions are used:
+    let zero = animations_time_value_create_zero(animations_animation_timeline(animation))
+
+    # - interval start = max(min(-start delay, active duration), 0)
+    let interval_start = animations_time_value_max(animations_time_value_min(animations_time_value_neg(animations_animation_effect_start_delay(effect)), animations_animation_effect_active_duration(effect)), zero)
+
+    # - interval end = max(min(associated effect end - start delay, active duration), 0)
+    let interval_end = animations_time_value_max(animations_time_value_min(animations_time_value_sub(animations_animation_effect_end_time(effect), animations_animation_effect_start_delay(effect)), animations_animation_effect_active_duration(effect)), zero)
+
+    match previous_phase:
+        .before, .idle:
+            if current_phase == AnimationsAnimationEffectPhase.active:
+                dom_document_dispatch_animation_event(this, css_animation, target, html_event_names_animationstart, interval_start)
+            elif current_phase == AnimationsAnimationEffectPhase.after:
+                dom_document_dispatch_animation_event(this, css_animation, target, html_event_names_animationstart, interval_start)
+                dom_document_dispatch_animation_event(this, css_animation, target, html_event_names_animationend, interval_end)
+        .active:
+            if current_phase == AnimationsAnimationEffectPhase.before:
+                dom_document_dispatch_animation_event(this, css_animation, target, html_event_names_animationend, interval_start)
+            elif current_phase == AnimationsAnimationEffectPhase.active:
+                let previous_current_iteration = animations_animation_effect_previous_current_iteration(effect)
+                if previous_current_iteration != current_iteration:
+                    # The elapsed time for an animationiteration event is defined as follows:
+
+                    # 1. Let previous current iteration be the current iteration from the previous animation frame.
+
+                    # 2. If previous current iteration is greater than current iteration, let iteration boundary be current iteration + 1,
+                    #    otherwise let it be current iteration.
+                    let iteration_boundary = current_iteration + 1.0 if previous_current_iteration > current_iteration else current_iteration
+
+                    # 3. The elapsed time is the result of evaluating (iteration boundary - iteration start) × iteration duration).
+                    let elapsed_time = animations_time_value_mul(animations_animation_effect_iteration_duration(effect), iteration_boundary - animations_animation_effect_iteration_start(effect))
+
+                    dom_document_dispatch_animation_event(this, css_animation, target, html_event_names_animationiteration, elapsed_time)
+            elif current_phase == AnimationsAnimationEffectPhase.after:
+                dom_document_dispatch_animation_event(this, css_animation, target, html_event_names_animationend, interval_end)
+        .after:
+            if current_phase == AnimationsAnimationEffectPhase.active:
+                dom_document_dispatch_animation_event(this, css_animation, target, html_event_names_animationstart, interval_end)
+            elif current_phase == AnimationsAnimationEffectPhase.before:
+                dom_document_dispatch_animation_event(this, css_animation, target, html_event_names_animationstart, interval_end)
+                dom_document_dispatch_animation_event(this, css_animation, target, html_event_names_animationend, interval_start)
+        _:
+            trap("VERIFY_NOT_REACHED")
+
+    if current_phase == AnimationsAnimationEffectPhase.idle and previous_phase != AnimationsAnimationEffectPhase.idle and previous_phase != AnimationsAnimationEffectPhase.after:
+        # FIXME: Calculate a non-zero time when the animation is cancelled by means other than calling cancel()
+        let cancel_time = animations_animation_release_saved_cancel_time(animation) else zero
+        dom_document_dispatch_animation_event(this, css_animation, target, html_event_names_animationcancel, cancel_time)
+
+    animations_animation_effect_set_previous_phase(effect, current_phase)
+    animations_animation_effect_set_previous_current_iteration(effect, current_iteration)
+
+# mark: Animations ==============================================================================
+
+## Ported from Document.cpp:5994 Web::DOM::Document::timeline.
+# https://www.w3.org/TR/web-animations-1/#dom-document-timeline
+pub func dom_document_timeline(this: DomDocument*) -> AnimationsDocumentTimeline*:
+    # The DocumentTimeline object representing the default document timeline. The default document timeline has an
+    # origin time of zero.
+    if this.m_default_timeline == none:
+        this.m_default_timeline = animations_document_timeline_create(dom_document_realm(this), this, 0.0)
+    return this.m_default_timeline else trap("unreachable: set above")
+
+## Ported from Document.cpp:6003 Web::DOM::Document::associate_with_timeline.
+pub func dom_document_associate_with_timeline(this: DomDocument*, timeline: AnimationsAnimationTimeline*):
+    _ = ak.hash_table_set(&this.m_associated_animation_timelines, timeline)
+
+## Ported from Document.cpp:6008 Web::DOM::Document::disassociate_with_timeline.
+pub func dom_document_disassociate_with_timeline(this: DomDocument*, timeline: AnimationsAnimationTimeline*):
+    _ = ak.hash_table_remove_t(&this.m_associated_animation_timelines, timeline)
+
+## Ported from Document.cpp:6013 Web::DOM::Document::append_pending_animation_event.
+pub func dom_document_append_pending_animation_event(this: DomDocument*, event: DomDocumentPendingAnimationEvent):
+    ak.vector_append_t(&this.m_pending_animation_event_queue, event)
+
+## The block of update_animations_and_send_events that runs under a TemporaryExecutionContext (steps 1-3).
+func dom_document_update_animations_in_temporary_execution_context(this: DomDocument*, timestamp: f64, timelines_to_update: ak.Vector[AnimationsAnimationTimeline*]*):
+    var temporary_execution_context: HtmlTemporaryExecutionContext = ---
+    html_temporary_execution_context_construct_realm(&temporary_execution_context, dom_document_realm(this))
+    defer html_temporary_execution_context_destruct(&temporary_execution_context)
+
+    # 1. Update the current time of all timelines associated with doc passing now as the timestamp.
+    #
+    # Note: Due to the hierarchical nature of the timing model, updating the current time of a timeline also involves:
+    # - Updating the current time of any animations associated with the timeline.
+    # - Running the update an animation’s finished state procedure for any animations whose current time has been
+    #   updated.
+    # - Queueing animation events for any such animations.
+    for timeline in ak.vector_span(timelines_to_update):
+        animations_animation_timeline_update_current_time(timeline, timestamp)
+
+        var associated = animations_animation_timeline_associated_animations(timeline)
+        for animation in ak.vector_span(&associated):
+            animations_animation_update(animation)
+
+        var animations = animations_animation_timeline_associated_animations(timeline)
+        for animation in ak.vector_span(&animations):
+            dom_document_dispatch_events_for_animation_if_necessary(this, animation)
+
+    # 2. Remove replaced animations for doc.
+    dom_document_remove_replaced_animations(this)
+
+    # 3. Perform a microtask checkpoint.
+    # NB: This is executed by the destructor of the TemporaryExecutionContext above.
+
+## The comparator `sort_events_by_composite_order` of update_animations_and_send_events.
+func dom_document_sort_events_by_composite_order(a: const DomDocumentPendingAnimationEvent*, b: const DomDocumentPendingAnimationEvent*) -> bool:
+    let a_effect = animations_animation_effect(a.animation) else return true
+    let b_effect = animations_animation_effect(b.animation) else return false
+    return animations_keyframe_effect_composite_order(as_animations_keyframe_effect(a_effect), as_animations_keyframe_effect(b_effect)) < 0
+
+## The insertion-sort comparator of update_animations_and_send_events (step 6).
+func dom_document_pending_animation_event_less_than(context: void*?, a: const DomDocumentPendingAnimationEvent*, b: const DomDocumentPendingAnimationEvent*) -> bool:
+    # Sort the events by their scheduled event time such that events that were scheduled to occur earlier, sort
+    # before events scheduled to occur later and events whose scheduled event time is unresolved sort before events
+    # with a resolved scheduled event time.
+    #
+    # Within events with equal scheduled event times, sort by their composite order.
+    if let b_time = b.scheduled_event_time:
+        let a_time = a.scheduled_event_time else return true
+
+        if a_time == b_time:
+            return dom_document_sort_events_by_composite_order(a, b)
+
+        return a_time < b_time
+
+    if a.scheduled_event_time != none:
+        return false
+
+    return dom_document_sort_events_by_composite_order(a, b)
+
+## Ported from Document.cpp:6019 Web::DOM::Document::update_animations_and_send_events.
+# https://www.w3.org/TR/web-animations-1/#update-animations-and-send-events
+pub func dom_document_update_animations_and_send_events(this: DomDocument*, timestamp: f64):
+    this.m_last_animation_frame_timestamp = timestamp
+    var timelines_to_update = ak.hash_table_values(&this.m_associated_animation_timelines)
+
+    dom_document_update_animations_in_temporary_execution_context(this, timestamp, &timelines_to_update)
+
+    # 4. Let events to dispatch be a copy of doc’s pending animation event queue.
+    var events_to_dispatch = ak.vector_clone(&this.m_pending_animation_event_queue)
+
+    # 5. Clear doc’s pending animation event queue.
+    ak.vector_clear(&this.m_pending_animation_event_queue)
+
+    # 6. Perform a stable sort of the animation events in events to dispatch as follows:
+    ak.insertion_sort_t_comparator(ak.vector_span(&events_to_dispatch), ak.Function2[const DomDocumentPendingAnimationEvent*, const DomDocumentPendingAnimationEvent*, bool](call = dom_document_pending_animation_event_less_than, context = none))
+
+    # 7. Dispatch each of the events in events to dispatch at their corresponding target using the order established in
+    #    the previous step.
+    for event in ak.vector_span(&events_to_dispatch):
+        _ = dom_event_target_dispatch_event(event.target, event.event)
+
+## Ported from Document.cpp:6102 Web::DOM::Document::remove_replaced_animations.
+# https://www.w3.org/TR/web-animations-1/#remove-replaced-animations
+pub func dom_document_remove_replaced_animations(this: DomDocument*):
+    # When asked to remove replaced animations for a Document, doc, then for every animation, animation, that:
+    # - has an associated animation effect whose effect target is a descendant of doc, and
+    # - is replaceable, and
+    # - has a replace state of active, and
+    # - for which there exists for each target property of every animation effect associated with animation, an
+    #   animation effect associated with a replaceable animation with a higher composite order than animation that
+    #   includes the same target property
+
+    var replaceable_animations: ak.Vector[AnimationsAnimation*]
+    for timeline in ak.hash_table_begin(&this.m_associated_animation_timelines):
+        var associated = animations_animation_timeline_associated_animations(*timeline)
+        for animation in ak.vector_span(&associated):
+            let effect = animations_animation_effect(animation) else continue
+            let target = animations_animation_effect_target(effect) else continue
+            if dom_node_document(target.dom_node()) != this:
+                continue
+
+            if not animations_animation_is_replaceable(animation):
+                continue
+
+            if animations_animation_replace_state(animation) != BindAnimationReplaceState.active:
+                continue
+
+            # Composite order is only defined for KeyframeEffects
+            if not animations_animation_effect_is_keyframe_effect(effect):
+                continue
+
+            ak.vector_append_t(&replaceable_animations, animation)
+
+    ak.quick_sort_t_collection_t_less_than(ak.vector_span(&replaceable_animations), ak.Function2[const (AnimationsAnimation*)*, const (AnimationsAnimation*)*, bool](call = dom_document_replaceable_animations_less_than, context = none))
+
+    # Lower value = higher priority
+    var highest_property_composite_orders: ak.HashMap[css_data.PropertyId, usize, css_data.PropertyIdTraits]
+    var i = (i64)ak.vector_size(&replaceable_animations) - 1
+    while i >= 0:
+        let animation = *ak.vector_at(&replaceable_animations, (usize)i)
+        var has_any_highest_priority_property = false
+
+        let effect = animations_animation_effect(animation) else trap("a null effect: animation->effect()")
+        for property in ak.hash_table_begin_const(animations_animation_effect_target_properties(effect)):
+            if not ak.hash_map_contains_k(&highest_property_composite_orders, *property):
+                has_any_highest_priority_property = true
+                _ = ak.hash_map_set(&highest_property_composite_orders, *property, (usize)i)
+
+        if not has_any_highest_priority_property:
+            dom_document_remove_replaced_animation(this, animation)
+        i -= 1
+
+## remove_replaced_animations' steps for an animation none of whose target properties has the highest priority: mark
+## it removed and queue its "remove" event.
+func dom_document_remove_replaced_animation(this: DomDocument*, animation: AnimationsAnimation*):
+    let realm = dom_document_realm(this)
+    let timeline = animations_animation_timeline(animation) else trap("a null timeline: animation->timeline()")
+
+    # perform the following steps:
+
+    # - Set animation’s replace state to removed.
+    animations_animation_set_replace_state(animation, BindAnimationReplaceState.removed)
+
+    # - Create an AnimationPlaybackEvent, removeEvent.
+    # - Set removeEvent’s type attribute to remove.
+    # - Set removeEvent’s currentTime attribute to the current time of animation.
+    # - Set removeEvent’s timelineTime attribute to the current time of the timeline with which animation is
+    #   associated.
+    var init = animations_animation_playback_event_init_new()
+    if let current_time = animations_animation_current_time(animation):
+        init.current_time = animations_nullable_css_numberish_from_css_numberish(animations_time_value_as_css_numberish(current_time, realm))
+    if let timeline_time = animations_animation_timeline_current_time(timeline):
+        init.timeline_time = animations_nullable_css_numberish_from_css_numberish(animations_time_value_as_css_numberish(timeline_time, realm))
+    let remove_event = animations_animation_playback_event_create(realm, html_event_names_remove, &init)
+
+    # - If animation has a document for timing, then append removeEvent to its document for timing's pending
+    #   animation event queue along with its target, animation. For the scheduled event time, use the result of
+    #   applying the procedure to convert timeline time to origin-relative time to the current time of the
+    #   timeline with which animation is associated.
+    if let document = animations_animation_document_for_timing(animation):
+        let pending_animation_event = DomDocumentPendingAnimationEvent(event = remove_event.dom_event(), animation = animation, target = animation.dom_event_target(), scheduled_event_time = animations_animation_timeline_convert_a_timeline_time_to_an_origin_relative_time(timeline, animations_animation_timeline_current_time(timeline)))
+        dom_document_append_pending_animation_event(document, pending_animation_event)
+    #   Otherwise, queue a task to dispatch removeEvent at animation. The task source for this task is the DOM
+    #   manipulation task source.
+    else:
+        let captures = new DomDocumentRemoveReplacedAnimationDispatch(animation = animation, remove_event = remove_event) else trap("out of memory")
+        _ = html_queue_global_task(HtmlTaskSource.dom_manipulation, realm_global_object(realm), gc.create_function0(gc.cell_heap(this.cell()), ak.Function0[unit](call = dom_document_remove_replaced_animation_dispatch, context = captures)))
+
+## The captures of remove_replaced_animations' queued task: `[animation, remove_event]`.
+struct DomDocumentRemoveReplacedAnimationDispatch:
+    var animation: AnimationsAnimation*
+    var remove_event: AnimationsAnimationPlaybackEvent*
+
+## remove_replaced_animations' queued task: dispatch removeEvent at the animation.
+func dom_document_remove_replaced_animation_dispatch(context: void*?):
+    let captures = (DomDocumentRemoveReplacedAnimationDispatch*)(context else trap("no captures"))
+    _ = dom_event_target_dispatch_event(captures.animation.dom_event_target(), captures.remove_event.dom_event())
+
+## remove_replaced_animations' quick_sort comparator: the composite order of the animations' keyframe effects.
+func dom_document_replaceable_animations_less_than(context: void*?, a: const (AnimationsAnimation*)*, b: const (AnimationsAnimation*)*) -> bool:
+    _ = context
+    let a_effect = animations_animation_effect(*a) else trap("a null effect")
+    let b_effect = animations_animation_effect(*b) else trap("a null effect")
+    assert(animations_animation_effect_is_keyframe_effect(a_effect))
+    assert(animations_animation_effect_is_keyframe_effect(b_effect))
+    return animations_keyframe_effect_composite_order((AnimationsKeyframeEffect*)a_effect, (AnimationsKeyframeEffect*)b_effect) < 0
+
+## Ported from Document.cpp:6193 Web::DOM::Document::get_animations.
+pub func dom_document_get_animations(this: DomDocument*) -> ak.Vector[AnimationsAnimation*]!:
+    dom_document_update_style(this)
+    return try dom_calculate_get_animations(this.dom_node())

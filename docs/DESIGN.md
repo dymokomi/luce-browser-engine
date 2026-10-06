@@ -1865,6 +1865,11 @@ P3 (bindings generator, WebIDL 3k, Bindings 2.3k, the JS-facing halves of DOM/HT
 Range/TreeWalker/MutationObserver, UIEvents, Streams, XHR, Encoding, …) and P4 are planned when P2
 converges, from the same skeleton tooling with a wider scope.
 
+Phase-4 regions ported ahead of the plan because real sites trap in them: p4a (animations:
+`CSS/EasingFunction`, `Animations/*`, `CSSAnimation`, `CSSTransition`, `Interpolation`, the animation and
+transition events and Document's animation update; `docs/regions/p4a.md`). Their JS-facing entry points keep their
+signatures and trap `unported (P3)`.
+
 ### 8.3 Estimate
 
 Calibration: luce-js ported quickjs.c (≈60k lines of C, by its region commits' line ranges) in ≈30 regions (≈2k C lines per region), then
