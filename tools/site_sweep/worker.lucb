@@ -28,11 +28,60 @@ let worker_settle_milliseconds: u64 = 2000
 func worker_stage(name: str):
     print(f"site_sweep: stage {name}")
 
+## A socket the engine handed to the worker's loop (--watch), and what the engine waits for on it.
+struct WorkerSocket:
+    var descriptor: i64
+    var readable: bool
+    var writable: bool
+
+## The worker's loop: the sockets it watches when the engine hands them over (--watch).
+struct WorkerLoop:
+    var watch: bool
+    var sockets: ak.Vector[WorkerSocket]
+
+## Takes the sockets whose wanted readiness changed (webview_api.take_socket_change), as
+## luced-browser's watch_sockets does.
+func worker_take_socket_changes(loop: WorkerLoop*):
+    while true:
+        let descriptor = webview_api.take_socket_change()
+        if descriptor < 0:
+            return
+        let sockets = ak.vector_span(&loop.sockets)
+        for index in 0..<sockets.length:
+            if sockets[index].descriptor == descriptor:
+                ak.vector_remove(&loop.sockets, index)
+                break
+        let readable = webview_api.socket_readable(descriptor)
+        let writable = webview_api.socket_writable(descriptor)
+        if readable or writable:
+            ak.vector_append_t(&loop.sockets, WorkerSocket(descriptor = descriptor, readable = readable, writable = writable))
+
+## Waits until a watched socket is ready or `milliseconds` pass.
+func worker_wait_for_sockets(loop: WorkerLoop*, milliseconds: u64):
+    let sockets = ak.vector_span(&loop.sockets)
+    with memory.heap:
+        var poller = net.Poller.create(sockets.length) else trap("site_sweep: no poller")
+        defer poller.destroy()
+        for index in 0..<sockets.length:
+            let socket = sockets[index]
+            let interest = net.WaitInterest.both if socket.readable and socket.writable else (net.WaitInterest.read if socket.readable else net.WaitInterest.write)
+            poller.watch(index, (platform.SocketDescriptor)socket.descriptor, interest) catch failure: trap(f"site_sweep: cannot watch a socket: {failure.message}")
+        _ = poller.wait(net.Deadline.at(time.now() + milliseconds * 1000000)) catch failure: trap(f"site_sweep: the wait failed: {failure.message}")
+
 ## One turn of the loop: the engine's due work, then a sleep until it next has work (at most
-## 5 ms).
-func worker_turn():
+## 5 ms), or with --watch until a watched socket is ready or the engine is due (at most 50 ms).
+func worker_turn(loop: WorkerLoop*):
     _ = webview_api.process_events()
     let due = webview_api.next_due()
+    if loop.watch:
+        worker_take_socket_changes(loop)
+        let wait: u64 = 50 if due < 0.0 or due > 0.05 else (u64)(due * 1000.0)
+        if not ak.vector_is_empty(&loop.sockets):
+            worker_wait_for_sockets(loop, wait)
+            return
+        if wait > 0:
+            thread.sleep(wait)
+        return
     if due < 0.0 or due > 0.005:
         thread.sleep(5)
     elif due > 0.0:
@@ -65,16 +114,20 @@ func worker_result(outcome: str, detail: str) -> i32:
     print(f"site_sweep: result {outcome} {detail}")
     return 0
 
-## Whether the presented frame is one color (or there is none).
-func worker_frame_is_blank(view: webview_api.View) -> bool:
+## The presented frame as straight RGBA bytes (none when there is none). Lives in memory.heap.
+func worker_frame_pixels(view: webview_api.View) -> u8[]?:
     let width = (i32)webview_api.frame_width(view)
     let height = (i32)webview_api.frame_height(view)
     if width <= 0 or height <= 0:
-        return true
+        return none
     let pixels = new u8[(usize)width * (usize)height * 4] --- in memory.heap catch failure: trap("out of memory")
-    defer free(pixels) in memory.heap
     if not webview_api.copy_frame(view, pixels, width, height):
-        return true
+        free(pixels) in memory.heap
+        return none
+    return pixels
+
+## Whether `pixels` are one color.
+func worker_is_one_color(pixels: const u8[]) -> bool:
     var at: usize = 4
     while at < pixels.length:
         if pixels[at] != pixels[0] or pixels[at + 1] != pixels[1] or pixels[at + 2] != pixels[2] or pixels[at + 3] != pixels[3]:
@@ -82,12 +135,22 @@ func worker_frame_is_blank(view: webview_api.View) -> bool:
         at += 4
     return true
 
+## Writes `pixels`, the view's frame, as a PNG at `path`.
+func worker_write_png(view: webview_api.View, pixels: const u8[], path: str) -> !:
+    var encoded = Buffer()
+    defer encoded.close()
+    try png.encode_rgba8(pixels, (usize)webview_api.frame_width(view), (usize)webview_api.frame_height(view), &encoded, png.EncodeOptions(threads = 1))
+    try files.write(c_path(path), encoded.view())
+
 ## Loads `url` and reports how it went (see the header).
 func worker_main(url: str, options: const Options*) -> i32:
     worker_stage("initialize")
     webview_api.initialize(options.resources) catch failure: return worker_result("error", cat(["the engine did not initialize: ", failure.message]))
     let view = webview_api.open(options.width, options.height, options.scale)
     defer webview_api.close(view)
+    var loop = WorkerLoop(watch = options.watch)
+    if options.watch:
+        webview_api.hand_over_sockets()
 
     worker_stage("load")
     if not webview_api.load(view, url):
@@ -95,7 +158,7 @@ func worker_main(url: str, options: const Options*) -> i32:
     var log = WorkerLog()
     let start = time.now()
     while not log.loaded:
-        worker_turn()
+        worker_turn(&loop)
         worker_take_events(view, &log)
         if time.now() - start > worker_wait:
             return worker_result("timeout", "the load did not finish")
@@ -107,7 +170,7 @@ func worker_main(url: str, options: const Options*) -> i32:
         webview.webview_take_screenshot(worker_web_view(view))
     let rendered = time.now()
     while webview.webview_screenshot(worker_web_view(view)) == none or log.frames == frames:
-        worker_turn()
+        worker_turn(&loop)
         worker_take_events(view, &log)
         if time.now() - rendered > worker_wait:
             return worker_result("timeout", "loaded, but no frame was presented")
@@ -115,11 +178,15 @@ func worker_main(url: str, options: const Options*) -> i32:
     worker_stage("settle")
     let settle_end = time.now() + worker_settle_milliseconds * 1000000
     while time.now() < settle_end:
-        worker_turn()
+        worker_turn(&loop)
         worker_take_events(view, &log)
 
     let title = webview_api.page_title(view)
     let final_url = webview_api.page_url(view)
-    if worker_frame_is_blank(view):
+    let pixels = worker_frame_pixels(view) else return worker_result("blank", cat([final_url, " \"", title, "\" (no frame)"]))
+    defer free(pixels) in memory.heap
+    if let path = options.png_path:
+        worker_write_png(view, pixels, path) catch failure: return worker_result("error", cat(["cannot write the PNG: ", failure.message]))
+    if worker_is_one_color(pixels):
         return worker_result("blank", cat([final_url, " \"", title, "\""]))
     return worker_result("ok", cat([final_url, " \"", title, "\""]))
