@@ -986,6 +986,18 @@ a `JS::Map`. Before luce-js these are **cells of the engine** (`external/lib_js/
   `rejectionhandled` are fired, and an unhandled DOMException rejection is logged.)
   WebIDL `ReactionSteps` cannot throw before P3 (a GC::Function's result cannot be fallible).
 
+**Strings, arrays, objects and JSON (fix/real-sites).** Real pages reach JS values with
+scripting disabled: CSSFontFeatureValuesMap keys its `JS::Map` by strings and keeps each value
+list as a `JS::Array`, Infra serializes a Content-Security-Policy report to JSON through
+`%JSON.stringify%`, MediaList, DOMTokenList and attribute callbacks make strings. So
+`external/lib_js` also has `JS::PrimitiveString` (a cell under LibJS's STRING_TAG; SameValue and
+ValueTraits compare strings by content), `JS::Array` (dense indexed storage: ArrayCreate,
+create_from, its length), ordinary objects (OrdinaryObjectCreate with a null prototype,
+CreateDataPropertyOrThrow, EnumerableOwnPropertyNames' key order), `JSON.stringify` without a
+replacer or space, and Value's ToString, ToInt32, ToUint32 and ToLength for the values that
+exist before P3. Number::toString of a number that is not an integer, ToPrimitive of an object
+and every other property access still trap `unported (P3)`.
+
 **The ReadableStream stand-in (phase 2, region p2s).** Streams are P4, but every fetch body is a
 `Streams::ReadableStream`: `Body::fully_read`, `incrementally_read`, `clone` (a tee),
 `byte_sequence_as_body` and the network's chunks all go through one. So the engine ports the part
@@ -1628,6 +1640,7 @@ Ladybird's implementation, so the work benefits the whole ecosystem. Decisions:
 | XML | LibXML over libxml2 | `web.XmlParser` | — | a Luce XML 1.0 parser (P2) | new |
 | Regex | LibRegex (Rust) | — | — | luce-regex's ECMAScript dialect | luce-regex |
 | JS | LibJS | §3.6 | types only | luce-js | luce-js |
+| Media playback | LibMedia (Matroska and FFmpeg demuxers, data providers, sinks, audio output) | `external/lib_media`: Track, DecoderError, TimeRanges, IncrementallyPopulatedStream's writing side, a PlaybackManager whose `create_demuxer_for_stream` answers NotImplemented | every media resource is an unsupported format (the element's failure steps, the poster) | a demuxer and decoders | — |
 | Rasterization | Skia (`DisplayListPlayerSkia`, `PainterSkia`, `PathSkia`, `PaintingSurface`) | `display_list.DisplayListPlayer` (ported abstract class, 32 pure virtuals) | CPU player (§7.3) | GPU player on luce-gpu | luce-browser-render |
 | Event loop, timers, notifiers | `Platform::EventLoopPlugin`, `Core::Timer`, `Core::Promise`, `Core::Notifier` | ported plugin interfaces; the loop registers notifiers and waits for timers and notifiers in one wait (`event_loop_notifiers`: EventLoopImplementationUnix's poll over luce-std `net.Poller`, p2/net) | the runner's loop | luce-window's loop in the browser | luce-window, luce-std |
 | Color management | LibGfx `ColorSpace`, Skia color spaces | `gfx.ColorSpace` | sRGB only (ported `Color`, `ColorConversion` for CSS math) | p2/icc: ICC and CICP via luce-color's `icc` (skcms and SkColorSpace ported); PNG cICP/iCCP (luce-png), JPEG APP2 profiles (luce-jpeg) and a BMP's BITMAPV5HEADER embedded profile give a decoded image its color space as ImageDecoder::color_space does (icons stay sRGB, as ICOImageDecoderPlugin has no icc_data); wherever Skia samples the image (the CPU player, the canvas painter's draw_bitmap and patterns, SkImageFilters::Image) its pixels are converted to sRGB after sampling with Skia's SkColorSpaceXformSteps (raster `color_xform`) | luce-color |
