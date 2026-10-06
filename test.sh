@@ -33,10 +33,13 @@ for module in src/web src/webview src/webview_api tools/gen_css_values tools/emb
     fi
 done
 
-# Unit tests (the regions' `tests_*` fragments), module by module.
-for module in web webview; do
-    echo "== luce-base test src/$module"
-    luce-base test "src/$module"
+# Unit tests (the regions' `tests_*` fragments). `luce-base test MODULE` runs the tests of MODULE
+# and of every module of the package it imports, in one process: src/webview's run web's too, under
+# the default profile and then the diagnostic one (see web_test below); tests/web_test's, which
+# imports web but not webview, run web's a third time.
+for profile in default diagnostic; do
+    echo "== luce-base test src/webview --profile $profile"
+    luce-base test src/webview --profile "$profile"
 done
 echo "== luce-base test tests/web_test"
 luce-base test tests/web_test

@@ -838,6 +838,16 @@ The rules agents follow:
    `KeywordStyleValue`'s static instances are); a cache filled later does the same around each
    insertion.
 
+   A static that holds cells or a VM's state cannot follow this rule: the donor's
+   `static GC::Root<...>`s (the user-agent style sheets, `internal_css_realm()`, the input
+   element's static styles), the image elements' `BatchingDispatcher`, `ResourceLoader` (made
+   with a VM's heap) and the blob URL store. In Ladybird each lives as long as the process's
+   one VM; here a process may make several VMs one after another (`luce-base test` runs every
+   module's tests in one process), so they belong to the VM they were made in:
+   `vm_destroy` (external/lib_js/vm.lucb) forgets them, releasing their roots while the heap
+   is still there, and the next VM makes its own on first use, as a new process would. A new
+   static of this kind is added to `vm_forget_process_statics`.
+
    Fonts follow this rule with one refinement (luce-browser-render
    `web_fonts/font_allocators.lucb`). In Ladybird fonts are reference counted and the font
    database, its system font provider, their typefaces and the fonts those cache live for the
