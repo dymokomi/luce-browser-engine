@@ -780,11 +780,14 @@ v: js.Value)` exists from P1 and is a no-op until P3 (§3.6).
 
 Additions to LibGC (clearly marked as such in their fragments):
 
-- **Blob allocation** in the same size classes (a blob is a cell whose header says "blob" and
-  whose `visit_edges` is a conservative scan), plus **atomic blobs** (not scanned).
-- A **large-object space** for blobs above 3 KiB (Vector buffers, big strings, bitmaps) and for
-  any cell too large for a 16 KiB block: individually mapped, kept in an address-sorted array for
-  pointer lookup.
+- **Blob allocation** (a blob is a cell whose header says "blob" and whose `visit_edges` is a
+  conservative scan), plus **atomic blobs** (not scanned), in 28 size classes of their own from
+  32 to 8160 bytes, as fine as malloc's: blobs hold what Ladybird keeps in malloc. A blob's
+  header carries the tag of the phase that allocated it (`gc.heap_blob_tag`), which the webview
+  module's memory census counts by.
+- A **large-object space** for blobs above 8160 bytes (Vector buffers, big strings, bitmaps) and
+  for any cell too large for a 16 KiB block: individually mapped (fresh, zero pages that become
+  resident as they are written), kept in an address-sorted array for pointer lookup.
 - The heap implements luce-base's `Allocator` interface, and LibWeb's thread makes it the
   **current allocator** (`with heap:` around the event loop). So the ported code allocates with
   plain `new` and `alloc`, and `free` is never needed (it is allowed as an optimization).
@@ -851,7 +854,8 @@ The rules agents follow:
    Fonts follow this rule with one refinement (luce-browser-render
    `web_fonts/font_allocators.lucb`). In Ladybird fonts are reference counted and the font
    database, its system font provider, their typefaces and the fonts those cache live for the
-   process. Here `FontDatabase::the()`, `PathFontProvider` (with every font file it loads),
+   process. Here `FontDatabase::the()`, `PathFontProvider` (which maps font files and parses a
+   family's faces when the family is first asked for),
    `Platform::FontPlugin` (its generic-family tables and fallback lists) and gfx's color-space
    singletons live in the C heap whatever is current. A `Typeface` records the allocators that
    were current when it was made (`m_allocators`), and everything it and its fonts keep later
@@ -914,7 +918,8 @@ backend is only used for comparison runs. A diagnostic mode collects on every al
 ### 3.5 External resources
 
 Almost nothing in the port owns memory outside the heap: web fonts are parsed from managed
-bytes (system fonts live in the C heap for the process, §3.3 rule 7), bitmaps are atomic blobs,
+bytes (system fonts are mapped files, their typefaces in the C heap for the process, §3.3
+rule 7), bitmaps are atomic blobs,
 the rasterizer draws into managed buffers. What remains (open files
 during loading, GPU textures from P4, luce-js values held by cells, native font handles if a
 platform shaper is used) is released by `finalize` or a blob finalizer. Finalizers run before the
