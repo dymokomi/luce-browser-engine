@@ -1,0 +1,183 @@
+#==============================================================================================
+#
+#   bench - one page: load it, scroll it frame by frame, time the frames
+#
+#   DESCRIPTION:
+#       The loop of a frame: the wheel event, then the engine's turns until the view presents
+#       a new frame, then the frame's way to the GPU (see the module's header). Only the time
+#       spent inside the engine's turns and the frame's delivery counts; sleeping until the
+#       engine's next deadline does not. A wheel that does not scroll (the page's end) yields no
+#       frame: after half a second the direction turns.
+#
+#       Copyright (c) 2026 the luce-browser authors.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+## How long to wait for a load or a first frame, and how long without a frame means the page
+## did not scroll, in nanoseconds.
+let bench_load_wait: u64 = 60000000000
+let bench_no_frame: u64 = 500000000
+
+## How long a loaded page settles (late images and fonts) before scrolling, in nanoseconds.
+let bench_settle: u64 = 1500000000
+
+## The webview behind a webview_api handle.
+func bench_web_view(view: webview_api.View) -> webview.WebView*:
+    return (webview.WebView*)(void*)view
+
+## One engine turn, timed: the nanoseconds it worked. When it had nothing due, the loop sleeps
+## (uncounted) until it does, at most a millisecond.
+func bench_turn() -> u64:
+    let start = time.now()
+    _ = webview_api.process_events()
+    let worked = time.now() - start
+    let due = webview_api.next_due()
+    if due < 0.0 or due > 0.001:
+        thread.sleep(1)
+    return worked
+
+## Takes the view's events; answers whether a load other than about:blank finished.
+func bench_take_events(view: webview_api.View) -> bool:
+    var loaded = false
+    while true:
+        match webview_api.take_event(view):
+            .none_: return loaded
+            .load_finished:
+                let url = webview_api.finished_load_url(view)
+                if url.length > 0 and url != "about:blank":
+                    loaded = true
+            _: _ = 0
+
+## The frames of one run and what they cost.
+struct BenchRun:
+    var times: ak.Vector[u64]
+    var scrolled: f64
+    var load: u64
+    var mismatches: usize
+    var checks: usize
+
+## Loads `page` into a new view, scrolls it and prints its line.
+func bench_page(page: str, options: const Options*):
+    let view = webview_api.open(options.width, options.height, options.scale)
+    defer webview_api.close(view)
+    var run = BenchRun()
+    if not webview_api.load(view, page):
+        print(f"{page}: not a location")
+        return
+    let start = time.now()
+    while not bench_take_events(view):
+        run.load += bench_turn()
+        if time.now() - start > bench_load_wait:
+            print(f"{page}: the load did not finish")
+            return
+    while webview_api.frame_serial(view) == 0:
+        run.load += bench_turn()
+        _ = bench_take_events(view)
+        if time.now() - start > bench_load_wait:
+            print(f"{page}: no frame")
+            return
+    let settle_end = time.now() + bench_settle
+    while time.now() < settle_end:
+        _ = bench_turn()
+        _ = bench_take_events(view)
+
+    var presenter = bench_presenter_open(view, options)
+    defer bench_presenter_close(&presenter)
+    # The first frame's delivery is the page's start-up, not a scroll frame.
+    bench_present(&presenter, view, &run, true)
+
+    var direction = 1.0
+    var frame: usize = 0
+    let x = options.width / 2.0
+    let y = options.height / 2.0
+    while frame < options.frames:
+        let before = webview_api.frame_serial(view)
+        webview_api.wheel(view, x, y, 0.0, direction * options.step, 0)
+        var worked: u64 = 0
+        let waited = time.now()
+        var presented = true
+        while webview_api.frame_serial(view) == before:
+            worked += bench_turn()
+            _ = bench_take_events(view)
+            if time.now() - waited > (bench_no_frame if run.scrolled > 0.0 else bench_load_wait // 10):
+                presented = false
+                break
+        if not presented:
+            direction = -direction
+            if run.scrolled == 0.0:
+                break
+            continue
+        let delivery = time.now()
+        bench_present(&presenter, view, &run, frame % 16 == 0)
+        worked += time.now() - delivery
+        ak.vector_append_t(&run.times, worked)
+        run.scrolled += options.step
+        frame += 1
+    bench_write_pngs(&presenter, view, page, options)
+    bench_report(page, &run, &presenter)
+    bench_presenter_report(&presenter)
+    if options.layers:
+        webview.webview_gpu_describe_layers(bench_web_view(view))
+
+## Prints a page's line.
+func bench_report(page: str, run: const BenchRun*, presenter: const BenchPresenter*):
+    let count = ak.vector_size(&run.times)
+    var sorted = ak.Vector[u64]()
+    var total: u64 = 0
+    for value in ak.vector_span_const(&run.times):
+        total += value
+        ak.vector_append_t(&sorted, value)
+    let values = ak.vector_span(&sorted)
+    # Insertion sort: a few hundred frames.
+    for i in 1..<values.length:
+        let value = values[i]
+        var j = i
+        while j > 0 and values[j - 1] > value:
+            values[j] = values[j - 1]
+            j -= 1
+        values[j] = value
+    let average: u64 = total // (u64)count if count > 0 else 0
+    let p95: u64 = values[(count * 95) // 100 if (count * 95) // 100 < count else count - 1] if count > 0 else 0
+    let name = bench_short_name(page)
+    let check = owned(f"{decimal((u64)run.mismatches)}/{decimal((u64)run.checks)} differ") if run.checks > 0 else "-"
+    print(f"{bench_pad(name, 24)}  {bench_pad(milliseconds(run.load), 8)}  {bench_pad(milliseconds(average), 13)}  {bench_pad(milliseconds(p95), 13)}  {bench_pad(decimal((u64)run.scrolled), 12)}  {bench_pad(bench_presenter_tiles(presenter), 10)}  {bench_pad(mebibytes(peak_resident()), 9)}  {check}")
+
+## The last path component of `page` (its directory for an index.html).
+func bench_short_name(page: str) -> str:
+    var name = page
+    if strings.ends_with(name, "/index.html"):
+        name = (str)name.bytes[..<name.length - 11]
+    if let slash = strings.find_last(name, "/"):
+        name = (str)name.bytes[slash + 1..]
+    return name
+
+## `text` padded with spaces to `width`.
+func bench_pad(text: str, width: usize) -> str:
+    if text.length >= width:
+        return text
+    var padded = strings.copy(text) catch failure: trap("out of memory")
+    for _ in 0..<width - text.length:
+        padded = strings.join([padded, " "], "") catch failure: trap("out of memory")
+    return padded
+
+## Writes the last frame of each player as PREFIX-NAME-PLAYER.png.
+func bench_write_pngs(presenter: BenchPresenter*, view: webview_api.View, page: str, options: const Options*):
+    let prefix = options.png_prefix else return
+    let width = (usize)webview_api.frame_width(view)
+    let height = (usize)webview_api.frame_height(view)
+    let name = bench_short_name(page)
+    if presenter.cpu_pixels.length > 0:
+        bench_write_png(presenter.cpu_pixels, width, height, owned(f"{prefix}-{name}-cpu.png"))
+    if presenter.gpu_pixels.length > 0:
+        bench_write_png(presenter.gpu_pixels, width, height, owned(f"{prefix}-{name}-gpu.png"))
+
+## Writes straight RGBA `pixels` as a PNG at `path`.
+func bench_write_png(pixels: const u8[], width: usize, height: usize, path: str):
+    var encoded = Buffer()
+    defer encoded.close()
+    png.encode_rgba8(pixels, width, height, &encoded, png.EncodeOptions(threads = 1)) catch failure:
+        print(f"scroll_bench: {path}: {failure.message}")
+        return
+    let name = (c.str)(strings.copy(path) catch failure: trap("out of memory"))
+    files.write(name, encoded.view()) catch failure: print(f"scroll_bench: {path}: {failure.message}")

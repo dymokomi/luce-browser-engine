@@ -1,0 +1,120 @@
+#==============================================================================================
+#
+#   presenter - a presented frame's way to the GPU, for each player
+#
+#   DESCRIPTION:
+#       cpu: the frame the CPU player rasterized is copied out of the view
+#       (webview_copy_frame), as luced-browser does when the GPU player is off.
+#
+#       gpu: the view's GPU player draws the frame into an offscreen texture of the view's size
+#       (webview_gpu_draw on the texture's frame), and the tool reads one texel back, which
+#       waits for the GPU. With `both`, a checked frame is also read back whole and compared
+#       with the CPU player's frame of the same display list and scroll state.
+#
+#       Copyright (c) 2026 the luce-browser authors.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+## A player's state for one page.
+struct BenchPresenter:
+    var player: Player
+    var cpu_pixels: u8[]
+    var gpu_pixels: u8[]
+    var device: gpu.Device?
+    var texture: gpu.Texture?
+
+## The presenter of `options.player` for `view`.
+func bench_presenter_open(view: webview_api.View, options: const Options*) -> BenchPresenter:
+    var presenter = BenchPresenter(player = options.player)
+    let bytes = (usize)webview_api.frame_width(view) * (usize)webview_api.frame_height(view) * 4
+    presenter.cpu_pixels = new u8[bytes] --- in memory.heap catch failure: trap("out of memory")
+    if options.player == Player.cpu:
+        return presenter
+    let allocator: memory.Allocator = webview.webview_heap()
+    with allocator:
+        webview.webview_set_gpu_player(bench_web_view(view), true)
+    var device = gpu.Device.open() catch failure: trap(f"scroll_bench: no GPU device: {failure.message}")
+    presenter.texture = gpu.Texture.create(device, (u32)webview_api.frame_width(view), (u32)webview_api.frame_height(view), gpu.Format.rgba8) catch failure: trap(f"scroll_bench: no texture: {failure.message}")
+    presenter.device = device
+    presenter.gpu_pixels = new u8[bytes] --- in memory.heap catch failure: trap("out of memory")
+    return presenter
+
+## Releases the presenter's pixels, texture and device.
+func bench_presenter_close(presenter: BenchPresenter*):
+    if let texture = presenter.texture:
+        var handle = texture
+        handle.destroy()
+    if let device = presenter.device:
+        var handle = device
+        handle.destroy()
+    if presenter.cpu_pixels.length > 0:
+        free(presenter.cpu_pixels) in memory.heap
+    if presenter.gpu_pixels.length > 0:
+        free(presenter.gpu_pixels) in memory.heap
+
+## The GPU player's tile counts ("rastered on the GPU/on the CPU"), "-" for the CPU player.
+func bench_presenter_tiles(presenter: const BenchPresenter*) -> str:
+    if presenter.player == Player.cpu:
+        return "-"
+    let stats = webview.webview_gpu_player_stats()
+    return owned(f"{decimal(stats.gpu_tiles)}/{decimal(stats.cpu_tiles)}")
+
+## Prints why tiles went to the CPU player, and resets the counts for the next page.
+func bench_presenter_report(presenter: const BenchPresenter*):
+    if presenter.player == Player.cpu:
+        return
+    let stats = webview.webview_gpu_player_stats()
+    for kind in 0..<(usize)16:
+        if stats.fallbacks[kind] > 0:
+            print(f"    CPU tiles for {gpu_player.gpu_fallback_name(kind)}: {stats.fallbacks[kind]}")
+    print(f"    tiles: {stats.gpu_tiles} GPU, {stats.cpu_tiles} CPU, {stats.empty_tiles} empty, {stats.composited_tiles} composited; {stats.resident_tiles} resident, {mebibytes(stats.resident_bytes)} MiB of GPU memory")
+    gpu_player.gpu_player_reset_stats()
+
+## Delivers the view's presented frame through the presenter's player; `check` compares the
+## players' pixels (both).
+func bench_present(presenter: BenchPresenter*, view: webview_api.View, run: BenchRun*, check: bool):
+    let width = (i32)webview_api.frame_width(view)
+    let height = (i32)webview_api.frame_height(view)
+    if presenter.player == Player.cpu:
+        _ = webview_api.copy_frame(view, presenter.cpu_pixels, width, height)
+        return
+    let texture = presenter.texture else trap("scroll_bench: no texture")
+    let frame = texture.frame() catch failure: trap(f"scroll_bench: no frame: {failure.message}")
+    defer frame.release()
+    let target = frame.value().target() catch failure: trap(f"scroll_bench: no target: {failure.message}")
+    defer target.release()
+    webview.webview_gpu_draw(bench_web_view(view), target.value(), gpu.Format.rgba8) catch failure: trap(f"scroll_bench: the GPU player failed: {failure.message}")
+    _ = frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)) catch failure: trap(f"scroll_bench: present failed: {failure.message}")
+    let allocator: memory.Allocator = webview.webview_heap()
+    if presenter.player == Player.both and check:
+        texture.read(presenter.gpu_pixels) catch failure: trap(f"scroll_bench: read failed: {failure.message}")
+        with allocator:
+            webview.webview_cpu_reference_frame(bench_web_view(view), presenter.cpu_pixels, width, height)
+        run.checks += 1
+        if bench_differs(presenter.cpu_pixels, presenter.gpu_pixels):
+            run.mismatches += 1
+        return
+    var texel: u8[4]
+    texture.read(texel, gpu.Region(0, 0, 1, 1)) catch failure: trap(f"scroll_bench: read failed: {failure.message}")
+
+## Whether more than 0.1% of the pixels of two frames differ by more than 2 in a channel;
+## prints how many differ and by how much when they do.
+func bench_differs(a: const u8[], b: const u8[]) -> bool:
+    var differing: usize = 0
+    var worst: i32 = 0
+    var at: usize = 0
+    while at + 3 < a.length:
+        var pixel: i32 = 0
+        for channel in 0..<(usize)4:
+            let d = (i32)a[at + channel] - (i32)b[at + channel]
+            let magnitude = d if d >= 0 else -d
+            pixel = magnitude if magnitude > pixel else pixel
+        if pixel > 2:
+            differing += 1
+        worst = pixel if pixel > worst else worst
+        at += 4
+    let differs = differing * 1000 > a.length // 4
+    if differs:
+        print(f"    check: {differing} of {a.length // 4} pixels differ by more than 2 (worst {worst})")
+    return differs

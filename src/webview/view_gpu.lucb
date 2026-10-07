@@ -1,0 +1,96 @@
+#==============================================================================================
+#
+#   view_gpu - the page drawn by the GPU player (luce-browser-render docs/GPU.md)
+#
+#   DESCRIPTION:
+#       Ladybird's WebContent rasters with Skia's GPU backend and shares the result with the UI.
+#       In process, the view keeps the display list and scroll state its rendering thread was
+#       last given, and the application draws them on its own luce-gpu target each time it
+#       draws the view (webview_gpu_draw): luce-browser-render's GpuCompositor keeps the
+#       page's tiles in textures, so a scroll moves tiles and draws only the ones it uncovers.
+#
+#       With the GPU player on (webview_set_gpu_player), the rendering thread still presents
+#       frames (the view's frame serial counts them, and ready_to_paint answers) but rasters
+#       nothing into the back stores; webview_copy_frame then has no current pixels, and
+#       webview_cpu_reference_frame draws the same display list with the CPU player instead
+#       (for comparisons). The switch is per view and starts off.
+#
+#       Copyright (c) 2026 the luce-browser authors.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+## The rendering thread of the view's top-level traversable.
+func webview_rendering_thread_data(view: const WebView*) -> web.HtmlRenderingThreadThreadData*:
+    let client = webview_client(view)
+    let page = client.m_page else trap("webview: no page")
+    let traversable = web.page_top_level_traversable(page)
+    return web.html_navigable_rendering_thread((web.HtmlNavigable*)traversable).m_thread_data
+
+## Turns the GPU player on or off for `view` (see the header). Turning it off releases its
+## textures; the next frame is the CPU player's.
+pub func webview_set_gpu_player(view: WebView*, enabled: bool):
+    webview_rendering_thread_data(view).m_gpu_presents = enabled
+    if not enabled:
+        webview_gpu_release(view)
+    else:
+        if view.m_gpu == none:
+            view.m_gpu = gpu_player.gpu_compositor_create()
+
+## Whether the GPU player draws `view`.
+pub func webview_gpu_player_enabled(view: const WebView*) -> bool:
+    return view.m_gpu != none
+
+## Releases the GPU player's textures and caches (on the main thread, as every GPU call).
+func webview_gpu_release(view: WebView*):
+    if let compositor = view.m_gpu:
+        gpu_player.gpu_compositor_destroy(compositor)
+        view.m_gpu = none
+
+## Draws the view's last presented display list onto `target` (a frame target of
+## `target_format`, none for a window's surface), the page's top left at the target's, a device
+## pixel a backing pixel of the target. Draws nothing before the first frame or with the player off.
+pub func webview_gpu_draw(view: WebView*, target: const gpu.RenderTarget*, target_format: gpu.Format? = none) -> !:
+    let compositor = view.m_gpu else return
+    if view.m_frame.surface == none:
+        return
+    let data = webview_rendering_thread_data(view)
+    let list = data.m_cached_display_list else return
+    let size = view.m_frame.last_painted_size
+    try gpu_player.gpu_compositor_draw(compositor, list, &data.m_cached_scroll_state_snapshot, target, target_format, size.m_width, size.m_height, webview_heap())
+
+## The GPU players' counts (tiles drawn on the GPU and on the CPU, why tiles fell back).
+pub func webview_gpu_player_stats() -> gpu_player.GpuPlayerStats:
+    return gpu_player.gpu_player_stats()
+
+## The CPU player's frame of the view's last presented display list, as straight RGBA bytes
+## into `pixels` (`width` by `height`), as webview_copy_frame lays them out.
+pub func webview_cpu_reference_frame(view: WebView*, pixels: u8[], width: i32, height: i32):
+    memory.set(pixels, 0)
+    let data = webview_rendering_thread_data(view)
+    let list = data.m_cached_display_list else return
+    let player = data.m_skia_player else return
+    let size = view.m_frame.last_painted_size
+    if size.m_width <= 0 or size.m_height <= 0:
+        return
+    let surface = gfx.painting_surface_create_with_size(size, gfx.BitmapFormat.bgra8888, gfx.AlphaType.premultiplied)
+    display_list.display_list_player_execute((display_list.DisplayListPlayer*)player, list, &data.m_cached_scroll_state_snapshot, surface)
+    let bitmap = gfx.painting_surface_bitmap(surface)
+    let rows = webview_min(height, size.m_height)
+    let columns = webview_min(width, size.m_width)
+    for y in 0..<rows:
+        let source = gfx.bitmap_scanline_const(bitmap, y) else continue
+        for x in 0..<columns:
+            webview_store_straight_rgba(pixels[((usize)y * (usize)width + (usize)x) * 4..], source[x])
+
+## The layers the GPU player cuts the view's last presented display list into, one line each
+## (kind, commands, scroll frame), for measurement tools.
+pub func webview_gpu_describe_layers(view: WebView*):
+    let data = webview_rendering_thread_data(view)
+    let list = data.m_cached_display_list else return
+    with memory.heap:
+        var layers = gpu_player.gpu_layers_of(list)
+        defer ak.vector_clear(&layers)
+        let kinds: str[3] = ["fixed", "scrolled", "dynamic"]
+        for layer in ak.vector_span_const(&layers):
+            print(f"    layer {kinds[(usize)layer.kind]} commands {layer.first}..<{layer.end} frame {layer.frame}")

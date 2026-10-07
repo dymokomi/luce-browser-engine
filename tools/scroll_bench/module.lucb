@@ -1,0 +1,180 @@
+#==============================================================================================
+#
+#   scroll_bench - how fast a page scrolls and how much memory it takes, without a window
+#
+#   DESCRIPTION:
+#       A measurement tool, not a test (docs: luce-browser-render docs/GPU.md):
+#
+#         scroll_bench PAGE ... [--frames N] [--step PX] [--width W] [--height H] [--scale DPR]
+#                      [--player cpu|gpu|both] [--png PREFIX] [--resources DIR]
+#
+#       For each PAGE (a URL or a file path) it loads the page the way luced-browser does
+#       (webview_api, scripting disabled), waits for its first frame, then scrolls it by PX CSS
+#       pixels a frame (down, and back up at the end) for N frames. A frame is the wheel event,
+#       the engine's work until it presents the frame, and the frame reaching the GPU:
+#
+#         cpu   the CPU player rasterizes the frame and the application copies it out
+#               (webview_copy_frame), as luced-browser does without the GPU player;
+#         gpu   the GPU player draws it into an offscreen texture of the view's size and the
+#               tool waits for the GPU to finish (a one-texel read);
+#         both  as gpu, and at the first and every 16th frame the CPU player's frame is
+#               compared with the GPU's (pixels further apart than 2 in a channel).
+#
+#       It prints one line per page: the load time, the frame time's average and 95th
+#       percentile (the main thread's work: idle waits for the engine's rendering timer are
+#       not counted), the scrolled distance, the GPU player's tile counts, and the process's
+#       peak resident memory so far. --png PREFIX writes the last frame of each player;
+#       --layers lists the GPU player's layers of each page.
+#
+#       Run from the repository's root:
+#
+#           luce-base build tools/scroll_bench -o build/scroll_bench --release
+#           build/scroll_bench tests/scroll_bench/*.html
+#
+#       Copyright (c) 2026 the luce-browser authors.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+import c
+import io
+import memory
+import strings
+import thread
+import time
+import platform
+from luce_std import files
+from luce_browser_foundation import ak
+from luce_png import png
+from luce_raster.binary import Buffer
+from luce_gpu import gpu
+from luce_browser_render import gpu_player
+import webview
+import webview_api
+
+# mark: The command line ========================================================================
+
+## Which player draws the frames.
+enum Player as u8:
+    cpu = 0
+    gpu = 1
+    both = 2
+
+## What the command line asked for.
+struct Options:
+    var pages: ak.Vector[str]
+    var frames: usize = 120
+    var step: f64 = 40.0
+    var width: f64 = 1280.0
+    var height: f64 = 800.0
+    var scale: f64 = 2.0
+    var player: Player = Player.cpu
+    var png_prefix: str?
+    var resources: str = "build/scroll_bench_res"
+    ## Whether to list the GPU player's layers of each page (--layers).
+    var layers: bool = false
+
+## Prints the usage text; answers the exit status of a command line not understood.
+func usage() -> i32:
+    io.stderr().write("usage: scroll_bench PAGE ... [--frames N] [--step PX] [--width W] [--height H] [--scale DPR]\n") catch failure: return 2
+    io.stderr().write("                    [--player cpu|gpu|both] [--png PREFIX] [--resources DIR] [--layers]\n") catch failure: return 2
+    return 2
+
+## The options of `arguments` (the program name first), or none when they are not understood.
+func parse_options(arguments: const str[]) -> Options?:
+    var options = Options()
+    var index: usize = 1
+    while index < arguments.length:
+        let argument = arguments[index]
+        index += 1
+        if not strings.starts_with(argument, "-"):
+            ak.vector_append_t(&options.pages, argument)
+            continue
+        if argument == "--layers":
+            options.layers = true
+            continue
+        if index >= arguments.length:
+            return none
+        let value = arguments[index]
+        index += 1
+        if argument == "--frames":
+            options.frames = (usize)(strings.parse_u64(value) else return none)
+        elif argument == "--step":
+            options.step = strings.parse_f64(value) catch failure: return none
+        elif argument == "--width":
+            options.width = strings.parse_f64(value) catch failure: return none
+        elif argument == "--height":
+            options.height = strings.parse_f64(value) catch failure: return none
+        elif argument == "--scale":
+            options.scale = strings.parse_f64(value) catch failure: return none
+        elif argument == "--player":
+            if value == "cpu":
+                options.player = Player.cpu
+            elif value == "gpu":
+                options.player = Player.gpu
+            elif value == "both":
+                options.player = Player.both
+            else:
+                return none
+        elif argument == "--png":
+            options.png_prefix = value
+        elif argument == "--resources":
+            options.resources = value
+        else:
+            return none
+    if ak.vector_is_empty(&options.pages):
+        return none
+    return options
+
+# mark: Process memory ==========================================================================
+
+extern func getrusage(who: i32, usage: void*) -> i32
+
+## The process's peak resident memory in bytes (getrusage's ru_maxrss: bytes on macOS,
+## kilobytes on Linux).
+func peak_resident() -> u64:
+    # struct rusage: two timevals (32 bytes), then ru_maxrss.
+    var record: i64[18]
+    if getrusage(0, (void*)&record[0]) != 0:
+        return 0
+    let value = (u64)record[4]
+    return value if platform.macos else value * 1024
+
+# mark: Text ====================================================================================
+
+## `text` as an owned string (at most 512 bytes).
+func owned(text: fmt) -> str:
+    var buffer: u8[512] = ---
+    let written = strings.format(buffer, text) catch failure: return "?"
+    return strings.copy(written) catch failure: trap("out of memory")
+
+## `value` in decimal.
+func decimal(value: u64) -> str:
+    var buffer: u8[24] = ---
+    let text = strings.format_u64(value, buffer) catch failure: return "?"
+    return strings.copy(text) catch failure: trap("out of memory")
+
+## `nanoseconds` as milliseconds with two decimals.
+func milliseconds(nanoseconds: u64) -> str:
+    let hundredths = (nanoseconds + 5000) // 10000
+    let fraction = hundredths % 100
+    let pad = "0" if fraction < 10 else ""
+    return owned(f"{decimal(hundredths // 100)}.{pad}{decimal(fraction)}")
+
+## `bytes` in MiB with one decimal.
+func mebibytes(bytes: u64) -> str:
+    let tenths = (bytes * 10 + 524288) // 1048576
+    return owned(f"{decimal(tenths // 10)}.{decimal(tenths % 10)}")
+
+# mark: main ====================================================================================
+
+pub func main(arguments: str[]) -> i32:
+    let options = parse_options(arguments) else return usage()
+    webview_api.initialize(options.resources) catch failure:
+        print(f"scroll_bench: the engine did not initialize: {failure.message}")
+        return 1
+    print(f"scroll_bench: engine initialized, peak resident {mebibytes(peak_resident())} MiB")
+    print("page                      load ms   frame avg ms   frame p95 ms   scrolled px   tiles r/c   peak MiB   check")
+    for page in ak.vector_span_const(&options.pages):
+        bench_page(page, &options)
+    return 0
