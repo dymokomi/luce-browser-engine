@@ -1209,7 +1209,7 @@ luce-browser-engine/
   tests/web_test/                     # the headless runner (Luce)
   tests/libweb/                       # copied Ladybird test data (§6.8)
   tests/expected_failures/
-  test.sh                             # what CI runs
+  tools/check.sh                      # the lint; `luc test` runs the tests
 ```
 
 A directory module's `ORDER` may list fragments in subdirectories (`dom/node_1.lucb`); this was
@@ -1431,7 +1431,7 @@ reading JSON with luce-json. Tools that read C++ stay local (§6.8).
 | `generate_window_or_worker_interfaces.py` (609) | P3 | part of `gen_bindings` | |
 | `generate_ipc_definitions.py`, LibJS generators | never | | |
 
-Each package's `test.sh` regenerates every generated file into a temporary directory and fails
+Each package's `luc test` regenerates every generated file into `build/tests/generated` and fails
 on any difference with the committed output.
 
 ---

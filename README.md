@@ -26,10 +26,13 @@ of this repository.
 
 ## Testing
 
-`./test.sh` type-checks every module, runs the unit tests and the generators' comparisons, then runs
+`luc test` runs the unit tests and four programs: `tests/generated` (the generators'
+comparisons), `tests/webview_diagnostic` (web's and webview's tests again under the diagnostic
+profile), `tests/web_test_units` (the runner's own tests) and `tests/ladybird`, which runs
 Ladybird's phase-1 and phase-2 Layout, Ref, Crash and Screenshot tests (copied in `tests/libweb`)
-through the headless runner `tests/web_test` against `tests/expected_failures` (see
-`docs/regions/r57.md`). The runner decodes and writes PNGs with luce-png.
+through the headless runner `tests/web_test`, built with the diagnostic profile, against
+`tests/expected_failures` (see `docs/regions/r57.md`). The runner decodes and writes PNGs with
+luce-png. `tools/check.sh` is the lint: formatting and `-W`.
 
 ## License
 
