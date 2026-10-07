@@ -9,6 +9,12 @@
 #       engine's next deadline does not. A wheel that does not scroll (the page's end) yields no
 #       frame: after 20 seconds the direction turns (and the run ends when neither way scrolls).
 #
+#       Between frames the rest of a display's frame interval (--interval, 16.7 ms) is idle
+#       time, as in luced-browser's loop: the GPU player draws tiles ahead of the scroll then
+#       (webview_gpu_idle), timed apart from the frames. With --fling the run starts with a
+#       fling, a viewport's height in four frames, and goes on at the steady step; the two
+#       phases are reported apart.
+#
 #       Copyright (c) 2026 the luce-browser authors.
 #       SPDX-License-Identifier: BSD-2-Clause
 #
@@ -19,8 +25,6 @@
 let bench_load_wait: u64 = 60000000000
 let bench_no_frame: u64 = 20000000000
 
-## How long a loaded page settles (late images and fonts) before scrolling, in nanoseconds.
-let bench_settle: u64 = 1500000000
 
 ## The webview behind a webview_api handle.
 func bench_web_view(view: webview_api.View) -> webview.WebView*:
@@ -49,13 +53,30 @@ func bench_take_events(view: webview_api.View) -> bool:
                     loaded = true
             _: _ = 0
 
-## The frames of one run and what they cost.
-struct BenchRun:
+## The frames of one phase of a run (the fling or the steady scroll) and what they cost: the
+## main thread's time per frame, the GPU's, the visible tiles shown before they were ready
+## and the frames that showed any, and the idle time's raster.
+struct BenchPhase:
     var times: ak.Vector[u64]
+    var gpu_times: ak.Vector[u64]
+    var untimed: u64
+    ## The last frame's delivery (presenter.lucb).
+    var delivery: u64
+    var not_ready_tiles: u64
+    var not_ready_frames: u64
+    var idle_ns: u64
+    var idle_tiles: u64
+
+## A run: its phases (0 the fling, 1 the steady scroll), and the page's load and checks.
+struct BenchRun:
+    var phases: BenchPhase[2]
     var scrolled: f64
     var load: u64
     var mismatches: usize
     var checks: usize
+
+## How many frames the fling takes.
+let bench_fling_frames: usize = 4
 
 ## Loads `page` into a new view, scrolls it and prints its line.
 func bench_page(page: str, options: const Options*):
@@ -82,7 +103,7 @@ func bench_page(page: str, options: const Options*):
         if time.now() - start > bench_load_wait:
             print(f"{page}: no frame")
             return
-    let settle_end = time.now() + bench_settle
+    let settle_end = time.now() + (u64)(options.settle * 1000000000.0)
     while time.now() < settle_end:
         _ = bench_turn()
         _ = bench_take_events(view)
@@ -90,16 +111,22 @@ func bench_page(page: str, options: const Options*):
     var presenter = bench_presenter_open(view, options)
     defer bench_presenter_close(&presenter)
     # The first frame's delivery is the page's start-up, not a scroll frame.
-    bench_present(&presenter, view, &run, true)
+    var startup = BenchPhase()
+    bench_present(&presenter, view, &run, &startup, true)
+    ak.vector_clear(&startup.gpu_times)
 
     var direction = 1.0
     var misses = 0
     var frame: usize = 0
+    let fling_frames: usize = bench_fling_frames if options.fling else 0
     let x = options.width / 2.0
     let y = options.height / 2.0
-    while frame < options.frames:
+    while frame < options.frames + fling_frames:
+        let phase = &run.phases[0 if frame < fling_frames else 1]
+        let step = options.height / (f64)bench_fling_frames if frame < fling_frames else options.step
         let before = webview_api.frame_serial(view)
-        webview_api.wheel(view, x, y, 0.0, direction * options.step, 0)
+        let frame_start = time.now()
+        webview_api.wheel(view, x, y, 0.0, direction * step, 0)
         var worked: u64 = 0
         let waited = time.now()
         var presented = true
@@ -117,20 +144,50 @@ func bench_page(page: str, options: const Options*):
                 break
             continue
         misses = 0
-        let delivery = time.now()
-        bench_present(&presenter, view, &run, frame % 16 == 0)
-        worked += time.now() - delivery
-        ak.vector_append_t(&run.times, worked)
-        run.scrolled += options.step
+        let counts = gpu_player.gpu_player_stats()
+        bench_present(&presenter, view, &run, phase, frame % 16 == 0)
+        worked += phase.delivery
+        ak.vector_append_t(&phase.times, worked)
+        let after = gpu_player.gpu_player_stats()
+        if after.not_ready_tiles > counts.not_ready_tiles:
+            phase.not_ready_tiles += after.not_ready_tiles - counts.not_ready_tiles
+            phase.not_ready_frames += 1
+        bench_idle(view, options, phase, frame_start + worked)
+        run.scrolled += step
         frame += 1
-    bench_collect_gpu_time(&presenter)
     bench_write_pngs(&presenter, view, page, options)
-    bench_report(page, &run, &presenter)
+    if options.fling:
+        bench_report(owned(f"{bench_short_name(page)} (fling)"), &run, &run.phases[0], &presenter)
+        bench_report(owned(f"{bench_short_name(page)} (steady)"), &run, &run.phases[1], &presenter)
+    else:
+        bench_report(bench_short_name(page), &run, &run.phases[1], &presenter)
     bench_presenter_report(&presenter)
+    for index in 0..<(usize)2:
+        ak.vector_clear(&run.phases[index].times)
+        ak.vector_clear(&run.phases[index].gpu_times)
     if options.layers:
         webview.webview_gpu_describe_layers(bench_web_view(view))
     if options.census:
         bench_print_census(&presenter)
+
+## The idle time after a frame whose work ended at `worked_until`: until the frame interval
+## (from the frame's start) is over, the GPU player draws ahead (as long as it wants to);
+## its raster time is the phase's idle time, not the frame's.
+func bench_idle(view: webview_api.View, options: const Options*, phase: BenchPhase*, worked_until: u64):
+    if options.player == Player.cpu or options.interval <= 0.0:
+        return
+    let frame_end = worked_until + (u64)(options.interval * 1000000.0)
+    let tiles = gpu_player.gpu_player_stats().idle_tiles
+    while true:
+        let now = time.now()
+        if now + 500000 >= frame_end:
+            break
+        let started = time.now()
+        let next = webview_api.gpu_idle(view, (f64)(frame_end - now) / 1000000000.0)
+        phase.idle_ns += time.now() - started
+        if next != 0.0:
+            break
+    phase.idle_tiles += gpu_player.gpu_player_stats().idle_tiles - tiles
 
 ## The names of the blob tags (web.MemoryTag), in order.
 let bench_tag_names: str[7] = ["untagged", "parse", "style", "layout", "paint", "image", "gpu_player"]
@@ -175,8 +232,8 @@ func bench_print_census(presenter: const BenchPresenter*):
         tag_line = owned(f"{tag_line} {bench_tag_names[tag]}={decimal((u64)census.blob_bytes_by_tag[tag])}")
     print(tag_line)
 
-## The average and 95th percentile of `times` (ns).
-func bench_statistics(times: const ak.Vector[u64]*) -> u64[2]:
+## The average, 95th percentile and maximum of `times` (ns).
+func bench_statistics(times: const ak.Vector[u64]*) -> u64[3]:
     let count = ak.vector_size(times)
     var sorted = ak.Vector[u64]()
     defer ak.vector_clear(&sorted)
@@ -195,20 +252,27 @@ func bench_statistics(times: const ak.Vector[u64]*) -> u64[2]:
         values[j] = value
     let average: u64 = total // (u64)count if count > 0 else 0
     let p95: u64 = values[(count * 95) // 100 if (count * 95) // 100 < count else count - 1] if count > 0 else 0
-    return [average, p95]
+    let most: u64 = values[count - 1] if count > 0 else 0
+    return [average, p95, most]
 
-## Prints a page's line: CPU frame time (the main thread's), then the GPU's (the GPU player).
-func bench_report(page: str, run: const BenchRun*, presenter: const BenchPresenter*):
-    let cpu = bench_statistics(&run.times)
-    let name = bench_short_name(page)
+## Prints a page's line for one phase: the main thread's frame time, the GPU's, the visible
+## tiles not ready (tiles/frames that showed any), the idle raster per frame.
+func bench_report(name: str, run: const BenchRun*, phase: const BenchPhase*, presenter: const BenchPresenter*):
+    let cpu = bench_statistics(&phase.times)
     let check = owned(f"{decimal((u64)run.mismatches)}/{decimal((u64)run.checks)} differ") if run.checks > 0 else "-"
     var gpu_column: str = "-"
-    if ak.vector_size(&presenter.gpu_times) > 0:
-        let gpu_time = bench_statistics(&presenter.gpu_times)
-        gpu_column = owned(f"{milliseconds(gpu_time[0])}/{milliseconds(gpu_time[1])}")
-        if presenter.untimed > 0:
-            gpu_column = owned(f"{gpu_column} ({decimal(presenter.untimed)} untimed)")
-    print(f"{bench_pad(name, 24)}  {bench_pad(milliseconds(run.load), 8)}  {bench_pad(milliseconds(cpu[0]), 13)}  {bench_pad(milliseconds(cpu[1]), 13)}  {bench_pad(gpu_column, 15)}  {bench_pad(decimal((u64)run.scrolled), 12)}  {bench_pad(bench_presenter_tiles(presenter), 10)}  {bench_pad(mebibytes(peak_resident()), 9)}  {check}")
+    var ready_column: str = "-"
+    var idle_column: str = "-"
+    if presenter.player != Player.cpu:
+        if ak.vector_size(&phase.gpu_times) > 0:
+            let gpu_time = bench_statistics(&phase.gpu_times)
+            gpu_column = owned(f"{milliseconds(gpu_time[0])}/{milliseconds(gpu_time[1])}")
+        if phase.untimed > 0:
+            gpu_column = owned(f"{gpu_column} ({decimal(phase.untimed)} untimed)")
+        ready_column = owned(f"{decimal(phase.not_ready_tiles)}/{decimal(phase.not_ready_frames)}")
+        let frames = ak.vector_size(&phase.times)
+        idle_column = milliseconds(phase.idle_ns // (u64)frames if frames > 0 else 0)
+    print(f"{bench_pad(name, 24)}  {bench_pad(milliseconds(run.load), 8)}  {bench_pad(milliseconds(cpu[0]), 9)}  {bench_pad(milliseconds(cpu[1]), 9)}  {bench_pad(milliseconds(cpu[2]), 9)}  {bench_pad(gpu_column, 11)}  {bench_pad(ready_column, 9)}  {bench_pad(idle_column, 8)}  {bench_pad(decimal((u64)run.scrolled), 8)}  {bench_pad(bench_presenter_tiles(presenter), 10)}  {bench_pad(mebibytes(peak_resident()), 9)}  {check}")
 
 ## The last path component of `page` (its directory for an index.html).
 func bench_short_name(page: str) -> str:

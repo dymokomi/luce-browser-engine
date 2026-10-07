@@ -8,17 +8,14 @@
 #
 #       gpu: the view's GPU player draws the frame into an offscreen rgba8_linear texture of
 #       the view's size (webview_gpu_draw on the texture's frame; that format blends on stored
-#       values, as an encoded window surface does, so tiles go straight onto it), and the tool
-#       reads one texel back, which waits for the GPU. With `both`, a checked frame is also
-#       read back whole and compared with the CPU player's frame of the same display list and
-#       scroll state.
-#
-#       GPU time: before a frame's delivery the presenter submits an empty frame of a one-texel
-#       texture, whose submission marks where the frame's work starts on the queue; the frame's
-#       GPU time is the sum of the GPU times of every submission after the mark through the
-#       frame's own (its tiles' uploads, masks and frames, and the composite), read at the next
-#       frame (luce-gpu keeps the times of the last 32 submissions; a frame with more counts as
-#       incomplete).
+#       values, as an encoded window surface does, so tiles go straight onto it) and submits
+#       it. The frame's time is the main thread's until then: a window's present does not wait
+#       for the GPU either. The tool then waits for the GPU (not counted) and takes the frame's
+#       GPU time: its submission's (Frame.submission(); luce-gpu encodes a frame's uploads,
+#       tile frames and composite into one command buffer, but commits one on its own after 64
+#       encodings, so a frame of more counts only its last). With `both`, a checked frame is
+#       drawn complete (every visible tile, whatever the raster budget), read back whole and
+#       compared with the CPU player's frame of the same display list and scroll state.
 #
 #       Copyright (c) 2026 the luce-browser authors.
 #       SPDX-License-Identifier: BSD-2-Clause
@@ -32,14 +29,6 @@ struct BenchPresenter:
     var gpu_pixels: u8[]
     var device: gpu.Device?
     var texture: gpu.Texture?
-    ## The one-texel texture whose empty frame marks a frame's start on the queue.
-    var marker: gpu.Texture?
-    ## The submissions of the frame whose GPU time is still to be read (`first..=last`).
-    var pending_first: u64
-    var pending_last: u64
-    ## Each frame's GPU time (ns), and how many frames had more submissions than are timed.
-    pub var gpu_times: ak.Vector[u64]
-    pub var untimed: u64
 
 ## The presenter of `options.player` for `view`.
 func bench_presenter_open(view: webview_api.View, options: const Options*) -> BenchPresenter:
@@ -53,7 +42,6 @@ func bench_presenter_open(view: webview_api.View, options: const Options*) -> Be
         webview.webview_set_gpu_player(bench_web_view(view), true)
     var device = gpu.Device.open() catch failure: trap(f"scroll_bench: no GPU device: {failure.message}")
     presenter.texture = gpu.Texture.create(device, (u32)webview_api.frame_width(view), (u32)webview_api.frame_height(view), gpu.Format.rgba8_linear) catch failure: trap(f"scroll_bench: no texture: {failure.message}")
-    presenter.marker = gpu.Texture.create(device, 1, 1, gpu.Format.rgba8_linear) catch failure: trap(f"scroll_bench: no texture: {failure.message}")
     presenter.device = device
     presenter.gpu_pixels = new u8[bytes] --- in memory.heap catch failure: trap("out of memory")
     return presenter
@@ -63,10 +51,6 @@ func bench_presenter_close(presenter: BenchPresenter*):
     if let texture = presenter.texture:
         var handle = texture
         handle.destroy()
-    if let texture = presenter.marker:
-        var handle = texture
-        handle.destroy()
-    ak.vector_clear(&presenter.gpu_times)
     if let device = presenter.device:
         var handle = device
         handle.destroy()
@@ -91,67 +75,44 @@ func bench_presenter_report(presenter: const BenchPresenter*):
         if stats.reasons[kind] > 0:
             print(f"    CPU tiles for {gpu_player.gpu_fallback_name(kind)}: {stats.fallbacks[kind]} (met in {stats.reasons[kind]})")
     print(f"    tiles: {stats.gpu_tiles} GPU, {stats.cpu_tiles} CPU, {stats.empty_tiles} empty, {stats.composited_tiles} composited; {stats.resident_tiles} resident, {mebibytes(stats.resident_bytes)} MiB of GPU memory")
+    print(f"    schedule: {stats.prefetched_tiles} tiles drawn ahead in frames, {stats.idle_tiles} in idle time; raster {milliseconds(stats.frame_raster_ns)} ms in frames, {milliseconds(stats.idle_raster_ns)} ms idle; tiles played {stats.played_commands} of their layers' {stats.layer_commands} commands; {stats.new_lists} new display lists")
     gpu_player.gpu_player_reset_stats()
 
-## Delivers the view's presented frame through the presenter's player; `check` compares the
-## players' pixels (both).
-func bench_present(presenter: BenchPresenter*, view: webview_api.View, run: BenchRun*, check: bool):
+## Delivers the view's presented frame through the presenter's player into `phase`: the main
+## thread's time for it, and the GPU's. `check` compares the players' pixels (both).
+func bench_present(presenter: BenchPresenter*, view: webview_api.View, run: BenchRun*, phase: BenchPhase*, check: bool):
     let width = (i32)webview_api.frame_width(view)
     let height = (i32)webview_api.frame_height(view)
+    let start = time.now()
     if presenter.player == Player.cpu:
         _ = webview_api.copy_frame(view, presenter.cpu_pixels, width, height)
+        phase.delivery = time.now() - start
         return
     let texture = presenter.texture else trap("scroll_bench: no texture")
-    bench_collect_gpu_time(presenter)
-    let start = bench_mark(presenter)
+    let compare = presenter.player == Player.both and check
     let frame = texture.frame() catch failure: trap(f"scroll_bench: no frame: {failure.message}")
     defer frame.release()
     let target = frame.value().target() catch failure: trap(f"scroll_bench: no target: {failure.message}")
     defer target.release()
-    webview.webview_gpu_draw(bench_web_view(view), target.value()) catch failure: trap(f"scroll_bench: the GPU player failed: {failure.message}")
+    webview.webview_gpu_draw(bench_web_view(view), target.value(), compare) catch failure: trap(f"scroll_bench: the GPU player failed: {failure.message}")
     _ = frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)) catch failure: trap(f"scroll_bench: present failed: {failure.message}")
-    presenter.pending_first = start + 1
-    presenter.pending_last = frame.value().submission().serial
-    let allocator: memory.Allocator = webview.webview_heap()
-    if presenter.player == Player.both and check:
+    phase.delivery = time.now() - start
+    let submission = frame.value().submission()
+    let device = presenter.device else trap("scroll_bench: no device")
+    device.wait(submission) catch failure: trap(f"scroll_bench: wait failed: {failure.message}")
+    let measured = device.gpu_time(submission) catch failure: trap(f"scroll_bench: {failure.message}")
+    if let span = measured:
+        ak.vector_append_t(&phase.gpu_times, span.elapsed())
+    else:
+        phase.untimed += 1
+    if compare:
         texture.read(presenter.gpu_pixels) catch failure: trap(f"scroll_bench: read failed: {failure.message}")
+        let allocator: memory.Allocator = webview.webview_heap()
         with allocator:
             webview.webview_cpu_reference_frame(bench_web_view(view), presenter.cpu_pixels, width, height)
         run.checks += 1
         if bench_differs(presenter.cpu_pixels, presenter.gpu_pixels):
             run.mismatches += 1
-        return
-    var texel: u8[4]
-    texture.read(texel, gpu.Region(0, 0, 1, 1)) catch failure: trap(f"scroll_bench: read failed: {failure.message}")
-
-## Submits an empty frame of the marker texture: the serial where a frame's work starts.
-func bench_mark(presenter: BenchPresenter*) -> u64:
-    let marker = presenter.marker else return 0
-    let frame = marker.frame() catch failure: trap(f"scroll_bench: no frame: {failure.message}")
-    defer frame.release()
-    _ = frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)) catch failure: trap(f"scroll_bench: present failed: {failure.message}")
-    return frame.value().submission().serial
-
-## Adds the pending frame's GPU time (the sum over its submissions), waiting for its last.
-pub func bench_collect_gpu_time(presenter: BenchPresenter*):
-    if presenter.pending_last == 0 or presenter.pending_first > presenter.pending_last:
-        return
-    let device = presenter.device else return
-    device.wait(gpu.Submission(serial = presenter.pending_last)) catch failure: trap(f"scroll_bench: wait failed: {failure.message}")
-    var total: u64 = 0
-    var complete = true
-    for serial in presenter.pending_first..<presenter.pending_last + 1:
-        let measured = device.gpu_time(gpu.Submission(serial = serial)) catch failure: trap(f"scroll_bench: {failure.message}")
-        if let span = measured:
-            total += span.elapsed()
-        else:
-            complete = false
-    presenter.pending_first = 0
-    presenter.pending_last = 0
-    if complete:
-        ak.vector_append_t(&presenter.gpu_times, total)
-    else:
-        presenter.untimed += 1
 
 ## Whether more than 0.1% of the pixels of two frames differ by more than 2 in a channel;
 ## prints how many differ and by how much when they do.
