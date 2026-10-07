@@ -1,0 +1,261 @@
+#==============================================================================================
+#
+#   memory - what the engine's memory holds: the process's resident and footprint, and a
+#            census of the collected heap by class
+#
+#   DESCRIPTION:
+#       Addition, with no donor counterpart (Ladybird measures with the platform's tools).
+#       The census walks the main thread VM's heap: every live cell of every heap block,
+#       counted by class (ak.ClassInfo), with AK's storage counted apart as blobs (scanned)
+#       and atomic blobs (bytes, pixels), and the large-object space by the same kinds. Blocks
+#       the heap's allocators keep for reuse (released to the system as reusable) are
+#       counted apart too. The process figures come from the system: on macOS task_info's
+#       phys_footprint (what Activity Monitor shows) and resident size, on Linux
+#       /proc/self/status; elsewhere they are zero (`available` false).
+#
+#       Memory outside the collected heap is not in the census: the C heap (fonts' tables and
+#       caches, the views), mapped font files, the GPU player's textures (its own statistics)
+#       and the code.
+#
+#       Copyright (c) 2026 the luce-browser authors.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+extern func mach_task_self_port as "mach_task_self"() -> u32
+extern func task_info(task: u32, flavor: i32, info: void*, count: u32*) -> i32
+extern func memory_getrusage as "getrusage"(who: i32, usage: void*) -> i32
+
+## TASK_VM_INFO, and where task_vm_info_data_t's resident_size and phys_footprint are, in u64s.
+let memory_task_vm_info: i32 = 22
+let memory_vm_info_resident: usize = 2
+let memory_vm_info_footprint: usize = 18
+
+## The process's memory as the system counts it, in bytes.
+pub struct WebViewProcessMemory:
+    ## Whether the platform answered (macOS and Linux).
+    pub var available: bool
+    ## Pages in memory now (resident set).
+    pub var resident: u64
+    ## The most pages in memory so far (getrusage's ru_maxrss).
+    pub var peak_resident: u64
+    ## Dirty and compressed memory the process owns (macOS phys_footprint; Linux: resident).
+    pub var footprint: u64
+
+## The process's memory now.
+pub func webview_process_memory() -> WebViewProcessMemory:
+    var memory_now = WebViewProcessMemory(available = false, resident = 0, peak_resident = 0, footprint = 0)
+    var usage: i64[18]
+    if memory_getrusage(0, (void*)&usage[0]) == 0:
+        memory_now.peak_resident = (u64)usage[4] if os.macos else (u64)usage[4] * 1024
+    if os.macos:
+        var info: u64[64]
+        var count: u32 = 128
+        if task_info(mach_task_self_port(), memory_task_vm_info, (void*)&info[0], &count) == 0:
+            memory_now.available = true
+            memory_now.resident = info[memory_vm_info_resident]
+            memory_now.footprint = info[memory_vm_info_footprint]
+    elif os.linux:
+        let status: interop.Owned[const u8[]]? = files.read("/proc/self/status") catch:
+            recover none
+        if let text = status:
+            memory_now.resident = webview_memory_status_field(text.value, "VmRSS:") * 1024
+            memory_now.footprint = memory_now.resident
+            memory_now.available = memory_now.resident > 0
+            text.release()
+    return memory_now
+
+## The number after `name` on its line of /proc/self/status (kilobytes), or 0.
+func webview_memory_status_field(text: const u8[], name: str) -> u64:
+    let found = strings.find((str)text, name) else return 0
+    var value: u64 = 0
+    var index = found + name.length
+    while index < text.length and text[index] == ' ':
+        index += 1
+    while index < text.length and text[index] >= '0' and text[index] <= '9':
+        value = value * 10 + (u64)(text[index] - '0')
+        index += 1
+    return value
+
+# mark: The heap census ==========================================================================
+
+## The live cells of one class.
+pub struct WebViewMemoryClass:
+    pub var class_info: const ak.ClassInfo*?
+    pub var cells: usize
+    pub var bytes: usize
+
+## The most classes a census tells apart; the rest are counted as "other".
+let webview_memory_class_limit: usize = 768
+
+## The heap's contents by kind, in bytes, and its cells by class.
+pub struct WebViewMemoryCensus:
+    ## Heap blocks in use (16 KiB each), live cells or not.
+    pub var block_bytes: usize
+    ## Heap blocks kept for reuse by the heap's allocators, given back to the system as reusable.
+    pub var cached_block_bytes: usize
+    ## Live cells of classes (not blobs), in blocks and in the large-object space.
+    pub var cell_bytes: usize
+    ## Live scanned blobs (AK storage holding pointers: vectors, hash tables, ref-counted objects).
+    pub var blob_bytes: usize
+    ## Live atomic blobs (string bytes, pixels, glyph ids).
+    pub var atomic_blob_bytes: usize
+    ## Mappings of the large-object space (each a multiple of the block size), and how many.
+    pub var large_object_bytes: usize
+    pub var large_objects: usize
+    ## The cells' bytes in the large-object space (what large_object_bytes maps for them).
+    pub var large_cell_bytes: usize
+    ## The part of large_object_bytes that is atomic blobs (mostly pixels).
+    pub var large_atomic_bytes: usize
+    ## Free and dead cells in the blocks in use.
+    pub var free_cell_bytes: usize
+    ## Live blobs (scanned and atomic) by the tag they were allocated with (web.MemoryTag).
+    pub var blob_bytes_by_tag: usize[8]
+    ## Live blobs by tag and size (webview_memory_size_bucket): how many, and their bytes.
+    pub var blob_counts_by_size: usize[8][10]
+    pub var blob_bytes_by_size: usize[8][10]
+    ## Live cells by what they belong to (WebViewMemoryCellKind).
+    pub var cell_bytes_by_kind: usize[8]
+    ## Live cells by class, the largest first after webview_memory_census sorts them.
+    pub var classes: WebViewMemoryClass[768]
+    pub var class_count: usize
+
+## What a cell belongs to, by its class.
+pub enum WebViewMemoryCellKind as u8:
+    ## DOM nodes (Node and its subclasses).
+    dom = 0
+    ## Style: CSS rules, style sheets, declarations, computed and cascaded properties.
+    style = 1
+    ## Layout nodes.
+    layout = 2
+    ## Paintables.
+    paint = 3
+    ## Everything else: JS objects, fetch, HTML infrastructure, events.
+    other = 4
+
+## The kind of the cell of class `class_id` named `name`.
+func webview_memory_cell_kind(class_id: u16, name: str) -> WebViewMemoryCellKind:
+    if class_id >= web.dom_node_class.first_id and class_id <= web.dom_node_class.last_id:
+        return WebViewMemoryCellKind.dom
+    if class_id >= web.layout_node_class.first_id and class_id <= web.layout_node_class.last_id:
+        return WebViewMemoryCellKind.layout
+    if class_id >= web.paint_paintable_class.first_id and class_id <= web.paint_paintable_class.last_id:
+        return WebViewMemoryCellKind.paint
+    if strings.starts_with(name, "CSS") or strings.ends_with(name, "Properties") or strings.ends_with(name, "StyleSheet") or name == "MediaList" or name == "StyleSheetList":
+        return WebViewMemoryCellKind.style
+    return WebViewMemoryCellKind.other
+
+## The upper bounds of the census's size buckets (the heap's size classes, then large objects).
+pub let webview_memory_bucket_limits: usize[10] = [64, 128, 256, 512, 1024, 3072, 16384, 65536, 1048576, ~(usize)0]
+
+## The size bucket of a cell of `bytes`.
+func webview_memory_size_bucket(bytes: usize) -> usize:
+    for index in 0..<webview_memory_bucket_limits.length:
+        if bytes <= webview_memory_bucket_limits[index]:
+            return index
+    return webview_memory_bucket_limits.length - 1
+
+## Adds `bytes` of a cell of `class_info` to the census.
+func webview_memory_census_add_class(census: WebViewMemoryCensus*, class_info: const ak.ClassInfo*?, bytes: usize):
+    for index in 0..<census.class_count:
+        if census.classes[index].class_info == class_info:
+            census.classes[index].cells += 1
+            census.classes[index].bytes += bytes
+            return
+    if census.class_count < webview_memory_class_limit:
+        census.classes[census.class_count] = WebViewMemoryClass(class_info = class_info, cells = 1, bytes = bytes)
+        census.class_count += 1
+        return
+    # Out of room: count it with the last entry, renamed "other" by the report.
+    census.classes[webview_memory_class_limit - 1].class_info = none
+    census.classes[webview_memory_class_limit - 1].cells += 1
+    census.classes[webview_memory_class_limit - 1].bytes += bytes
+
+## Counts one live cell of `bytes` bytes.
+func webview_memory_census_add_cell(census: WebViewMemoryCensus*, cell: gc.Cell*, bytes: usize):
+    if cell.vtable == &gc.blob_vtable or cell.vtable == &gc.atomic_blob_vtable:
+        if cell.vtable == &gc.blob_vtable:
+            census.blob_bytes += bytes
+        else:
+            census.atomic_blob_bytes += bytes
+        let tag = (usize)cell.class_id if (usize)cell.class_id < 8 else 0
+        census.blob_bytes_by_tag[tag] += bytes
+        let bucket = webview_memory_size_bucket(bytes)
+        census.blob_counts_by_size[tag][bucket] += 1
+        census.blob_bytes_by_size[tag][bucket] += bytes
+        return
+    census.cell_bytes += bytes
+    let class_info = cell.vtable.class_info
+    census.cell_bytes_by_kind[(usize)webview_memory_cell_kind(cell.class_id, class_info.name)] += bytes
+    webview_memory_census_add_class(census, class_info, bytes)
+
+## Counts the blocks of `blocks` (an allocator's list) and their cells.
+func webview_memory_census_add_blocks(census: WebViewMemoryCensus*, blocks: const gc.List*):
+    var block_node = blocks.m_first
+    while block_node != none:
+        let node = block_node else break
+        block_node = node.m_next
+        let block = (gc.HeapBlock*)((u8*)node - memory.offset_of(gc.HeapBlock, m_list_node))
+        census.block_bytes += gc.heap_block_base_block_size
+        let cell_size = gc.heap_block_cell_size(block)
+        let end = (usize)block.m_next_lazy_freelist_index if gc.heap_block_has_lazy_freelist(block) else gc.heap_block_cell_count(block)
+        census.free_cell_bytes += (gc.heap_block_cell_count(block) - end) * cell_size
+        for index in 0..<end:
+            let cell = gc.heap_block_cell(block, index)
+            if gc.cell_state(cell) == gc.CellState.live:
+                webview_memory_census_add_cell(census, cell, cell_size)
+            else:
+                census.free_cell_bytes += cell_size
+
+## A census of `heap` (the main thread VM's by default). Collect garbage first to count only
+## what is reachable.
+pub func webview_memory_census(heap: gc.Heap*) -> WebViewMemoryCensus:
+    var census: WebViewMemoryCensus = ---
+    census.block_bytes = 0
+    census.cached_block_bytes = 0
+    census.cell_bytes = 0
+    census.blob_bytes = 0
+    census.atomic_blob_bytes = 0
+    census.large_object_bytes = 0
+    census.large_objects = 0
+    census.large_cell_bytes = 0
+    census.large_atomic_bytes = 0
+    census.free_cell_bytes = 0
+    census.class_count = 0
+    memory.set(u8[]((u8*)&census.blob_bytes_by_tag[0], memory.size_of(usize[8])), 0)
+    memory.set(u8[]((u8*)&census.cell_bytes_by_kind[0], memory.size_of(usize[8])), 0)
+    memory.set(u8[]((u8*)&census.blob_counts_by_size[0][0], memory.size_of(usize[8][10])), 0)
+    memory.set(u8[]((u8*)&census.blob_bytes_by_size[0][0], memory.size_of(usize[8][10])), 0)
+    # Heap::for_each_block and HeapBlock::for_each_cell, walked by hand: their loops are not
+    # public outside the foundation package.
+    var allocator_node = heap.m_all_cell_allocators.m_first
+    while allocator_node != none:
+        let node = allocator_node else break
+        allocator_node = node.m_next
+        # The node is a CellAllocator's first field (IntrusiveList's container_of).
+        let allocator = (gc.CellAllocator*)node
+        census.cached_block_bytes += gc.gc_vector_size(gc.block_allocator_blocks(gc.cell_allocator_block_allocator(allocator))) * gc.heap_block_base_block_size
+        webview_memory_census_add_blocks(&census, &allocator.m_full_blocks)
+        webview_memory_census_add_blocks(&census, &allocator.m_usable_blocks)
+    for object in gc.gc_vector_span(&heap.m_large_objects):
+        census.large_objects += 1
+        census.large_object_bytes += object.m_mapping_size
+        census.large_cell_bytes += object.m_cell_size
+        let cell = (gc.Cell*)((u8*)object + object.m_cell_offset)
+        if cell.vtable == &gc.atomic_blob_vtable:
+            census.large_atomic_bytes += object.m_cell_size
+        webview_memory_census_add_cell(&census, cell, object.m_cell_size)
+    # Largest classes first (insertion sort: a few hundred classes).
+    for i in 1..<census.class_count:
+        let entry = census.classes[i]
+        var j = i
+        while j > 0 and census.classes[j - 1].bytes < entry.bytes:
+            census.classes[j] = census.classes[j - 1]
+            j -= 1
+        census.classes[j] = entry
+    return census
+
+## The name of a census class.
+pub func webview_memory_class_name(entry: const WebViewMemoryClass*) -> str:
+    let class_info = entry.class_info else return "other"
+    return class_info.name
