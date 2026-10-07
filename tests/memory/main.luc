@@ -1,0 +1,89 @@
+# Memory budgets: each page loads into a new process of tools/scroll_bench (built for release),
+# which scrolls it 30 frames on the GPU player (the CPU player where there is no GPU device)
+# and prints the process's peak resident memory and a census of the heap after a collection
+# (`--census`). A page over a budget fails the run: the process's peak (fonts mapped and loaded
+# by family, no back stores in GPU mode), the engine's before any page loads, and the live
+# heap that each phase allocated (parsing, style, layout, the display list, decoding, the GPU
+# player's CPU side; untagged is mostly bitmaps such as back stores). Where the platform cannot
+# measure (only macOS and Linux can), the run is skipped. Budgets sit about a quarter above
+# what was measured on an Apple M-series Mac (2026-10-07); a change that needs more memory
+# raises them on purpose, in the same commit.
+from luce_std import files, paths, process
+import platform
+
+let failed = ErrorCode.package(1)
+
+## A page, its peak resident memory and its live heap by tag, in MiB.
+struct Budget:
+    let page: str
+    let peak: int
+    let tags: map[str, int]
+
+let mebibyte = 1048576
+
+## The engine before any page: mapped fonts, nothing loaded.
+let initialized_budget = 30
+
+func budgets() -> list[Budget]:
+    return [
+        Budget("tests/memory/blank.html", 75, {"untagged": 4, "parse": 3, "style": 2, "layout": 2, "paint": 2, "image": 1, "gpu_player": 4}),
+        Budget("tests/scroll_bench/text.html", 100, {"untagged": 4, "parse": 4, "style": 3, "layout": 8, "paint": 4, "image": 1, "gpu_player": 4}),
+        Budget("tests/scroll_bench/shadows.html", 100, {"untagged": 4, "parse": 3, "style": 3, "layout": 4, "paint": 2, "image": 1, "gpu_player": 4}),
+        Budget("tests/scroll_bench/boxes.html", 150, {"untagged": 4, "parse": 3, "style": 10, "layout": 12, "paint": 4, "image": 4, "gpu_player": 4}),
+    ]
+
+## The `key=value` pairs after the first word of `line`.
+func fields(line: str) -> map[str, int]!:
+    var found: map[str, int] = {}
+    for piece in line.split()[1..]:
+        let parts = piece.split("=")
+        if parts.length == 2:
+            found[parts[0]] = int(parts[1])
+    return found
+
+## The line of `output` that starts with `prefix`, or "".
+func line_starting(output: str, prefix: str) -> str:
+    for line in output.lines():
+        if line.starts_with(prefix):
+            return line
+    return ""
+
+pub func main(arguments: list[str]) -> int!:
+    let base = process.variable("LUCE_BASE") else "luce-base"
+    let work = paths.join(process.current_directory(), "build/tests/memory")
+    files.ensure_directory(work)
+    let bench = paths.join(work, "scroll_bench" + (".exe" if platform.windows else ""))
+    let built = process.run(base, ["build", "tools/scroll_bench", "-o", bench, "--release"])
+    if built.exit_code != 0:
+        error(failed, f"tools/scroll_bench does not build\n{built.output}{built.error_output}")
+    var problems: list[str] = []
+    var player = "gpu"
+    for budget in budgets():
+        var done = process.run(bench, [budget.page, "--frames", "30", "--player", player, "--census"])
+        if player == "gpu" and done.exit_code != 0 and done.error_output.contains("no GPU device"):
+            player = "cpu"
+            done = process.run(bench, [budget.page, "--frames", "30", "--player", player, "--census"])
+        if done.exit_code != 0:
+            error(failed, f"scroll_bench {budget.page}: exit status {done.exit_code}\n{done.output}{done.error_output}")
+        let census = fields(line_starting(done.output, "census "))
+        if census.get("available", 0) != 1:
+            print("skipped: the platform does not measure process memory")
+            return 0
+        let tags = fields(line_starting(done.output, "census_tags "))
+        let initialized = line_starting(done.output, "scroll_bench: engine initialized")
+        let initialized_mib = float(initialized.split()[5])
+        if initialized_mib > float(initialized_budget):
+            problems.append(f"{budget.page}: {initialized_mib} MiB resident before the page, over {initialized_budget}")
+        let peak = (census.get("peak_resident", 0) + mebibyte - 1) // mebibyte
+        if peak > budget.peak:
+            problems.append(f"{budget.page}: peak resident {peak} MiB, over {budget.peak}")
+        var report = f"{budget.page}: peak {peak} MiB (budget {budget.peak})"
+        for (tag, allowed) in budget.tags.items():
+            let used = tags.get(tag, 0) // 1024
+            report = report + f", {tag} {used} KiB"
+            if used > allowed * 1024:
+                problems.append(f"{budget.page}: {tag} holds {used} KiB, over {allowed} MiB")
+        print(f"ok    {report} ({player} player)")
+    if problems.length > 0:
+        error(failed, "over budget:\n" + problems.join("\n"))
+    return 0
