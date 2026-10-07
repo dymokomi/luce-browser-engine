@@ -1,0 +1,69 @@
+#==============================================================================================
+#
+#   worker_gpu - screenshots drawn by the GPU player (--player gpu)
+#
+#   DESCRIPTION:
+#       With `--player gpu`, a worker draws its screenshots with luce-browser-render's GPU
+#       player instead of the CPU player: the rendering thread's screenshot hook
+#       (web.html_screenshot_drawer) hands over the display list, which a GpuCompositor draws
+#       into an offscreen rgba8_linear texture of the screenshot's size (premultiplied,
+#       sRGB-encoded bytes, as the CPU player's surface holds them); the texture is read back
+#       into the screenshot's surface. Ref and Screenshot tests then compare as they always
+#       do, so their pass counts measure the GPU player against Ladybird's expectations. The
+#       compositor's CPU fallback tiles draw with the page's heap, as the webview's do.
+#
+#       Copyright (c) 2026 the luce-browser authors.
+#       SPDX-License-Identifier: BSD-2-Clause
+#
+#==============================================================================================
+
+## The worker's GPU device and compositor, made by the first screenshot, and the page's heap.
+struct WorkerGpu:
+    var device: gpu.Device?
+    var compositor: gpu_player.GpuCompositor*?
+    var heap: gc.Heap*?
+
+var worker_gpu_the: WorkerGpu = WorkerGpu()
+
+## Makes the worker's screenshots the GPU player's (see the header).
+func worker_use_gpu_player(heap: gc.Heap*):
+    worker_gpu_the.heap = heap
+    web.html_screenshot_drawer = worker_gpu_screenshot
+
+## The rendering thread's screenshot hook: `list` at `snapshot` into `surface` by the GPU player.
+func worker_gpu_screenshot(list: display_list.DisplayList*, snapshot: const display_list.ScrollStateSnapshot*, surface: gfx.PaintingSurface*):
+    worker_gpu_draw(list, snapshot, surface) catch failure: trap(f"web_test: the GPU player failed: {failure.message}")
+
+func worker_gpu_draw(list: display_list.DisplayList*, snapshot: const display_list.ScrollStateSnapshot*, surface: gfx.PaintingSurface*) -> !:
+    let size = gfx.painting_surface_size(surface)
+    if size.m_width <= 0 or size.m_height <= 0:
+        return
+    let width = (usize)size.m_width
+    let height = (usize)size.m_height
+    let pixels = try new u8[width * height * 4] --- in memory.heap
+    defer free(pixels) in memory.heap
+    with memory.heap:
+        if worker_gpu_the.device == none:
+            worker_gpu_the.device = try gpu.Device.open()
+            worker_gpu_the.compositor = gpu_player.gpu_compositor_create()
+        let device = worker_gpu_the.device else trap("no device")
+        let compositor = worker_gpu_the.compositor else trap("no compositor")
+        var texture = try gpu.Texture.create(device, (u32)width, (u32)height, gpu.Format.rgba8_linear)
+        defer texture.destroy()
+        let frame = try texture.frame()
+        defer frame.release()
+        let target = try frame.value().target()
+        defer target.release()
+        var allocator: memory.Allocator? = none
+        if let heap = worker_gpu_the.heap:
+            allocator = heap
+        try gpu_player.gpu_compositor_draw(compositor, list, snapshot, target.value(), size.m_width, size.m_height, allocator)
+        _ = try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0))
+        try texture.read(pixels)
+    # The texture's premultiplied RGBA into the surface's premultiplied BGRA.
+    let bitmap = gfx.painting_surface_bitmap(surface)
+    for y in 0..<height:
+        let row = gfx.bitmap_scanline(bitmap, (i32)y) else continue
+        for x in 0..<width:
+            let at = (y * width + x) * 4
+            row[x] = ((u32)pixels[at + 3] << 24) | ((u32)pixels[at] << 16) | ((u32)pixels[at + 1] << 8) | (u32)pixels[at + 2]
